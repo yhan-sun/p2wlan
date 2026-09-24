@@ -29,6 +29,12 @@ impl Daemon {
             self.config.control.proxy_mode.as_label(),
             crate::control::proxy_http_behavior_label(self.config.control.proxy_mode)
         );
+        if self.config.network.hard_hard_experiment_only {
+            info!(
+                event = "hard_hard_experiment_lane_enabled",
+                "Hard↔Hard experiment lane enabled: ordinary candidate offers and punch workers are isolated"
+            );
+        }
         self.timeline.emit(
             "daemon_started",
             None,
@@ -164,6 +170,8 @@ impl Daemon {
         resolved_config.network.udp_observers =
             udp_observers_from_sources(&relay_catalog, &resolved_config.network.udp_observers);
         self.config = Arc::new(resolved_config);
+        self.peers
+            .set_local_node_id_for_traversal(&assigned_node_id);
 
         info!(
             "[startup] initializing TUN: interface={} address={} netmask={} mtu={}",

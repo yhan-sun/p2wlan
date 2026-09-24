@@ -80,6 +80,23 @@ pub(super) fn control_udp_endpoint_from_candidates(
     candidates: &[String],
     candidate_sources: &HashMap<String, String>,
 ) -> Option<String> {
+    control_udp_endpoint_from_candidates_with_loopback(candidates, candidate_sources, false)
+}
+
+/// Select the endpoint published to the control plane, with an explicit
+/// loopback-only escape hatch for the deterministic NAT simulator.
+///
+/// Production must never publish a loopback STUN observation as remotely
+/// reachable.  The simulator deliberately models both NAT public sides on
+/// loopback, however, and already requires the matching
+/// `fresh_mapping_harness_loopback` flag for socket routing.  Reusing that
+/// opt-in here lets peers receive the *measured* NAT label early enough to
+/// exercise the real hard↔hard planner without weakening the default filter.
+pub(super) fn control_udp_endpoint_from_candidates_with_loopback(
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+    allow_loopback_stun: bool,
+) -> Option<String> {
     candidates
         .iter()
         .enumerate()
@@ -89,6 +106,7 @@ pub(super) fn control_udp_endpoint_from_candidates(
                 control_udp_endpoint_rank(
                     endpoint,
                     candidate_sources.get(endpoint).map(String::as_str),
+                    allow_loopback_stun,
                 ),
                 *index,
             )
@@ -98,18 +116,24 @@ pub(super) fn control_udp_endpoint_from_candidates(
             (control_udp_endpoint_rank(
                 endpoint,
                 candidate_sources.get(endpoint).map(String::as_str),
+                allow_loopback_stun,
             ) < u8::MAX)
                 .then(|| endpoint.to_string())
         })
 }
 
-fn control_udp_endpoint_rank(endpoint: &str, source: Option<&str>) -> u8 {
+fn control_udp_endpoint_rank(
+    endpoint: &str,
+    source: Option<&str>,
+    allow_loopback_stun: bool,
+) -> u8 {
     match source {
         Some("manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping") => 0,
         Some("stun_observed")
-            if endpoint
-                .parse::<SocketAddr>()
-                .is_ok_and(is_public_udp_candidate) =>
+            if endpoint.parse::<SocketAddr>().is_ok_and(|candidate| {
+                is_public_udp_candidate(candidate)
+                    || (allow_loopback_stun && candidate.ip().is_loopback())
+            }) =>
         {
             1
         }

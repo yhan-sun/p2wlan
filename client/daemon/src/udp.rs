@@ -311,7 +311,7 @@ use learning::model_deltas;
 
 use learning::fresh_mapping_target_eligible;
 
-use dynamic_punch::monotonic_millis;
+pub(crate) use dynamic_punch::monotonic_millis;
 
 #[cfg(test)]
 use birthday::hard_hard_birthday_candidates;

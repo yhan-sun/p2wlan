@@ -5,6 +5,13 @@ const HARD_HARD_MIN_RESPONSE_LEAD: Duration = Duration::from_millis(1_250);
 /// ordinary Relay/backoff recovery owns all later retries.
 const HARD_HARD_SESSION_TTL: Duration = Duration::from_secs(8);
 const HARD_HARD_SWEEP_DEADLINE: Duration = Duration::from_secs(3);
+/// REST signaling translates one server-clock deadline into each endpoint's
+/// wall clock. Request/poll transit can move the translated value by a few
+/// milliseconds when the reciprocal prediction comes back to the initiator.
+/// Keep that harmless normalization jitter distinct from a forged or stale
+/// rendezvous deadline: the token, candidate/profile generations and this
+/// tight bound must all match before the original 3500ms schedule is used.
+const HARD_HARD_RESPONSE_DEADLINE_TOLERANCE: Duration = Duration::from_millis(250);
 // The validation worker's individual ACK lease is 750ms.  Keep a bounded
 // second lease for scheduler/ingress handoff under a busy executor without
 // changing the send budget or any identity/generation fence.
@@ -66,6 +73,7 @@ pub(crate) enum HardHardInitiatorNotStarted {
     RecoverySuperseded,
     RecoveryBudgetExhausted,
     FreshGenerationQuotaExhausted,
+    ServerClockUnavailable,
 }
 
 impl HardHardInitiatorNotStarted {
@@ -77,6 +85,7 @@ impl HardHardInitiatorNotStarted {
             Self::RecoverySuperseded => "recovery_superseded",
             Self::RecoveryBudgetExhausted => "recovery_budget_exhausted",
             Self::FreshGenerationQuotaExhausted => "fresh_generation_quota_exhausted",
+            Self::ServerClockUnavailable => "server_clock_unavailable",
         }
     }
 }
@@ -318,6 +327,10 @@ fn hard_hard_plan_matches(
         && left.remote_candidate_epoch == right.remote_candidate_epoch
         && left.local_profile_generation == right.local_profile_generation
         && left.remote_profile_generation == right.remote_profile_generation
+}
+
+fn hard_hard_response_deadline_matches(expected_ms: u64, received_ms: u64) -> bool {
+    expected_ms.abs_diff(received_ms) <= HARD_HARD_RESPONSE_DEADLINE_TOLERANCE.as_millis() as u64
 }
 
 fn hard_hard_prediction_targets(candidates: &[String], limit: usize) -> Vec<SocketAddr> {
@@ -653,6 +666,7 @@ fn hard_hard_initiator_response_record_matches(
         && current.fresh_socket == expected.fresh_socket
         && current.punch_at_ms == expected.punch_at_ms
         && current.expires_at_ms == expected.expires_at_ms
+        && current.measurement == expected.measurement
         && Arc::ptr_eq(&current.cancellation, &expected.cancellation)
         && !current.cancellation.is_cancelled()
 }

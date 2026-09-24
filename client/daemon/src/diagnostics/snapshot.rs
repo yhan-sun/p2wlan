@@ -1,4 +1,4 @@
-async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
+async fn build_snapshot(context: DiagnosticsContext, request_id: u64) -> DiagnosticsSnapshot {
     let udp = context.udp_transport.read().await.clone();
     let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
     let udp_local_addr = udp_local_endpoint.map(|addr| addr.to_string());
@@ -18,6 +18,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
 
     let stable_peers = capture_stable_peer_snapshot(
         &context,
+        request_id,
         relay_connected,
         direct_retry_after,
         udp_local_endpoint,
@@ -143,6 +144,7 @@ struct StablePeerSnapshot {
 /// `/status` behind the same writer and eventually returning HTTP 503.
 async fn capture_stable_peer_snapshot(
     context: &DiagnosticsContext,
+    request_id: u64,
     relay_connected: bool,
     direct_retry_after: Duration,
     udp_local_endpoint: Option<std::net::SocketAddr>,
@@ -155,6 +157,7 @@ async fn capture_stable_peer_snapshot(
     // making normal transient contention converge to a fresh snapshot.
     const MAX_CAPTURE_ATTEMPTS: usize = 32;
     const CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(2);
+    let capture_started = std::time::Instant::now();
 
     for attempt in 0..MAX_CAPTURE_ATTEMPTS {
         let revision_before = context.status_events.current_seq();
@@ -162,6 +165,7 @@ async fn capture_stable_peer_snapshot(
         let Some(connections_before) = context.peers.try_all_connections() else {
             emit_status_connection_map_contention(
                 context,
+                request_id,
                 generation_before,
                 "initial_read",
                 attempt,
@@ -199,6 +203,7 @@ async fn capture_stable_peer_snapshot(
         if retry {
             emit_status_connection_map_contention(
                 context,
+                request_id,
                 generation_before,
                 "peer_diagnostic_read",
                 attempt,
@@ -211,6 +216,7 @@ async fn capture_stable_peer_snapshot(
         let Some(live_after) = context.peers.try_all_connections() else {
             emit_status_connection_map_contention(
                 context,
+                request_id,
                 generation_before,
                 "validation_read",
                 attempt,
@@ -247,6 +253,18 @@ async fn capture_stable_peer_snapshot(
             .peer_snapshot_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cached);
+        tracing::debug!(
+            event = "diagnostics_status_peer_capture_completed",
+            request_id,
+            process_id = std::process::id(),
+            capture_attempts = attempt + 1,
+            capture_elapsed_ms = capture_started.elapsed().as_micros() as u64 / 1_000,
+            peer_count = peers.len(),
+            network_generation = generation_after,
+            capture_revision = capture_revision,
+            stale = false,
+            "status peer snapshot passed its consistency checks"
+        );
         return StablePeerSnapshot {
             peers,
             cached_peer_count,
@@ -262,25 +280,51 @@ async fn capture_stable_peer_snapshot(
     let generation = context.peers.current_network_generation_sync();
     emit_status_connection_map_contention(
         context,
+        request_id,
         generation,
         "coherency_retry_exhausted",
         MAX_CAPTURE_ATTEMPTS,
     );
-    cached_or_best_effort_peer_snapshot(
+    let fallback = cached_or_best_effort_peer_snapshot(
         context,
         relay_connected,
         direct_retry_after,
         udp_local_endpoint,
     )
-    .await
+    .await;
+    tracing::debug!(
+        event = "diagnostics_status_peer_capture_fallback",
+        request_id,
+        process_id = std::process::id(),
+        capture_attempts = MAX_CAPTURE_ATTEMPTS,
+        capture_elapsed_ms = capture_started.elapsed().as_micros() as u64 / 1_000,
+        peer_count = fallback.peers.len(),
+        network_generation = fallback.network_generation,
+        capture_revision = fallback.capture_revision,
+        peer_snapshot_age_ms = fallback.captured_at.elapsed().as_millis() as u64,
+        stale = fallback.stale,
+        "status peer snapshot used bounded last-good or best-effort fallback"
+    );
+    fallback
 }
 
 fn emit_status_connection_map_contention(
     context: &DiagnosticsContext,
+    request_id: u64,
     generation: u64,
     phase: &'static str,
     attempt: usize,
 ) {
+    tracing::debug!(
+        event = "diagnostics_status_peer_capture_retry",
+        request_id,
+        process_id = std::process::id(),
+        generation,
+        phase,
+        attempt = attempt + 1,
+        reason = "connection_map_read_or_snapshot_coherency",
+        "status peer snapshot capture will retry"
+    );
     context.timeline.emit_first_scoped(
         &format!("status:{generation}"),
         "status_connection_map_read_contended",

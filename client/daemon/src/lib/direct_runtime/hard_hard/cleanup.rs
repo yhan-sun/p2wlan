@@ -214,6 +214,75 @@ fn spawn_hard_hard_session_cleanup_with_owner(
             && hard_hard_exact_direct_socket_is_current_for_cleanup(&udp, &peers, &current_socket)
                 .await;
 
+        // An initiator can finish measurement and advertisement but never
+        // receive an admissible reciprocal prediction. That is still an
+        // executed experiment attempt, not missing evidence. Commit one typed
+        // zero-send terminal report while the exact session identity is still
+        // current; ordinary sweep paths have already advanced state/attempt
+        // and therefore cannot be double reported here.
+        if let Some(record) = snapshot.as_ref().filter(|record| {
+            record.state == crate::peer::HardHardSessionState::AwaitingPeer
+                && record.attempt_count == 0
+        }) {
+            if let Some(peer_session_generation) =
+                peers.peer_session_generation_sync(&descriptor.peer_id)
+            {
+                let targets = record.remote_prediction.as_slice();
+                let planned_sockets = record.requested_socket_indices.len();
+                let planned_socket_target_combinations = if record.birthday {
+                    targets
+                        .len()
+                        .saturating_mul(hard_hard_birthday_wave_count(planned_sockets))
+                } else {
+                    targets.len()
+                };
+                let planned_logical_probes = if record.birthday {
+                    planned_socket_target_combinations
+                } else {
+                    targets
+                        .len()
+                        .saturating_mul(HARD_HARD_SWEEP_ATTEMPTS as usize)
+                };
+                let probe_rx = udp
+                    .probe_rx_snapshot_for_peer_session(
+                        &descriptor.peer_id,
+                        record.local_network_generation,
+                        record.probe_session_id.as_deref(),
+                    )
+                    .await;
+                let _ = record_hard_hard_terminal_attempt(
+                    &peers,
+                    &descriptor.peer_id,
+                    peer_session_generation,
+                    &record.fresh_socket,
+                    &record.session_token,
+                    if record.initiator {
+                        "initiator"
+                    } else {
+                        "responder"
+                    },
+                    record.birthday,
+                    record.attempt_count,
+                    &record.measurement,
+                    targets,
+                    planned_sockets,
+                    planned_socket_target_combinations,
+                    planned_logical_probes,
+                    None,
+                    &PunchSendReport::default(),
+                    probe_rx,
+                    false,
+                    None,
+                    if expiry_woke {
+                        "peer_response_timeout"
+                    } else {
+                        "session_cancelled"
+                    },
+                )
+                .await;
+            }
+        }
+
         // The ledger is retired before any UDP cleanup await. This is the
         // completion-fence boundary: no admission/fence query can revive the
         // session, while the descriptor and token still own cleanup.

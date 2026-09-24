@@ -4,6 +4,9 @@ pub(super) struct UdpCandidateRefreshContext {
     pub(super) stun_timeout: Duration,
     pub(super) udp_advertise: Option<String>,
     pub(super) upnp_enabled: bool,
+    /// Explicit NAT-simulator opt-in; production keeps rejecting loopback
+    /// STUN mappings at the control publication boundary.
+    pub(super) allow_loopback_stun_endpoint: bool,
     pub(super) published_endpoint: Option<String>,
     pub(super) local_candidates: Arc<RwLock<Vec<String>>>,
     pub(super) local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
@@ -162,6 +165,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         stun_timeout,
         udp_advertise,
         upnp_enabled,
+        allow_loopback_stun_endpoint,
         mut published_endpoint,
         local_candidates,
         local_candidate_sources,
@@ -484,7 +488,19 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             Some(&report.nat_profile),
             &candidates,
             &candidate_sources,
-        );
+        ) || (allow_loopback_stun_endpoint
+            && report
+                .nat_profile
+                .public_endpoint
+                .as_ref()
+                .is_some_and(|endpoint| {
+                    control_udp_endpoint_from_candidates_with_loopback(
+                        std::slice::from_ref(endpoint),
+                        &candidate_sources,
+                        true,
+                    )
+                    .is_some()
+                }));
         let want_fast = !reliable_public;
         if want_fast != fast_retry_active {
             fast_retry_active = want_fast;
@@ -566,17 +582,27 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     report.nat_profile.public_endpoint,
                     nat_publication.observation,
                 );
-                let endpoint =
-                    control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
-                        .or(advertised_endpoint)
-                        .unwrap_or_default();
+                let endpoint = control_udp_endpoint_from_candidates_with_loopback(
+                    &candidates,
+                    &candidate_sources,
+                    allow_loopback_stun_endpoint,
+                )
+                .or(advertised_endpoint)
+                .unwrap_or_default();
                 let nat_type = report
                     .nat_profile
                     .control_label_with_generation_and_observation(
                         nat_publication.generation,
                         nat_publication.observation,
                     );
-                if let Err(err) = control.update_endpoint(&endpoint, &nat_type).await {
+                let publish_result = if allow_loopback_stun_endpoint {
+                    control
+                        .update_endpoint_for_handshake(&endpoint, &nat_type)
+                        .await
+                } else {
+                    control.update_endpoint(&endpoint, &nat_type).await
+                };
+                if let Err(err) = publish_result {
                     warn!("Failed to publish refreshed UDP NAT profile '{endpoint}': {err}");
                 } else if !endpoint.is_empty() {
                     published_endpoint = Some(endpoint.clone());
@@ -612,9 +638,13 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         debug!(
             "UDP candidate set diff: changed_reason={change_reason} old_candidates={previous_candidates:?} new_candidates={candidates:?}"
         );
-        let endpoint = control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
-            .or(advertised_endpoint)
-            .unwrap_or_default();
+        let endpoint = control_udp_endpoint_from_candidates_with_loopback(
+            &candidates,
+            &candidate_sources,
+            allow_loopback_stun_endpoint,
+        )
+        .or(advertised_endpoint)
+        .unwrap_or_default();
         if should_advance_generation {
             peers
                 // `network_identity_changed` only becomes true when an
@@ -653,7 +683,14 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     nat_publication.generation,
                     nat_publication.observation,
                 );
-            if let Err(err) = control.update_endpoint(&endpoint, &nat_type).await {
+            let publish_result = if allow_loopback_stun_endpoint {
+                control
+                    .update_endpoint_for_handshake(&endpoint, &nat_type)
+                    .await
+            } else {
+                control.update_endpoint(&endpoint, &nat_type).await
+            };
+            if let Err(err) = publish_result {
                 warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
             } else if !endpoint.is_empty() {
                 published_endpoint = Some(endpoint.clone());
@@ -785,6 +822,34 @@ pub(super) async fn publish_local_candidates_to_known_peers(
             debug!(
                 "Skipping {reason} candidate publication to peer {peer_id}: healthy confirmed Direct path is active"
             );
+            continue;
+        }
+        if peers.hard_hard_experiment_only() {
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "hard_hard_experiment_trigger",
+                    None,
+                    Some(candidates.len()),
+                    None,
+                    format!(
+                        "suppressed ordinary {reason} candidate offer; invoking planner-gated Hard↔Hard experiment lane"
+                    ),
+                )
+                .await;
+            spawn_hole_punch_task(
+                udp.clone(),
+                peers.clone(),
+                punch_deduplicator.clone(),
+                peer_id,
+                probe_interval,
+                attempts,
+                None,
+                signal.clone(),
+                None,
+                None,
+            )
+            .await;
             continue;
         }
         let Ok(permit) = fanout_permits.clone().acquire_owned().await else {

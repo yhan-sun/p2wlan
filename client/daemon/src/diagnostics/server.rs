@@ -1,4 +1,7 @@
 /// Run the local diagnostics HTTP endpoint until the listener fails.
+static DIAGNOSTICS_REQUEST_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 pub async fn run_diagnostics_server(
     bind: String,
     context: DiagnosticsContext,
@@ -137,6 +140,9 @@ async fn serve_diagnostics(
 }
 
 async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -> Result<()> {
+    let handler_started = std::time::Instant::now();
+    let request_id =
+        DIAGNOSTICS_REQUEST_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let request = match read_diagnostics_head(&mut stream).await {
         Ok(request) => request,
         Err((status, message)) => {
@@ -229,17 +235,70 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
         }
         ("GET", "/status") => {
-            match timeout(DIAGNOSTICS_SNAPSHOT_TIMEOUT, build_snapshot(context)).await {
+            debug!(
+                event = "diagnostics_status_handler_entered",
+                request_id,
+                process_id = std::process::id(),
+                path = "/status",
+                "authenticated status request entered the snapshot handler"
+            );
+            let snapshot_started = std::time::Instant::now();
+            match timeout(
+                DIAGNOSTICS_SNAPSHOT_TIMEOUT,
+                build_snapshot(context, request_id),
+            )
+            .await
+            {
                 Ok(snapshot) => {
+                    let snapshot_ms = snapshot_started.elapsed().as_micros() as u64 / 1_000;
+                    let serialization_started = std::time::Instant::now();
                     let body =
                         serde_json::to_string_pretty(&StatusResponse::from_snapshot(snapshot))?;
-                    write_response(&mut stream, 200, "application/json", &body, cors_origin)
-                        .await?;
+                    let serialization_ms =
+                        serialization_started.elapsed().as_micros() as u64 / 1_000;
+                    let write_started = std::time::Instant::now();
+                    write_response_with_headers(
+                        &mut stream,
+                        200,
+                        "application/json",
+                        &body,
+                        cors_origin,
+                        &format!("X-P2WLAN-Status-Request-ID: {request_id}\r\n"),
+                    )
+                    .await?;
+                    debug!(
+                        event = "diagnostics_status_handler_completed",
+                        request_id,
+                        process_id = std::process::id(),
+                        http_status = 200,
+                        snapshot_ms,
+                        serialization_ms,
+                        response_bytes = body.len(),
+                        response_write_ms = write_started.elapsed().as_micros() as u64 / 1_000,
+                        handler_total_ms = handler_started.elapsed().as_micros() as u64 / 1_000,
+                        "status snapshot was serialized and written"
+                    );
                 }
                 Err(_) => {
                     let body = diagnostics_snapshot_timeout_body();
-                    write_response(&mut stream, 503, "application/json", &body, cors_origin)
-                        .await?;
+                    write_response_with_headers(
+                        &mut stream,
+                        503,
+                        "application/json",
+                        &body,
+                        cors_origin,
+                        &format!("X-P2WLAN-Status-Request-ID: {request_id}\r\n"),
+                    )
+                    .await?;
+                    debug!(
+                        event = "diagnostics_status_handler_timed_out",
+                        request_id,
+                        process_id = std::process::id(),
+                        http_status = 503,
+                        snapshot_timeout_ms = DIAGNOSTICS_SNAPSHOT_TIMEOUT.as_millis(),
+                        handler_total_ms = handler_started.elapsed().as_micros() as u64 / 1_000,
+                        "status snapshot exceeded its bounded capture deadline"
+                    );
                 }
             }
         }

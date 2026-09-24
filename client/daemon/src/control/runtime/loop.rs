@@ -13,6 +13,7 @@ async fn run_control_loop(
     advertised_snapshot: Arc<std::sync::Mutex<AdvertisedEndpointSnapshot>>,
     event_loop_ready: Arc<AtomicBool>,
     telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
+    server_clock: Arc<ServerClockEstimate>,
 ) {
     let base_url = normalize_http_base_url(&config.control.server_url);
 
@@ -336,6 +337,7 @@ async fn run_control_loop(
                 event_tx,
                 0,
                 &recent_signal_ids,
+                &server_clock,
             )
             .await
         }
@@ -564,6 +566,7 @@ async fn run_control_loop(
                             event_tx,
                             0,
                             &recent_signal_ids,
+                            &server_clock,
                         )
                         .await
                     }
@@ -620,6 +623,7 @@ async fn run_control_loop(
                             event_tx,
                             wait_ms,
                             &recent_signal_ids,
+                            &server_clock,
                         )
                         .await
                     }

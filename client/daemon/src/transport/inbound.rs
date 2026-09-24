@@ -1134,15 +1134,33 @@ impl WireGuardTransport {
                                             packet_identity,
                                             wire_fingerprint(&inbound.packet),
                                         );
-                                        timeline.emit_first_scoped_with_key(
+                                        let business_attribution_identity = if path
+                                            == crate::peer::NetworkPath::Direct
+                                            && owns_direct_packet
+                                        {
+                                            udp.as_ref().and_then(|udp| {
+                                                    udp.hard_hard_business_attribution_identity_for_ingress(
+                                                        &inbound.peer_id,
+                                                        source,
+                                                        local_endpoint,
+                                                        socket_index,
+                                                        udp_transport_owner,
+                                                        packet_network_generation,
+                                                    )
+                                                })
+                                        } else {
+                                            None
+                                        };
+                                        timeline.emit_first_scoped_with_business_attribution_identity(
                                             &scope,
                                             &format!(
-                                                "path={path_label} relay_connection_id={relay_transport_key} usable={first_usable_recorded}"
+                                                "path={path_label} relay_connection_id={relay_transport_key} business_identity={business_attribution_identity:?} usable={first_usable_recorded}"
                                             ),
                                             "business_ingress_observed",
                                             Some(path_label),
                                             Some(first_usable_result),
                                             Some(detail.clone()),
+                                            business_attribution_identity,
                                         );
                                         timeline.emit_first_scoped(
                                             &scope,

@@ -70,6 +70,8 @@ pub struct DirectTraversalEventDiagnostics {
     pub probe_tx_alt_socket_count: Option<u32>,
     pub probe_tx_unique_target_ports: Option<u32>,
     pub probe_tx_repeated_target_ports: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_hard_attempt: Option<HardHardAttemptReport>,
     pub detail: String,
 }
 
@@ -97,6 +99,7 @@ impl From<&DirectTraversalEvent> for DirectTraversalEventDiagnostics {
             probe_tx_alt_socket_count: event.probe_tx_alt_socket_count,
             probe_tx_unique_target_ports: event.probe_tx_unique_target_ports,
             probe_tx_repeated_target_ports: event.probe_tx_repeated_target_ports,
+            hard_hard_attempt: event.hard_hard_attempt.clone(),
             detail: event.detail.clone(),
         }
     }

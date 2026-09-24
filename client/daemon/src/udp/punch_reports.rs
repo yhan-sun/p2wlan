@@ -89,9 +89,15 @@ pub(super) fn merge_punch_send_reports(destination: &mut PunchSendReport, source
     destination.physical_datagrams_sent = destination
         .physical_datagrams_sent
         .saturating_add(source_physical_datagrams_sent);
+    destination.physical_bytes_sent = destination
+        .physical_bytes_sent
+        .saturating_add(source.physical_bytes_sent);
     destination.physical_send_errors = destination
         .physical_send_errors
         .saturating_add(source.physical_send_errors);
+    destination.physical_send_error_bytes = destination
+        .physical_send_error_bytes
+        .saturating_add(source.physical_send_error_bytes);
     destination.partial_physical_send_errors = destination
         .partial_physical_send_errors
         .saturating_add(source.partial_physical_send_errors);
@@ -233,9 +239,13 @@ pub(crate) fn apply_live_birthday_counters(
     report.physical_datagrams_sent = report
         .physical_datagrams_sent
         .max(counters.physical_datagrams_sent);
+    report.physical_bytes_sent = report.physical_bytes_sent.max(counters.physical_bytes_sent);
     report.physical_send_errors = report
         .physical_send_errors
         .max(counters.physical_send_errors);
+    report.physical_send_error_bytes = report
+        .physical_send_error_bytes
+        .max(counters.physical_send_error_bytes);
     report.partial_physical_send_errors = report
         .partial_physical_send_errors
         .max(counters.partial_physical_send_errors);

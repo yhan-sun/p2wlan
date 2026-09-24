@@ -189,6 +189,7 @@ pub(super) async fn poll_signals(
     event_tx: &mpsc::UnboundedSender<ControlEvent>,
     wait_ms: u64,
     delivery_tracker: &Arc<tokio::sync::Mutex<SignalDeliveryTracker>>,
+    server_clock: &ServerClockEstimate,
 ) -> Result<()> {
     // ACK mode (`ack=1`): the server hands out delivery LEASES instead of
     // deleting rows at GET time, so a connection that breaks mid-body or a
@@ -207,6 +208,11 @@ pub(super) async fn poll_signals(
     .send()
     .await
     .map_err(|e| DaemonError::ControlPlane(format!("list signals request failed: {e}")))?;
+    // Capture the local clock edge as soon as the response headers arrive.
+    // `server_time_ms` is stamped while the server writes this response; JSON
+    // decoding and executor contention must not extend a synchronized punch
+    // deadline or candidate lifetime after the bytes have already arrived.
+    let received_at_ms = unix_time_millis();
 
     if !res.status().is_success() {
         let status = res.status();
@@ -223,8 +229,10 @@ pub(super) async fn poll_signals(
         .json()
         .await
         .map_err(|e| DaemonError::ControlPlane(format!("list signals decode failed: {e}")))?;
-    let received_at_ms = unix_time_millis();
     let server_time_ms = body.server_time_ms;
+    if let Some(server_time_ms) = server_time_ms {
+        server_clock.observe(server_time_ms, received_at_ms);
+    }
     if let Some(protocol_version) = body.protocol_version {
         if protocol_version != SIGNAL_REST_PROTOCOL_VERSION {
             warn!(

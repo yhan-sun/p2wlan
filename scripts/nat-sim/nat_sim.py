@@ -15,6 +15,13 @@ socket.  The receiving forwarder then handles the translated packet normally.
 Consequently the receiver observes the sender NAT's public endpoint, rather
 than its own public endpoint or the sender's private socket.
 
+The Hard<->Hard experiment may additionally pre-bind a bounded window of the
+allocator's next public ports.  Those sockets are *egress listeners*, not NAT
+mappings: they can observe a registered private daemon's first packet so the
+sender NAT can translate it, but they never admit public inbound traffic until
+the corresponding port is consumed by a real mapping.  This models the kernel
+interposition that loopback lacks without inventing a peer-visible mapping.
+
 STUN observers are the NAT's measurement face.  They return RFC 5389 Binding
 responses with the allocated mapping encoded as XOR-MAPPED-ADDRESS.  They are
 kept separate from public forwarders so observer packets cannot accidentally
@@ -29,6 +36,7 @@ import collections
 import dataclasses
 import errno
 import json
+import os
 import random
 import struct
 import time
@@ -199,9 +207,25 @@ class Nat:
         reorder: bool = False,
         strict_filtering: bool = False,
         block_direct: bool = False,
+        mapping_mode: str = "step",
+        delivery_delay_ms: int = 0,
+        stun_delay_ms: int = 0,
+        duplicate_rate: float = 0.0,
+        direct_gate_file: Optional[str] = None,
+        unassigned_egress_listeners: int = 0,
     ) -> None:
-        if step == 0:
+        if mapping_mode not in {"step", "random"}:
+            raise ValueError("mapping_mode must be 'step' or 'random'")
+        if mapping_mode == "step" and step == 0:
             raise ValueError("--step must not be zero for address/port-dependent mappings")
+        if not 1024 <= base_port <= 65535:
+            raise ValueError("--base must be in the allocatable UDP range 1024..65535")
+        if delivery_delay_ms < 0 or stun_delay_ms < 0:
+            raise ValueError("simulated delays must be non-negative")
+        if not 0.0 <= duplicate_rate <= 1.0:
+            raise ValueError("duplicate_rate must be between 0 and 1")
+        if not 0 <= unassigned_egress_listeners <= 32:
+            raise ValueError("unassigned_egress_listeners must be between 0 and 32")
         self.name = name
         self.public_ip = public_ip
         self.step = step
@@ -210,6 +234,10 @@ class Nat:
         self.consume_before_punch = consume_before_punch
         self.loss_rate = loss_rate
         self.reorder = reorder
+        self.mapping_mode = mapping_mode
+        self.delivery_delay_ms = delivery_delay_ms
+        self.stun_delay_ms = stun_delay_ms
+        self.duplicate_rate = duplicate_rate
         # Endpoint-dependent filtering: only the exact destination a client's
         # mapping was created toward may send in; a peer's other public socket
         # is not automatically admitted.
@@ -219,24 +247,40 @@ class Nat:
         # never establish but the relay data plane still carries traffic.  This
         # models the field CGNAT bidirectional UDP blackhole.
         self.block_direct = block_direct
+        # Hard<->Hard experiment-only startup gate. STUN observers and the
+        # TCP control/Relay planes remain live; only inter-NAT UDP is held
+        # until the harness observes that both real rendezvous workers were
+        # scheduled. An absent option preserves every established topology.
+        self.direct_gate_file = direct_gate_file
+        # Explicit loopback-only look-ahead. A provisional listener captures
+        # only a registered private sender's first outbound edge; it is not a
+        # peer-visible mapping and cannot admit public inbound traffic.
+        self.unassigned_egress_listeners = unassigned_egress_listeners
         self.mappings: Dict[Tuple[Address, Address], Mapping] = {}
         self.mapping_by_port: Dict[int, Mapping] = {}
         self.forwarders: Dict[int, asyncio.DatagramTransport] = {}
+        self.provisional_forwarders: Dict[int, asyncio.DatagramTransport] = {}
         self.client_sockets: Set[Address] = set()
         self.observers: List[Tuple[asyncio.DatagramTransport, Address]] = []
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.fabric: Optional[NatFabric] = None
         self.observed_sequence: List[int] = []
+        self._egress_refresh_task: Optional[asyncio.Task] = None
+        self._egress_refresh_needed = False
 
     async def start(self, fabric: Optional[NatFabric] = None) -> "Nat":
         self.loop = asyncio.get_running_loop()
         self.fabric = fabric
         if fabric is not None:
             fabric.add_nat(self)
+        await self._ensure_egress_listeners()
         return self
 
     async def close(self) -> None:
         tasks = []
+        if self._egress_refresh_task is not None and not self._egress_refresh_task.done():
+            self._egress_refresh_task.cancel()
+            tasks.append(self._egress_refresh_task)
         for mapping in self.mappings.values():
             for task in (mapping.bind_task, mapping.send_task):
                 if task is not None and not task.done():
@@ -248,15 +292,22 @@ class Nat:
             transport.close()
         for transport in self.forwarders.values():
             transport.close()
+        for transport in self.provisional_forwarders.values():
+            transport.close()
         self.observers.clear()
         self.forwarders.clear()
+        self.provisional_forwarders.clear()
 
     def alloc_port(self) -> int:
-        port = self.next_port
+        if self.mapping_mode == "random":
+            port = self.rng.randrange(1024, 65536)
+        else:
+            port = self.next_port
+            # Walk the complete allocatable UDP port ring. This preserves a
+            # signed step at both ends instead of folding low ports onto an
+            # unrelated +1024 sequence.
+            self.next_port = 1024 + ((port - 1024 + self.step) % 64512)
         self.observed_sequence.append(port)
-        self.next_port = (self.next_port + self.step) % 65536
-        if self.next_port < 1024:
-            self.next_port += 1024
         return port
 
     def _allocate_unused_port(self) -> int:
@@ -267,6 +318,71 @@ class Nat:
             if port not in self.mapping_by_port:
                 return port
         raise RuntimeError(f"NAT {self.name} exhausted public UDP ports")
+
+    def _preview_unused_ports(self, count: int) -> List[int]:
+        """Preview allocator outputs without advancing production state."""
+        if count <= 0:
+            return []
+        preview_rng = random.Random()
+        preview_rng.setstate(self.rng.getstate())
+        next_port = self.next_port
+        ports: List[int] = []
+        reserved: Set[int] = set(self.mapping_by_port)
+        for _ in range(64512):
+            if self.mapping_mode == "random":
+                port = preview_rng.randrange(1024, 65536)
+            else:
+                port = next_port
+                next_port = 1024 + ((port - 1024 + self.step) % 64512)
+            if port in reserved:
+                continue
+            ports.append(port)
+            reserved.add(port)
+            if len(ports) == count:
+                break
+        return ports
+
+    def _schedule_egress_listener_refresh(self) -> None:
+        if self.unassigned_egress_listeners == 0 or self.loop is None:
+            return
+        self._egress_refresh_needed = True
+        if self._egress_refresh_task is None or self._egress_refresh_task.done():
+            self._egress_refresh_task = self.loop.create_task(self._refresh_egress_listeners())
+
+    async def _refresh_egress_listeners(self) -> None:
+        while self._egress_refresh_needed:
+            self._egress_refresh_needed = False
+            await self._ensure_egress_listeners()
+
+    async def _ensure_egress_listeners(self) -> None:
+        """Keep only the bounded allocator look-ahead window bound."""
+        if self.unassigned_egress_listeners == 0:
+            return
+        if self.loop is None:
+            raise RuntimeError("start the NAT before binding egress listeners")
+        desired = set(self._preview_unused_ports(self.unassigned_egress_listeners))
+        for port in set(self.provisional_forwarders) - desired:
+            self.provisional_forwarders.pop(port).close()
+        for port in desired - set(self.provisional_forwarders):
+            if port in self.mapping_by_port or port in self.forwarders:
+                continue
+            try:
+                transport, _ = await self.loop.create_datagram_endpoint(
+                    lambda port=port: PublicForwarderProtocol(self, port),
+                    local_addr=(self.public_ip, port),
+                )
+            except OSError as error:
+                if error.errno == errno.EADDRINUSE:
+                    continue
+                raise
+            mapping = self.mapping_by_port.get(port)
+            if mapping is not None and mapping.transport is None:
+                mapping.transport = transport
+                self.forwarders[port] = transport
+            elif mapping is None:
+                self.provisional_forwarders[port] = transport
+            else:
+                transport.close()
 
     def _reassign_mapping_port(self, mapping: Mapping) -> None:
         previous = mapping.port
@@ -286,6 +402,11 @@ class Nat:
         mapping = Mapping(client=client, destination=destination, port=self._allocate_unused_port())
         self.mappings[key] = mapping
         self.mapping_by_port[mapping.port] = mapping
+        provisional = self.provisional_forwarders.pop(mapping.port, None)
+        if provisional is not None:
+            mapping.transport = provisional
+            self.forwarders[mapping.port] = provisional
+        self._schedule_egress_listener_refresh()
         if self.fabric is not None:
             self.fabric.record(
                 "mapping_created",
@@ -311,6 +432,11 @@ class Nat:
     async def ensure_bound(self, mapping: Mapping) -> None:
         if mapping.transport is not None:
             return
+        provisional = self.provisional_forwarders.pop(mapping.port, None)
+        if provisional is not None:
+            mapping.transport = provisional
+            self.forwarders[mapping.port] = provisional
+            return
         if mapping.bind_task is None:
             if self.loop is None:
                 raise RuntimeError("start the NAT before allocating mappings")
@@ -322,6 +448,11 @@ class Nat:
             raise RuntimeError("start the NAT before allocating mappings")
         while mapping.transport is None:
             port = mapping.port
+            provisional = self.provisional_forwarders.pop(port, None)
+            if provisional is not None:
+                mapping.transport = provisional
+                self.forwarders[port] = provisional
+                return
             try:
                 transport, _ = await self.loop.create_datagram_endpoint(
                     lambda: PublicForwarderProtocol(self, port),
@@ -367,7 +498,10 @@ class Nat:
             await self.ensure_bound(mapping)
         except OSError:
             return
-        observer_transport.sendto(binding_response(transaction, self.public_ip, mapping.port), client)
+        response = binding_response(transaction, self.public_ip, mapping.port)
+        if self.stun_delay_ms > 0:
+            await asyncio.sleep(self.stun_delay_ms / 1000.0)
+        observer_transport.sendto(response, client)
 
     def translate_outbound(self, client: Address, destination: Address, data: bytes) -> None:
         """Source-NAT a daemon datagram then send it to the public destination."""
@@ -409,12 +543,22 @@ class Nat:
 
     def handle_public_datagram(self, port: int, data: bytes, addr: Address) -> None:
         mapping = self.mapping_by_port.get(port)
-        if mapping is None:
-            return
         source_nat = self.fabric.owner_for_private_client(addr) if self.fabric is not None else None
         if source_nat is not None:
             if source_nat is not self:
-                if self.block_direct or source_nat.block_direct:
+                receiver_gate_closed = self.direct_gate_file is not None and not os.path.exists(
+                    self.direct_gate_file
+                )
+                sender_gate_closed = (
+                    source_nat.direct_gate_file is not None
+                    and not os.path.exists(source_nat.direct_gate_file)
+                )
+                if (
+                    self.block_direct
+                    or source_nat.block_direct
+                    or receiver_gate_closed
+                    or sender_gate_closed
+                ):
                     # Deterministic bidirectional UDP blackhole: this is a
                     # daemon's direct data-plane datagram and the blackhole is
                     # on.  Drop it so Direct can never establish while STUN
@@ -425,6 +569,11 @@ class Nat:
                             receiver_nat=self.name,
                             sender_nat=source_nat.name,
                             receiver_endpoint=f"{self.public_ip}:{port}",
+                            reason=(
+                                "permanent_blackhole"
+                                if self.block_direct or source_nat.block_direct
+                                else "startup_gate_closed"
+                            ),
                         )
                     return
                 # This is a daemon's direct loopback send.  Re-inject it from
@@ -432,6 +581,11 @@ class Nat:
                 # sender's public endpoint, exactly once.
                 source_nat.translate_outbound(addr, (self.public_ip, port), data)
             # Hairpinning is intentionally unsupported by this harness.
+            return
+        # Provisional sockets exist solely to observe a registered private
+        # sender's first outbound edge. Public inbound to an unassigned port
+        # cannot create or impersonate a NAT mapping.
+        if mapping is None:
             return
         if not self.inbound_allowed(mapping, addr):
             if self.fabric is not None:
@@ -444,10 +598,33 @@ class Nat:
                 )
             return
         if self.loss_rate > 0 and self.rng.random() < self.loss_rate:
+            if self.fabric is not None:
+                self.fabric.record(
+                    "packet_dropped_loss",
+                    nat=self.name,
+                    receiver_endpoint=f"{self.public_ip}:{mapping.port}",
+                    bytes=len(data),
+                )
             return
+        delay_seconds = self.delivery_delay_ms / 1000.0
         if self.reorder and self.rng.random() < 0.25:
+            delay_seconds += 0.02
+        duplicate = self.duplicate_rate > 0 and self.rng.random() < self.duplicate_rate
+        if delay_seconds > 0:
             if self.loop is not None:
-                self.loop.create_task(self._delayed_delivery(mapping, data, addr, 0.02))
+                self.loop.create_task(self._delayed_delivery(mapping, data, addr, delay_seconds))
+                if duplicate:
+                    self.loop.create_task(
+                        self._delayed_delivery(mapping, data, addr, delay_seconds + 0.001)
+                    )
+            if self.fabric is not None:
+                self.fabric.record(
+                    "packet_delayed",
+                    nat=self.name,
+                    delay_ms=round(delay_seconds * 1000),
+                    duplicated=duplicate,
+                    bytes=len(data),
+                )
             return
         if self.fabric is not None:
             self.fabric.record(
@@ -456,8 +633,18 @@ class Nat:
                 receiver_endpoint=f"{self.public_ip}:{mapping.port}",
                 expected_source=format_address(mapping.destination),
                 actual_source=format_address(addr),
+                bytes=len(data),
             )
         self._deliver(mapping, data, addr)
+        if duplicate:
+            if self.fabric is not None:
+                self.fabric.record(
+                    "packet_duplicated",
+                    nat=self.name,
+                    receiver_endpoint=f"{self.public_ip}:{mapping.port}",
+                    bytes=len(data),
+                )
+            self._deliver(mapping, data, addr)
 
     def _deliver(self, mapping: Mapping, data: bytes, source: Address) -> None:
         peer_mapping = (
@@ -498,7 +685,26 @@ def main() -> None:
     parser.add_argument("--loss", type=float, default=0.0)
     parser.add_argument("--reorder", action="store_true")
     parser.add_argument("--strict-filtering", action="store_true")
+    parser.add_argument("--strict-filtering-a", action="store_true")
+    parser.add_argument("--strict-filtering-b", action="store_true")
     parser.add_argument("--block-direct", action="store_true")
+    parser.add_argument(
+        "--direct-gate-file",
+        help="hold inter-NAT UDP until this file exists (Hard<->Hard harness only)",
+    )
+    parser.add_argument(
+        "--unassigned-egress-listeners",
+        type=int,
+        default=0,
+        help="bind 0..32 allocator look-ahead ports for loopback egress capture",
+    )
+    parser.add_argument("--mapping-mode-a", choices=("step", "random"), default="step")
+    parser.add_argument("--mapping-mode-b", choices=("step", "random"), default="step")
+    parser.add_argument("--delay-a-ms", type=int, default=0)
+    parser.add_argument("--delay-b-ms", type=int, default=0)
+    parser.add_argument("--stun-delay-a-ms", type=int, default=0)
+    parser.add_argument("--stun-delay-b-ms", type=int, default=0)
+    parser.add_argument("--duplicate-rate", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=20260806)
     parser.add_argument("--observers", type=int, default=4)
     parser.add_argument("--base-a", type=int, default=16000)
@@ -518,8 +724,14 @@ def main() -> None:
             args.consume_a,
             args.loss,
             args.reorder,
-            args.strict_filtering,
+            args.strict_filtering or args.strict_filtering_a,
             args.block_direct,
+            args.mapping_mode_a,
+            args.delay_a_ms,
+            args.stun_delay_a_ms,
+            args.duplicate_rate,
+            args.direct_gate_file,
+            args.unassigned_egress_listeners,
         )
         nat_b = Nat(
             "B",
@@ -530,8 +742,14 @@ def main() -> None:
             args.consume_b,
             args.loss,
             args.reorder,
-            args.strict_filtering,
+            args.strict_filtering or args.strict_filtering_b,
             args.block_direct,
+            args.mapping_mode_b,
+            args.delay_b_ms,
+            args.stun_delay_b_ms,
+            args.duplicate_rate,
+            args.direct_gate_file,
+            args.unassigned_egress_listeners,
         )
         try:
             await nat_a.start(fabric)
@@ -545,6 +763,28 @@ def main() -> None:
             # Harness-verifiable banner: relay-only topologies assert the
             # Direct blackhole is actually active before they verify.
             print("BLOCK_DIRECT=%d" % (1 if args.block_direct else 0), flush=True)
+            print("DIRECT_GATE=%d" % (1 if args.direct_gate_file else 0), flush=True)
+            print(
+                "NAT_FEATURES="
+                + json.dumps(
+                    {
+                        "mapping_mode_a": args.mapping_mode_a,
+                        "mapping_mode_b": args.mapping_mode_b,
+                        "strict_filtering_a": args.strict_filtering or args.strict_filtering_a,
+                        "strict_filtering_b": args.strict_filtering or args.strict_filtering_b,
+                        "delay_a_ms": args.delay_a_ms,
+                        "delay_b_ms": args.delay_b_ms,
+                        "stun_delay_a_ms": args.stun_delay_a_ms,
+                        "stun_delay_b_ms": args.stun_delay_b_ms,
+                        "duplicate_rate": args.duplicate_rate,
+                        "direct_gate": bool(args.direct_gate_file),
+                        "unassigned_egress_listeners": args.unassigned_egress_listeners,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
             await asyncio.Event().wait()
         finally:
             await nat_a.close()

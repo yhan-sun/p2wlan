@@ -1383,6 +1383,7 @@ impl PeerManager {
         remote_candidate_epoch: u64,
         local_endpoint: Option<SocketAddr>,
     ) {
+        let confirmed_at_ms = self.timeline_uptime_ms();
         self.direct_commit_pair_mirror
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1392,6 +1393,7 @@ impl PeerManager {
                     generation,
                     remote_candidate_epoch,
                     local_endpoint,
+                    confirmed_at_ms,
                 },
             );
     }

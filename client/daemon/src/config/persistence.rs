@@ -114,6 +114,7 @@ impl Config {
                 fresh_mapping_punch_enabled: true,
                 predicted_candidates_enabled: true,
                 fresh_mapping_harness_loopback: false,
+                hard_hard_experiment_only: false,
                 gather_host_candidates: true,
                 validate_overlay: false,
                 overlay_start_gate_file: None,

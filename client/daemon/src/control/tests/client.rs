@@ -367,6 +367,7 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
     });
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let server_clock = ServerClockEstimate::default();
     let result = poll_signals(
         &test_no_proxy_client(),
         &format!("http://{address}"),
@@ -376,6 +377,7 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
         &event_tx,
         0,
         &Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default())),
+        &server_clock,
     )
     .await;
     assert!(
@@ -486,6 +488,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let dedup = Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default()));
+    let server_clock = ServerClockEstimate::default();
 
     // First poll: the signal is decoded and dispatched, but remains durable
     // until the daemon state machine completes the receipt.
@@ -498,6 +501,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         &event_tx,
         0,
         &dedup,
+        &server_clock,
     )
     .await;
     assert!(result.is_ok(), "first poll must succeed: {result:?}");
@@ -529,6 +533,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         &event_tx,
         0,
         &dedup,
+        &server_clock,
     )
     .await;
     assert!(
@@ -569,6 +574,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         &event_tx,
         0,
         &dedup,
+        &server_clock,
     )
     .await;
     assert!(result.is_ok(), "third poll must succeed: {result:?}");

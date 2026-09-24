@@ -14,13 +14,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-#[cfg(test)]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::connection_timeline::ConnectionTimeline;

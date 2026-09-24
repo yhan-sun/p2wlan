@@ -109,6 +109,9 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if cli.fresh_mapping_harness_loopback {
         config.network.fresh_mapping_harness_loopback = true;
     }
+    if cli.hard_hard_experiment_only {
+        config.network.hard_hard_experiment_only = true;
+    }
     if cli.no_host_candidates {
         config.network.gather_host_candidates = false;
     }

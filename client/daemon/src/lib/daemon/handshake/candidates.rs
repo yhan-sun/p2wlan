@@ -178,6 +178,45 @@ impl Daemon {
             debug!("Local UDP candidates are not ready; skipping {reason} candidate publication to {node_id}");
             return;
         }
+
+        if self.peers.hard_hard_experiment_only() {
+            // The dedicated Hard↔Hard matrix must not let the ordinary offer
+            // lane advance candidate epochs or consume the shared recovery
+            // quota before the planner sees both live NAT profiles. This does
+            // not force Hard↔Hard: the regular worker still runs every
+            // planner/generation/session gate and Relay remains the fallback.
+            self.peers
+                .record_direct_event(
+                    node_id,
+                    "hard_hard_experiment_trigger",
+                    None,
+                    Some(candidates.len()),
+                    None,
+                    format!(
+                        "suppressed ordinary {reason} candidate offer; invoking planner-gated Hard↔Hard experiment lane"
+                    ),
+                )
+                .await;
+            let attempts = self
+                .peers
+                .recommended_punch_attempts(self.config.network.punch_attempts)
+                .await;
+            let signal = self.hole_punch_signal_context().await;
+            spawn_hole_punch_task(
+                udp,
+                self.peers.clone(),
+                self.punch_attempts.clone(),
+                node_id.to_string(),
+                Duration::from_millis(self.config.network.punch_interval_ms),
+                attempts,
+                None,
+                signal,
+                None,
+                None,
+            )
+            .await;
+            return;
+        }
         let punch_at_ms = Some(relay_assisted_punch_at_ms());
 
         if let Err(error) = self

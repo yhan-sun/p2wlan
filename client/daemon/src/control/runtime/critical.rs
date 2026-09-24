@@ -232,6 +232,7 @@ async fn run_candidate_offer_worker(
             candidate_sources,
             handshake_init,
             punch_at_ms,
+            punch_at_server_ms,
             fresh_ownership,
             response_tx,
         } = command;
@@ -275,7 +276,7 @@ async fn run_candidate_offer_worker(
             &candidate_sources,
             &handshake_init,
             punch_at_ms,
-            None,
+            punch_at_server_ms,
             session_id.as_deref(),
             probe_ephemeral_public_key.as_deref(),
             auth.signal_signing_identity.as_ref(),

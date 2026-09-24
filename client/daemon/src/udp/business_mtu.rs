@@ -43,6 +43,56 @@ impl UdpTransport {
             })
     }
 
+    /// Return the exact currently committed Direct path identity used by the
+    /// business-MTU publisher. This is a read-only evidence key: callers still
+    /// make readiness and send decisions through the existing gates.
+    pub(crate) fn hard_hard_business_attribution_identity(
+        &self,
+        peer_id: &str,
+    ) -> Option<crate::peer::HardHardBusinessAttributionIdentity> {
+        let entry = self.dplpmtud.direct_business_budget_entry(peer_id)?;
+        let identity = &entry.update.path_identity;
+        if identity.socket.transport_instance_id != self.transport_instance_id
+            || !self.peers.dplpmtud_path_is_current_sync(identity)
+        {
+            return None;
+        }
+        Some(crate::peer::HardHardBusinessAttributionIdentity {
+            validation_session_id: identity.direct_validation_owner_token,
+            direct_commit_sequence: self.peers.direct_commit_seq_sync(peer_id)?,
+            transport_instance_id: identity.socket.transport_instance_id,
+            socket_index: identity.socket.socket_index,
+        })
+    }
+
+    /// Attach current-path identity to a decrypted Direct ingress only when
+    /// the original receive envelope still matches the published transport,
+    /// socket, endpoint pair, and network generation.
+    pub(crate) fn hard_hard_business_attribution_identity_for_ingress(
+        &self,
+        peer_id: &str,
+        source: Option<SocketAddr>,
+        local_endpoint: Option<SocketAddr>,
+        socket_index: Option<usize>,
+        packet_owner: Option<u64>,
+        packet_network_generation: Option<u64>,
+    ) -> Option<crate::peer::HardHardBusinessAttributionIdentity> {
+        let entry = self.dplpmtud.direct_business_budget_entry(peer_id)?;
+        let identity = &entry.update.path_identity;
+        if identity.socket.transport_instance_id != self.transport_instance_id
+            || identity.socket.socket_index != socket_index?
+            || identity.authenticated_remote_endpoint != source?
+            || identity.local_endpoint != local_endpoint?
+            || identity.epoch.network_generation != packet_network_generation?
+            || self.inbound_publication_owner() == 0
+            || self.inbound_publication_owner() != packet_owner?
+            || !self.peers.dplpmtud_path_is_current_sync(identity)
+        {
+            return None;
+        }
+        self.hard_hard_business_attribution_identity(peer_id)
+    }
+
     /// Bind the peer's authenticated Direct-validation Request ingress to the
     /// exact receiving socket and local lifecycle. The route is response-only:
     /// it never selects or promotes a business path.

@@ -161,6 +161,7 @@ fn probe_rx_snapshot_delta_is_saturating() {
         legacy_probe_acks_observed: 4,
         legacy_probe_acks_unmatched: 1,
         probe_acks_received: 3,
+        ..UdpProbeRxSnapshot::default()
     };
     let older = UdpProbeRxSnapshot {
         known_peer_ip_datagrams_received: 9,
@@ -170,6 +171,7 @@ fn probe_rx_snapshot_delta_is_saturating() {
         legacy_probe_acks_observed: 2,
         legacy_probe_acks_unmatched: 5,
         probe_acks_received: 9,
+        ..UdpProbeRxSnapshot::default()
     };
 
     assert_eq!(
@@ -182,6 +184,7 @@ fn probe_rx_snapshot_delta_is_saturating() {
             legacy_probe_acks_observed: 2,
             legacy_probe_acks_unmatched: 0,
             probe_acks_received: 0,
+            ..UdpProbeRxSnapshot::default()
         }
     );
 }

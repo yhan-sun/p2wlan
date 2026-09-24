@@ -331,7 +331,7 @@ impl Daemon {
             // provisional non-empty snapshot must not immediately win the first
             // offer. Give the full startup snapshot a bounded opportunity while
             // preserving the relay-first fast path.
-            let (candidates, candidate_sources) = {
+            let (mut candidates, mut candidate_sources) = {
                 let initial_snapshot = self.initial_candidate_set_if_ready().await;
                 let mut relay_available = self.relay_available_tx.subscribe();
                 let relay_is_available = *relay_available.borrow();
@@ -412,6 +412,20 @@ impl Daemon {
                     }
                 }
             };
+            if self.peers.hard_hard_experiment_only() && !candidates.is_empty() {
+                self.peers
+                    .record_direct_event(
+                        &peer_info.node_id,
+                        "hard_hard_experiment_handshake_candidates_suppressed",
+                        None,
+                        Some(candidates.len()),
+                        None,
+                        "kept the production encrypted handshake but removed its ordinary Direct candidate payload for the isolated Hard↔Hard experiment",
+                    )
+                    .await;
+                candidates.clear();
+                candidate_sources.clear();
+            }
             if *reservation.cancellation.borrow() {
                 return Ok(None);
             }

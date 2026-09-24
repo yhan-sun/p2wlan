@@ -260,7 +260,7 @@ async fn run_udp_direct_instance(
 ) -> Result<()> {
     let UdpDirectTaskContext {
         udp_bind: _,
-        fresh_mapping_harness_loopback: _,
+        fresh_mapping_harness_loopback,
         peers,
         control,
         local_candidates,
@@ -649,20 +649,28 @@ async fn run_udp_direct_instance(
                 *local_sources.write().await = sources;
             });
         }
+        let initial_control_endpoint = control_udp_endpoint_from_candidates_with_loopback(
+            &candidate_endpoints,
+            &candidate_sources,
+            fresh_mapping_harness_loopback,
+        );
+        let defer_simulator_endpoint_publication =
+            fresh_mapping_harness_loopback && peers.hard_hard_experiment_only();
         let mut published_endpoint = None;
-        if let Some(endpoint) =
-            control_udp_endpoint_from_candidates(&candidate_endpoints, &candidate_sources)
+        if let Some(endpoint) = initial_control_endpoint
+            .as_ref()
+            .filter(|_| !defer_simulator_endpoint_publication)
         {
             // The handshake control lane has its own bounded deadline; a
             // short caller budget keeps a pathological lane from stalling
             // transport startup.
             match tokio::time::timeout(
                 Duration::from_millis(STARTUP_ENDPOINT_PUBLISH_BUDGET_MS),
-                control.update_endpoint_for_handshake(&endpoint, &advertised_nat_type),
+                control.update_endpoint_for_handshake(endpoint, &advertised_nat_type),
             )
             .await
             {
-                Ok(Ok(())) => published_endpoint = Some(endpoint),
+                Ok(Ok(())) => published_endpoint = Some(endpoint.clone()),
                 Ok(Err(err)) => {
                     warn!("Failed to publish initial UDP endpoint '{endpoint}': {err}")
                 }
@@ -677,7 +685,7 @@ async fn run_udp_direct_instance(
         // reader and validation workers must not wait behind a serial
         // control lane servicing a large peer roster; a foreground
         // handshake can then use the critical offer lane immediately.
-        let initial_publication_worker = tokio::spawn({
+        let initial_publication_task = {
             let control = control.clone();
             let peers = peers.clone();
             let udp = udp.clone();
@@ -687,6 +695,10 @@ async fn run_udp_direct_instance(
             let candidate_snapshot = candidate_snapshot.clone();
             let stun_servers = stun_servers.clone();
             let signal_control = control.clone();
+            let deferred_control_endpoint = defer_simulator_endpoint_publication
+                .then_some(initial_control_endpoint)
+                .flatten();
+            let deferred_nat_type = advertised_nat_type.clone();
             async move {
                 publish_local_candidates_to_known_peers(
                     &control,
@@ -707,8 +719,44 @@ async fn run_udp_direct_instance(
                     }),
                 )
                 .await;
+
+                // The isolated Hard↔Hard simulator lane is deliberately
+                // stricter than production and the existing topology gates:
+                // candidate signaling must land first so the following
+                // live-measurement publication binds the NAT profile to the
+                // receiver's final candidate epoch. Ordinary direct/relay
+                // gates retain their endpoint-first startup ordering.
+                let endpoint = deferred_control_endpoint?;
+                match tokio::time::timeout(
+                    Duration::from_millis(STARTUP_ENDPOINT_PUBLISH_BUDGET_MS),
+                    control.update_endpoint_for_handshake(&endpoint, &deferred_nat_type),
+                )
+                .await
+                {
+                    Ok(Ok(())) => Some(endpoint),
+                    Ok(Err(err)) => {
+                        warn!(
+                            "Failed to publish simulator UDP endpoint after candidate fan-out '{endpoint}': {err}"
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Simulator UDP endpoint publish after candidate fan-out '{endpoint}' exceeded its budget"
+                        );
+                        None
+                    }
+                }
             }
-        });
+        };
+        let initial_publication_worker = if defer_simulator_endpoint_publication {
+            if let Some(endpoint) = initial_publication_task.await {
+                published_endpoint = Some(endpoint);
+            }
+            None
+        } else {
+            Some(tokio::spawn(initial_publication_task))
+        };
 
         // Route inspection invokes platform commands (`route`/`ip`) and must
         // not block the async runtime while the UDP instance is starting.
@@ -733,6 +781,7 @@ async fn run_udp_direct_instance(
                     stun_timeout,
                     udp_advertise,
                     upnp_enabled,
+                    allow_loopback_stun_endpoint: fresh_mapping_harness_loopback,
                     published_endpoint,
                      local_candidates: local_candidates.clone(),
                      local_candidate_sources: udp_local_candidate_sources.clone(),
@@ -789,6 +838,7 @@ async fn run_udp_direct_instance(
                     stun_timeout,
                     udp_advertise,
                     upnp_enabled,
+                    allow_loopback_stun_endpoint: fresh_mapping_harness_loopback,
                     published_endpoint,
                      local_candidates: local_candidates.clone(),
                      local_candidate_sources: udp_local_candidate_sources.clone(),
@@ -829,8 +879,10 @@ async fn run_udp_direct_instance(
                 },
             }
         };
-        initial_publication_worker.abort();
-        let _ = initial_publication_worker.await;
+        if let Some(initial_publication_worker) = initial_publication_worker {
+            initial_publication_worker.abort();
+            let _ = initial_publication_worker.await;
+        }
         outcome
     } else {
         Ok(())

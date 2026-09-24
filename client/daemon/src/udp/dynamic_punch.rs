@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
 
-pub(super) fn monotonic_millis() -> u64 {
+pub(crate) fn monotonic_millis() -> u64 {
     static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     // Zero is reserved for a missing response in MappingObservation. Never
     // publish this process-local value as an absolute signaling timestamp.
@@ -12,6 +12,12 @@ pub(super) fn monotonic_millis() -> u64 {
         .as_millis()
         .min((u64::MAX - 1) as u128) as u64
         + 1
+}
+
+#[derive(Debug, Default)]
+pub(super) struct FreshMappingMeasurementBatch {
+    pub(super) observations: Vec<MappingObservation>,
+    pub(super) stats: HardHardMeasurementStats,
 }
 
 impl UdpTransport {
@@ -60,7 +66,7 @@ impl UdpTransport {
         observers: &[SocketAddr],
         stun_timeout: Duration,
         keep_measuring: impl Fn() -> bool,
-    ) -> Vec<MappingObservation> {
+    ) -> FreshMappingMeasurementBatch {
         let mut seen = HashSet::new();
         let observers = observers
             .iter()
@@ -70,6 +76,11 @@ impl UdpTransport {
             .collect::<Vec<_>>();
         let started_ms = monotonic_millis();
         let mut observations = Vec::with_capacity(observers.len());
+        let mut stun_datagrams_sent = 0u32;
+        let mut stun_bytes_sent = 0u64;
+        let mut stun_send_errors = 0u32;
+        let mut stun_send_error_bytes = 0u64;
+        let mut last_send_at_ms = None;
         for (sequence, observer) in observers.iter().enumerate() {
             if !keep_measuring() {
                 debug!(
@@ -107,10 +118,15 @@ impl UdpTransport {
                 .insert(transaction_id, response_tx);
             let sent_at_ms = monotonic_millis();
             if let Err(error) = socket.send_to(&encoded, observer).await {
+                stun_send_errors = stun_send_errors.saturating_add(1);
+                stun_send_error_bytes = stun_send_error_bytes.saturating_add(encoded.len() as u64);
                 self.stun_waiters.lock().await.remove(&transaction_id);
                 debug!("Fresh-mapping STUN send {sequence} to {observer} failed: {error}");
                 continue;
             }
+            stun_datagrams_sent = stun_datagrams_sent.saturating_add(1);
+            stun_bytes_sent = stun_bytes_sent.saturating_add(encoded.len() as u64);
+            last_send_at_ms = Some(sent_at_ms);
             if !keep_measuring() {
                 self.stun_waiters.lock().await.remove(&transaction_id);
                 debug!(
@@ -160,7 +176,20 @@ impl UdpTransport {
                 );
             }
         }
-        observations
+        let finished_at_ms = monotonic_millis();
+        FreshMappingMeasurementBatch {
+            stats: HardHardMeasurementStats {
+                stun_datagrams_sent,
+                stun_bytes_sent,
+                stun_send_errors,
+                stun_send_error_bytes,
+                stun_responses: u32::try_from(observations.len()).unwrap_or(u32::MAX),
+                measurement_started_at_ms: Some(started_ms),
+                last_measurement_send_at_ms: last_send_at_ms,
+                measurement_completed_at_ms: Some(finished_at_ms),
+            },
+            observations,
+        }
     }
 
     /// Run one atomic fresh-mapping punch generation for a peer.
@@ -342,7 +371,7 @@ impl UdpTransport {
 
         let started_ms = monotonic_millis();
         let measurement_peer_id = peer_id.to_string();
-        let observations = self
+        let measurement = self
             .measure_fresh_mapping_batch(&socket, &observers, stun_timeout, || {
                 !cancellation.is_some_and(|c| c.is_cancelled())
                     && !self.peers.is_direct_sync(&measurement_peer_id)
@@ -360,7 +389,7 @@ impl UdpTransport {
             generation: punch_generation,
             network_generation,
             socket_identity: local_endpoint,
-            observations,
+            observations: measurement.observations,
             started_at_ms: started_ms,
             finished_at_ms: finished_ms,
         };
@@ -911,6 +940,7 @@ impl UdpTransport {
                 public_ip,
                 first_punch_sent_at_ms,
                 last_punch_sent_at_ms,
+                measurement: measurement.stats,
             }),
             Box::new(provisional_guard),
         )

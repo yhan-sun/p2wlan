@@ -695,7 +695,17 @@ impl Daemon {
                             // WireGuard session. A same-node restart is reset only
                             // when a later peer offer carries a different encoded
                             // candidate-generation incarnation.
-                            self.punch_attempts.cancel(&peer_info.node_id);
+                            // The explicit Hard↔Hard experiment lane owns one
+                            // authoritative fresh-mapping attempt. Registration
+                            // endpoint churn can arrive while the responder is
+                            // still measuring, before its bounded session ledger
+                            // record exists; cancelling the punch permit here
+                            // would make unrelated roster metadata decide the
+                            // experiment outcome. Production/default traversal
+                            // keeps the existing cancellation behavior.
+                            if !self.peers.hard_hard_experiment_only() {
+                                self.punch_attempts.cancel(&peer_info.node_id);
+                            }
                             if let Some(udp) = self.udp_transport.read().await.clone() {
                                 udp.clear_pending_probes_for_peer(&peer_info.node_id).await;
                             }

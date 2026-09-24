@@ -28,6 +28,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
+use crate::peer::HardHardBusinessAttributionIdentity;
+
 /// Bound on the diagnostics ring so `/status` stays bounded while retaining
 /// a complete burst/failure window. 64 events was too small for a 256-packet
 /// acceptance burst: the timeline evicted its own queue-overflow records even
@@ -80,6 +82,10 @@ pub struct ConnectionTimelineEvent {
     /// from the later first-usable timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_first_remaining_ms: Option<u64>,
+    /// Exact local validation/commit/transport/socket identity when the event
+    /// can be tied to one committed Direct path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_attribution_identity: Option<HardHardBusinessAttributionIdentity>,
 }
 
 /// Persistent, per-peer/per-network-generation first-usable commit summary.
@@ -233,6 +239,7 @@ impl ConnectionTimeline {
         path: Option<&str>,
         reason_code: Option<&str>,
         detail: Option<String>,
+        business_attribution_identity: Option<HardHardBusinessAttributionIdentity>,
     ) -> (u64, u64) {
         let at_ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
         if event == "control_registered" {
@@ -302,6 +309,7 @@ impl ConnectionTimeline {
             relay_region: fields.relay_region,
             transition_revision: (revision != 0).then_some(revision),
             direct_first_remaining_ms: fields.direct_first_remaining_ms,
+            business_attribution_identity,
         });
         while events.len() > TIMELINE_MAX_EVENTS {
             events.pop_front();
@@ -332,7 +340,26 @@ impl ConnectionTimeline {
         reason_code: Option<&str>,
         detail: Option<String>,
     ) {
-        let (at_ms, _) = self.record_event(event, path, reason_code, detail.clone());
+        self.emit_with_business_attribution_identity(event, path, reason_code, detail, None);
+    }
+
+    /// Emit a timeline event with the exact current Direct path identity when
+    /// the caller has verified the source socket and transport publication.
+    pub fn emit_with_business_attribution_identity(
+        &self,
+        event: &'static str,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+        business_attribution_identity: Option<HardHardBusinessAttributionIdentity>,
+    ) {
+        let (at_ms, _) = self.record_event(
+            event,
+            path,
+            reason_code,
+            detail.clone(),
+            business_attribution_identity,
+        );
         info!(
             event = event,
             run_id = ?self.run_id,
@@ -341,6 +368,7 @@ impl ConnectionTimeline {
             path = path,
             reason_code = reason_code,
             detail = detail,
+            business_attribution_identity = ?business_attribution_identity,
             "{event}",
         );
     }
@@ -406,6 +434,30 @@ impl ConnectionTimeline {
         reason_code: Option<&str>,
         detail: Option<String>,
     ) -> bool {
+        self.emit_first_scoped_with_business_attribution_identity(
+            scope,
+            key,
+            event,
+            path,
+            reason_code,
+            detail,
+            None,
+        )
+    }
+
+    /// Emit an exact-identity first milestone, preserving the identity in the
+    /// same bounded status event as its timestamp.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_first_scoped_with_business_attribution_identity(
+        &self,
+        scope: &str,
+        key: &str,
+        event: &'static str,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+        business_attribution_identity: Option<HardHardBusinessAttributionIdentity>,
+    ) -> bool {
         let mut firsts = self
             .first_events
             .lock()
@@ -415,7 +467,13 @@ impl ConnectionTimeline {
             return false;
         }
         drop(firsts);
-        self.emit(event, path, reason_code, detail);
+        self.emit_with_business_attribution_identity(
+            event,
+            path,
+            reason_code,
+            detail,
+            business_attribution_identity,
+        );
         true
     }
 
@@ -463,8 +521,13 @@ impl ConnectionTimeline {
             .as_deref()
             .map(parse_detail_fields)
             .unwrap_or_default();
-        let (at_ms, transition_revision) =
-            self.record_event("first_usable_path", Some(path), reason_code, detail.clone());
+        let (at_ms, transition_revision) = self.record_event(
+            "first_usable_path",
+            Some(path),
+            reason_code,
+            detail.clone(),
+            None,
+        );
         let ready_key = (peer_id.to_string(), generation);
         let relay_ready_timing = self
             .relay_ready_timing
@@ -649,6 +712,36 @@ mod tests {
         let empty: ConnectionTimelineDiagnostics =
             serde_json::from_str(r#"{"correlation_id":"x","events":[]}"#).unwrap();
         assert!(empty.events.is_empty());
+    }
+
+    #[test]
+    fn direct_business_milestones_preserve_exact_path_identity() {
+        let timeline = ConnectionTimeline::new("node-a", 0);
+        let identity = HardHardBusinessAttributionIdentity {
+            validation_session_id: 11,
+            direct_commit_sequence: 3,
+            transport_instance_id: 30,
+            socket_index: 4097,
+        };
+        assert!(
+            timeline.emit_first_scoped_with_business_attribution_identity(
+                "peer:node-b:5",
+                "direct_commit=3 socket=4097",
+                "business_ingress_observed",
+                Some("direct"),
+                None,
+                None,
+                Some(identity),
+            )
+        );
+        let snapshot = timeline.snapshot();
+        assert_eq!(
+            snapshot.events[0].business_attribution_identity,
+            Some(identity)
+        );
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(encoded.contains("\"direct_commit_sequence\":3"));
+        assert!(encoded.contains("\"transport_instance_id\":30"));
     }
 
     #[test]
@@ -865,7 +958,7 @@ mod tests {
         // The first registration is the initial connection, not a reconnect.
         timeline.emit("control_registered", None, None, None);
         for _ in 0..TIMELINE_MAX_EVENTS {
-            timeline.record_event("diagnostic_noise", None, None, None);
+            timeline.record_event("diagnostic_noise", None, None, None, None);
         }
         // The initial registration has been evicted from the bounded ring.
         timeline.emit("control_registered", None, None, None);

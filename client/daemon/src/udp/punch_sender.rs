@@ -187,7 +187,9 @@ impl UdpTransport {
         let mut logical_probes_sent = 0u32;
         let mut logical_probe_send_failures = 0u32;
         let mut physical_datagrams_sent = 0u32;
+        let mut physical_bytes_sent = 0u64;
         let mut physical_send_errors = 0u32;
+        let mut physical_send_error_bytes = 0u64;
         let mut partial_physical_send_errors = 0u32;
         let mut probe_path_errors = 0u32;
         let mut budget_skipped = 0u32;
@@ -408,8 +410,12 @@ impl UdpTransport {
                         per_socket_sent_index = sent.socket_index;
                         physical_datagrams_sent =
                             physical_datagrams_sent.saturating_add(successful_datagrams);
+                        physical_bytes_sent =
+                            physical_bytes_sent.saturating_add(sent.physical_bytes_sent);
                         physical_send_errors =
                             physical_send_errors.saturating_add(failed_datagrams);
+                        physical_send_error_bytes = physical_send_error_bytes
+                            .saturating_add(sent.physical_send_error_bytes);
                         if failed_datagrams > 0 {
                             partial_physical_send_errors =
                                 partial_physical_send_errors.saturating_add(failed_datagrams);
@@ -438,6 +444,8 @@ impl UdpTransport {
                     }
                     Err(failure) => {
                         let failed_datagrams = u32::from(failure.physical_send_errors);
+                        physical_send_error_bytes = physical_send_error_bytes
+                            .saturating_add(failure.physical_send_error_bytes);
                         if failure.kind == ProbeSendFailureKind::PhysicalSend
                             && failed_datagrams > 0
                         {
@@ -491,7 +499,9 @@ impl UdpTransport {
             logical_probes_sent,
             logical_probe_send_failures,
             physical_datagrams_sent,
+            physical_bytes_sent,
             physical_send_errors,
+            physical_send_error_bytes,
             partial_physical_send_errors,
             probe_path_errors,
             unique_target_endpoints: u32::try_from(sent_endpoints.len()).unwrap_or(u32::MAX),

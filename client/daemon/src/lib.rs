@@ -107,9 +107,10 @@ use acl::AclEngine;
 use candidate_refresh::{
     add_peer_reflexive_candidate_to_set, advertised_udp_endpoint, candidate_endpoints_from_report,
     candidate_refresh_requires_commit, candidate_set_change_reason, candidate_set_hash,
-    control_udp_endpoint_from_candidates, maybe_add_port_mapping_udp_candidate,
-    network_identity_changed, prepare_signal_candidates_and_network_identity,
-    publish_local_candidates_to_known_peers, run_udp_candidate_refresh, UdpCandidateRefreshContext,
+    control_udp_endpoint_from_candidates, control_udp_endpoint_from_candidates_with_loopback,
+    maybe_add_port_mapping_udp_candidate, network_identity_changed,
+    prepare_signal_candidates_and_network_identity, publish_local_candidates_to_known_peers,
+    run_udp_candidate_refresh, UdpCandidateRefreshContext,
 };
 #[cfg(test)]
 use candidate_refresh::{
