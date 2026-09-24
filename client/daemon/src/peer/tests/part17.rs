@@ -179,19 +179,22 @@ fn remote_nat_profile_binding_returns_typed_reason_and_coherent_snapshot() {
     ));
     let unversioned_result =
         unversioned.bind_remote_nat_profile_to_candidate_epoch_with_snapshot(7);
-    assert!(matches!(
-        unversioned_result,
-        RemoteNatProfileBindResult::Rejected {
-            reason: RemoteNatProfileBindFailure::ProfileGenerationMissing,
-            snapshot: RemoteNatProfileBindSnapshot {
-                profile_present: true,
-                profile_generation: None,
-                profile_fresh: false,
-                declared_generation: 7,
-                ..
+    assert!(
+        matches!(
+            unversioned_result,
+            RemoteNatProfileBindResult::Rejected {
+                reason: RemoteNatProfileBindFailure::ProfileGenerationMissing,
+                snapshot: RemoteNatProfileBindSnapshot {
+                    profile_present: true,
+                    profile_generation: None,
+                    profile_fresh: false,
+                    declared_generation: 7,
+                    ..
+                }
             }
-        }
-    ), "{unversioned_result:?}");
+        ),
+        "{unversioned_result:?}"
+    );
 }
 
 #[test]

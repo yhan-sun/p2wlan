@@ -4758,20 +4758,16 @@ mod tests {
             .expect("send valid current-session ciphertext into nat_sim");
         let mut first_buf = vec![0; 2048];
         let mut second_buf = vec![0; 2048];
-        let (first_len, first_source) = tokio::time::timeout(
-            Duration::from_secs(3),
-            receiver.recv_from(&mut first_buf),
-        )
-        .await
-        .expect("first simulated copy reaches the receiving socket")
-        .expect("receive first simulated copy");
-        let (second_len, second_source) = tokio::time::timeout(
-            Duration::from_secs(3),
-            receiver.recv_from(&mut second_buf),
-        )
-        .await
-        .expect("duplicate simulated copy reaches the receiving socket")
-        .expect("receive duplicate simulated copy");
+        let (first_len, first_source) =
+            tokio::time::timeout(Duration::from_secs(3), receiver.recv_from(&mut first_buf))
+                .await
+                .expect("first simulated copy reaches the receiving socket")
+                .expect("receive first simulated copy");
+        let (second_len, second_source) =
+            tokio::time::timeout(Duration::from_secs(3), receiver.recv_from(&mut second_buf))
+                .await
+                .expect("duplicate simulated copy reaches the receiving socket")
+                .expect("receive duplicate simulated copy");
         assert_eq!(&first_buf[..first_len], wire);
         assert_eq!(&second_buf[..second_len], wire);
         assert_eq!(first_source, second_source);
@@ -4787,7 +4783,10 @@ mod tests {
             .filter(|row| row["event"] == "packet_duplicated")
             .collect();
         assert_eq!(duplicate_events.len(), 1);
-        assert_eq!(duplicate_events[0]["payload_class"], "wireguard_transport_v1");
+        assert_eq!(
+            duplicate_events[0]["payload_class"],
+            "wireguard_transport_v1"
+        );
         assert_eq!(duplicate_events[0]["wire_fp"], wire_fp_text);
         assert_eq!(duplicate_events[0]["wireguard_counter"], counter);
         let delivery_events: Vec<_> = trace_records
@@ -4795,9 +4794,9 @@ mod tests {
             .filter(|row| row["event"] == "simulator_delivery")
             .collect();
         assert_eq!(delivery_events.len(), 2);
-        assert!(delivery_events.iter().all(|row| {
-            row["wire_fp"] == wire_fp_text && row["wireguard_counter"] == counter
-        }));
+        assert!(delivery_events
+            .iter()
+            .all(|row| { row["wire_fp"] == wire_fp_text && row["wireguard_counter"] == counter }));
         assert_eq!(delivery_events[0]["duplicate_copy"], 0);
         assert_eq!(delivery_events[1]["duplicate_copy"], 1);
 
@@ -4839,7 +4838,9 @@ mod tests {
         assert_eq!(delivered.peer_id, "peer-b");
         assert_eq!(delivered.packet, packet);
         assert!(!delivered.from_previous_session);
-        let session_instance = delivered.session_instance.expect("current session instance");
+        let session_instance = delivered
+            .session_instance
+            .expect("current session instance");
         assert_eq!(
             transport
                 .session_instance_state("peer-b", session_instance)

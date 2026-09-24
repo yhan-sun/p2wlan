@@ -634,6 +634,7 @@ impl PeerManager {
     /// profile generation carried by the same authenticated Hard↔Hard
     /// envelope. A profile that is merely young, but belongs to an older
     /// candidate context, cannot be revived by this method.
+    #[cfg(test)]
     pub(crate) async fn bind_remote_nat_profile_to_candidate_epoch(
         &self,
         node_id: &str,

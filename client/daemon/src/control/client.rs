@@ -41,7 +41,7 @@ pub(crate) fn hard_hard_a0_control_stage(
     if std::env::var("P2WLAN_EXPERIMENT_VARIANT").ok().as_deref() != Some("a0-phase-diagnosis")
         || std::env::var("P2WLAN_EXPERIMENT_SCENARIO")
             .ok()
-            .map_or(true, |scenario| scenario.is_empty())
+            .is_none_or(|scenario| scenario.is_empty())
     {
         return;
     }

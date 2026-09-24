@@ -372,6 +372,7 @@ impl PeerConnection {
         self.remote_nat_profile_candidate_epoch == Some(self.remote_candidate_epoch)
     }
 
+    #[cfg(test)]
     pub(crate) fn bind_remote_nat_profile_to_candidate_epoch(
         &mut self,
         profile_generation: u64,
