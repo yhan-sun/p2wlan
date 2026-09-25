@@ -3,13 +3,12 @@ import { useQuery } from '@tanstack/react-query'
 import { type ColumnDef } from '@tanstack/react-table'
 import { Search } from 'lucide-react'
 import { adminApi } from '../../api'
-import { PageHeader, Panel } from '../../components/ui/console'
+import { PageHeader, Panel, StatusPill } from '../../components/ui/console'
 import {
   DataTable,
   ErrorBlock,
   Pagination,
   PendingBlock,
-  Status,
   formatAgo,
   natLabel,
   useDebouncedValue,
@@ -32,7 +31,7 @@ export function DevicesPage() {
     { id: 'ip', header: 'Virtual IP', cell: ({ row }) => <span className="mono">{row.original.virtual_ip}</span> },
     { id: 'nat', header: 'NAT', cell: ({ row }) => natLabel(row.original.nat_type) },
     { id: 'rtt', header: 'Relay RTT', cell: ({ row }) => row.original.relay_rtt_ms === undefined ? '—' : `${row.original.relay_rtt_ms} ms` },
-    { id: 'status', header: '状态', cell: ({ row }) => <Status online={row.original.online} /> },
+    { id: 'status', header: '状态', cell: ({ row }) => <StatusPill tone={row.original.online ? 'success' : 'neutral'} dot>{row.original.online ? '在线' : '离线'}</StatusPill> },
     { id: 'last', header: '最后活动', cell: ({ row }) => formatAgo(row.original.last_seen) },
   ], [])
 
