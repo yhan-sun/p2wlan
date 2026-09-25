@@ -4636,3 +4636,67 @@ body {
 .console-page-eyebrow {
   display: none;
 }
+
+
+/* Navigation belongs to the workspace, not a separate dark dashboard slab. */
+.sidebar-v2 {
+  background: var(--console-bg);
+  border-right: 1px solid var(--console-border);
+}
+
+.sidebar-v2 .brand-lockup .brand-symbol {
+  color: var(--console-text);
+  background: var(--console-surface-subtle);
+  border: 1px solid var(--console-border);
+}
+
+.sidebar-v2 .brand-lockup strong {
+  color: var(--console-text);
+}
+
+.sidebar-v2 .brand-lockup span,
+.nav-group-label,
+.sidebar-runtime > span,
+.sidebar-runtime small {
+  color: var(--console-text-muted);
+}
+
+.nav-link {
+  color: var(--console-text-soft);
+}
+
+.nav-link svg {
+  color: var(--console-text-muted);
+}
+
+.nav-link:hover {
+  color: var(--console-text);
+  background: var(--console-surface-subtle);
+}
+
+.nav-link.active {
+  color: var(--console-text);
+  background: color-mix(in srgb, var(--console-text) 5%, transparent);
+}
+
+.nav-link.active svg {
+  color: var(--console-text-soft);
+}
+
+.sidebar-collapse {
+  color: var(--console-text-muted);
+}
+
+.sidebar-collapse:hover {
+  color: var(--console-text);
+  background: var(--console-surface-subtle);
+  border-color: var(--console-border);
+}
+
+.sidebar-runtime {
+  border-top-color: var(--console-border);
+}
+
+.runtime-line strong {
+  color: var(--console-text-soft);
+}
