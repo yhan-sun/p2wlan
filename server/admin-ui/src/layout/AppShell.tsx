@@ -110,9 +110,35 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
         <div className="runtime-line">
           <span className={`health-dot${runtime.isError ? ' down' : runtime.isPending ? ' unknown' : ''}`} />
           <strong>{runtime.isError ? 'Control 不可达' : runtime.isPending ? '正在检查 Control' : 'Control 正常'}</strong>
+          <span className="sidebar-version">{runtime.data?.build_version ?? (runtime.isError ? '—' : 'loading…')}</span>
         </div>
-        <span>{runtime.data?.build_version ?? (runtime.isError ? '—' : 'loading…')}</span>
-        <small>只读管理模式</small>
+        <div className="sidebar-account-row">
+          <div className="sidebar-admin">
+            <span className="user-avatar">AD</span>
+            <span className="sidebar-admin-copy"><strong>admin</strong><small>只读</small></span>
+          </div>
+          <div className="sidebar-footer-actions">
+            <IconButton
+              label={themeMode === 'system' ? '主题：跟随系统' : themeMode === 'light' ? '主题：浅色' : '主题：深色'}
+              icon={themeMode === 'system'
+                ? <MonitorSmartphone size={15} />
+                : resolveTheme(themeMode) === 'dark'
+                  ? <Moon size={15} />
+                  : <Sun size={15} />}
+              onClick={() => setThemeMode((value) => nextThemeMode(value))}
+            />
+            <IconButton
+              label="刷新数据"
+              icon={<RefreshCw size={15} className={refreshing ? 'spin' : ''} />}
+              onClick={refresh}
+            />
+            <IconButton
+              label="退出登录"
+              icon={<LogOut size={15} />}
+              onClick={() => { clearAdminToken(); queryClient.clear(); onLogout() }}
+            />
+          </div>
+        </div>
       </div>
     </aside>
     <div className="app-main">
