@@ -26,7 +26,7 @@ import {
   Users,
 } from 'lucide-react'
 import { accountColor, accountIdentity, colorWithAlpha } from './colors'
-import { IconButton } from './components/ui/console'
+import { IconButton, StatusPill } from './components/ui/console'
 import type { AdminTopology, AdminTopologyNode } from './types'
 
 interface TopologyCanvasProps {
@@ -220,7 +220,7 @@ function DetailPanel({ node, onClose }: { node: AdminTopologyNode; onClose: () =
         {node.app_version && <div><dt>版本</dt><dd>{node.app_version}</dd></div>}
         {node.nat_type && <div><dt>NAT</dt><dd>{node.nat_type}</dd></div>}
         {node.relay_rtt_ms !== undefined && <div><dt>Relay RTT</dt><dd>{node.relay_rtt_ms} ms</dd></div>}
-        {node.online !== undefined && <div><dt>状态</dt><dd><span className={`status-label ${node.online ? 'online' : ''}`}><span />{node.online ? '在线' : '离线'}</span></dd></div>}
+        {node.online !== undefined && <div><dt>状态</dt><dd><StatusPill tone={node.online ? 'success' : 'neutral'} dot>{node.online ? '在线' : '离线'}</StatusPill></dd></div>}
       </dl>
     </aside>
   )
