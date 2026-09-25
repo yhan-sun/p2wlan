@@ -22,10 +22,11 @@ import {
   Server,
   Shrink,
   Smartphone,
-  Users,
   X,
+  Users,
 } from 'lucide-react'
 import { accountColor, accountIdentity, colorWithAlpha } from './colors'
+import { IconButton } from './components/ui/console'
 import type { AdminTopology, AdminTopologyNode } from './types'
 
 interface TopologyCanvasProps {
@@ -161,12 +162,12 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
         height: size.height,
         padding: 0,
         borderRadius: 12,
-        border: node.focus ? `2px solid ${color}` : neutral ? '1px solid #cfd6df' : `1px solid ${colorWithAlpha(color, 0.38)}`,
-        background: neutral ? '#ffffff' : colorWithAlpha(color, node.focus ? 0.09 : 0.045),
+        border: node.focus ? `2px solid ${color}` : neutral ? '1px solid var(--console-border-strong)' : `1px solid ${colorWithAlpha(color, 0.38)}`,
+        background: neutral ? 'var(--console-surface-solid)' : colorWithAlpha(color, node.focus ? 0.11 : 0.065),
         boxShadow: node.focus
           ? `0 0 0 4px ${colorWithAlpha(color, 0.1)}, 0 10px 28px rgba(15, 23, 42, .09)`
-          : '0 5px 18px rgba(15, 23, 42, .055)',
-        color: '#0f172a',
+          : 'var(--console-shadow)',
+        color: 'var(--console-text)',
         opacity: 1,
         transition: 'opacity 150ms ease, box-shadow 150ms ease',
       },
@@ -179,7 +180,7 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
     const source = sourceNodes.get(edge.source)
     const target = sourceNodes.get(edge.target)
     const colorSource = edge.kind === 'attachment' ? target : source
-    const color = colorSource ? ownerColor(colorSource) : '#94a3b8'
+    const color = colorSource ? ownerColor(colorSource) : 'var(--console-text-muted)'
     const isSignal = edge.kind === 'pending_signal'
     return {
       id: edge.id,
@@ -188,15 +189,15 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
       type: 'smoothstep',
       animated: false,
       style: {
-        stroke: isSignal ? '#d97706' : color,
+        stroke: isSignal ? 'var(--console-warning)' : color,
         strokeWidth: isSignal ? 1.7 : edge.kind === 'membership' ? 2 : 1.5,
         strokeDasharray: isSignal ? '7 6' : undefined,
         opacity: isSignal ? 0.78 : 0.46,
       },
-      markerEnd: isSignal ? { type: MarkerType.ArrowClosed, color: '#d97706', width: 14, height: 14 } : undefined,
+      markerEnd: isSignal ? { type: MarkerType.ArrowClosed, color: 'var(--console-warning)', width: 14, height: 14 } : undefined,
       label: isSignal && edge.count && edge.count > 1 ? `${edge.signal_type || 'signal'} ×${edge.count}` : undefined,
-      labelStyle: { fontSize: 11, fill: '#92400e', fontWeight: 600 },
-      labelBgStyle: { fill: '#fffbeb', fillOpacity: 0.96 },
+      labelStyle: { fontSize: 11, fill: 'var(--console-warning)', fontWeight: 600 },
+      labelBgStyle: { fill: 'var(--console-surface-solid)', fillOpacity: 0.96 },
     }
   })
 
@@ -207,7 +208,7 @@ function DetailPanel({ node, onClose }: { node: AdminTopologyNode; onClose: () =
   const color = ownerColor(node)
   return (
     <aside className="topology-detail" aria-label="关系图节点详情">
-      <button className="icon-button topology-detail-close" onClick={onClose} aria-label="关闭详情"><X size={16} /></button>
+      <IconButton className="topology-detail-close" onClick={onClose} label="关闭详情" icon={<X size={16} />} />
       <div className="topology-detail-type" style={{ color }}>{node.kind.toUpperCase()}</div>
       <h3>{node.label}</h3>
       {node.username && node.kind !== 'account' && <p className="topology-detail-owner">账号 · {node.username}</p>}
@@ -276,7 +277,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
         onNodeClick={(_, node) => setSelectedId(node.id)}
         proOptions={{ hideAttribution: true }}
       >
-        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#d8dee8" />
+        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--console-border-strong)" />
         <Controls showInteractive={false} position="bottom-left" />
         {!compact && <MiniMap
           pannable
@@ -284,8 +285,8 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
           nodeStrokeWidth={3}
           nodeColor={(node) => {
             const source = data.nodes.find((item) => item.id === node.id)
-            if (!source) return '#94a3b8'
-            return source.kind === 'network' || source.kind === 'room' ? '#cbd5e1' : ownerColor(source)
+            if (!source) return 'var(--console-text-muted)'
+            return source.kind === 'network' || source.kind === 'room' ? 'var(--console-border-strong)' : ownerColor(source)
           }}
         />}
       </ReactFlow>
