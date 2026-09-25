@@ -23,11 +23,11 @@ Control 可选提供 `/admin/` 只读管理台。只有配置独立的 `CONTROL_
 
 管理台还展示 Control 数据库和当前 Control 进程能直接确认的网络、房间、设备、活动隧道、待处理信令和构建信息。设备的 `online`、Relay RTT 或 Control 健康状态都不能单独证明虚拟 IP 业务已经双向可达。
 
-### Connections 与路径观测
+### 连接路径（Connections）与路径观测
 
-管理台的 **Connections** 工作区与“资源关系”是两个独立视图：资源关系回答账号、网络、房间和设备之间的 membership / attachment；Connections 只读取客户端 daemon 已提交并由 Control 持久化的单向活动路径观测，不根据 signaling、Relay RTT 或 membership 推断 Direct / Relay。
+管理台的 **连接路径（Connections）** 工作区与“资源关系”是两个独立视图：资源关系回答账号、网络、房间和设备之间的 membership / attachment；连接路径只读取客户端 daemon 已提交并由 Control 持久化的单向活动路径观测，不根据 signaling、Relay RTT 或 membership 推断 Direct / Relay。
 
-Connections 默认使用列表视图，支持服务端搜索设备名、账号名或网络名，并按 `network_id`、`account_id`、`device_id`、`path`（direct / relay / none）与 `freshness`（fresh / stale）过滤。`GET /admin/api/v1/connections` 使用 `limit` / `offset` 分页。条目始终保持方向性：`A → B` 与 `B → A` 是两个独立观测；stale 或 reporter offline 的记录只表示最后一次已知路径，不等于当前仍存在活动连接。
+连接路径默认使用列表视图，支持服务端搜索设备名、账号名或网络名，并按 `network_id`、`account_id`、`device_id`、`path`（direct / relay / none）与 `freshness`（fresh / stale）过滤。`GET /admin/api/v1/connections` 使用 `limit` / `offset` 分页。条目始终保持方向性：`A → B` 与 `B → A` 是两个独立观测；stale 或 reporter offline 的记录只表示最后一次已知路径，不等于当前仍存在活动连接。
 
 选择单个网络后可切换到 Live Topology。拓扑默认只画 fresh authoritative observations；显式开启 stale 后才以弱化虚线显示旧观测。大规模网络受前端明确的连接预算保护，达到预算会提示收紧搜索或路径过滤，不会静默把局部图声称为完整网络。
 
@@ -51,7 +51,7 @@ attention signal 是固定、可解释的条件：
 
 管理台提供独立的 **连接健康** 工作区消费该接口。Dashboard 只展示最近 1 小时的轻量摘要；`/admin/health` 支持按 Network scope 查看 1h / 6h / 24h 窗口，直接展示 fresh / stale / reporter offline、Direct / Relay、online-no-path、路径切换、显式失败与 validation RTT 样本。页面不会计算综合健康分，也不会把 Relay 本身着色成故障。
 
-Needs attention 列表逐条显示服务端返回的固定 signal 和阈值相关计数。点击某一项会读取相同 `(network, reporting device, remote device)` 的最新 directional Connection，并打开与 Connections 工作区共用的只读详情 / transition timeline；Health UI 不维护第二份连接详情或路径状态。
+Needs attention 列表逐条显示服务端返回的固定 signal 和阈值相关计数。点击某一项会读取相同 `(network, reporting device, remote device)` 的最新 directional Connection，并打开与连接路径工作区共用的只读详情 / transition timeline；Health UI 不维护第二份连接详情或路径状态。
 
 ### Connection Trends
 
