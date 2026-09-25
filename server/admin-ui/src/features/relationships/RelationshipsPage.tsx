@@ -35,7 +35,7 @@ export function RelationshipsPage() {
 
   return <div className="page-stack topology-page-stack">
     <PageHeader
-      eyebrow="RELATIONSHIPS"
+      eyebrow="资源关系"
       title={accountId ? '账号资源关系' : '全局资源关系'}
       description={accountId ? '展示账号、共享网络 / 房间和设备之间的控制面关系。' : '这是资源关系工作区，不是实时 Direct / Relay 网络拓扑；大规模部署按账号游标分批加载。'}
       actions={<div className="toolbar-controls">
@@ -44,7 +44,7 @@ export function RelationshipsPage() {
       </div>}
     />
     <Panel className="topology-main-panel">
-      <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>这里的连线表示 membership、设备挂载等控制面资源关系。待处理 signaling 默认隐藏；daemon 权威 Direct / Relay 路径请到 Connections 查看，二者不会互相推断。</span></div>
+      <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>这里的连线表示成员关系、设备挂载等控制面资源关系。待处理信令默认隐藏；daemon 权威 Direct / Relay 路径请到连接路径查看，二者不会互相推断。</span></div>
       {!accountId && globalData && <div className="topology-page-progress">
         <span>已加载 {globalData.loaded_accounts} / {globalData.total_accounts} 个账号</span>
         {globalData.partial
