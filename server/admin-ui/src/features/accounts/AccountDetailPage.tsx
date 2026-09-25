@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useParams } from 'react-router-dom'
 import { adminApi } from '../../api'
 import { accountColor } from '../../colors'
-import { Panel } from '../../components/ui/console'
+import { Panel, SegmentedControl } from '../../components/ui/console'
 import { AccountMark, ErrorBlock, PathNotice, PendingBlock } from '../../shared/console'
 import { TopologyCanvas } from '../../TopologyCanvas'
 import { DeviceTable, NetworkTable, RoomTable } from '../resources/ResourceTables'
@@ -26,9 +26,17 @@ export function AccountDetailPage() {
       <div className="account-hero-stats"><div><strong>{account.device_count}</strong><span>设备</span></div><div><strong className="positive-text">{account.online_devices}</strong><span>在线</span></div><div><strong>{account.network_count}</strong><span>网络</span></div><div><strong>{account.room_count}</strong><span>房间</span></div></div>
     </section>
 
-    <div className="tabs-v2">
-      {([['topology', '关系'], ['devices', `设备 ${account.device_count}`], ['networks', `网络 ${account.network_count}`], ['rooms', `房间 ${account.room_count}`]] as const).map(([value, label]) => <button key={value} className={tab === value ? 'active' : ''} onClick={() => setTab(value)}>{label}</button>)}
-    </div>
+    <SegmentedControl
+      label="账号详情视图"
+      value={tab}
+      onChange={setTab}
+      options={[
+        { value: 'topology', label: '关系' },
+        { value: 'devices', label: `设备 ${account.device_count}` },
+        { value: 'networks', label: `网络 ${account.network_count}` },
+        { value: 'rooms', label: `房间 ${account.room_count}` },
+      ]}
+    />
 
     {tab === 'topology' && <Panel title={`${account.username} 的资源关系`} subtitle="包含该账号以及共享网络 / 房间中的对端账号和设备">
       <PathNotice data={topology.data} fallback="这是 Control 资源关系图：只展示成员关系、设备挂载和可选的待处理 signaling。daemon 权威路径观测保存在独立的 Connections 工作区，这里不会把它们混成资源关系。" />
