@@ -1,6 +1,5 @@
 import {
   type FormEvent,
-  type ReactNode,
   useEffect,
   useMemo,
   useState,
@@ -24,6 +23,10 @@ import {
   KeyRound,
   LayoutDashboard,
   LogOut,
+  Menu,
+  Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
   MonitorSmartphone,
   Network,
   RadioTower,
@@ -31,6 +34,7 @@ import {
   Search,
   Server,
   ShieldCheck,
+  Sun,
   Users,
   Waypoints,
 } from 'lucide-react'
@@ -47,6 +51,7 @@ import {
   useParams,
 } from 'react-router-dom'
 import { adminApi, ApiError, clearAdminToken, getAdminToken, setAdminToken, verifyAdminToken } from './api'
+import { IconButton, MetricCard, Panel } from './components/ui/console'
 import { accountColor, colorWithAlpha } from './colors'
 import { ConnectionsPage } from './ConnectionsPage'
 import { ConnectionHealthPage } from './ConnectionHealthPage'
@@ -144,23 +149,6 @@ function PathNotice({ data, fallback }: { data?: AdminTopology; fallback: string
   return <div className="truth-notice"><CircleAlert size={15} /><span>{note || fallback}</span></div>
 }
 
-function MetricCard({ icon, label, value, meta }: { icon: ReactNode; label: string; value: ReactNode; meta: ReactNode }) {
-  return <article className="metric-card-v2">
-    <div className="metric-icon">{icon}</div>
-    <div className="metric-copy"><span>{label}</span><strong>{value}</strong><p>{meta}</p></div>
-  </article>
-}
-
-function Panel({ title, subtitle, action, className = '', children }: { title?: string; subtitle?: string; action?: ReactNode; className?: string; children: ReactNode }) {
-  return <section className={`panel-v2 ${className}`}>
-    {(title || action) && <header className="panel-v2-header">
-      <div>{title && <h2>{title}</h2>}{subtitle && <p>{subtitle}</p>}</div>
-      {action}
-    </header>}
-    {children}
-  </section>
-}
-
 function DataTable<T>({ columns, data, onRowClick, empty = '暂无数据' }: {
   columns: ColumnDef<T, unknown>[]
   data: T[]
@@ -252,17 +240,17 @@ function Login({ onSuccess }: { onSuccess: () => void }) {
 }
 
 const navGroups = [
-  { label: 'GENERAL', items: [
+  { label: '工作台', items: [
     { to: '/', end: true, icon: <LayoutDashboard size={17} />, label: '概览' },
     { to: '/accounts', icon: <Users size={17} />, label: '账号' },
   ] },
-  { label: 'NETWORK', items: [
+  { label: '网络', items: [
     { to: '/devices', icon: <MonitorSmartphone size={17} />, label: '设备' },
     { to: '/networks', icon: <Network size={17} />, label: '网络与房间' },
-    { to: '/connections', icon: <RadioTower size={17} />, label: 'Connections' },
+    { to: '/connections', icon: <RadioTower size={17} />, label: '连接路径' },
     { to: '/relationships', icon: <Waypoints size={17} />, label: '资源关系' },
   ] },
-  { label: 'OPERATIONS', items: [
+  { label: '可观测性', items: [
     { to: '/health', icon: <Gauge size={17} />, label: '连接健康' },
     { to: '/system', icon: <Activity size={17} />, label: '运行健康' },
   ] },
@@ -272,7 +260,7 @@ function pageMeta(pathname: string): { title: string; eyebrow: string } {
   if (pathname.startsWith('/accounts/')) return { title: '账号详情', eyebrow: 'ACCOUNTS' }
   if (pathname === '/accounts') return { title: '账号', eyebrow: 'ACCOUNTS' }
   if (pathname === '/relationships') return { title: '资源关系', eyebrow: 'RELATIONSHIPS' }
-  if (pathname === '/connections') return { title: 'Connections', eyebrow: 'NETWORK' }
+  if (pathname === '/connections') return { title: '连接路径', eyebrow: 'NETWORK' }
   if (pathname === '/devices') return { title: '设备', eyebrow: 'DEVICES' }
   if (pathname === '/networks') return { title: '网络与房间', eyebrow: 'NETWORK' }
   if (pathname === '/health') return { title: '连接健康', eyebrow: 'OPERATIONS' }
@@ -286,29 +274,107 @@ function Shell({ onLogout }: { onLogout: () => void }) {
   const queryClient = useQueryClient()
   const runtime = useQuery({ queryKey: ['runtime-shell'], queryFn: adminApi.runtime, refetchInterval: 60_000 })
   const [refreshing, setRefreshing] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [mobileOpen, setMobileOpen] = useState(false)
+  const [theme, setTheme] = useState<'light' | 'dark'>(() =>
+    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
+  )
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme
+    document.documentElement.style.colorScheme = theme
+  }, [theme])
+
+  useEffect(() => {
+    setMobileOpen(false)
+  }, [location.pathname])
 
   const refresh = async () => {
     setRefreshing(true)
     try { await queryClient.invalidateQueries() } finally { window.setTimeout(() => setRefreshing(false), 250) }
   }
 
-  return <div className="app-layout">
+  const layoutClass = [
+    'app-layout',
+    sidebarCollapsed ? 'sidebar-collapsed' : '',
+    mobileOpen ? 'mobile-nav-open' : '',
+  ].filter(Boolean).join(' ')
+
+  return <div className={layoutClass}>
+    <button
+      className="mobile-nav-backdrop"
+      aria-label="关闭导航"
+      onClick={() => setMobileOpen(false)}
+    />
     <aside className="sidebar-v2">
-      <Link to="/" className="brand-lockup"><div className="brand-symbol"><Waypoints size={20} /></div><div><strong>P2WLAN</strong><span>Control</span></div></Link>
-      <nav className="sidebar-nav">{navGroups.map((group) => <div className="nav-group" key={group.label}><span className="nav-group-label">{group.label}</span>{group.items.map((item) => <NavLink key={item.to} to={item.to} end={item.end} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>{item.icon}<span>{item.label}</span></NavLink>)}</div>)}</nav>
+      <div className="sidebar-brand-row">
+        <Link to="/" className="brand-lockup">
+          <div className="brand-symbol"><Waypoints size={20} /></div>
+          <div><strong>P2WLAN</strong><span>Control Plane</span></div>
+        </Link>
+        <IconButton
+          className="sidebar-collapse"
+          label={sidebarCollapsed ? '展开导航' : '收起导航'}
+          icon={sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+          onClick={() => setSidebarCollapsed((value) => !value)}
+        />
+      </div>
+      <nav className="sidebar-nav">
+        {navGroups.map((group) => <div className="nav-group" key={group.label}>
+          <span className="nav-group-label">{group.label}</span>
+          {group.items.map((item) => <NavLink
+            key={item.to}
+            to={item.to}
+            end={item.end}
+            title={sidebarCollapsed ? item.label : undefined}
+            onClick={() => setMobileOpen(false)}
+            className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
+          >
+            {item.icon}<span>{item.label}</span>
+          </NavLink>)}
+        </div>)}
+      </nav>
       <div className="sidebar-runtime">
-        <div className="runtime-line"><span className={`health-dot${runtime.isError ? ' down' : runtime.isPending ? ' unknown' : ''}`} /><strong>{runtime.isError ? 'Control 不可达' : runtime.isPending ? '正在检查 Control' : 'Control healthy'}</strong></div>
+        <div className="runtime-line">
+          <span className={`health-dot${runtime.isError ? ' down' : runtime.isPending ? ' unknown' : ''}`} />
+          <strong>{runtime.isError ? 'Control 不可达' : runtime.isPending ? '正在检查 Control' : 'Control healthy'}</strong>
+        </div>
         <span>{runtime.data?.build_version ?? (runtime.isError ? '—' : 'loading…')}</span>
         <small>只读管理模式</small>
       </div>
     </aside>
     <div className="app-main">
       <header className="topbar-v2">
-        <div><span className="topbar-eyebrow">{meta.eyebrow}</span><h1>{meta.title}</h1></div>
+        <IconButton
+          className="topbar-mobile-menu"
+          label="打开导航"
+          icon={<Menu size={18} />}
+          onClick={() => setMobileOpen(true)}
+        />
+        <div className="topbar-context">
+          <span className="topbar-eyebrow">{meta.eyebrow}</span>
+          <h1>{meta.title}</h1>
+        </div>
         <div className="topbar-actions-v2">
-          <button className="icon-button-v2" onClick={refresh} title="刷新数据" aria-label="刷新数据"><RefreshCw size={17} className={refreshing ? 'spin' : ''} /></button>
+          <IconButton
+            label={theme === 'dark' ? '切换浅色模式' : '切换深色模式'}
+            icon={theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
+            onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}
+          />
+          <IconButton
+            label="刷新数据"
+            icon={<RefreshCw size={17} className={refreshing ? 'spin' : ''} />}
+            onClick={refresh}
+          />
           <div className="topbar-divider" />
-          <button className="user-menu-button" onClick={() => { clearAdminToken(); queryClient.clear(); onLogout() }}><span className="user-avatar">AD</span><span className="user-menu-copy"><strong>admin</strong><small>read-only</small></span><LogOut size={15} /></button>
+          <button
+            className="user-menu-button"
+            onClick={() => { clearAdminToken(); queryClient.clear(); onLogout() }}
+          >
+            <span className="user-avatar">AD</span>
+            <span className="user-menu-copy"><strong>admin</strong><small>read-only</small></span>
+            <LogOut size={15} />
+          </button>
         </div>
       </header>
       <main className="page-content"><Outlet /></main>
@@ -333,6 +399,27 @@ function Dashboard() {
   const offlineDevices = Math.max(0, overview.data.devices - overview.data.online_devices)
 
   return <div className="page-stack">
+    <section className="overview-hero">
+      <div className="overview-hero-copy">
+        <div className="overview-kicker">
+          <span className="live-label">Control plane online</span>
+          <span className="mono">{runtime.data.build_version}</span>
+        </div>
+        <h2>从控制面到真实路径，<br />一眼看清。</h2>
+        <p>集中查看设备、连接路径、信令与运行事实。资源关系与 daemon 权威路径继续分层呈现，不用一个“健康分”掩盖真实状态。</p>
+        <div className="overview-hero-actions">
+          <Link className="button primary" to="/connections">查看连接路径<ArrowRight size={15} /></Link>
+          <Link className="button secondary" to="/relationships">打开资源拓扑</Link>
+        </div>
+      </div>
+      <div className="overview-snapshot">
+        <div><span>在线设备</span><strong>{overview.data.online_devices}/{overview.data.devices}</strong><small>{offlineDevices ? `${offlineDevices} 台离线` : '当前全部在线'}</small></div>
+        <div><span>Fresh Direct</span><strong>{connectionHealth.data?.summary.fresh_direct ?? '—'}</strong><small>最近 1 小时观测</small></div>
+        <div><span>Fresh Relay</span><strong>{connectionHealth.data?.summary.fresh_relay ?? '—'}</strong><small>最近 1 小时观测</small></div>
+        <div><span>快照</span><strong>{formatAgo(overview.data.generated_at)}</strong><small>Control generated</small></div>
+      </div>
+    </section>
+
     <section className="metrics-grid-v2">
       <MetricCard icon={<Users size={18} />} label="账号" value={overview.data.users} meta="Control 中的非系统账号" />
       <MetricCard icon={<MonitorSmartphone size={18} />} label="设备在线" value={<>{overview.data.online_devices}/{overview.data.devices}</>} meta={offlineDevices ? <>{offlineDevices} 台离线</> : '全部设备在线'} />
