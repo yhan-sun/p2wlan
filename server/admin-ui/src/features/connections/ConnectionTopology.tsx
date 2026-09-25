@@ -13,6 +13,7 @@ import {
 import { CircleAlert, Expand, Eye, EyeOff, MonitorSmartphone, Shrink } from 'lucide-react'
 import type { AdminConnection } from '../../types'
 import { EmptyState, IconButton } from '../../components/ui/console'
+import { spreadDagreRankCollisions } from '../../shared/dagreLayout'
 
 const NODE_WIDTH = 220
 const NODE_HEIGHT = 76
