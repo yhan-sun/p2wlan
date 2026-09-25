@@ -16,6 +16,7 @@ import {
   Expand,
   Eye,
   EyeOff,
+  Info,
   Laptop,
   Network,
   RadioTower,
@@ -253,6 +254,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [showOffline, setShowOffline] = useState(true)
   const [showSignals, setShowSignals] = useState(false)
+  const [showLegend, setShowLegend] = useState(false)
   const layoutGraph = useMemo(
     () => data ? buildGraph(data, { showOffline, showSignals }) : { nodes: [], edges: [] },
     [data, showOffline, showSignals],
@@ -307,6 +309,9 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
           <button className={`topology-filter-button ${showSignals ? 'active' : ''}`} onClick={() => setShowSignals((value) => !value)} title="显示或隐藏控制面的待处理信令">
             <RadioTower size={15} />控制信令
           </button>
+          <button className={`topology-filter-button ${showLegend ? 'active' : ''}`} onClick={() => setShowLegend((value) => !value)} title="显示或隐藏图例">
+            <Info size={15} />图例
+          </button>
         </>}
         <button className="icon-button topology-fullscreen-button" onClick={() => setFullscreen((value) => !value)} aria-label={fullscreen ? '退出全屏' : '全屏'}>
           {fullscreen ? <Shrink size={16} /> : <Expand size={16} />}
@@ -315,7 +320,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
 
       <TopologySummary data={data} />
 
-      {!compact && <aside className="topology-legend">
+      {!compact && showLegend && <aside className="topology-legend">
         <div className="topology-legend-heading">账号标识</div>
         <div className="topology-account-legend-list">
           {accounts.map((account) => (
