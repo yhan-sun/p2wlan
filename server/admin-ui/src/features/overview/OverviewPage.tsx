@@ -6,7 +6,6 @@ import {
   CircleCheck,
   Gauge,
   RadioTower,
-  Waypoints,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { adminApi } from '../../api'
