@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { type ColumnDef } from '@tanstack/react-table'
 import { Search } from 'lucide-react'
 import { adminApi } from '../../api'
-import { Panel } from '../../components/ui/console'
+import { PageHeader, Panel } from '../../components/ui/console'
 import {
   DataTable,
   ErrorBlock,
@@ -37,7 +37,15 @@ export function DevicesPage() {
   ], [])
 
   return <div className="page-stack">
-    <div className="page-intro"><div><h2>设备</h2><p>全部账号下已注册的 P2WLAN 设备。</p></div><div className="toolbar-controls"><div className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索设备、账号、IP 或网络" /></div><select className="select-field" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">全部状态</option><option value="online">在线</option><option value="offline">离线</option></select></div></div>
+    <PageHeader
+      eyebrow="DEVICES"
+      title="设备"
+      description="全部账号下已注册的 P2WLAN 设备。"
+      actions={<div className="toolbar-controls">
+        <label className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索设备、账号、IP 或网络" aria-label="搜索设备" /></label>
+        <select className="select-field" value={status} onChange={(event) => setStatus(event.target.value)} aria-label="按在线状态过滤"><option value="all">全部状态</option><option value="online">在线</option><option value="offline">离线</option></select>
+      </div>}
+    />
     <Panel>{result.isPending ? <PendingBlock queries={[result]} /> : result.error ? <ErrorBlock error={result.error} /> : result.data ? <><DataTable<AdminDevice> columns={columns} data={result.data.items} /><Pagination total={result.data.total} offset={offset} limit={PAGE_SIZE} onChange={setOffset} /></> : <ErrorBlock error={new Error('Control 未返回设备列表。')} />}</Panel>
   </div>
 }
