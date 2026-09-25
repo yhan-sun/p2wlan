@@ -27,6 +27,7 @@ import {
 } from 'lucide-react'
 import { accountColor, accountIdentity, colorWithAlpha } from '../../colors'
 import { IconButton, StatusPill } from '../../components/ui/console'
+import { spreadDagreRankCollisions } from '../../shared/dagreLayout'
 import type { AdminTopology, AdminTopologyNode } from '../../types'
 
 interface TopologyCanvasProps {
