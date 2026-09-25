@@ -3373,3 +3373,1260 @@ select {
   background: var(--console-warning-soft);
   color: var(--console-warning);
 }
+
+
+
+/* === Minimal premium console ====================================================
+ * Final visual authority: calm hierarchy, dense information, almost no decoration.
+ * Status color is reserved for status. Layout, spacing and typography carry hierarchy.
+ */
+
+:root {
+  --console-bg: #fafafa;
+  --console-surface: rgba(255, 255, 255, .98);
+  --console-surface-solid: #ffffff;
+  --console-surface-subtle: #f6f6f7;
+  --console-surface-raised: #ffffff;
+  --console-sidebar: #101113;
+  --console-sidebar-hover: rgba(255, 255, 255, .045);
+  --console-sidebar-active: rgba(255, 255, 255, .075);
+  --console-text: #15171a;
+  --console-text-soft: #5e646e;
+  --console-text-muted: #8c929c;
+  --console-border: #e9e9ec;
+  --console-border-strong: #dcdde2;
+  --console-accent: #5968c9;
+  --console-accent-hover: #4d5bb9;
+  --console-accent-soft: #f0f1fb;
+  --console-success: #21845f;
+  --console-success-soft: #f0f8f4;
+  --console-warning: #9a671d;
+  --console-warning-soft: #fbf6ed;
+  --console-danger: #b64a4a;
+  --console-danger-soft: #fbf1f1;
+  --console-radius-sm: 6px;
+  --console-radius: 9px;
+  --console-radius-lg: 12px;
+  --console-shadow: none;
+  --console-shadow-lg: 0 12px 34px rgba(15, 23, 42, .08);
+}
+
+:root[data-theme="dark"] {
+  --console-bg: #0d0e10;
+  --console-surface: rgba(18, 19, 21, .98);
+  --console-surface-solid: #121315;
+  --console-surface-subtle: #17181b;
+  --console-surface-raised: #18191c;
+  --console-sidebar: #0a0b0c;
+  --console-sidebar-hover: rgba(255, 255, 255, .045);
+  --console-sidebar-active: rgba(255, 255, 255, .075);
+  --console-text: #ebedf0;
+  --console-text-soft: #a5aab3;
+  --console-text-muted: #717782;
+  --console-border: #24262a;
+  --console-border-strong: #303238;
+  --console-accent: #8892df;
+  --console-accent-hover: #9ca5ea;
+  --console-accent-soft: rgba(120, 132, 222, .10);
+  --console-success: #62ad8e;
+  --console-success-soft: rgba(73, 153, 119, .10);
+  --console-warning: #c09a61;
+  --console-warning-soft: rgba(176, 128, 55, .09);
+  --console-danger: #d77d7d;
+  --console-danger-soft: rgba(190, 85, 85, .09);
+  --console-shadow: none;
+  --console-shadow-lg: 0 16px 42px rgba(0, 0, 0, .30);
+}
+
+html,
+body {
+  background: var(--console-bg);
+}
+
+body {
+  background: var(--console-bg);
+  color: var(--console-text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.app-layout {
+  --sidebar-width: 220px;
+  --sidebar-collapsed-width: 62px;
+}
+
+.sidebar-v2 {
+  width: var(--sidebar-width);
+  padding: 14px 10px 12px;
+  background: var(--console-sidebar);
+  border-right: 1px solid rgba(255, 255, 255, .045);
+  box-shadow: none;
+}
+
+.sidebar-brand-row {
+  min-height: 42px;
+  padding: 0 6px 14px;
+}
+
+.sidebar-v2 .brand-lockup {
+  gap: 9px;
+}
+
+.sidebar-v2 .brand-lockup .brand-symbol {
+  width: 29px;
+  height: 29px;
+  border-radius: 8px;
+  background: #202226;
+  box-shadow: none;
+}
+
+.sidebar-v2 .brand-lockup strong {
+  color: #eceef2;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.sidebar-v2 .brand-lockup span {
+  color: #666d79;
+  font-size: 9px;
+}
+
+.sidebar-collapse {
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+}
+
+.sidebar-nav {
+  gap: 16px;
+  padding-top: 4px;
+}
+
+.nav-group {
+  gap: 2px;
+}
+
+.nav-group-label {
+  padding: 0 9px 5px;
+  color: #555b65;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+
+.nav-link {
+  height: 34px;
+  gap: 9px;
+  padding: 0 9px;
+  border-radius: 6px;
+  color: #8b929e;
+  font-size: 12px;
+  font-weight: 520;
+}
+
+.nav-link svg {
+  width: 15px;
+  height: 15px;
+  color: #6d747f;
+}
+
+.nav-link:hover {
+  color: #d9dde4;
+  background: var(--console-sidebar-hover);
+}
+
+.nav-link.active {
+  color: #f0f1f4;
+  background: var(--console-sidebar-active);
+  box-shadow: none;
+}
+
+.nav-link.active svg {
+  color: #c5cad2;
+}
+
+.sidebar-runtime {
+  padding: 12px 9px 2px;
+  border-top-color: rgba(255, 255, 255, .055);
+}
+
+.runtime-line {
+  gap: 7px;
+}
+
+.runtime-line strong {
+  color: #aeb4be;
+  font-size: 10px;
+  font-weight: 550;
+}
+
+.health-dot {
+  width: 6px;
+  height: 6px;
+  box-shadow: none !important;
+}
+
+.sidebar-runtime > span,
+.sidebar-runtime small {
+  margin-left: 13px;
+  color: #5b626d;
+  font-size: 9px;
+}
+
+.app-main {
+  margin-left: var(--sidebar-width);
+}
+
+.topbar-v2 {
+  min-height: 50px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--console-border);
+  background: color-mix(in srgb, var(--console-bg) 94%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+.topbar-spacer {
+  flex: 1;
+}
+
+.topbar-actions-v2 {
+  gap: 6px;
+}
+
+.topbar-divider {
+  height: 20px;
+  margin: 0 3px;
+}
+
+.icon-button-v2,
+.icon-button {
+  width: 30px;
+  height: 30px;
+  border-color: transparent;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.icon-button-v2:hover,
+.icon-button:hover {
+  border-color: var(--console-border);
+  background: var(--console-surface-solid);
+}
+
+.user-menu-button {
+  min-height: 34px;
+  gap: 7px;
+  padding: 2px 3px;
+  border-radius: 6px;
+}
+
+.user-menu-button:hover {
+  background: transparent;
+}
+
+.user-avatar {
+  width: 27px;
+  height: 27px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--console-surface-subtle);
+  font-size: 9px;
+}
+
+.user-menu-copy strong {
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.user-menu-copy small {
+  font-size: 9px;
+}
+
+.page-content {
+  padding: 22px 24px 44px;
+}
+
+.page-stack {
+  max-width: 1460px;
+  gap: 14px;
+}
+
+.console-page-header {
+  min-height: 58px;
+  align-items: flex-end;
+  padding: 0 0 4px;
+}
+
+.console-page-eyebrow {
+  margin-bottom: 4px;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: .07em;
+}
+
+.console-page-heading h2 {
+  font-size: 20px;
+  line-height: 1.2;
+  letter-spacing: -.025em;
+  font-weight: 650;
+}
+
+.console-page-heading p {
+  max-width: 760px;
+  margin-top: 6px;
+  color: var(--console-text-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.console-page-actions {
+  gap: 6px;
+}
+
+.panel-v2 {
+  overflow: hidden;
+  border: 1px solid var(--console-border);
+  border-radius: var(--console-radius);
+  background: var(--console-surface-solid);
+  box-shadow: none;
+}
+
+.panel-v2-header {
+  min-height: 52px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--console-border);
+}
+
+.panel-v2-header h2 {
+  margin: 0 0 2px;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: -.005em;
+}
+
+.panel-v2-header p {
+  color: var(--console-text-muted);
+  font-size: 10px;
+}
+
+.button {
+  min-height: 32px;
+  gap: 6px;
+  padding: 0 10px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 600;
+  box-shadow: none !important;
+}
+
+.button.primary {
+  background: var(--console-text);
+  color: var(--console-surface-solid);
+}
+
+.button.primary:hover {
+  background: color-mix(in srgb, var(--console-text) 88%, var(--console-bg));
+}
+
+.button.secondary {
+  border-color: var(--console-border-strong);
+  background: transparent;
+}
+
+.button.secondary:hover {
+  background: var(--console-surface-subtle);
+}
+
+.button.compact {
+  min-height: 29px;
+  padding: 0 9px;
+}
+
+.text-link {
+  gap: 4px;
+  color: var(--console-text-soft);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.text-link:hover {
+  color: var(--console-text);
+}
+
+.console-status-pill,
+.badge {
+  min-height: 21px;
+  gap: 5px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.console-status-pill.success,
+.badge.success {
+  color: var(--console-success);
+  background: transparent;
+}
+
+.console-status-pill.warning,
+.badge.warning {
+  color: var(--console-warning);
+  background: transparent;
+}
+
+.console-status-pill.danger {
+  color: var(--console-danger);
+  background: transparent;
+}
+
+.console-status-pill.accent {
+  color: var(--console-accent);
+  background: transparent;
+}
+
+.console-status-dot {
+  width: 5px;
+  height: 5px;
+}
+
+.search-field,
+.select-field,
+.input-with-icon {
+  height: 33px;
+  border-color: var(--console-border);
+  border-radius: 7px;
+  background: var(--console-surface-solid);
+}
+
+.search-field {
+  padding: 0 9px;
+}
+
+.search-field input,
+.select-field {
+  font-size: 11px;
+}
+
+.select-field {
+  min-width: 122px;
+  padding-left: 9px;
+}
+
+.search-field:focus-within,
+.select-field:focus,
+.input-with-icon:focus-within {
+  border-color: var(--console-border-strong);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--console-accent) 10%, transparent);
+}
+
+/* Overview: one statistical surface instead of a wall of cards. */
+.overview-page {
+  gap: 12px;
+}
+
+.overview-page-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.overview-build {
+  color: var(--console-text-muted);
+  font-size: 10px;
+}
+
+.overview-stat-strip {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  overflow: hidden;
+  border: 1px solid var(--console-border);
+  border-radius: var(--console-radius);
+  background: var(--console-surface-solid);
+}
+
+.overview-stat-strip > div {
+  min-width: 0;
+  padding: 15px 16px 14px;
+  border-right: 1px solid var(--console-border);
+}
+
+.overview-stat-strip > div:last-child {
+  border-right: 0;
+}
+
+.overview-stat-strip span {
+  display: block;
+  color: var(--console-text-muted);
+  font-size: 10px;
+  font-weight: 550;
+}
+
+.overview-stat-strip strong {
+  display: block;
+  margin-top: 6px;
+  color: var(--console-text);
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: -.035em;
+  font-weight: 630;
+}
+
+.overview-stat-strip strong small {
+  color: var(--console-text-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.overview-stat-strip p {
+  margin: 8px 0 0;
+  color: var(--console-text-muted);
+  font-size: 9px;
+}
+
+.overview-primary-grid,
+.overview-secondary-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(320px, .75fr);
+  gap: 12px;
+}
+
+.overview-health-list {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  min-height: 118px;
+}
+
+.overview-health-list > div {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 14px;
+  border-right: 1px solid var(--console-border);
+}
+
+.overview-health-list > div:last-child {
+  border-right: 0;
+}
+
+.overview-health-list span {
+  color: var(--console-text-muted);
+  font-size: 9px;
+}
+
+.overview-health-list strong {
+  margin-top: 6px;
+  color: var(--console-text);
+  font-size: 18px;
+  font-weight: 620;
+}
+
+.overview-health-list strong small {
+  color: var(--console-text-muted);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.warning-text {
+  color: var(--console-warning) !important;
+}
+
+.overview-inline-state {
+  min-height: 118px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--console-text-muted);
+  font-size: 11px;
+}
+
+.overview-inline-state.warning {
+  color: var(--console-warning);
+}
+
+.attention-list.minimal .attention-item {
+  min-height: 56px;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 10px 13px;
+  border-bottom-color: var(--console-border);
+}
+
+.attention-list.minimal .attention-item > svg {
+  width: 14px;
+  height: 14px;
+}
+
+.attention-list.minimal .attention-item strong {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.attention-list.minimal .attention-item span {
+  font-size: 10px;
+}
+
+.attention-list.minimal .attention-item > a {
+  color: var(--console-text-muted);
+  font-size: 10px;
+}
+
+.recent-account-list.compact .recent-account-row {
+  min-height: 49px;
+  grid-template-columns: 30px minmax(150px, 1fr) 68px 72px 16px;
+  padding: 7px 13px;
+}
+
+.recent-account-list.compact .recent-account-main strong,
+.recent-account-list.compact .recent-account-stat strong {
+  font-size: 10px;
+}
+
+.recent-account-list.compact .recent-account-main span,
+.recent-account-list.compact .recent-account-stat span,
+.recent-account-list.compact .recent-account-time {
+  font-size: 9px;
+}
+
+.overview-runtime-list {
+  margin: 0;
+  padding: 2px 13px;
+}
+
+.overview-runtime-list > div {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border-bottom: 1px solid var(--console-border);
+}
+
+.overview-runtime-list > div:last-child {
+  border-bottom: 0;
+}
+
+.overview-runtime-list dt {
+  color: var(--console-text-muted);
+  font-size: 10px;
+}
+
+.overview-runtime-list dd {
+  margin: 0;
+  color: var(--console-text);
+  font-size: 10px;
+  font-weight: 550;
+  text-align: right;
+}
+
+.overview-footnote {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 2px;
+  color: var(--console-text-muted);
+  font-size: 9px;
+}
+
+.overview-footnote a {
+  margin-left: auto;
+  color: var(--console-text-soft);
+  font-weight: 600;
+}
+
+/* Old dashboard presentation is intentionally suppressed. */
+.overview-hero,
+.metrics-grid-v2,
+.dashboard-health-strip,
+.dashboard-grid.operations-grid,
+.dashboard-lower-grid {
+  box-shadow: none;
+}
+
+/* Tables: less chrome, more scanability. */
+.data-table th {
+  height: 34px;
+  padding: 0 12px;
+  border-bottom-color: var(--console-border);
+  background: var(--console-surface-subtle);
+  color: var(--console-text-muted);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  text-transform: none;
+}
+
+.data-table td {
+  height: 48px;
+  padding: 7px 12px;
+  border-bottom-color: var(--console-border);
+  color: var(--console-text-soft);
+  font-size: 10px;
+}
+
+.data-table tbody tr:hover td,
+.data-table tbody tr.clickable:hover td {
+  background: color-mix(in srgb, var(--console-surface-subtle) 72%, transparent);
+}
+
+.identity-cell,
+.primary-secondary {
+  gap: 8px;
+}
+
+.identity-cell strong,
+.primary-secondary strong,
+.ratio-cell strong {
+  color: var(--console-text);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.identity-cell span,
+.primary-secondary span,
+.ratio-cell span {
+  color: var(--console-text-muted);
+  font-size: 9px;
+}
+
+.account-mark {
+  width: 29px;
+  height: 29px;
+  border-radius: 7px;
+  font-size: 8px;
+}
+
+.account-mark.small {
+  width: 25px;
+  height: 25px;
+  border-radius: 6px;
+}
+
+.pagination-v2 {
+  min-height: 44px;
+  padding: 7px 11px;
+  border-top-color: var(--console-border);
+  font-size: 9px;
+}
+
+/* Metrics elsewhere become one quiet surface, not five floating cards. */
+.connection-health-metrics {
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--console-border);
+  border-radius: var(--console-radius);
+  background: var(--console-surface-solid);
+}
+
+.connection-health-metrics .metric-card-v2 {
+  min-height: 94px;
+  padding: 13px;
+  border: 0;
+  border-right: 1px solid var(--console-border);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.connection-health-metrics .metric-card-v2:last-child {
+  border-right: 0;
+}
+
+.connection-health-metrics .metric-icon,
+.metric-icon {
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--console-text-muted);
+}
+
+.connection-health-metrics .metric-copy > span,
+.metric-copy > span {
+  color: var(--console-text-muted);
+  font-size: 9px;
+}
+
+.connection-health-metrics .metric-copy strong,
+.metric-copy strong {
+  color: var(--console-text);
+  font-size: 20px;
+  font-weight: 620;
+}
+
+.connection-health-metrics .metric-copy p,
+.metric-copy p {
+  margin-top: 5px;
+  font-size: 9px;
+}
+
+.health-threshold-strip {
+  min-height: 34px;
+  padding: 7px 10px;
+  border-color: var(--console-border);
+  border-radius: 7px;
+  background: transparent;
+  font-size: 9px;
+}
+
+.health-alert-row {
+  min-height: 66px;
+  padding: 9px 12px;
+  border-bottom-color: var(--console-border);
+}
+
+.health-alert-severity,
+.connection-health-metric-icon {
+  width: 24px;
+  height: 24px;
+  border: 0;
+  background: transparent;
+}
+
+.health-signal-chip {
+  min-height: 20px;
+  padding: 0 6px;
+  border-color: var(--console-border);
+  background: transparent;
+  font-size: 9px;
+}
+
+.console-segmented {
+  gap: 1px;
+  padding: 2px;
+  border-color: var(--console-border);
+  border-radius: 7px;
+  background: var(--console-surface-subtle);
+}
+
+.console-segmented button {
+  min-height: 28px;
+  gap: 5px;
+  padding: 0 8px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 580;
+}
+
+.console-segmented button.active {
+  background: var(--console-surface-solid);
+  box-shadow: none;
+}
+
+/* Sheets: precise side panel, not a modal billboard. */
+.console-sheet-backdrop {
+  background: rgba(0, 0, 0, .16);
+  backdrop-filter: none;
+}
+
+.console-sheet,
+.console-sheet.wide {
+  width: min(460px, 100vw);
+  border-left-color: var(--console-border);
+  box-shadow: -14px 0 34px rgba(0, 0, 0, .09);
+}
+
+.console-sheet-header {
+  min-height: 66px;
+  padding: 15px 16px;
+  backdrop-filter: none;
+}
+
+.console-sheet-header h2 {
+  font-size: 15px;
+  font-weight: 640;
+}
+
+.console-sheet-header p {
+  margin-top: 3px;
+  font-size: 10px;
+}
+
+.console-sheet-body {
+  height: calc(100vh - 66px);
+}
+
+.connection-drawer-section {
+  padding: 14px 16px;
+}
+
+.connection-detail-list > div {
+  min-height: 37px;
+  grid-template-columns: 118px minmax(0, 1fr);
+  border-bottom-color: var(--console-border);
+}
+
+.connection-detail-list dt,
+.connection-detail-list dd {
+  font-size: 10px;
+}
+
+.connection-detail-list dd small {
+  font-size: 9px;
+}
+
+/* System and account detail surfaces. */
+.system-grid {
+  gap: 12px;
+}
+
+.system-hero {
+  padding: 16px 14px 6px;
+}
+
+.system-hero-icon,
+.health-runtime-icon,
+.summary-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--console-text-muted);
+}
+
+.system-hero strong {
+  font-size: 18px;
+  font-weight: 620;
+}
+
+.system-metrics {
+  padding: 6px 12px 12px;
+}
+
+.system-metrics div {
+  min-height: 72px;
+  padding: 10px;
+  border-color: var(--console-border);
+}
+
+.system-metrics span {
+  font-size: 9px;
+}
+
+.system-metrics strong {
+  margin-top: 4px;
+  font-size: 17px;
+  font-weight: 620;
+}
+
+.account-hero {
+  min-height: 86px;
+  padding: 14px 16px;
+  border-radius: var(--console-radius);
+  background: var(--console-surface-solid);
+  box-shadow: none;
+}
+
+.account-hero-copy h2 {
+  font-size: 16px;
+  font-weight: 630;
+}
+
+.account-hero-stats strong {
+  font-size: 14px;
+}
+
+/* Topology: neutral canvas, identity color only where it earns attention. */
+.topology-canvas,
+.connection-topology {
+  background: var(--console-surface-solid);
+}
+
+.topology-node-icon,
+.connection-node-icon {
+  border: 0;
+  background: var(--console-surface-subtle) !important;
+}
+
+.topology-legend,
+.topology-detail,
+.topology-summary,
+.connection-topology-head > div:first-child,
+.connection-topology-legend {
+  border-radius: 7px !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+}
+
+.topology-filter-button {
+  border-radius: 6px;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.react-flow__controls,
+.react-flow__minimap {
+  border-radius: 6px !important;
+  box-shadow: none !important;
+}
+
+/* Login: one quiet task, no marketing split-screen. */
+.login-page-v2 {
+  display: block;
+  min-height: 100vh;
+  background: var(--console-bg);
+}
+
+.login-brand-side {
+  display: none;
+}
+
+.login-form-side {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--console-bg);
+}
+
+.login-card-v2 {
+  width: min(380px, 100%);
+  padding: 28px;
+  border: 1px solid var(--console-border);
+  border-radius: 11px;
+  background: var(--console-surface-solid);
+  box-shadow: none;
+}
+
+.login-card-v2 h2 {
+  font-size: 20px;
+  font-weight: 650;
+}
+
+.login-card-v2 > p {
+  margin-bottom: 22px;
+  color: var(--console-text-muted);
+  font-size: 12px;
+}
+
+.login-card-v2 label {
+  color: var(--console-text-soft);
+  font-size: 10px;
+}
+
+.mobile-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 28px;
+}
+
+.mobile-brand .brand-symbol {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--console-text);
+  background: var(--console-surface-subtle);
+}
+
+.mobile-brand strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.eyebrow-v2 {
+  margin-bottom: 10px;
+  color: var(--console-text-muted);
+  font-size: 9px;
+  letter-spacing: .08em;
+}
+
+.session-note {
+  margin-top: 14px;
+  font-size: 9px;
+}
+
+/* Focus stays visible without becoming decoration. */
+:where(
+  button,
+  a,
+  input,
+  select,
+  [tabindex]
+):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--console-accent) 42%, transparent);
+  outline-offset: 2px;
+}
+
+@media (max-width: 1120px) {
+  .overview-stat-strip {
+    grid-template-columns: repeat(3, 1fr);
+  }
+
+  .overview-stat-strip > div:nth-child(3) {
+    border-right: 0;
+  }
+
+  .overview-stat-strip > div:nth-child(-n+3) {
+    border-bottom: 1px solid var(--console-border);
+  }
+
+  .overview-primary-grid,
+  .overview-secondary-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .connection-health-metrics {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .connection-health-metrics .metric-card-v2:nth-child(3) {
+    border-right: 0;
+  }
+
+  .connection-health-metrics .metric-card-v2:nth-child(-n+3) {
+    border-bottom: 1px solid var(--console-border);
+  }
+}
+
+@media (max-width: 900px) {
+  .page-content {
+    padding: 18px 14px 34px;
+  }
+
+  .topbar-v2 {
+    min-height: 46px;
+    padding: 0 12px;
+  }
+
+  .console-page-header {
+    gap: 10px;
+  }
+
+  .overview-stat-strip {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .overview-stat-strip > div,
+  .overview-stat-strip > div:nth-child(3) {
+    border-right: 1px solid var(--console-border);
+    border-bottom: 1px solid var(--console-border);
+  }
+
+  .overview-stat-strip > div:nth-child(even) {
+    border-right: 0;
+  }
+
+  .overview-stat-strip > div:last-child {
+    grid-column: 1 / -1;
+    border-right: 0;
+    border-bottom: 0;
+  }
+
+  .overview-health-list {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .overview-health-list > div {
+    border-right: 1px solid var(--console-border);
+    border-bottom: 1px solid var(--console-border);
+  }
+
+  .overview-health-list > div:nth-child(even) {
+    border-right: 0;
+  }
+
+  .overview-health-list > div:last-child {
+    grid-column: 1 / -1;
+    border-right: 0;
+    border-bottom: 0;
+  }
+}
+
+@media (max-width: 650px) {
+  .console-page-heading h2 {
+    font-size: 18px;
+  }
+
+  .console-page-heading p {
+    font-size: 11px;
+  }
+
+  .overview-page-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .overview-stat-strip > div {
+    padding: 13px;
+  }
+
+  .overview-stat-strip strong {
+    font-size: 21px;
+  }
+
+  .recent-account-list.compact .recent-account-row {
+    grid-template-columns: 28px minmax(120px, 1fr) 52px 16px;
+  }
+
+  .recent-account-list.compact .recent-account-time {
+    display: none;
+  }
+
+  .connection-health-metrics {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .connection-health-metrics .metric-card-v2,
+  .connection-health-metrics .metric-card-v2:nth-child(3) {
+    border-right: 1px solid var(--console-border);
+    border-bottom: 1px solid var(--console-border);
+  }
+
+  .connection-health-metrics .metric-card-v2:nth-child(even) {
+    border-right: 0;
+  }
+
+  .connection-health-metrics .metric-card-v2:last-child {
+    grid-column: 1 / -1;
+    border-right: 0;
+  }
+
+  .attention-list.minimal .attention-item {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+
+  .attention-list.minimal .attention-item > a {
+    grid-column: 2;
+  }
+}
+
+@media (max-width: 430px) {
+  .overview-stat-strip {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .overview-footnote {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    padding-top: 4px;
+  }
+
+  .overview-footnote a {
+    width: 100%;
+    margin-left: 21px;
+  }
+
+  .connection-health-metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .connection-health-metrics .metric-card-v2,
+  .connection-health-metrics .metric-card-v2:nth-child(3),
+  .connection-health-metrics .metric-card-v2:nth-child(even),
+  .connection-health-metrics .metric-card-v2:last-child {
+    grid-column: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--console-border);
+  }
+
+  .connection-health-metrics .metric-card-v2:last-child {
+    border-bottom: 0;
+  }
+}
