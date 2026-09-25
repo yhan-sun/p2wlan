@@ -40,15 +40,15 @@ const navGroups = [
 ]
 
 function pageMeta(pathname: string): { title: string; eyebrow: string } {
-  if (pathname.startsWith('/accounts/')) return { title: '账号详情', eyebrow: 'ACCOUNTS' }
-  if (pathname === '/accounts') return { title: '账号', eyebrow: 'ACCOUNTS' }
-  if (pathname === '/relationships') return { title: '资源关系', eyebrow: 'RELATIONSHIPS' }
-  if (pathname === '/connections') return { title: '连接路径', eyebrow: 'NETWORK' }
-  if (pathname === '/devices') return { title: '设备', eyebrow: 'DEVICES' }
-  if (pathname === '/networks') return { title: '网络与房间', eyebrow: 'NETWORK' }
-  if (pathname === '/health') return { title: '连接健康', eyebrow: 'OPERATIONS' }
-  if (pathname === '/system') return { title: '运行健康', eyebrow: 'OPERATIONS' }
-  return { title: '概览', eyebrow: 'OVERVIEW' }
+  if (pathname.startsWith('/accounts/')) return { title: '账号详情', eyebrow: '账号' }
+  if (pathname === '/accounts') return { title: '账号', eyebrow: '账号' }
+  if (pathname === '/relationships') return { title: '资源关系', eyebrow: '资源关系' }
+  if (pathname === '/connections') return { title: '连接路径', eyebrow: '网络' }
+  if (pathname === '/devices') return { title: '设备', eyebrow: '设备' }
+  if (pathname === '/networks') return { title: '网络与房间', eyebrow: '网络' }
+  if (pathname === '/health') return { title: '连接健康', eyebrow: '可观测性' }
+  if (pathname === '/system') return { title: '运行健康', eyebrow: '可观测性' }
+  return { title: '概览', eyebrow: '总览' }
 }
 
 export function Shell({ onLogout }: { onLogout: () => void }) {
@@ -91,11 +91,11 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
       aria-label="关闭导航"
       onClick={() => setMobileOpen(false)}
     />
-    <aside className="sidebar-v2">
+    <aside className="sidebar-v2" id="primary-navigation">
       <div className="sidebar-brand-row">
         <Link to="/" className="brand-lockup">
           <div className="brand-symbol"><Waypoints size={20} /></div>
-          <div><strong>P2WLAN</strong><span>Control Plane</span></div>
+          <div><strong>P2WLAN</strong><span>控制平面</span></div>
         </Link>
         <IconButton
           className="sidebar-collapse"
@@ -122,7 +122,7 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
       <div className="sidebar-runtime">
         <div className="runtime-line">
           <span className={`health-dot${runtime.isError ? ' down' : runtime.isPending ? ' unknown' : ''}`} />
-          <strong>{runtime.isError ? 'Control 不可达' : runtime.isPending ? '正在检查 Control' : 'Control healthy'}</strong>
+          <strong>{runtime.isError ? 'Control 不可达' : runtime.isPending ? '正在检查 Control' : 'Control 正常'}</strong>
         </div>
         <span>{runtime.data?.build_version ?? (runtime.isError ? '—' : 'loading…')}</span>
         <small>只读管理模式</small>
@@ -161,7 +161,7 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
             onClick={() => { clearAdminToken(); queryClient.clear(); onLogout() }}
           >
             <span className="user-avatar">AD</span>
-            <span className="user-menu-copy"><strong>admin</strong><small>read-only</small></span>
+            <span className="user-menu-copy"><strong>admin</strong><small>只读</small></span>
             <LogOut size={15} />
           </button>
         </div>
