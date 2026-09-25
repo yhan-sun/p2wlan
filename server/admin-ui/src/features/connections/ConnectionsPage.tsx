@@ -62,7 +62,7 @@ function PathBadge({ connection }: { connection: AdminConnection }) {
   return <StatusPill tone={tone} dot>{pathLabel(connection.current_path)}</StatusPill>
 }
 
-function 新鲜nessBadge({ connection }: { connection: AdminConnection }) {
+function FreshnessBadge({ connection }: { connection: AdminConnection }) {
   const label = connection.fresh ? '新鲜' : connection.freshness === 'reporter_offline' ? '上报端离线' : '过期'
   return <StatusPill tone={connection.fresh ? 'success' : connection.freshness === 'reporter_offline' ? 'warning' : 'neutral'}>{label}</StatusPill>
 }
@@ -136,7 +136,7 @@ export function ConnectionDrawer({
     <section className="connection-drawer-section">
       <div className="connection-state-hero">
         <PathBadge connection={current} />
-        <新鲜nessBadge connection={current} />
+        <FreshnessBadge connection={current} />
       </div>
       {!current.fresh && <div className="connection-stale-note">
         这是 daemon 最后一次权威上报的路径，不表示当前仍处于活动连接。
@@ -172,7 +172,7 @@ export function ConnectionsPage() {
   const [query, setQuery] = useState('')
   const [networkId, setNetworkId] = useState('')
   const [path, setPath] = useState('')
-  const [freshness, set新鲜ness] = useState<'fresh' | 'stale' | ''>('')
+  const [freshness, setFreshness] = useState<'fresh' | 'stale' | ''>('')
   const [offset, setOffset] = useState(0)
   const [showStaleTopology, setShowStaleTopology] = useState(false)
   const [selected, setSelected] = useState<AdminConnection | null>(null)
@@ -231,9 +231,9 @@ export function ConnectionsPage() {
     { id: 'direction', header: '方向', cell: ({ row }) => <ConnectionDirection connection={row.original} /> },
     { id: 'network', header: '网络', cell: ({ row }) => <div className="primary-secondary"><strong>{row.original.network_name}</strong><span className="mono">{row.original.network_id}</span></div> },
     { id: 'path', header: '路径', cell: ({ row }) => <PathBadge connection={row.original} /> },
-    { id: 'fresh', header: '观测', cell: ({ row }) => <新鲜nessBadge connection={row.original} /> },
+    { id: 'fresh', header: '观测', cell: ({ row }) => <FreshnessBadge connection={row.original} /> },
     { id: 'rtt', header: '验证 RTT', cell: ({ row }) => row.original.last_validation_rtt_ms === undefined ? '—' : `${row.original.last_validation_rtt_ms} ms` },
-    { id: 'age', header: 'Path age', cell: ({ row }) => formatMilliseconds(row.original.path_age_ms) },
+    { id: 'age', header: '路径存续', cell: ({ row }) => formatMilliseconds(row.original.path_age_ms) },
     { id: 'reason', header: '原因', cell: ({ row }) => <span className="connection-reason" title={row.original.transition_reason}>{reasonLabel(row.original.transition_reason)}</span> },
     { id: 'observed', header: '最后观测', cell: ({ row }) => formatAgo(row.original.received_at) },
     { id: 'action', header: '', cell: () => <ChevronRight className="row-chevron" size={16} /> },
@@ -276,7 +276,7 @@ export function ConnectionsPage() {
         <option value="relay">Relay</option>
         <option value="none">无路径</option>
       </select>
-      {view === 'table' && <select className="select-field" value={freshness} onChange={(event) => set新鲜ness(event.target.value as 'fresh' | 'stale' | '')} aria-label="按观测新鲜度过滤">
+      {view === 'table' && <select className="select-field" value={freshness} onChange={(event) => setFreshness(event.target.value as 'fresh' | 'stale' | '')} aria-label="按观测新鲜度过滤">
         <option value="">全部观测</option>
         <option value="fresh">新鲜</option>
         <option value="stale">过期 / 上报端离线</option>
@@ -308,7 +308,7 @@ export function ConnectionsPage() {
       {!networkId ? <EmptyState
         icon={<Network size={20} />}
         title="选择一个网络查看 Live Topology"
-        description="拓扑不会跨网络拼接，也不会从 membership、signaling 或 RTT 推断连接。"
+        description="拓扑不会跨网络拼接，也不会从成员关系、信令或 RTT 推断连接。"
       /> : topology.isPending ? <LoadingBlock label="正在读取权威连接拓扑…" /> : topology.error ? <ErrorBlock error={topology.error} /> : topology.data ? <>
         {topology.data.total > topology.data.items.length && <div className="connection-partial-warning"><CircleAlert size={15} />当前网络共有 {topology.data.total} 条匹配观测，拓扑仅展示前 {topology.data.items.length} 条；请收紧搜索或路径过滤。</div>}
         <ConnectionTopology
