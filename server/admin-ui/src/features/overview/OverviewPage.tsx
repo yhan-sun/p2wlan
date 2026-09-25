@@ -33,7 +33,7 @@ export function Dashboard() {
   return <div className="page-stack overview-page">
     <PageHeader
       title="概览"
-      description="Control 状态、连接路径与最近活动。只展示可确认的事实，不合成健康分。"
+      description="Control、路径与最近活动。这里只展示可确认事实，不合成健康分。"
       actions={<div className="overview-page-actions">
         <StatusPill tone="success" dot>Control 在线</StatusPill>
         <span className="overview-build mono">{runtime.data.build_version}</span>
@@ -52,14 +52,14 @@ export function Dashboard() {
         <p>{overview.data.networks} 个网络</p>
       </div>
       <div>
-        <span>直连</span>
+        <span>新鲜直连</span>
         <strong>{health?.summary.fresh_direct ?? '—'}</strong>
-        <p>最近 1 小时 fresh</p>
+        <p>最近 1 小时</p>
       </div>
       <div>
-        <span>中继</span>
+        <span>新鲜中继</span>
         <strong>{health?.summary.fresh_relay ?? '—'}</strong>
-        <p>最近 1 小时 fresh</p>
+        <p>最近 1 小时</p>
       </div>
       <div>
         <span>待处理信令</span>
@@ -87,15 +87,15 @@ export function Dashboard() {
             </div>}
       </Panel>
 
-      <Panel title="需要关注" subtitle="当前 Control 快照">
+      <Panel title="需要关注" subtitle="仅显示当前快照中需要处理的事实">
         <div className="attention-list minimal">
-          {offlineDevices > 0
-            ? <div className="attention-item warning"><CircleAlert size={15} /><div><strong>{offlineDevices} 台设备离线</strong><span>结合最后活动时间确认是否为预期离线。</span></div><Link to="/devices">设备</Link></div>
-            : <div className="attention-item success"><CircleCheck size={15} /><div><strong>设备在线状态正常</strong><span>当前没有离线设备。</span></div></div>}
-          {overview.data.pending_signals > 0
-            ? <div className="attention-item warning"><RadioTower size={15} /><div><strong>{overview.data.pending_signals} 条待处理信令</strong><span>这是控制面协调状态，不等于数据路径故障。</span></div><Link to="/relationships">关系</Link></div>
-            : <div className="attention-item success"><CircleCheck size={15} /><div><strong>没有待处理信令</strong><span>Control 当前未记录协调积压。</span></div></div>}
-          <div className="attention-item neutral"><Waypoints size={15} /><div><strong>路径与资源关系分离</strong><span>连接路径来自 daemon committed observation。</span></div><Link to="/connections">连接</Link></div>
+          {connectionHealth.isPending && <div className="attention-item neutral"><Gauge size={15} /><div><strong>正在读取连接关注信号</strong><span>设备与信令状态仍可独立确认。</span></div></div>}
+          {connectionHealth.error && <div className="attention-item warning"><CircleAlert size={15} /><div><strong>连接健康暂不可用</strong><span>无法读取最近 1 小时的派生关注信号。</span></div><Link to="/health">连接健康</Link></div>}
+          {health && health.alerts_total > 0 && <div className="attention-item warning"><CircleAlert size={15} /><div><strong>{health.alerts_total} 条连接需要关注</strong><span>来自 daemon 路径观测与受限迁移历史。</span></div><Link to="/health">连接健康</Link></div>}
+          {offlineDevices > 0 && <div className="attention-item warning"><CircleAlert size={15} /><div><strong>{offlineDevices} 台设备离线</strong><span>结合最后活动时间确认是否为预期离线。</span></div><Link to="/devices">设备</Link></div>}
+          {overview.data.pending_signals > 0 && <div className="attention-item warning"><RadioTower size={15} /><div><strong>{overview.data.pending_signals} 条待处理信令</strong><span>这是控制面协调状态，不等于数据路径故障。</span></div><Link to="/relationships">资源关系</Link></div>}
+          {!connectionHealth.isPending && !connectionHealth.error && (health?.alerts_total ?? 0) === 0 && offlineDevices === 0 && overview.data.pending_signals === 0 &&
+            <div className="attention-item success"><CircleCheck size={15} /><div><strong>暂无需要处理的关注项</strong><span>当前快照未发现离线设备、信令积压或连接关注信号。</span></div></div>}
         </div>
       </Panel>
     </section>
