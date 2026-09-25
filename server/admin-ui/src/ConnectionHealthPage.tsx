@@ -14,6 +14,7 @@ import {
 } from 'lucide-react'
 import { adminApi } from './api'
 import { MetricCard, PageHeader, Panel, SegmentedControl, StatusPill } from './components/ui/console'
+import { ErrorBlock, LoadingBlock, formatAgo } from './shared/console'
 import { ConnectionDrawer } from './ConnectionsPage'
 import type { AdminConnectionHealthAlert } from './types'
 
@@ -24,15 +25,6 @@ const WINDOW_OPTIONS = [
   { label: '6h', value: 21600 },
   { label: '24h', value: 86400 },
 ] as const
-
-function formatAgo(unix?: number): string {
-  if (!unix) return '—'
-  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - unix)
-  if (seconds < 45) return '刚刚'
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`
-  return `${Math.floor(seconds / 86400)} 天前`
-}
 
 function pathLabel(path?: string | null): string {
   if (!path) return 'None'
@@ -50,15 +42,6 @@ function signalLabel(signal: string): string {
     repeated_path_failures: '路径失败重复发生',
   }
   return labels[signal] ?? signal.replaceAll('_', ' ')
-}
-
-function LoadingBlock({ label = '加载中…' }: { label?: string }) {
-  return <div className="loading-block"><div className="spinner" />{label}</div>
-}
-
-function ErrorBlock({ error }: { error: unknown }) {
-  const message = error instanceof Error ? error.message : '加载失败'
-  return <div className="error-block"><CircleAlert size={18} /><div><strong>无法加载数据</strong><span>{message}</span></div></div>
 }
 
 function HealthAlertRow({
