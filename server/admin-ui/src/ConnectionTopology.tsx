@@ -12,6 +12,7 @@ import {
 } from '@xyflow/react'
 import { CircleAlert, Expand, Eye, EyeOff, MonitorSmartphone, Shrink } from 'lucide-react'
 import type { AdminConnection } from './types'
+import { EmptyState, IconButton } from './components/ui/console'
 
 const NODE_WIDTH = 220
 const NODE_HEIGHT = 76
@@ -113,9 +114,9 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
         width: NODE_WIDTH,
         height: NODE_HEIGHT,
         borderRadius: 10,
-        border: '1px solid #d7dde6',
-        background: '#fff',
-        boxShadow: '0 4px 16px rgba(15, 23, 42, .06)',
+        border: '1px solid var(--console-border-strong)',
+        background: 'var(--console-surface-solid)',
+        boxShadow: 'var(--console-shadow)',
         padding: 0,
       },
       draggable: false,
@@ -134,7 +135,7 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
     const pair = [connection.reporting_device_id, connection.remote_device_id].sort().join(':')
     const hasReverse = (pairCounts.get(pair) ?? 0) > 1
     const lexicalForward = connection.reporting_device_id.localeCompare(connection.remote_device_id) < 0
-    const stroke = kind === 'direct' ? '#16803d' : kind === 'relay' ? '#2563eb' : '#98a2b3'
+    const stroke = kind === 'direct' ? 'var(--console-success)' : kind === 'relay' ? 'var(--console-accent)' : 'var(--console-text-muted)'
     const label = `${pathLabel(connection.current_path)}${connection.last_validation_rtt_ms !== undefined ? ` · 验证 ${connection.last_validation_rtt_ms} ms` : ''}${connection.fresh ? '' : ' · stale'}`
     return {
       id: connectionKey(connection),
@@ -144,8 +145,8 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
       pathOptions: { offset: hasReverse ? (lexicalForward ? 18 : 38) : 24, borderRadius: 14 },
       markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 },
       label,
-      labelStyle: { fontSize: 11, fill: kind === 'stale' ? '#667085' : '#344054', fontWeight: 650 },
-      labelBgStyle: { fill: '#ffffff', fillOpacity: 0.94 },
+      labelStyle: { fontSize: 11, fill: kind === 'stale' ? 'var(--console-text-muted)' : 'var(--console-text-soft)', fontWeight: 650 },
+      labelBgStyle: { fill: 'var(--console-surface-solid)', fillOpacity: 0.94 },
       style: {
         stroke,
         strokeWidth: connection.fresh ? 2 : 1.6,
@@ -176,10 +177,11 @@ export function ConnectionTopology({
   const activeConnectionCount = connections.filter((connection) => Boolean(connection.current_path)).length
 
   if (activeConnectionCount === 0) {
-    return <div className="connection-topology-empty">
-      <CircleAlert size={18} />
-      <div><strong>暂无活动路径</strong><span>只有 daemon 权威上报且 current_path 非空的观测才会生成连接边；None 观测仍保留在列表中用于诊断。</span></div>
-    </div>
+    return <EmptyState
+      icon={<CircleAlert size={18} />}
+      title="暂无活动路径"
+      description="只有 daemon 权威上报且 current_path 非空的观测才会生成连接边；None 观测仍保留在列表中用于诊断。"
+    />
   }
 
   return <div className={`connection-topology ${fullscreen ? 'fullscreen' : ''}`}>
@@ -189,9 +191,7 @@ export function ConnectionTopology({
         <button className={`topology-filter-button ${showStale ? 'active' : ''}`} onClick={() => onShowStaleChange(!showStale)}>
           {showStale ? <Eye size={15} /> : <EyeOff size={15} />}Stale
         </button>
-        <button className="icon-button topology-fullscreen-button" onClick={() => setFullscreen((value) => !value)} aria-label={fullscreen ? '退出全屏' : '全屏'}>
-          {fullscreen ? <Shrink size={16} /> : <Expand size={16} />}
-        </button>
+        <IconButton className="topology-fullscreen-button" onClick={() => setFullscreen((value) => !value)} label={fullscreen ? '退出全屏' : '全屏'} icon={fullscreen ? <Shrink size={16} /> : <Expand size={16} />} />
       </div>
     </div>
     <ReactFlow
@@ -210,13 +210,13 @@ export function ConnectionTopology({
       }}
       proOptions={{ hideAttribution: true }}
     >
-      <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#d8dee8" />
+      <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--console-border-strong)" />
       <Controls showInteractive={false} position="bottom-left" />
       <MiniMap
         pannable
         zoomable
         nodeStrokeWidth={2}
-        nodeColor={() => '#cbd5e1'}
+        nodeColor={() => 'var(--console-border-strong)'}
       />
     </ReactFlow>
     <div className="connection-topology-legend">
