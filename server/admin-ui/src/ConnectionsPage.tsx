@@ -21,34 +21,12 @@ import {
 import { Link } from 'react-router-dom'
 import { adminApi } from './api'
 import { EmptyState, PageHeader, SegmentedControl, Sheet, StatusPill } from './components/ui/console'
+import { ErrorBlock, LoadingBlock, formatAgo, formatDate } from './shared/console'
 import { ConnectionTopology } from './ConnectionTopology'
 import type { AdminConnection, AdminConnectionTransition } from './types'
 
 const PAGE_SIZE = 25
 const TOPOLOGY_LIMIT = 100
-
-function formatAgo(unix?: number): string {
-  if (!unix) return '—'
-  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - unix)
-  if (seconds < 45) return '刚刚'
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`
-  if (seconds < 86400 * 30) return `${Math.floor(seconds / 86400)} 天前`
-  return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(unix * 1000))
-}
-
-function formatDate(unix?: number): string {
-  if (!unix) return '—'
-  return new Intl.DateTimeFormat('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  }).format(new Date(unix * 1000))
-}
 
 function formatMilliseconds(value?: number): string {
   if (value === undefined) return '—'
@@ -101,15 +79,6 @@ function ConnectionDirection({ connection }: { connection: AdminConnection }) {
       <span>{connection.remote_username}</span>
     </div>
   </div>
-}
-
-function LoadingBlock({ label = '加载中…' }: { label?: string }) {
-  return <div className="loading-block"><div className="spinner" />{label}</div>
-}
-
-function ErrorBlock({ error }: { error: unknown }) {
-  const message = error instanceof Error ? error.message : '加载失败'
-  return <div className="error-block"><CircleAlert size={18} /><div><strong>无法加载数据</strong><span>{message}</span></div></div>
 }
 
 function TransitionRow({ transition }: { transition: AdminConnectionTransition }) {
