@@ -93,8 +93,18 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
   for (const connection of visibleConnections) graph.setEdge(connection.reporting_device_id, connection.remote_device_id)
   dagre.layout(graph)
 
+  const placements = spreadDagreRankCollisions(
+    sortedDevices.map((device) => ({
+      id: device.id,
+      width: NODE_WIDTH,
+      height: NODE_HEIGHT,
+      point: (graph.node(device.id) as { x: number; y: number } | undefined) ?? { x: 0, y: 0 },
+    })),
+    56,
+  )
+
   const nodes: Node[] = sortedDevices.map((device) => {
-    const point = graph.node(device.id) as { x: number; y: number } | undefined
+    const point = placements.get(device.id) ?? { x: 0, y: 0 }
     return {
       id: device.id,
       position: {
@@ -106,7 +116,7 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
           <span className="connection-node-icon"><MonitorSmartphone size={17} /></span>
           <span className="connection-node-copy">
             <strong>{device.name}</strong>
-            <small>{device.username} · {device.freshOutbound} out / {device.freshInbound} in</small>
+            <small>{device.username} · 出 {device.freshOutbound} / 入 {device.freshInbound}</small>
           </span>
         </div>,
       },
@@ -136,7 +146,7 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
     const hasReverse = (pairCounts.get(pair) ?? 0) > 1
     const lexicalForward = connection.reporting_device_id.localeCompare(connection.remote_device_id) < 0
     const stroke = kind === 'direct' ? 'var(--console-success)' : kind === 'relay' ? 'var(--console-accent)' : 'var(--console-text-muted)'
-    const label = `${pathLabel(connection.current_path)}${connection.last_validation_rtt_ms !== undefined ? ` · 验证 ${connection.last_validation_rtt_ms} ms` : ''}${connection.fresh ? '' : ' · stale'}`
+    const label = `${pathLabel(connection.current_path)}${connection.last_validation_rtt_ms !== undefined ? ` · 验证 ${connection.last_validation_rtt_ms} ms` : ''}${connection.fresh ? '' : ' · 过期'}`
     return {
       id: connectionKey(connection),
       source: connection.reporting_device_id,
@@ -186,10 +196,10 @@ export function ConnectionTopology({
 
   return <div className={`connection-topology ${fullscreen ? 'fullscreen' : ''}`}>
     <div className="connection-topology-head">
-      <div><strong>{networkName}</strong><span>{activeConnectionCount} 条活动 directional path{partial ? ' · 当前视图已截断' : ''}</span></div>
+      <div><strong>{networkName}</strong><span>{activeConnectionCount} 条活动单向路径{partial ? ' · 当前视图已截断' : ''}</span></div>
       <div>
         <button className={`topology-filter-button ${showStale ? 'active' : ''}`} onClick={() => onShowStaleChange(!showStale)}>
-          {showStale ? <Eye size={15} /> : <EyeOff size={15} />}Stale
+          {showStale ? <Eye size={15} /> : <EyeOff size={15} />}过期观测
         </button>
         <IconButton className="topology-fullscreen-button" onClick={() => setFullscreen((value) => !value)} label={fullscreen ? '退出全屏' : '全屏'} icon={fullscreen ? <Shrink size={16} /> : <Expand size={16} />} />
       </div>
@@ -222,7 +232,7 @@ export function ConnectionTopology({
     <div className="connection-topology-legend">
       <span><i className="connection-legend-line direct" />Direct</span>
       <span><i className="connection-legend-line relay" />Relay</span>
-      {showStale && <span><i className="connection-legend-line stale" />Stale</span>}
+      {showStale && <span><i className="connection-legend-line stale" />过期</span>}
     </div>
   </div>
 }
