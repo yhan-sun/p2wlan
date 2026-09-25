@@ -5056,3 +5056,133 @@ body {
     border-bottom: 0;
   }
 }
+
+
+/* Readability pass: density comes from spacing, never microscopic type. */
+:root[data-theme="dark"] {
+  --console-text-soft: #b1b6bf;
+  --console-text-muted: #808690;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.nav-link {
+  font-size: 12.5px;
+}
+
+.console-page-heading h2 {
+  font-size: 21px;
+}
+
+.console-page-heading p {
+  font-size: 12.5px;
+}
+
+.panel-v2-header h2 {
+  font-size: 12.5px;
+}
+
+.panel-v2-header p {
+  font-size: 11px;
+}
+
+.overview-stat-strip span {
+  font-size: 10.5px;
+}
+
+.overview-stat-strip p {
+  font-size: 10px;
+}
+
+.overview-health-list span {
+  font-size: 10px;
+}
+
+.attention-list.minimal .attention-item strong {
+  font-size: 11.5px;
+}
+
+.attention-list.minimal .attention-item span {
+  font-size: 10.5px;
+}
+
+.recent-account-list.compact .recent-account-main strong,
+.recent-account-list.compact .recent-account-stat strong {
+  font-size: 11px;
+}
+
+.recent-account-list.compact .recent-account-main span,
+.recent-account-list.compact .recent-account-stat span,
+.recent-account-list.compact .recent-account-time {
+  font-size: 10px;
+}
+
+.overview-runtime-list dt,
+.overview-runtime-list dd {
+  font-size: 10.5px;
+}
+
+.data-table th {
+  font-size: 10px;
+}
+
+.data-table td {
+  font-size: 11px;
+}
+
+.identity-cell strong,
+.primary-secondary strong,
+.ratio-cell strong {
+  font-size: 11px;
+}
+
+.identity-cell span,
+.primary-secondary span,
+.ratio-cell span {
+  font-size: 10px;
+}
+
+.console-status-pill,
+.badge {
+  font-size: 10px;
+}
+
+.connection-detail-list dt,
+.connection-detail-list dd {
+  font-size: 11px;
+}
+
+.health-alert-direction strong,
+.health-alert-facts strong,
+.health-alert-tail strong {
+  font-size: 11px;
+}
+
+.health-alert-direction small,
+.health-alert-facts small,
+.health-alert-tail small,
+.health-signal-chip {
+  font-size: 10px;
+}
+
+@media (max-width: 650px) {
+  .console-page-heading h2 {
+    font-size: 19px;
+  }
+
+  .console-page-heading p {
+    font-size: 11.5px;
+  }
+
+  .connection-mobile-direction strong {
+    font-size: 12px;
+  }
+
+  .connection-mobile-direction small,
+  .connection-mobile-facts {
+    font-size: 10px;
+  }
+}
