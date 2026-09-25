@@ -3314,3 +3314,54 @@ select {
 @media (max-width: 430px) {
   .connection-health-metrics { grid-template-columns: 1fr; }
 }
+
+
+/* Final accessibility and dark-theme corrections from real browser review. */
+.topology-page-progress {
+  border-color: var(--console-border);
+  background: var(--console-surface-subtle);
+  color: var(--console-text-muted);
+}
+
+.topology-partial-warning {
+  color: var(--console-warning);
+}
+
+.attention-item > a,
+.panel-footer-link,
+.dashboard-health-strip > a {
+  color: var(--console-text-soft);
+}
+
+.attention-item > a:hover,
+.panel-footer-link:hover,
+.dashboard-health-strip > a:hover {
+  color: var(--console-text);
+}
+
+:where(
+  a,
+  button,
+  input,
+  select,
+  textarea,
+  [tabindex]:not([tabindex="-1"])
+):focus-visible {
+  outline: 2px solid var(--console-accent);
+  outline-offset: 2px;
+}
+
+.console-sheet-backdrop {
+  cursor: default;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
