@@ -37,7 +37,7 @@ function formatMilliseconds(value?: number): string {
 }
 
 function pathLabel(path?: string | null): string {
-  if (!path) return 'None'
+  if (!path) return '无路径'
   if (path === 'direct') return 'Direct'
   if (path === 'relay') return 'Relay'
   return path.replaceAll('_', ' ')
@@ -46,12 +46,12 @@ function pathLabel(path?: string | null): string {
 function reasonLabel(reason: string): string {
   if (!reason) return '—'
   const known: Record<string, string> = {
-    initial: 'Initial observation',
-    direct_committed: 'Direct committed',
-    relay_peer_confirmed: 'Relay confirmed',
-    direct_path_failed: 'Direct path failed',
-    relay_path_failed: 'Relay path failed',
-    network_generation_advanced: 'Network generation advanced',
+    initial: '初始观测',
+    direct_committed: '直连已提交',
+    relay_peer_confirmed: '中继已确认',
+    direct_path_failed: '直连路径失败',
+    relay_path_failed: '中继路径失败',
+    network_generation_advanced: '网络代际已推进',
   }
   return known[reason] ?? reason.replaceAll('_', ' ')
 }
@@ -62,8 +62,8 @@ function PathBadge({ connection }: { connection: AdminConnection }) {
   return <StatusPill tone={tone} dot>{pathLabel(connection.current_path)}</StatusPill>
 }
 
-function FreshnessBadge({ connection }: { connection: AdminConnection }) {
-  const label = connection.fresh ? 'Fresh' : connection.freshness === 'reporter_offline' ? 'Reporter offline' : 'Stale'
+function 新鲜nessBadge({ connection }: { connection: AdminConnection }) {
+  const label = connection.fresh ? '新鲜' : connection.freshness === 'reporter_offline' ? '上报端离线' : '过期'
   return <StatusPill tone={connection.fresh ? 'success' : connection.freshness === 'reporter_offline' ? 'warning' : 'neutral'}>{label}</StatusPill>
 }
 
@@ -129,29 +129,29 @@ export function ConnectionDrawer({
 
   return <Sheet
     title={<>{current.reporting_device_name} → {current.remote_device_name}</>}
-    description={<>Directional connection · {current.network_name}</>}
+    description={<>单向连接 · {current.network_name}</>}
     onClose={onClose}
   >
 
     <section className="connection-drawer-section">
       <div className="connection-state-hero">
         <PathBadge connection={current} />
-        <FreshnessBadge connection={current} />
+        <新鲜nessBadge connection={current} />
       </div>
       {!current.fresh && <div className="connection-stale-note">
         这是 daemon 最后一次权威上报的路径，不表示当前仍处于活动连接。
       </div>}
       <dl className="connection-detail-list">
-        <div><dt>From</dt><dd>{current.reporting_device_name}<small>{current.reporting_username}</small></dd></div>
-        <div><dt>To</dt><dd>{current.remote_device_name}<small>{current.remote_username}</small></dd></div>
+        <div><dt>来源</dt><dd>{current.reporting_device_name}<small>{current.reporting_username}</small></dd></div>
+        <div><dt>目标</dt><dd>{current.remote_device_name}<small>{current.remote_username}</small></dd></div>
         <div><dt>验证 RTT</dt><dd>{current.last_validation_rtt_ms === undefined ? '—' : `${current.last_validation_rtt_ms} ms`}</dd></div>
-        <div><dt>Path age</dt><dd>{formatMilliseconds(current.path_age_ms)}</dd></div>
-        <div><dt>Last observed</dt><dd>{formatAgo(current.received_at)}</dd></div>
-        <div><dt>Lifecycle</dt><dd>{current.lifecycle || '—'}</dd></div>
-        <div><dt>Previous path</dt><dd>{pathLabel(current.previous_path)}</dd></div>
-        <div><dt>Reason</dt><dd title={current.transition_reason}>{reasonLabel(current.transition_reason)}</dd></div>
+        <div><dt>路径存续</dt><dd>{formatMilliseconds(current.path_age_ms)}</dd></div>
+        <div><dt>最后观测</dt><dd>{formatAgo(current.received_at)}</dd></div>
+        <div><dt>生命周期</dt><dd>{current.lifecycle || '—'}</dd></div>
+        <div><dt>上一路径</dt><dd>{pathLabel(current.previous_path)}</dd></div>
+        <div><dt>原因</dt><dd title={current.transition_reason}>{reasonLabel(current.transition_reason)}</dd></div>
         {current.selected_path_mtu !== undefined && <div><dt>Path MTU</dt><dd>{current.selected_path_mtu}</dd></div>}
-        {current.last_handshake_age_ms !== undefined && <div><dt>Handshake age</dt><dd>{formatMilliseconds(current.last_handshake_age_ms)}</dd></div>}
+        {current.last_handshake_age_ms !== undefined && <div><dt>握手距今</dt><dd>{formatMilliseconds(current.last_handshake_age_ms)}</dd></div>}
       </dl>
     </section>
 
@@ -172,7 +172,7 @@ export function ConnectionsPage() {
   const [query, setQuery] = useState('')
   const [networkId, setNetworkId] = useState('')
   const [path, setPath] = useState('')
-  const [freshness, setFreshness] = useState<'fresh' | 'stale' | ''>('')
+  const [freshness, set新鲜ness] = useState<'fresh' | 'stale' | ''>('')
   const [offset, setOffset] = useState(0)
   const [showStaleTopology, setShowStaleTopology] = useState(false)
   const [selected, setSelected] = useState<AdminConnection | null>(null)
@@ -231,7 +231,7 @@ export function ConnectionsPage() {
     { id: 'direction', header: '方向', cell: ({ row }) => <ConnectionDirection connection={row.original} /> },
     { id: 'network', header: '网络', cell: ({ row }) => <div className="primary-secondary"><strong>{row.original.network_name}</strong><span className="mono">{row.original.network_id}</span></div> },
     { id: 'path', header: '路径', cell: ({ row }) => <PathBadge connection={row.original} /> },
-    { id: 'fresh', header: '观测', cell: ({ row }) => <FreshnessBadge connection={row.original} /> },
+    { id: 'fresh', header: '观测', cell: ({ row }) => <新鲜nessBadge connection={row.original} /> },
     { id: 'rtt', header: '验证 RTT', cell: ({ row }) => row.original.last_validation_rtt_ms === undefined ? '—' : `${row.original.last_validation_rtt_ms} ms` },
     { id: 'age', header: 'Path age', cell: ({ row }) => formatMilliseconds(row.original.path_age_ms) },
     { id: 'reason', header: '原因', cell: ({ row }) => <span className="connection-reason" title={row.original.transition_reason}>{reasonLabel(row.original.transition_reason)}</span> },
@@ -247,18 +247,18 @@ export function ConnectionsPage() {
 
   return <div className="page-stack connections-page">
     <PageHeader
-      eyebrow="NETWORK"
+      eyebrow="网络"
       title="连接路径"
-      description="路径只来自 daemon 已提交的权威单向观测。Fresh 表示观测仍在有效 lease 内，不等于目标应用端口已经可达。"
+      description="路径只来自 daemon 已提交的权威单向观测。新鲜 表示观测仍在有效 lease 内，不等于目标应用端口已经可达。"
       actions={<div className="connections-intro-actions">
-        <Link className="button secondary compact" to="/health"><AlertTriangle size={15} />Needs attention</Link>
+        <Link className="button secondary compact" to="/health"><AlertTriangle size={15} />需要关注</Link>
         <SegmentedControl
           label="连接视图"
           value={view}
           onChange={setView}
           options={[
             { label: '列表', value: 'table', icon: <Table2 size={15} /> },
-            { label: 'Live topology', value: 'topology', icon: <Waypoints size={15} /> },
+            { label: '实时拓扑', value: 'topology', icon: <Waypoints size={15} /> },
           ]}
         />
       </div>}
@@ -274,12 +274,12 @@ export function ConnectionsPage() {
         <option value="">全部路径</option>
         <option value="direct">Direct</option>
         <option value="relay">Relay</option>
-        <option value="none">None</option>
+        <option value="none">无路径</option>
       </select>
-      {view === 'table' && <select className="select-field" value={freshness} onChange={(event) => setFreshness(event.target.value as 'fresh' | 'stale' | '')} aria-label="按观测新鲜度过滤">
+      {view === 'table' && <select className="select-field" value={freshness} onChange={(event) => set新鲜ness(event.target.value as 'fresh' | 'stale' | '')} aria-label="按观测新鲜度过滤">
         <option value="">全部观测</option>
-        <option value="fresh">Fresh</option>
-        <option value="stale">Stale / reporter offline</option>
+        <option value="fresh">新鲜</option>
+        <option value="stale">过期 / 上报端离线</option>
       </select>}
       {networks.hasNextPage && <button
         className="button secondary compact"
