@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from 'react'
+import { useEffect, type ButtonHTMLAttributes, type ReactNode } from 'react'
 import { X } from 'lucide-react'
 
 type PanelProps = {
@@ -148,6 +148,19 @@ export function Sheet({
   children: ReactNode
   width?: 'normal' | 'wide'
 }) {
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const close = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', close)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', close)
+    }
+  }, [onClose])
+
   return <>
     <button className="console-sheet-backdrop" aria-label="关闭详情" onClick={onClose} />
     <aside className={`console-sheet ${width}`} aria-label="详情">
