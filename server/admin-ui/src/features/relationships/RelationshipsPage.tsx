@@ -3,7 +3,7 @@ import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { CircleAlert, Search } from 'lucide-react'
 import { adminApi } from '../../api'
 import { PageHeader, Panel, StatusPill } from '../../components/ui/console'
-import { TopologyCanvas } from '../../TopologyCanvas'
+import { TopologyCanvas } from './TopologyCanvas'
 import { mergeTopologyPages } from '../../topologyPaging'
 
 export function RelationshipsPage() {
