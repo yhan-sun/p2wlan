@@ -2,8 +2,7 @@ import { useMemo, useState } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { CircleAlert, Search } from 'lucide-react'
 import { adminApi } from '../../api'
-import { Panel } from '../../components/ui/console'
-import { ErrorBlock } from '../../shared/console'
+import { PageHeader, Panel, StatusPill } from '../../components/ui/console'
 import { TopologyCanvas } from '../../TopologyCanvas'
 import { mergeTopologyPages } from '../../topologyPaging'
 
@@ -35,10 +34,15 @@ export function RelationshipsPage() {
   const relationshipError = accountId ? accountTopology.error : globalTopology.error
 
   return <div className="page-stack topology-page-stack">
-    <div className="page-intro topology-toolbar"><div><h2>{accountId ? '账号资源关系' : '全局资源关系'}</h2><p>{accountId ? '展示账号、共享网络 / 房间和设备之间的控制面关系。' : '这是资源关系工作区，不是实时 Direct / Relay 网络拓扑；大规模部署按账号游标分批加载。'}</p></div><div className="toolbar-controls">
-      <div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索账号、设备、IP、网络" /></div>
-      <select className="select-field" value={accountId} onChange={(event) => setAccountId(event.target.value)}><option value="">全部账号</option>{accounts.data?.items.map((account) => <option value={account.id} key={account.id}>{account.username}</option>)}</select>
-    </div></div>
+    <PageHeader
+      eyebrow="RELATIONSHIPS"
+      title={accountId ? '账号资源关系' : '全局资源关系'}
+      description={accountId ? '展示账号、共享网络 / 房间和设备之间的控制面关系。' : '这是资源关系工作区，不是实时 Direct / Relay 网络拓扑；大规模部署按账号游标分批加载。'}
+      actions={<div className="toolbar-controls">
+        <label className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索账号、设备、IP、网络" aria-label="搜索资源关系" /></label>
+        <select className="select-field" value={accountId} onChange={(event) => setAccountId(event.target.value)} aria-label="按账号过滤"><option value="">全部账号</option>{accounts.data?.items.map((account) => <option value={account.id} key={account.id}>{account.username}</option>)}</select>
+      </div>}
+    />
     <Panel className="topology-main-panel">
       <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>这里的连线表示 membership、设备挂载等控制面资源关系。待处理 signaling 默认隐藏；daemon 权威 Direct / Relay 路径请到 Connections 查看，二者不会互相推断。</span></div>
       {!accountId && globalData && <div className="topology-page-progress">
@@ -47,7 +51,7 @@ export function RelationshipsPage() {
           ? <span className="topology-partial-warning">当前切片达到 {globalData.partial_reason === 'edge_budget' ? '边' : '节点'}预算；请选择具体账号继续下钻。</span>
           : globalTopology.hasNextPage
             ? <button className="button secondary compact" onClick={() => globalTopology.fetchNextPage()} disabled={globalTopology.isFetchingNextPage}>{globalTopology.isFetchingNextPage ? '加载中…' : '加载更多账号'}</button>
-            : <span className="badge success"><span />全局账号已加载完成</span>}
+            : <StatusPill tone="success" dot>全局账号已加载完成</StatusPill>}
       </div>}
       <TopologyCanvas data={relationshipData} loading={relationshipPending} error={relationshipError instanceof Error ? relationshipError.message : undefined} search={search} />
     </Panel>
