@@ -4,7 +4,7 @@ import { type ColumnDef } from '@tanstack/react-table'
 import { ChevronRight, Search } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { adminApi } from '../../api'
-import { Panel } from '../../components/ui/console'
+import { PageHeader, Panel } from '../../components/ui/console'
 import {
   AccountMark,
   CursorPagination,
@@ -60,7 +60,12 @@ export function AccountsPage() {
   }
 
   return <div className="page-stack">
-    <div className="page-intro"><div><h2>所有账号</h2><p>账号按稳定 ID 游标翻页；最近活动只用于展示，不参与分页排序。</p></div><div className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索用户名或邮箱" /></div></div>
+    <PageHeader
+      eyebrow="IDENTITY"
+      title="账号"
+      description="账号按稳定 ID 游标翻页；最近活动只用于展示，不参与分页排序。"
+      actions={<label className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索用户名或邮箱" aria-label="搜索账号" /></label>}
+    />
     <Panel>
       {result.isPending ? <PendingBlock queries={[result]} /> : result.error ? <ErrorBlock error={result.error} /> : result.data ? <>
         <DataTable<AdminAccount> columns={columns} data={result.data.items} onRowClick={(account) => navigate(`/accounts/${encodeURIComponent(account.id)}`)} empty="没有符合条件的账号" />
