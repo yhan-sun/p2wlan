@@ -19,6 +19,7 @@ import {
 } from 'lucide-react'
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom'
 import { adminApi, clearAdminToken } from '../api'
+import { applyTheme, nextThemeMode, readThemeMode, resolveTheme, writeThemeMode, type ThemeMode } from '../shared/theme'
 import { IconButton } from '../components/ui/console'
 
 const navGroups = [
@@ -58,14 +59,16 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
   const [refreshing, setRefreshing] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
-  const [theme, setTheme] = useState<'light' | 'dark'>(() =>
-    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
-  )
+  const [themeMode, setThemeMode] = useState<ThemeMode>(readThemeMode)
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme
-    document.documentElement.style.colorScheme = theme
-  }, [theme])
+    writeThemeMode(themeMode)
+    if (themeMode !== 'system') return
+    const query = window.matchMedia('(prefers-color-scheme: dark)')
+    const sync = () => applyTheme('system')
+    query.addEventListener('change', sync)
+    return () => query.removeEventListener('change', sync)
+  }, [themeMode])
 
   useEffect(() => {
     setMobileOpen(false)
@@ -139,9 +142,13 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
         </div>
         <div className="topbar-actions-v2">
           <IconButton
-            label={theme === 'dark' ? '切换浅色模式' : '切换深色模式'}
-            icon={theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
-            onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}
+            label={themeMode === 'system' ? '主题：跟随系统' : themeMode === 'light' ? '主题：浅色' : '主题：深色'}
+            icon={themeMode === 'system'
+              ? <MonitorSmartphone size={17} />
+              : resolveTheme(themeMode) === 'dark'
+                ? <Moon size={17} />
+                : <Sun size={17} />}
+            onClick={() => setThemeMode((value) => nextThemeMode(value))}
           />
           <IconButton
             label="刷新数据"
