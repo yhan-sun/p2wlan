@@ -5000,3 +5000,59 @@ body {
     margin-top: auto;
   }
 }
+
+
+.account-detail-page {
+  gap: 12px;
+}
+
+.account-stat-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  overflow: hidden;
+  border: 1px solid var(--console-border);
+  border-radius: var(--console-radius);
+  background: var(--console-surface-solid);
+}
+
+.account-stat-strip > div {
+  padding: 12px 14px;
+  border-right: 1px solid var(--console-border);
+}
+
+.account-stat-strip > div:last-child {
+  border-right: 0;
+}
+
+.account-stat-strip span {
+  display: block;
+  color: var(--console-text-muted);
+  font-size: 9px;
+}
+
+.account-stat-strip strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--console-text);
+  font-size: 17px;
+  font-weight: 620;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 650px) {
+  .account-stat-strip {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .account-stat-strip > div {
+    border-bottom: 1px solid var(--console-border);
+  }
+
+  .account-stat-strip > div:nth-child(even) {
+    border-right: 0;
+  }
+
+  .account-stat-strip > div:nth-last-child(-n+2) {
+    border-bottom: 0;
+  }
+}
