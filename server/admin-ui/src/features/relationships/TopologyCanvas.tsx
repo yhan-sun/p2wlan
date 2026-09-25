@@ -75,13 +75,13 @@ function TopologyNodeLabel({ node }: { node: AdminTopologyNode }) {
   const color = identity.color
   return (
     <div className="topology-node-content">
-      <div className="topology-node-icon" style={{ color, background: colorWithAlpha(color, 0.1) }}>
+      <div className="topology-node-icon" style={{ color, background: 'var(--console-surface-subtle)' }}>
         {nodeIcon(node)}
       </div>
       <div className="topology-node-copy">
         <div className="topology-node-title-row">
           <strong>{node.label}</strong>
-          <span className="account-identity-code" style={{ color, borderColor: colorWithAlpha(color, 0.3), background: colorWithAlpha(color, 0.08) }}>{identity.code}</span>
+          <span className="account-identity-code" style={{ color, borderColor: colorWithAlpha(color, 0.28), background: 'transparent' }}>{identity.code}</span>
           {node.kind === 'device' && <span className={`presence-dot ${node.online ? 'online' : ''}`} title={node.online ? '在线' : '离线'} />}
         </div>
         <span>{nodeMeta(node)}</span>
@@ -170,11 +170,11 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
         height: size.height,
         padding: 0,
         borderRadius: 12,
-        border: node.focus ? `2px solid ${color}` : neutral ? '1px solid var(--console-border-strong)' : `1px solid ${colorWithAlpha(color, 0.38)}`,
-        background: neutral ? 'var(--console-surface-solid)' : colorWithAlpha(color, node.focus ? 0.11 : 0.065),
+        border: node.focus ? `1px solid ${color}` : neutral ? '1px solid var(--console-border)' : `1px solid ${colorWithAlpha(color, 0.34)}`,
+        background: 'var(--console-surface-solid)',
         boxShadow: node.focus
-          ? `0 0 0 4px ${colorWithAlpha(color, 0.1)}, 0 10px 28px rgba(15, 23, 42, .09)`
-          : 'var(--console-shadow)',
+          ? `0 0 0 2px ${colorWithAlpha(color, 0.10)}`
+          : 'none',
         color: 'var(--console-text)',
         opacity: 1,
         transition: 'opacity 150ms ease, box-shadow 150ms ease',
