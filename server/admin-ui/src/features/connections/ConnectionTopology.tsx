@@ -11,7 +11,9 @@ import {
   type Node,
 } from '@xyflow/react'
 import { CircleAlert, Expand, Eye, EyeOff, MonitorSmartphone, Shrink } from 'lucide-react'
-import type { AdminConnection } from './types'
+import type { AdminConnection } from '../../types'
+import { EmptyState, IconButton } from '../../components/ui/console'
+import { spreadDagreRankCollisions } from '../../shared/dagreLayout'
 
 const NODE_WIDTH = 220
 const NODE_HEIGHT = 76
@@ -92,8 +94,18 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
   for (const connection of visibleConnections) graph.setEdge(connection.reporting_device_id, connection.remote_device_id)
   dagre.layout(graph)
 
+  const placements = spreadDagreRankCollisions(
+    sortedDevices.map((device) => ({
+      id: device.id,
+      width: NODE_WIDTH,
+      height: NODE_HEIGHT,
+      point: (graph.node(device.id) as { x: number; y: number } | undefined) ?? { x: 0, y: 0 },
+    })),
+    56,
+  )
+
   const nodes: Node[] = sortedDevices.map((device) => {
-    const point = graph.node(device.id) as { x: number; y: number } | undefined
+    const point = placements.get(device.id) ?? { x: 0, y: 0 }
     return {
       id: device.id,
       position: {
@@ -105,7 +117,7 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
           <span className="connection-node-icon"><MonitorSmartphone size={17} /></span>
           <span className="connection-node-copy">
             <strong>{device.name}</strong>
-            <small>{device.username} · {device.freshOutbound} out / {device.freshInbound} in</small>
+            <small>{device.username} · 出 {device.freshOutbound} / 入 {device.freshInbound}</small>
           </span>
         </div>,
       },
@@ -113,9 +125,9 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
         width: NODE_WIDTH,
         height: NODE_HEIGHT,
         borderRadius: 10,
-        border: '1px solid #d7dde6',
-        background: '#fff',
-        boxShadow: '0 4px 16px rgba(15, 23, 42, .06)',
+        border: '1px solid var(--console-border-strong)',
+        background: 'var(--console-surface-solid)',
+        boxShadow: 'var(--console-shadow)',
         padding: 0,
       },
       draggable: false,
@@ -134,8 +146,8 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
     const pair = [connection.reporting_device_id, connection.remote_device_id].sort().join(':')
     const hasReverse = (pairCounts.get(pair) ?? 0) > 1
     const lexicalForward = connection.reporting_device_id.localeCompare(connection.remote_device_id) < 0
-    const stroke = kind === 'direct' ? '#16803d' : kind === 'relay' ? '#2563eb' : '#98a2b3'
-    const label = `${pathLabel(connection.current_path)}${connection.last_validation_rtt_ms !== undefined ? ` · 验证 ${connection.last_validation_rtt_ms} ms` : ''}${connection.fresh ? '' : ' · stale'}`
+    const stroke = kind === 'direct' ? 'var(--console-success)' : kind === 'relay' ? 'var(--console-accent)' : 'var(--console-text-muted)'
+    const label = `${pathLabel(connection.current_path)}${connection.last_validation_rtt_ms !== undefined ? ` · 验证 ${connection.last_validation_rtt_ms} ms` : ''}${connection.fresh ? '' : ' · 过期'}`
     return {
       id: connectionKey(connection),
       source: connection.reporting_device_id,
@@ -144,8 +156,8 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
       pathOptions: { offset: hasReverse ? (lexicalForward ? 18 : 38) : 24, borderRadius: 14 },
       markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 },
       label,
-      labelStyle: { fontSize: 11, fill: kind === 'stale' ? '#667085' : '#344054', fontWeight: 650 },
-      labelBgStyle: { fill: '#ffffff', fillOpacity: 0.94 },
+      labelStyle: { fontSize: 11, fill: kind === 'stale' ? 'var(--console-text-muted)' : 'var(--console-text-soft)', fontWeight: 650 },
+      labelBgStyle: { fill: 'var(--console-surface-solid)', fillOpacity: 0.94 },
       style: {
         stroke,
         strokeWidth: connection.fresh ? 2 : 1.6,
@@ -176,22 +188,21 @@ export function ConnectionTopology({
   const activeConnectionCount = connections.filter((connection) => Boolean(connection.current_path)).length
 
   if (activeConnectionCount === 0) {
-    return <div className="connection-topology-empty">
-      <CircleAlert size={18} />
-      <div><strong>暂无活动路径</strong><span>只有 daemon 权威上报且 current_path 非空的观测才会生成连接边；None 观测仍保留在列表中用于诊断。</span></div>
-    </div>
+    return <EmptyState
+      icon={<CircleAlert size={18} />}
+      title="暂无活动路径"
+      description="只有 daemon 权威上报且 current_path 非空的观测才会生成连接边；None 观测仍保留在列表中用于诊断。"
+    />
   }
 
   return <div className={`connection-topology ${fullscreen ? 'fullscreen' : ''}`}>
     <div className="connection-topology-head">
-      <div><strong>{networkName}</strong><span>{activeConnectionCount} 条活动 directional path{partial ? ' · 当前视图已截断' : ''}</span></div>
+      <div><strong>{networkName}</strong><span>{activeConnectionCount} 条活动单向路径{partial ? ' · 当前视图已截断' : ''}</span></div>
       <div>
         <button className={`topology-filter-button ${showStale ? 'active' : ''}`} onClick={() => onShowStaleChange(!showStale)}>
-          {showStale ? <Eye size={15} /> : <EyeOff size={15} />}Stale
+          {showStale ? <Eye size={15} /> : <EyeOff size={15} />}过期观测
         </button>
-        <button className="icon-button topology-fullscreen-button" onClick={() => setFullscreen((value) => !value)} aria-label={fullscreen ? '退出全屏' : '全屏'}>
-          {fullscreen ? <Shrink size={16} /> : <Expand size={16} />}
-        </button>
+        <IconButton className="topology-fullscreen-button" onClick={() => setFullscreen((value) => !value)} label={fullscreen ? '退出全屏' : '全屏'} icon={fullscreen ? <Shrink size={16} /> : <Expand size={16} />} />
       </div>
     </div>
     <ReactFlow
@@ -210,19 +221,19 @@ export function ConnectionTopology({
       }}
       proOptions={{ hideAttribution: true }}
     >
-      <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#d8dee8" />
+      <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--console-border-strong)" />
       <Controls showInteractive={false} position="bottom-left" />
       <MiniMap
         pannable
         zoomable
         nodeStrokeWidth={2}
-        nodeColor={() => '#cbd5e1'}
+        nodeColor={() => 'var(--console-border-strong)'}
       />
     </ReactFlow>
     <div className="connection-topology-legend">
       <span><i className="connection-legend-line direct" />Direct</span>
       <span><i className="connection-legend-line relay" />Relay</span>
-      {showStale && <span><i className="connection-legend-line stale" />Stale</span>}
+      {showStale && <span><i className="connection-legend-line stale" />过期</span>}
     </div>
   </div>
 }

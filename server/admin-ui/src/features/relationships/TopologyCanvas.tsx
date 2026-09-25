@@ -16,17 +16,20 @@ import {
   Expand,
   Eye,
   EyeOff,
+  Info,
   Laptop,
   Network,
   RadioTower,
   Server,
   Shrink,
   Smartphone,
-  Users,
   X,
+  Users,
 } from 'lucide-react'
-import { accountColor, accountIdentity, colorWithAlpha } from './colors'
-import type { AdminTopology, AdminTopologyNode } from './types'
+import { accountColor, accountIdentity, colorWithAlpha } from '../../colors'
+import { IconButton, StatusPill } from '../../components/ui/console'
+import { spreadDagreRankCollisions } from '../../shared/dagreLayout'
+import type { AdminTopology, AdminTopologyNode } from '../../types'
 
 interface TopologyCanvasProps {
   data?: AdminTopology
@@ -73,13 +76,13 @@ function TopologyNodeLabel({ node }: { node: AdminTopologyNode }) {
   const color = identity.color
   return (
     <div className="topology-node-content">
-      <div className="topology-node-icon" style={{ color, background: colorWithAlpha(color, 0.1) }}>
+      <div className="topology-node-icon" style={{ color, background: 'var(--console-surface-subtle)' }}>
         {nodeIcon(node)}
       </div>
       <div className="topology-node-copy">
         <div className="topology-node-title-row">
           <strong>{node.label}</strong>
-          <span className="account-identity-code" style={{ color, borderColor: colorWithAlpha(color, 0.3), background: colorWithAlpha(color, 0.08) }}>{identity.code}</span>
+          <span className="account-identity-code" style={{ color, borderColor: colorWithAlpha(color, 0.28), background: 'transparent' }}>{identity.code}</span>
           {node.kind === 'device' && <span className={`presence-dot ${node.online ? 'online' : ''}`} title={node.online ? '在线' : '离线'} />}
         </div>
         <span>{nodeMeta(node)}</span>
@@ -138,15 +141,22 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
   const graph = new dagre.graphlib.Graph()
   graph.setDefaultEdgeLabel(() => ({}))
   graph.setGraph({ rankdir: 'LR', ranksep: 112, nodesep: 38, edgesep: 24, marginx: 56, marginy: 56 })
-  for (const node of visibleSourceNodes) graph.setNode(node.id, dimensions[node.kind])
+  for (const node of visibleSourceNodes) graph.setNode(node.id, { ...dimensions[node.kind] })
   for (const edge of visibleEdges) {
     if (edge.kind !== 'pending_signal') graph.setEdge(edge.source, edge.target)
   }
   dagre.layout(graph)
 
+  const rawBoxes = visibleSourceNodes.map((node) => ({
+    id: node.id,
+    ...dimensions[node.kind],
+    point: (graph.node(node.id) as { x: number; y: number } | undefined) ?? { x: 0, y: 0 },
+  }))
+  const placements = spreadDagreRankCollisions(rawBoxes, 38)
+
   const nodes: Node[] = visibleSourceNodes.map((node) => {
     const size = dimensions[node.kind]
-    const point = graph.node(node.id) as { x: number; y: number } | undefined
+    const point = placements.get(node.id) ?? { x: 0, y: 0 }
     const color = ownerColor(node)
     const neutral = node.kind === 'network' || node.kind === 'room'
     return {
@@ -161,12 +171,12 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
         height: size.height,
         padding: 0,
         borderRadius: 12,
-        border: node.focus ? `2px solid ${color}` : neutral ? '1px solid #cfd6df' : `1px solid ${colorWithAlpha(color, 0.38)}`,
-        background: neutral ? '#ffffff' : colorWithAlpha(color, node.focus ? 0.09 : 0.045),
+        border: node.focus ? `1px solid ${color}` : neutral ? '1px solid var(--console-border)' : `1px solid ${colorWithAlpha(color, 0.34)}`,
+        background: 'var(--console-surface-solid)',
         boxShadow: node.focus
-          ? `0 0 0 4px ${colorWithAlpha(color, 0.1)}, 0 10px 28px rgba(15, 23, 42, .09)`
-          : '0 5px 18px rgba(15, 23, 42, .055)',
-        color: '#0f172a',
+          ? `0 0 0 2px ${colorWithAlpha(color, 0.10)}`
+          : 'none',
+        color: 'var(--console-text)',
         opacity: 1,
         transition: 'opacity 150ms ease, box-shadow 150ms ease',
       },
@@ -179,7 +189,7 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
     const source = sourceNodes.get(edge.source)
     const target = sourceNodes.get(edge.target)
     const colorSource = edge.kind === 'attachment' ? target : source
-    const color = colorSource ? ownerColor(colorSource) : '#94a3b8'
+    const color = colorSource ? ownerColor(colorSource) : 'var(--console-text-muted)'
     const isSignal = edge.kind === 'pending_signal'
     return {
       id: edge.id,
@@ -188,15 +198,15 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
       type: 'smoothstep',
       animated: false,
       style: {
-        stroke: isSignal ? '#d97706' : color,
+        stroke: isSignal ? 'var(--console-warning)' : color,
         strokeWidth: isSignal ? 1.7 : edge.kind === 'membership' ? 2 : 1.5,
         strokeDasharray: isSignal ? '7 6' : undefined,
         opacity: isSignal ? 0.78 : 0.46,
       },
-      markerEnd: isSignal ? { type: MarkerType.ArrowClosed, color: '#d97706', width: 14, height: 14 } : undefined,
-      label: isSignal && edge.count && edge.count > 1 ? `${edge.signal_type || 'signal'} ×${edge.count}` : undefined,
-      labelStyle: { fontSize: 11, fill: '#92400e', fontWeight: 600 },
-      labelBgStyle: { fill: '#fffbeb', fillOpacity: 0.96 },
+      markerEnd: isSignal ? { type: MarkerType.ArrowClosed, color: 'var(--console-warning)', width: 14, height: 14 } : undefined,
+      label: isSignal && edge.count && edge.count > 1 ? `待处理信令 ×${edge.count}` : undefined,
+      labelStyle: { fontSize: 11, fill: 'var(--console-warning)', fontWeight: 600 },
+      labelBgStyle: { fill: 'var(--console-surface-solid)', fillOpacity: 0.96 },
     }
   })
 
@@ -207,7 +217,7 @@ function DetailPanel({ node, onClose }: { node: AdminTopologyNode; onClose: () =
   const color = ownerColor(node)
   return (
     <aside className="topology-detail" aria-label="关系图节点详情">
-      <button className="icon-button topology-detail-close" onClick={onClose} aria-label="关闭详情"><X size={16} /></button>
+      <IconButton className="topology-detail-close" onClick={onClose} label="关闭详情" icon={<X size={16} />} />
       <div className="topology-detail-type" style={{ color }}>{node.kind.toUpperCase()}</div>
       <h3>{node.label}</h3>
       {node.username && node.kind !== 'account' && <p className="topology-detail-owner">账号 · {node.username}</p>}
@@ -219,7 +229,7 @@ function DetailPanel({ node, onClose }: { node: AdminTopologyNode; onClose: () =
         {node.app_version && <div><dt>版本</dt><dd>{node.app_version}</dd></div>}
         {node.nat_type && <div><dt>NAT</dt><dd>{node.nat_type}</dd></div>}
         {node.relay_rtt_ms !== undefined && <div><dt>Relay RTT</dt><dd>{node.relay_rtt_ms} ms</dd></div>}
-        {node.online !== undefined && <div><dt>状态</dt><dd><span className={`status-label ${node.online ? 'online' : ''}`}><span />{node.online ? '在线' : '离线'}</span></dd></div>}
+        {node.online !== undefined && <div><dt>状态</dt><dd><StatusPill tone={node.online ? 'success' : 'neutral'} dot>{node.online ? '在线' : '离线'}</StatusPill></dd></div>}
       </dl>
     </aside>
   )
@@ -244,6 +254,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [showOffline, setShowOffline] = useState(true)
   const [showSignals, setShowSignals] = useState(false)
+  const [showLegend, setShowLegend] = useState(false)
   const layoutGraph = useMemo(
     () => data ? buildGraph(data, { showOffline, showSignals }) : { nodes: [], edges: [] },
     [data, showOffline, showSignals],
@@ -276,7 +287,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
         onNodeClick={(_, node) => setSelectedId(node.id)}
         proOptions={{ hideAttribution: true }}
       >
-        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#d8dee8" />
+        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--console-border-strong)" />
         <Controls showInteractive={false} position="bottom-left" />
         {!compact && <MiniMap
           pannable
@@ -284,8 +295,8 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
           nodeStrokeWidth={3}
           nodeColor={(node) => {
             const source = data.nodes.find((item) => item.id === node.id)
-            if (!source) return '#94a3b8'
-            return source.kind === 'network' || source.kind === 'room' ? '#cbd5e1' : ownerColor(source)
+            if (!source) return 'var(--console-text-muted)'
+            return source.kind === 'network' || source.kind === 'room' ? 'var(--console-border-strong)' : ownerColor(source)
           }}
         />}
       </ReactFlow>
@@ -298,6 +309,9 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
           <button className={`topology-filter-button ${showSignals ? 'active' : ''}`} onClick={() => setShowSignals((value) => !value)} title="显示或隐藏控制面的待处理信令">
             <RadioTower size={15} />控制信令
           </button>
+          <button className={`topology-filter-button ${showLegend ? 'active' : ''}`} onClick={() => setShowLegend((value) => !value)} title="显示或隐藏图例">
+            <Info size={15} />图例
+          </button>
         </>}
         <button className="icon-button topology-fullscreen-button" onClick={() => setFullscreen((value) => !value)} aria-label={fullscreen ? '退出全屏' : '全屏'}>
           {fullscreen ? <Shrink size={16} /> : <Expand size={16} />}
@@ -306,7 +320,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
 
       <TopologySummary data={data} />
 
-      {!compact && <aside className="topology-legend">
+      {!compact && showLegend && <aside className="topology-legend">
         <div className="topology-legend-heading">账号标识</div>
         <div className="topology-account-legend-list">
           {accounts.map((account) => (
@@ -319,7 +333,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
         </div>
         <div className="topology-legend-heading edge-heading">资源关系</div>
         <div className="legend-row"><span className="legend-line solid" />成员 / 设备挂载</div>
-        <div className="legend-row"><span className="legend-line dashed" />待处理 signaling（控制面）</div>
+        <div className="legend-row"><span className="legend-line dashed" />待处理信令（控制面）</div>
       </aside>}
 
       {selected && <DetailPanel node={selected} onClose={() => setSelectedId(null)} />}
