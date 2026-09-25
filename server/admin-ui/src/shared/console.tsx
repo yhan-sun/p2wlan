@@ -44,7 +44,7 @@ export function natLabel(value: string): string {
   return (match?.[1] ?? value).replaceAll('_', ' ')
 }
 
-function useDebouncedValue<T>(value: T, delay = 250): T {
+export function useDebouncedValue<T>(value: T, delay = 250): T {
   const [debounced, setDebounced] = useState(value)
   useEffect(() => {
     const timer = window.setTimeout(() => setDebounced(value), delay)
@@ -91,7 +91,7 @@ export function PathNotice({ data, fallback }: { data?: AdminTopology; fallback:
   return <div className="truth-notice"><CircleAlert size={15} /><span>{note || fallback}</span></div>
 }
 
-function DataTable<T>({ columns, data, onRowClick, empty = '暂无数据' }: {
+export function DataTable<T>({ columns, data, onRowClick, empty = '暂无数据' }: {
   columns: ColumnDef<T, unknown>[]
   data: T[]
   onRowClick?: (row: T) => void
