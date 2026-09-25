@@ -7,7 +7,6 @@ import {
 } from '@tanstack/react-table'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import {
-  AlertTriangle,
   ArrowDownRight,
   ChevronLeft,
   ChevronRight,
@@ -249,9 +248,9 @@ export function ConnectionsPage() {
     <PageHeader
       eyebrow="网络"
       title="连接路径"
-      description="路径只来自 daemon 已提交的权威单向观测。新鲜 表示观测仍在有效 lease 内，不等于目标应用端口已经可达。"
+      description="daemon 权威单向路径观测。新鲜仅表示 lease 仍有效，不代表目标业务端口已经验证可达。"
       actions={<div className="connections-intro-actions">
-        <Link className="button secondary compact" to="/health"><AlertTriangle size={15} />需要关注</Link>
+        <Link className="text-link connections-health-link" to="/health">连接健康</Link>
         <SegmentedControl
           label="连接视图"
           value={view}
