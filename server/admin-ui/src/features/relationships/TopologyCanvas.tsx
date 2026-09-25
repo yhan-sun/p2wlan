@@ -145,9 +145,16 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
   }
   dagre.layout(graph)
 
+  const rawBoxes = visibleSourceNodes.map((node) => ({
+    id: node.id,
+    ...dimensions[node.kind],
+    point: (graph.node(node.id) as { x: number; y: number } | undefined) ?? { x: 0, y: 0 },
+  }))
+  const placements = spreadDagreRankCollisions(rawBoxes, 38)
+
   const nodes: Node[] = visibleSourceNodes.map((node) => {
     const size = dimensions[node.kind]
-    const point = graph.node(node.id) as { x: number; y: number } | undefined
+    const point = placements.get(node.id) ?? { x: 0, y: 0 }
     const color = ownerColor(node)
     const neutral = node.kind === 'network' || node.kind === 'room'
     return {
@@ -195,7 +202,7 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
         opacity: isSignal ? 0.78 : 0.46,
       },
       markerEnd: isSignal ? { type: MarkerType.ArrowClosed, color: 'var(--console-warning)', width: 14, height: 14 } : undefined,
-      label: isSignal && edge.count && edge.count > 1 ? `${edge.signal_type || 'signal'} ×${edge.count}` : undefined,
+      label: isSignal && edge.count && edge.count > 1 ? `待处理信令 ×${edge.count}` : undefined,
       labelStyle: { fontSize: 11, fill: 'var(--console-warning)', fontWeight: 600 },
       labelBgStyle: { fill: 'var(--console-surface-solid)', fillOpacity: 0.96 },
     }
@@ -320,7 +327,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
         </div>
         <div className="topology-legend-heading edge-heading">资源关系</div>
         <div className="legend-row"><span className="legend-line solid" />成员 / 设备挂载</div>
-        <div className="legend-row"><span className="legend-line dashed" />待处理 signaling（控制面）</div>
+        <div className="legend-row"><span className="legend-line dashed" />待处理信令（控制面）</div>
       </aside>}
 
       {selected && <DetailPanel node={selected} onClose={() => setSelectedId(null)} />}
