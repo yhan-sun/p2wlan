@@ -5,7 +5,7 @@ import { adminApi } from '../../api'
 import { accountColor } from '../../colors'
 import { Panel, SegmentedControl } from '../../components/ui/console'
 import { AccountMark, ErrorBlock, PathNotice, PendingBlock } from '../../shared/console'
-import { TopologyCanvas } from '../../TopologyCanvas'
+import { TopologyCanvas } from '../relationships/TopologyCanvas'
 import { DeviceTable, NetworkTable, RoomTable } from '../resources/ResourceTables'
 
 export function AccountDetailPage() {
