@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { CircleAlert, Server } from 'lucide-react'
 import { adminApi } from '../../api'
-import { Panel } from '../../components/ui/console'
+import { PageHeader, Panel, StatusPill } from '../../components/ui/console'
 import { ErrorBlock, PendingBlock, formatDate, formatDuration } from '../../shared/console'
 
 export function SystemPage() {
@@ -12,7 +12,12 @@ export function SystemPage() {
   if (error) return <ErrorBlock error={error} />
   if (!runtime.data || !overview.data) return <ErrorBlock error={new Error('Control 未返回完整的运行状态快照。')} />
   return <div className="page-stack">
-    <div className="page-intro"><div><h2>Control 运行健康</h2><p>这里只展示 Control 进程与数据库能直接确认的事实；Relay TLS、systemd、SQLite 完整性和备份请在部署主机运行 <code>p2wlan-server doctor</code>。</p></div><span className="badge success large"><span />运行中</span></div>
+    <PageHeader
+      eyebrow="RUNTIME"
+      title="Control 运行健康"
+      description={<>这里只展示 Control 进程与数据库能直接确认的事实；Relay TLS、systemd、SQLite 完整性和备份请在部署主机运行 <code>p2wlan-server doctor</code>。</>}
+      actions={<StatusPill tone="success" dot>运行中</StatusPill>}
+    />
     <section className="system-grid">
       <Panel title="进程" subtitle="构建与启动信息">
         <div className="system-hero"><div className="system-hero-icon"><Server size={26} /></div><div><span>UPTIME</span><strong>{formatDuration(runtime.data.uptime_seconds)}</strong></div></div>
