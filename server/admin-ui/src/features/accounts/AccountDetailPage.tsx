@@ -22,7 +22,7 @@ export function AccountDetailPage() {
   return <div className="page-stack">
     <section className="account-hero">
       <AccountMark account={account} size="large" />
-      <div className="account-hero-copy"><span className="account-color-label" style={{ color }}>ACCOUNT</span><h2>{account.username}</h2><p>{account.email}</p></div>
+      <div className="account-hero-copy"><span className="account-color-label" style={{ color }}>账号</span><h2>{account.username}</h2><p>{account.email}</p></div>
       <div className="account-hero-stats"><div><strong>{account.device_count}</strong><span>设备</span></div><div><strong className="positive-text">{account.online_devices}</strong><span>在线</span></div><div><strong>{account.network_count}</strong><span>网络</span></div><div><strong>{account.room_count}</strong><span>房间</span></div></div>
     </section>
 
@@ -39,7 +39,7 @@ export function AccountDetailPage() {
     />
 
     {tab === 'topology' && <Panel title={`${account.username} 的资源关系`} subtitle="包含该账号以及共享网络 / 房间中的对端账号和设备">
-      <PathNotice data={topology.data} fallback="这是 Control 资源关系图：只展示成员关系、设备挂载和可选的待处理 signaling。daemon 权威路径观测保存在独立的 Connections 工作区，这里不会把它们混成资源关系。" />
+      <PathNotice data={topology.data} fallback="这是 Control 资源关系图：只展示成员关系、设备挂载和可选的待处理信令。daemon 权威路径观测保存在独立的连接路径工作区，这里不会把它们混成资源关系。" />
       <TopologyCanvas data={topology.data} loading={topology.isPending} error={topology.error instanceof Error ? topology.error.message : undefined} />
     </Panel>}
     {tab === 'devices' && <Panel><DeviceTable devices={detail.data.devices} /></Panel>}
