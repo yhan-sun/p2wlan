@@ -135,7 +135,7 @@ export function ConnectionHealthPage() {
     <PageHeader
       eyebrow="可观测性"
       title="连接健康"
-      description="只读聚合 daemon 权威路径观测与受限迁移历史。这里没有综合健康分，稳定 Relay 也不会被自动判定为故障。"
+      description="基于 daemon 权威路径观测与受限迁移历史。没有综合健康分，稳定 Relay 不会被判为故障。"
       actions={<SegmentedControl
         label="健康窗口"
         value={windowSeconds}
@@ -152,7 +152,7 @@ export function ConnectionHealthPage() {
       {networks.hasNextPage && <button className="button secondary compact" onClick={() => networks.fetchNextPage()} disabled={networks.isFetchingNextPage}>
         {networks.isFetchingNextPage ? '加载中…' : '加载更多网络'}
       </button>}
-      <span className="health-toolbar-note"><Clock3 size={14} />窗口内切换/失败统计来自每方向最多 50 条保留历史。</span>
+      <span className="health-toolbar-note"><Clock3 size={14} />切换与失败统计基于每方向最近 50 条历史。</span>
     </div>
 
     {health.isPending ? <LoadingBlock label="正在聚合连接健康…" /> : health.error ? <ErrorBlock error={health.error} /> : health.data && summary ? <>
@@ -217,7 +217,7 @@ export function ConnectionHealthPage() {
 
       <div className="truth-notice health-truth-notice">
         <CircleAlert size={15} />
-        <span>连接健康是请求时派生视图，不会反写 daemon，也不是长期 SLA。验证 RTT 是已有观测的最近验证样本；最终业务可达性仍需虚拟 IP 流量验证。</span>
+        <span>连接健康是请求时派生视图，不反写 daemon，也不代表业务可达性；最终仍需虚拟 IP 流量验证。</span>
       </div>
     </> : <ErrorBlock error={new Error('Control 未返回连接健康。')} />}
 
