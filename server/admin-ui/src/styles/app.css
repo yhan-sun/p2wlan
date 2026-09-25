@@ -4630,3 +4630,9 @@ body {
     border-bottom: 0;
   }
 }
+
+
+/* Decorative English eyebrows were a template artifact; page title owns hierarchy. */
+.console-page-eyebrow {
+  display: none;
+}
