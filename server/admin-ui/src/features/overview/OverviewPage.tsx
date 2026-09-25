@@ -3,6 +3,7 @@ import {
   Activity,
   ArrowRight,
   CircleAlert,
+  ChevronRight,
   CircleCheck,
   Clock3,
   Gauge,
@@ -16,8 +17,7 @@ import {
 import { Link } from 'react-router-dom'
 import { adminApi } from '../../api'
 import { MetricCard, Panel } from '../../components/ui/console'
-import { AccountMark, ErrorBlock, PendingBlock } from '../../shared/console'
-import { formatAgo, formatDate, formatDuration } from '../../shared/console'
+import { AccountMark, ErrorBlock, PendingBlock, formatAgo, formatDate, formatDuration } from '../../shared/console'
 
 export function Dashboard() {
   const overview = useQuery({ queryKey: ['overview'], queryFn: adminApi.overview, refetchInterval: 30_000 })
