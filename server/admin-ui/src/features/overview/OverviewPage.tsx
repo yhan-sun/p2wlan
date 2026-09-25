@@ -79,7 +79,7 @@ export function Dashboard() {
           : connectionHealth.error
             ? <div className="overview-inline-state warning"><CircleAlert size={15} />连接健康暂不可用</div>
             : health && <div className="overview-health-list">
-              <div><span>Fresh observations</span><strong>{health.summary.fresh_observations}<small> / {health.summary.total_observations}</small></strong></div>
+              <div><span>新鲜观测</span><strong>{health.summary.fresh_observations}<small> / {health.summary.total_observations}</small></strong></div>
               <div><span>路径切换</span><strong>{health.summary.recent_path_switches}</strong></div>
               <div><span>显式路径失败</span><strong>{health.summary.recent_direct_failures + health.summary.recent_relay_failures}</strong></div>
               <div><span>需要关注</span><strong className={health.alerts_total ? 'warning-text' : ''}>{health.alerts_total}</strong></div>
