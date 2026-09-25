@@ -4700,3 +4700,205 @@ body {
 .runtime-line strong {
   color: var(--console-text-soft);
 }
+
+
+/* === Final finesse: remove residual dashboard-template chrome ================ */
+.topbar-v2 {
+  border-bottom: 0;
+  background: var(--console-bg);
+  backdrop-filter: none;
+}
+
+.sidebar-v2 .brand-lockup .brand-symbol {
+  width: 21px;
+  height: 21px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--console-text-soft);
+}
+
+.sidebar-brand-row {
+  padding-left: 8px;
+  padding-right: 4px;
+}
+
+.console-status-pill,
+.badge {
+  min-height: 20px;
+  padding-left: 2px;
+  padding-right: 2px;
+  border-color: transparent !important;
+  background: transparent !important;
+}
+
+.connection-health-metrics .metric-icon {
+  display: none;
+}
+
+.connection-health-metrics .metric-card-v2 {
+  gap: 0;
+}
+
+.truth-notice,
+.connection-partial-warning,
+.connection-stale-note {
+  border-left: 0;
+  border-right: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--console-text-muted);
+}
+
+.truth-notice svg,
+.connection-partial-warning svg,
+.connection-stale-note svg {
+  color: var(--console-warning);
+}
+
+.overview-primary-grid,
+.overview-secondary-grid {
+  align-items: start;
+}
+
+.overview-health-list {
+  min-height: 100px;
+}
+
+.overview-stat-strip strong,
+.overview-health-list strong,
+.connection-health-metrics .metric-copy strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.data-table td,
+.connection-mobile-facts,
+.connection-detail-list dd,
+.overview-runtime-list dd,
+.pagination-v2 {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Mobile connection rows keep operational facts visible instead of collapsing
+   a desktop table into only source and target. */
+.connections-mobile-list {
+  display: none;
+}
+
+@media (max-width: 650px) {
+  .connections-desktop-table {
+    display: none;
+  }
+
+  .connections-mobile-list {
+    display: grid;
+  }
+
+  .connection-mobile-row {
+    width: 100%;
+    display: grid;
+    gap: 9px;
+    padding: 12px 13px;
+    border: 0;
+    border-bottom: 1px solid var(--console-border);
+    background: transparent;
+    color: inherit;
+    text-align: left;
+  }
+
+  .connection-mobile-row:last-child {
+    border-bottom: 0;
+  }
+
+  .connection-mobile-row:active,
+  .connection-mobile-row:hover {
+    background: var(--console-surface-subtle);
+  }
+
+  .connection-mobile-head {
+    min-width: 0;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .connection-mobile-direction {
+    min-width: 0;
+    flex: 1;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 14px minmax(0, 1fr);
+    align-items: center;
+    gap: 6px;
+  }
+
+  .connection-mobile-direction > span {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+  }
+
+  .connection-mobile-direction strong,
+  .connection-mobile-direction small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .connection-mobile-direction strong {
+    color: var(--console-text);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .connection-mobile-direction small {
+    color: var(--console-text-muted);
+    font-size: 9px;
+  }
+
+  .connection-mobile-direction > svg {
+    color: var(--console-text-muted);
+  }
+
+  .connection-mobile-facts {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto auto 14px;
+    align-items: center;
+    gap: 8px;
+    color: var(--console-text-muted);
+    font-size: 9px;
+  }
+
+  .connection-mobile-facts > span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .connection-mobile-facts > svg {
+    color: var(--console-text-muted);
+  }
+
+  .connection-mobile-empty {
+    padding: 32px 16px;
+    color: var(--console-text-muted);
+    font-size: 10px;
+    text-align: center;
+  }
+
+  .connections-panel .pagination-v2 {
+    border-top: 1px solid var(--console-border);
+  }
+}
+
+@media (max-width: 430px) {
+  .connection-mobile-facts {
+    grid-template-columns: minmax(0, 1fr) auto auto 14px;
+  }
+
+  .connection-mobile-facts > span:nth-of-type(2) {
+    display: none;
+  }
+}
