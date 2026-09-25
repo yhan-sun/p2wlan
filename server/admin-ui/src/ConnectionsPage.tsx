@@ -17,10 +17,10 @@ import {
   Search,
   Table2,
   Waypoints,
-  X,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { adminApi } from './api'
+import { EmptyState, PageHeader, SegmentedControl, Sheet, StatusPill } from './components/ui/console'
 import { ConnectionTopology } from './ConnectionTopology'
 import type { AdminConnection, AdminConnectionTransition } from './types'
 
@@ -80,14 +80,13 @@ function reasonLabel(reason: string): string {
 
 function PathBadge({ connection }: { connection: AdminConnection }) {
   const path = connection.current_path || 'none'
-  return <span className={`connection-path-badge ${path} ${connection.fresh ? '' : 'stale'}`}>
-    <span />{pathLabel(connection.current_path)}
-  </span>
+  const tone = !connection.fresh ? 'neutral' : path === 'direct' ? 'success' : path === 'relay' ? 'accent' : 'neutral'
+  return <StatusPill tone={tone} dot>{pathLabel(connection.current_path)}</StatusPill>
 }
 
 function FreshnessBadge({ connection }: { connection: AdminConnection }) {
   const label = connection.fresh ? 'Fresh' : connection.freshness === 'reporter_offline' ? 'Reporter offline' : 'Stale'
-  return <span className={`connection-freshness ${connection.fresh ? 'fresh' : 'stale'}`}>{label}</span>
+  return <StatusPill tone={connection.fresh ? 'success' : connection.freshness === 'reporter_offline' ? 'warning' : 'neutral'}>{label}</StatusPill>
 }
 
 function ConnectionDirection({ connection }: { connection: AdminConnection }) {
@@ -157,25 +156,13 @@ export function ConnectionDrawer({
     getNextPageParam: (lastPage) => lastPage.next_cursor || undefined,
   })
 
-  useEffect(() => {
-    const close = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', close)
-    return () => window.removeEventListener('keydown', close)
-  }, [onClose])
-
   const transitions = history.data?.pages.flatMap((page) => page.items) ?? []
 
-  return <aside className="connection-drawer" aria-label="连接详情">
-    <header className="connection-drawer-head">
-      <div>
-        <span>Directional connection</span>
-        <h2>{current.reporting_device_name} → {current.remote_device_name}</h2>
-        <p>{current.network_name}</p>
-      </div>
-      <button className="icon-button-v2" onClick={onClose} aria-label="关闭连接详情"><X size={17} /></button>
-    </header>
+  return <Sheet
+    title={<>{current.reporting_device_name} → {current.remote_device_name}</>}
+    description={<>Directional connection · {current.network_name}</>}
+    onClose={onClose}
+  >
 
     <section className="connection-drawer-section">
       <div className="connection-state-hero">
@@ -208,7 +195,7 @@ export function ConnectionDrawer({
         {history.isFetchingNextPage ? '加载中…' : '加载更早记录'}
       </button>}
     </section>
-  </aside>
+  </Sheet>
 }
 
 export function ConnectionsPage() {
@@ -290,16 +277,23 @@ export function ConnectionsPage() {
   })
 
   return <div className="page-stack connections-page">
-    <div className="page-intro connections-intro">
-      <div><h2>Connections</h2><p>路径只来自 daemon 已提交的权威单向观测；Fresh 表示观测仍在有效 lease 内，不代表目标应用本身一定可达。</p></div>
-      <div className="connections-intro-actions">
+    <PageHeader
+      eyebrow="NETWORK"
+      title="连接路径"
+      description="路径只来自 daemon 已提交的权威单向观测。Fresh 表示观测仍在有效 lease 内，不等于目标应用端口已经可达。"
+      actions={<div className="connections-intro-actions">
         <Link className="button secondary compact" to="/health"><AlertTriangle size={15} />Needs attention</Link>
-        <div className="connections-view-switch" role="group" aria-label="连接视图">
-          <button className={view === 'table' ? 'active' : ''} onClick={() => setView('table')}><Table2 size={15} />列表</button>
-          <button className={view === 'topology' ? 'active' : ''} onClick={() => setView('topology')}><Waypoints size={15} />Live topology</button>
-        </div>
-      </div>
-    </div>
+        <SegmentedControl
+          label="连接视图"
+          value={view}
+          onChange={setView}
+          options={[
+            { label: '列表', value: 'table', icon: <Table2 size={15} /> },
+            { label: 'Live topology', value: 'topology', icon: <Waypoints size={15} /> },
+          ]}
+        />
+      </div>}
+    />
 
     <div className="connections-toolbar">
       <label className="search-field connections-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索设备、账号或网络" aria-label="搜索连接" /></label>
@@ -342,10 +336,11 @@ export function ConnectionsPage() {
         </div></div>
       </> : <ErrorBlock error={new Error('Control 未返回连接列表。')} />}
     </section> : <section className="panel-v2 connections-panel topology-mode">
-      {!networkId ? <div className="connection-topology-empty choose-network">
-        <Network size={20} />
-        <div><strong>选择一个网络查看 Live Topology</strong><span>拓扑不会跨网络拼接，也不会从 membership、signaling 或 RTT 推断连接。</span></div>
-      </div> : topology.isPending ? <LoadingBlock label="正在读取权威连接拓扑…" /> : topology.error ? <ErrorBlock error={topology.error} /> : topology.data ? <>
+      {!networkId ? <EmptyState
+        icon={<Network size={20} />}
+        title="选择一个网络查看 Live Topology"
+        description="拓扑不会跨网络拼接，也不会从 membership、signaling 或 RTT 推断连接。"
+      /> : topology.isPending ? <LoadingBlock label="正在读取权威连接拓扑…" /> : topology.error ? <ErrorBlock error={topology.error} /> : topology.data ? <>
         {topology.data.total > topology.data.items.length && <div className="connection-partial-warning"><CircleAlert size={15} />当前网络共有 {topology.data.total} 条匹配观测，拓扑仅展示前 {topology.data.items.length} 条；请收紧搜索或路径过滤。</div>}
         <ConnectionTopology
           connections={topology.data.items}
