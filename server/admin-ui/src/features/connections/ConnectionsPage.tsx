@@ -290,7 +290,32 @@ export function ConnectionsPage() {
 
     {view === 'table' ? <section className="panel-v2 connections-panel">
       {result.isPending ? <LoadingBlock label="正在读取连接观测…" /> : result.error ? <ErrorBlock error={result.error} /> : result.data ? <>
-        <div className="data-table-wrap"><table className="data-table connections-table">
+        <div className="connections-mobile-list">
+          {result.data.items.map((connection) => <button
+            type="button"
+            className="connection-mobile-row"
+            key={`${connection.network_id}:${connection.reporting_device_id}:${connection.remote_device_id}`}
+            onClick={() => setSelected(connection)}
+          >
+            <div className="connection-mobile-head">
+              <div className="connection-mobile-direction">
+                <span><strong>{connection.reporting_device_name}</strong><small>{connection.reporting_username}</small></span>
+                <ArrowDownRight size={14} aria-hidden />
+                <span><strong>{connection.remote_device_name}</strong><small>{connection.remote_username}</small></span>
+              </div>
+              <PathBadge connection={connection} />
+            </div>
+            <div className="connection-mobile-facts">
+              <span>{connection.network_name}</span>
+              <FreshnessBadge connection={connection} />
+              <span>{connection.last_validation_rtt_ms === undefined ? '—' : `${connection.last_validation_rtt_ms} ms`}</span>
+              <span>{formatAgo(connection.received_at)}</span>
+              <ChevronRight size={14} aria-hidden />
+            </div>
+          </button>)}
+          {result.data.items.length === 0 && <div className="connection-mobile-empty">尚无符合条件的 daemon 路径观测。</div>}
+        </div>
+        <div className="data-table-wrap connections-desktop-table"><table className="data-table connections-table">
           <thead>{table.getHeaderGroups().map((group) => <tr key={group.id}>{group.headers.map((header) => <th key={header.id}>{header.isPlaceholder ? null : flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead>
           <tbody>
             {table.getRowModel().rows.map((row) => <tr key={row.id} className="clickable" onClick={() => setSelected(row.original)}>
