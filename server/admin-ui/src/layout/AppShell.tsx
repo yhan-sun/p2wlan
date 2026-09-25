@@ -39,21 +39,8 @@ const navGroups = [
   ] },
 ]
 
-function pageMeta(pathname: string): { title: string; eyebrow: string } {
-  if (pathname.startsWith('/accounts/')) return { title: '账号详情', eyebrow: '账号' }
-  if (pathname === '/accounts') return { title: '账号', eyebrow: '账号' }
-  if (pathname === '/relationships') return { title: '资源关系', eyebrow: '资源关系' }
-  if (pathname === '/connections') return { title: '连接路径', eyebrow: '网络' }
-  if (pathname === '/devices') return { title: '设备', eyebrow: '设备' }
-  if (pathname === '/networks') return { title: '网络与房间', eyebrow: '网络' }
-  if (pathname === '/health') return { title: '连接健康', eyebrow: '可观测性' }
-  if (pathname === '/system') return { title: '运行健康', eyebrow: '可观测性' }
-  return { title: '概览', eyebrow: '总览' }
-}
-
 export function Shell({ onLogout }: { onLogout: () => void }) {
   const location = useLocation()
-  const meta = pageMeta(location.pathname)
   const queryClient = useQueryClient()
   const runtime = useQuery({ queryKey: ['runtime-shell'], queryFn: adminApi.runtime, refetchInterval: 60_000 })
   const [refreshing, setRefreshing] = useState(false)
@@ -136,10 +123,7 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
           icon={<Menu size={18} />}
           onClick={() => setMobileOpen(true)}
         />
-        <div className="topbar-context">
-          <span className="topbar-eyebrow">{meta.eyebrow}</span>
-          <h1>{meta.title}</h1>
-        </div>
+        <div className="topbar-spacer" aria-hidden="true" />
         <div className="topbar-actions-v2">
           <IconButton
             label={themeMode === 'system' ? '主题：跟随系统' : themeMode === 'light' ? '主题：浅色' : '主题：深色'}
