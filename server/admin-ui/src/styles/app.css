@@ -3365,3 +3365,11 @@ select {
     transition-duration: 0.01ms !important;
   }
 }
+
+.connection-partial-warning,
+.health-selection-error,
+.connection-stale-note {
+  border-color: color-mix(in srgb, var(--console-warning) 24%, var(--console-border));
+  background: var(--console-warning-soft);
+  color: var(--console-warning);
+}
