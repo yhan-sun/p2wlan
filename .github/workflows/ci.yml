@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   # A commit validation (push / pull_request) and a periodic health check
@@ -148,6 +148,18 @@ jobs:
             server/admin/web/app.css
           if-no-files-found: error
           retention-days: 7
+      - name: Sync embedded admin UI artifacts
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          if git diff --quiet -- server/admin/web; then
+            echo "embedded admin UI already matches"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/admin/web
+          git commit -m "chore: sync admin UI build"
+          git push origin "HEAD:${{ github.head_ref }}"
       - name: Verify embedded artifacts match the committed build
         run: |
           test -s server/admin/web/index.html
