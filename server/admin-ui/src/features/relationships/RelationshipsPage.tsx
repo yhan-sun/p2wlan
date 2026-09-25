@@ -1,0 +1,55 @@
+import { useMemo, useState } from 'react'
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
+import { CircleAlert, Search } from 'lucide-react'
+import { adminApi } from '../../api'
+import { Panel } from '../../components/ui/console'
+import { ErrorBlock } from '../../shared/console'
+import { TopologyCanvas } from '../../TopologyCanvas'
+import { mergeTopologyPages } from '../../topologyPaging'
+
+export function RelationshipsPage() {
+  const [accountId, setAccountId] = useState('')
+  const [search, setSearch] = useState('')
+  const accounts = useQuery({
+    queryKey: ['accounts', 'relationship-scope'],
+    queryFn: () => adminApi.accounts('', 50, 0),
+  })
+  const accountTopology = useQuery({
+    queryKey: ['relationships', 'account', accountId],
+    queryFn: () => adminApi.topology(accountId),
+    enabled: Boolean(accountId),
+  })
+  const globalTopology = useInfiniteQuery({
+    queryKey: ['relationships', 'global-paged'],
+    queryFn: ({ pageParam }) => adminApi.topologyPage(pageParam, 12, 600),
+    initialPageParam: '',
+    getNextPageParam: (lastPage) => lastPage.partial ? undefined : (lastPage.next_cursor || undefined),
+    enabled: !accountId,
+  })
+  const globalData = useMemo(
+    () => mergeTopologyPages(globalTopology.data?.pages ?? []),
+    [globalTopology.data?.pages],
+  )
+  const relationshipData = accountId ? accountTopology.data : globalData
+  const relationshipPending = accountId ? accountTopology.isPending : globalTopology.isPending
+  const relationshipError = accountId ? accountTopology.error : globalTopology.error
+
+  return <div className="page-stack topology-page-stack">
+    <div className="page-intro topology-toolbar"><div><h2>{accountId ? '账号资源关系' : '全局资源关系'}</h2><p>{accountId ? '展示账号、共享网络 / 房间和设备之间的控制面关系。' : '这是资源关系工作区，不是实时 Direct / Relay 网络拓扑；大规模部署按账号游标分批加载。'}</p></div><div className="toolbar-controls">
+      <div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索账号、设备、IP、网络" /></div>
+      <select className="select-field" value={accountId} onChange={(event) => setAccountId(event.target.value)}><option value="">全部账号</option>{accounts.data?.items.map((account) => <option value={account.id} key={account.id}>{account.username}</option>)}</select>
+    </div></div>
+    <Panel className="topology-main-panel">
+      <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>这里的连线表示 membership、设备挂载等控制面资源关系。待处理 signaling 默认隐藏；daemon 权威 Direct / Relay 路径请到 Connections 查看，二者不会互相推断。</span></div>
+      {!accountId && globalData && <div className="topology-page-progress">
+        <span>已加载 {globalData.loaded_accounts} / {globalData.total_accounts} 个账号</span>
+        {globalData.partial
+          ? <span className="topology-partial-warning">当前切片达到 {globalData.partial_reason === 'edge_budget' ? '边' : '节点'}预算；请选择具体账号继续下钻。</span>
+          : globalTopology.hasNextPage
+            ? <button className="button secondary compact" onClick={() => globalTopology.fetchNextPage()} disabled={globalTopology.isFetchingNextPage}>{globalTopology.isFetchingNextPage ? '加载中…' : '加载更多账号'}</button>
+            : <span className="badge success"><span />全局账号已加载完成</span>}
+      </div>}
+      <TopologyCanvas data={relationshipData} loading={relationshipPending} error={relationshipError instanceof Error ? relationshipError.message : undefined} search={search} />
+    </Panel>
+  </div>
+}
