@@ -4902,3 +4902,101 @@ body {
     display: none;
   }
 }
+
+
+/* Desktop has no empty global header: workspace starts at the page title. */
+.sidebar-runtime {
+  padding-bottom: 0;
+}
+
+.runtime-line .sidebar-version {
+  margin-left: auto;
+  color: var(--console-text-muted);
+  font-size: 8px;
+  font-weight: 500;
+}
+
+.sidebar-account-row {
+  margin-top: 11px;
+  padding-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  border-top: 1px solid var(--console-border);
+}
+
+.sidebar-admin {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.sidebar-admin .user-avatar {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+}
+
+.sidebar-admin-copy {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.sidebar-admin-copy strong {
+  color: var(--console-text-soft);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.sidebar-admin-copy small {
+  color: var(--console-text-muted);
+  font-size: 8px;
+}
+
+.sidebar-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+.sidebar-footer-actions .icon-button-v2 {
+  width: 26px;
+  height: 26px;
+}
+
+.app-layout.sidebar-collapsed .runtime-line .sidebar-version,
+.app-layout.sidebar-collapsed .sidebar-admin-copy {
+  display: none;
+}
+
+.app-layout.sidebar-collapsed .sidebar-account-row {
+  flex-direction: column;
+  padding-top: 8px;
+}
+
+.app-layout.sidebar-collapsed .sidebar-footer-actions {
+  flex-direction: column;
+}
+
+@media (min-width: 901px) {
+  .topbar-v2 {
+    display: none;
+  }
+
+  .page-content {
+    padding-top: 26px;
+  }
+}
+
+@media (max-width: 900px) {
+  .topbar-v2 {
+    display: flex;
+  }
+
+  .sidebar-runtime {
+    margin-top: auto;
+  }
+}
