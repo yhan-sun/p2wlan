@@ -39,7 +39,7 @@ export function Dashboard() {
     <section className="overview-hero">
       <div className="overview-hero-copy">
         <div className="overview-kicker">
-          <span className="live-label">Control plane online</span>
+          <span className="live-label">控制平面在线</span>
           <span className="mono">{runtime.data.build_version}</span>
         </div>
         <h2>从控制面到真实路径，<br />一眼看清。</h2>
@@ -51,9 +51,9 @@ export function Dashboard() {
       </div>
       <div className="overview-snapshot">
         <div><span>在线设备</span><strong>{overview.data.online_devices}/{overview.data.devices}</strong><small>{offlineDevices ? `${offlineDevices} 台离线` : '当前全部在线'}</small></div>
-        <div><span>Fresh Direct</span><strong>{connectionHealth.data?.summary.fresh_direct ?? '—'}</strong><small>最近 1 小时观测</small></div>
-        <div><span>Fresh Relay</span><strong>{connectionHealth.data?.summary.fresh_relay ?? '—'}</strong><small>最近 1 小时观测</small></div>
-        <div><span>快照</span><strong>{formatAgo(overview.data.generated_at)}</strong><small>Control generated</small></div>
+        <div><span>新鲜直连</span><strong>{connectionHealth.data?.summary.fresh_direct ?? '—'}</strong><small>最近 1 小时观测</small></div>
+        <div><span>新鲜中继</span><strong>{connectionHealth.data?.summary.fresh_relay ?? '—'}</strong><small>最近 1 小时观测</small></div>
+        <div><span>快照</span><strong>{formatAgo(overview.data.generated_at)}</strong><small>Control 快照</small></div>
       </div>
     </section>
 
@@ -65,15 +65,15 @@ export function Dashboard() {
     </section>
 
     {connectionHealth.isPending
-      ? <section className="dashboard-health-strip"><div className="dashboard-health-title"><span><Gauge size={16} /></span><div><strong>Connection Health</strong><small>正在聚合最近 1 小时的路径信号…</small></div></div></section>
+      ? <section className="dashboard-health-strip"><div className="dashboard-health-title"><span><Gauge size={16} /></span><div><strong>连接健康</strong><small>正在聚合最近 1 小时的路径信号…</small></div></div></section>
       : connectionHealth.error
-        ? <section className="dashboard-health-strip"><div className="dashboard-health-title"><span><CircleAlert size={16} /></span><div><strong>Connection Health 暂不可用</strong><small>{connectionHealth.error instanceof Error ? connectionHealth.error.message : '读取失败'}</small></div></div><Link to="/health">打开工作区<ArrowRight size={14} /></Link></section>
+        ? <section className="dashboard-health-strip"><div className="dashboard-health-title"><span><CircleAlert size={16} /></span><div><strong>连接健康暂不可用</strong><small>{connectionHealth.error instanceof Error ? connectionHealth.error.message : '读取失败'}</small></div></div><Link to="/health">打开工作区<ArrowRight size={14} /></Link></section>
         : connectionHealth.data && <section className="dashboard-health-strip">
-          <div className="dashboard-health-title"><span><Gauge size={16} /></span><div><strong>Connection Health · 1h</strong><small>派生信号，不是综合健康分</small></div></div>
-          <div className="dashboard-health-fact"><strong>{connectionHealth.data.alerts_total}</strong><span>Needs attention</span></div>
-          <div className="dashboard-health-fact"><strong>{connectionHealth.data.summary.fresh_direct}</strong><span>Fresh Direct</span></div>
-          <div className="dashboard-health-fact"><strong>{connectionHealth.data.summary.fresh_relay}</strong><span>Fresh Relay</span></div>
-          <div className="dashboard-health-fact"><strong>{connectionHealth.data.summary.recent_path_switches}</strong><span>Path switches</span></div>
+          <div className="dashboard-health-title"><span><Gauge size={16} /></span><div><strong>连接健康 · 1h</strong><small>派生信号，不是综合健康分</small></div></div>
+          <div className="dashboard-health-fact"><strong>{connectionHealth.data.alerts_total}</strong><span>需要关注</span></div>
+          <div className="dashboard-health-fact"><strong>{connectionHealth.data.summary.fresh_direct}</strong><span>新鲜直连</span></div>
+          <div className="dashboard-health-fact"><strong>{connectionHealth.data.summary.fresh_relay}</strong><span>新鲜中继</span></div>
+          <div className="dashboard-health-fact"><strong>{connectionHealth.data.summary.recent_path_switches}</strong><span>路径切换</span></div>
           <Link to="/health">查看连接健康<ArrowRight size={14} /></Link>
         </section>}
 
@@ -95,9 +95,9 @@ export function Dashboard() {
             ? <div className="attention-item warning"><CircleAlert size={17} /><div><strong>{offlineDevices} 台设备当前离线</strong><span>可到设备页按在线状态筛选，结合最后活动时间排查。</span></div><Link to="/devices">查看</Link></div>
             : <div className="attention-item success"><CircleCheck size={17} /><div><strong>设备在线状态正常</strong><span>当前快照中没有离线设备。</span></div></div>}
           {overview.data.pending_signals > 0
-            ? <div className="attention-item warning"><RadioTower size={17} /><div><strong>{overview.data.pending_signals} 条待处理 signaling</strong><span>这是控制面协调状态，不代表 Relay 或 Direct 数据路径。</span></div><Link to="/relationships">查看关系</Link></div>
-            : <div className="attention-item success"><CircleCheck size={17} /><div><strong>没有待处理 signaling</strong><span>Control 当前未记录积压的协调消息。</span></div></div>}
-          <div className="attention-item neutral"><Waypoints size={17} /><div><strong>权威路径与资源关系已分离</strong><span>Connections 只读取 daemon committed observation；资源关系仍只表达 membership / attachment。</span></div><Link to="/connections">查看连接</Link></div>
+            ? <div className="attention-item warning"><RadioTower size={17} /><div><strong>{overview.data.pending_signals} 条待处理信令</strong><span>这是控制面协调状态，不代表 Relay 或 Direct 数据路径。</span></div><Link to="/relationships">查看关系</Link></div>
+            : <div className="attention-item success"><CircleCheck size={17} /><div><strong>没有待处理信令</strong><span>Control 当前未记录积压的协调消息。</span></div></div>}
+          <div className="attention-item neutral"><Waypoints size={17} /><div><strong>权威路径与资源关系已分离</strong><span>连接路径只读取 daemon 已提交的权威观测；资源关系仍只表达成员关系与设备挂载。</span></div><Link to="/connections">查看连接</Link></div>
         </div>
       </Panel>
     </section>
