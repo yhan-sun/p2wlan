@@ -7,8 +7,8 @@ import {
   Routes,
 } from 'react-router-dom'
 import { clearAdminToken, getAdminToken } from './api'
-import { ConnectionHealthPage } from './ConnectionHealthPage'
-import { ConnectionsPage } from './ConnectionsPage'
+import { ConnectionHealthPage } from './features/health/ConnectionHealthPage'
+import { ConnectionsPage } from './features/connections/ConnectionsPage'
 import { AccountDetailPage } from './features/accounts/AccountDetailPage'
 import { AccountsPage } from './features/accounts/AccountsPage'
 import { Login } from './features/auth/LoginPage'
