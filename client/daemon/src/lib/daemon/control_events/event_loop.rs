@@ -1458,7 +1458,7 @@ impl Daemon {
                                     );
                                 }
                             }
-                            FreshPunchDecision::None => {
+                            FreshPunchDecision::None | FreshPunchDecision::Rejected(_) => {
                                 if candidate_signal_starts_synchronized_punch(
                                     &handshake_response,
                                     candidate_apply_result,

@@ -1,3 +1,65 @@
+fn hard_hard_a0_control_identity(session_id: &str) -> Option<(&'static str, &str)> {
+    let mut fields = session_id.splitn(4, ':');
+    if fields.next()? != "hh1" {
+        return None;
+    }
+    let role = match fields.next()? {
+        "i" => "initiator",
+        "r" => "responder",
+        _ => return None,
+    };
+    let token = fields.next()?;
+    if fields.next().is_none()
+        || token.is_empty()
+        || token.len() > 32
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return None;
+    }
+    Some((role, token))
+}
+
+fn hard_hard_a0_control_tag(token: &str, label: &str) -> String {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"p2wlan-hard-hard-report-v1\0");
+    hasher.update(token.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(label.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    digest[..16].to_string()
+}
+
+pub(crate) fn hard_hard_a0_control_stage(
+    session_id: Option<&str>,
+    stage: &'static str,
+    reason_code: &'static str,
+) {
+    if std::env::var("P2WLAN_EXPERIMENT_VARIANT").ok().as_deref() != Some("a0-phase-diagnosis")
+        || std::env::var("P2WLAN_EXPERIMENT_SCENARIO")
+            .ok()
+            .is_none_or(|scenario| scenario.is_empty())
+    {
+        return;
+    }
+    let Some((role, token)) = session_id.and_then(hard_hard_a0_control_identity) else {
+        return;
+    };
+    tracing::info!(
+        event = "hard_hard_attempt_stage",
+        role,
+        identity_scope = "shared_session",
+        session_tag = %hard_hard_a0_control_tag(token, "session"),
+        plan_tag = %hard_hard_a0_control_tag(token, "rendezvous-plan"),
+        stage,
+        reason_code,
+        "Hard-Hard A0 control signaling stage"
+    );
+}
+
 impl ControlClient {
     /// Translate one local Hard<->Hard deadline into the most recently
     /// observed control-server clock domain. A stale or missing sample fails
@@ -694,23 +756,42 @@ impl ControlClient {
             return result;
         }
         let (response_tx, response_rx) = oneshot::channel();
-        self.candidate_offer_tx
-            .try_send(CandidateOfferCommand {
-                to_node_id: to_node_id.to_string(),
-                candidates: candidates.to_vec(),
-                session_id,
-                probe_ephemeral_public_key: None,
-                candidate_sources: candidate_sources.clone(),
-                handshake_init: handshake_init.to_vec(),
-                punch_at_ms,
-                punch_at_server_ms,
-                fresh_ownership: Some(fresh_ownership),
-                response_tx,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => PeerOfferSendFailure::SendFailed,
-                mpsc::error::TrySendError::Closed(_) => PeerOfferSendFailure::ChannelClosed,
-            })?;
+        let a0_session_id = session_id.clone();
+        let enqueue_result = self.candidate_offer_tx.try_send(CandidateOfferCommand {
+            to_node_id: to_node_id.to_string(),
+            candidates: candidates.to_vec(),
+            session_id,
+            probe_ephemeral_public_key: None,
+            candidate_sources: candidate_sources.clone(),
+            handshake_init: handshake_init.to_vec(),
+            punch_at_ms,
+            punch_at_server_ms,
+            fresh_ownership: Some(fresh_ownership),
+            response_tx,
+        });
+        match enqueue_result {
+            Ok(()) => hard_hard_a0_control_stage(
+                a0_session_id.as_deref(),
+                "offer_api_dispatch",
+                "enqueued",
+            ),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                hard_hard_a0_control_stage(
+                    a0_session_id.as_deref(),
+                    "offer_api_dispatch",
+                    "queue_full",
+                );
+                return Err(PeerOfferSendFailure::SendFailed);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                hard_hard_a0_control_stage(
+                    a0_session_id.as_deref(),
+                    "offer_api_dispatch",
+                    "channel_closed",
+                );
+                return Err(PeerOfferSendFailure::ChannelClosed);
+            }
+        }
         match response_rx.await {
             Ok(PeerOfferSendOutcome::Sent) => Ok(()),
             Ok(PeerOfferSendOutcome::Cancelled) => Err(PeerOfferSendFailure::Cancelled),

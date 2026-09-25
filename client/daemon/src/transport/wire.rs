@@ -28,6 +28,13 @@ pub(crate) fn wire_counter(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?))
 }
 
+pub(crate) fn wire_receiver_index(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 8 || bytes.get(..4) != Some(&[4, 0, 0, 0]) {
+        return None;
+    }
+    Some(u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?))
+}
+
 #[cfg(test)]
 pub(crate) fn build_relay_validation_payload(sent_at_ms: u64) -> Vec<u8> {
     let mut payload = Vec::with_capacity(

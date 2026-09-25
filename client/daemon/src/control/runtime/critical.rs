@@ -306,13 +306,21 @@ async fn run_candidate_offer_worker(
                 // not prove that the server did not accept its POST; starting
                 // a new future here can therefore duplicate a candidate
                 // publication that already reached the control plane.
-                let request = send_prepared_signal(
-                    &current_http,
-                    &auth.base_url,
-                    &auth.token,
-                    auth.registration_seq,
-                    &payload,
-                );
+                let request = async {
+                    crate::control::hard_hard_a0_control_stage(
+                        session_id.as_deref(),
+                        "offer_http_attempt",
+                        "request_started",
+                    );
+                    send_prepared_signal(
+                        &current_http,
+                        &auth.base_url,
+                        &auth.token,
+                        auth.registration_seq,
+                        &payload,
+                    )
+                    .await
+                };
                 tokio::pin!(request);
                 loop {
                     let remaining = deadline.saturating_duration_since(Instant::now());

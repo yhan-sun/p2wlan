@@ -14,6 +14,33 @@ mod hard_hard_tests {
     }
 
     #[test]
+    fn hard_hard_a0_stage_tags_are_shared_only_after_session_identity_exists() {
+        let (session, plan, scope) = hard_hard_a0_stage_tags(None);
+        assert_eq!(session, "none");
+        assert_eq!(plan, "none");
+        assert_eq!(scope, "local_pre_session");
+
+        let raw_token = "hh1-raw-control-correlation-token";
+        let (session, plan, scope) = hard_hard_a0_stage_tags(Some(raw_token));
+        assert_eq!(scope, "shared_session");
+        assert!(session.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(plan.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(session.len(), 16);
+        assert_eq!(plan.len(), 16);
+        assert_ne!(session, plan);
+        assert!(!session.contains(raw_token));
+        assert!(!plan.contains(raw_token));
+        assert_eq!(
+            HardHardA0Stage::ReciprocalResponseAdmission.label(),
+            "reciprocal_response_admission"
+        );
+        assert_eq!(
+            HardHardA0Reason::DeadlineExpired.label(),
+            "deadline_expired"
+        );
+    }
+
+    #[test]
     fn birthday_level_caps_android_without_downgrading_desktop() {
         use crate::peer::RecoveryStage;
 

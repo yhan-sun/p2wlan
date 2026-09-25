@@ -43,6 +43,13 @@ pub(crate) async fn spawn_hard_hard_responder(
             .iter()
             .any(|endpoint| endpoint.ip().is_unspecified())
     {
+        hard_hard_a0_stage_log(
+            &peers,
+            "responder",
+            Some(&coordination.token),
+            HardHardA0Stage::PeerSignalAdmission,
+            HardHardA0Reason::InvalidPrediction,
+        );
         if let (Some(peer_session_generation), Some(diagnostic_plan)) =
             (peer_session_generation, diagnostic_plan)
         {
@@ -74,6 +81,13 @@ pub(crate) async fn spawn_hard_hard_responder(
     }
     match hard_hard_punch_window(now, punch_at_ms) {
         HardHardPunchWindow::TooSoon => {
+            hard_hard_a0_stage_log(
+                &peers,
+                "responder",
+                Some(&coordination.token),
+                HardHardA0Stage::PeerSignalAdmission,
+                HardHardA0Reason::OfferWindowTooLate,
+            );
             if let (Some(peer_session_generation), Some(diagnostic_plan)) =
                 (peer_session_generation, diagnostic_plan)
             {
@@ -104,6 +118,13 @@ pub(crate) async fn spawn_hard_hard_responder(
             return HardHardRemoteStart::NotStarted;
         }
         HardHardPunchWindow::BeyondFreshLifetime => {
+            hard_hard_a0_stage_log(
+                &peers,
+                "responder",
+                Some(&coordination.token),
+                HardHardA0Stage::PeerSignalAdmission,
+                HardHardA0Reason::OfferWindowExpired,
+            );
             if let (Some(peer_session_generation), Some(diagnostic_plan)) =
                 (peer_session_generation, diagnostic_plan)
             {
@@ -136,6 +157,17 @@ pub(crate) async fn spawn_hard_hard_responder(
         HardHardPunchWindow::Usable => {}
     }
     if signal.boot_epoch_ms == 0 || signal.stun_servers.len() < 3 {
+        hard_hard_a0_stage_log(
+            &peers,
+            "responder",
+            Some(&coordination.token),
+            HardHardA0Stage::PeerSignalAdmission,
+            if signal.boot_epoch_ms == 0 {
+                HardHardA0Reason::BootEpochUnavailable
+            } else {
+                HardHardA0Reason::StunObserversInsufficient
+            },
+        );
         if let (Some(peer_session_generation), Some(diagnostic_plan)) =
             (peer_session_generation, diagnostic_plan)
         {
@@ -166,12 +198,33 @@ pub(crate) async fn spawn_hard_hard_responder(
         return HardHardRemoteStart::NotStarted;
     }
     let Some(peer_session_generation) = peer_session_generation else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "responder",
+            Some(&coordination.token),
+            HardHardA0Stage::PeerSignalAdmission,
+            HardHardA0Reason::PeerSessionUnavailable,
+        );
         return HardHardRemoteStart::NotStarted;
     };
     let Some(diagnostic_plan) = diagnostic_plan else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "responder",
+            Some(&coordination.token),
+            HardHardA0Stage::PeerSignalAdmission,
+            HardHardA0Reason::PlanUnavailable,
+        );
         return HardHardRemoteStart::NotStarted;
     };
     let Some(plan) = peers.hard_hard_plan_for_peer(&peer_id).await else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "responder",
+            Some(&coordination.token),
+            HardHardA0Stage::PeerSignalAdmission,
+            HardHardA0Reason::PlanUnavailable,
+        );
         let _ = record_hard_hard_pre_session_failure(
             &peers,
             &peer_id,
@@ -187,6 +240,13 @@ pub(crate) async fn spawn_hard_hard_responder(
         .await;
         return HardHardRemoteStart::NotStarted;
     };
+    hard_hard_a0_stage_log(
+        &peers,
+        "responder",
+        Some(&coordination.token),
+        HardHardA0Stage::PeerSignalAdmission,
+        HardHardA0Reason::PlanAvailable,
+    );
     peers
         .record_direct_event(
             &peer_id,
@@ -210,6 +270,13 @@ pub(crate) async fn spawn_hard_hard_responder(
         || coordination.remote_profile_generation != plan.local_profile_generation
         || coordination.local_prediction_confidence == 0
     {
+        hard_hard_a0_stage_log(
+            &peers,
+            "responder",
+            Some(&coordination.token),
+            HardHardA0Stage::PeerSignalAdmission,
+            HardHardA0Reason::GenerationOrProfileFence,
+        );
         peers
             .record_direct_event(
                 &peer_id,
@@ -236,6 +303,13 @@ pub(crate) async fn spawn_hard_hard_responder(
         return HardHardRemoteStart::Rejected;
     }
     let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "responder",
+            Some(&coordination.token),
+            HardHardA0Stage::OwnerAdmission,
+            HardHardA0Reason::RecoveryAdmissionRejected,
+        );
         let _ = record_hard_hard_pre_session_failure(
             &peers,
             &peer_id,
@@ -262,6 +336,13 @@ pub(crate) async fn spawn_hard_hard_responder(
     )
     .await
     else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "responder",
+            Some(&coordination.token),
+            HardHardA0Stage::OwnerAdmission,
+            HardHardA0Reason::ClaimRejected,
+        );
         let _ = record_hard_hard_pre_session_failure(
             &peers,
             &peer_id,
@@ -277,11 +358,25 @@ pub(crate) async fn spawn_hard_hard_responder(
         .await;
         return HardHardRemoteStart::NotStarted;
     };
+    hard_hard_a0_stage_log(
+        &peers,
+        "responder",
+        Some(&coordination.token),
+        HardHardA0Stage::OwnerAdmission,
+        HardHardA0Reason::OwnerClaimed,
+    );
     let cancellation = session.cancellation_handle();
     let session_id = coordination.encode();
     tokio::spawn(async move {
         let mut pending_session_cancellation =
             PendingHardHardSessionCancellation::new(cancellation.clone());
+        hard_hard_a0_stage_log(
+            &peers,
+            "responder",
+            Some(&coordination.token),
+            HardHardA0Stage::LocalMeasurement,
+            HardHardA0Reason::Started,
+        );
         let mut measurement = match run_hard_hard_local_measurement(
             &udp,
             &peers,
@@ -293,8 +388,24 @@ pub(crate) async fn spawn_hard_hard_responder(
         )
         .await
         {
-            Ok(measurement) => measurement,
+            Ok(measurement) => {
+                hard_hard_a0_stage_log(
+                    &peers,
+                    "responder",
+                    Some(&coordination.token),
+                    HardHardA0Stage::LocalMeasurement,
+                    HardHardA0Reason::Completed,
+                );
+                measurement
+            }
             Err(rejection) => {
+                hard_hard_a0_stage_log(
+                    &peers,
+                    "responder",
+                    Some(&coordination.token),
+                    HardHardA0Stage::LocalMeasurement,
+                    HardHardA0Reason::MeasurementRejected,
+                );
                 let failure_class = hard_hard_measurement_failure_class(&rejection);
                 let reason = rejection.label();
                 let _ = record_hard_hard_pre_session_failure(
@@ -428,8 +539,8 @@ pub(crate) async fn spawn_hard_hard_responder(
                 Some(candidates.len()),
                 None,
                 format!(
-                    "role=responder token={} model={} confidence={} {}",
-                    coordination.token,
+                    "role=responder session_tag={} model={} confidence={} {}",
+                    hard_hard_anonymized_tag(&coordination.token, "session"),
                     local_model,
                     local_confidence,
                     hard_hard_measurement_summary(&measurement),
@@ -444,8 +555,8 @@ pub(crate) async fn spawn_hard_hard_responder(
                 Some(remote_prediction.len()),
                 None,
                 format!(
-                    "role=responder token={} model={} confidence={}",
-                    coordination.token,
+                    "role=responder session_tag={} model={} confidence={}",
+                    hard_hard_anonymized_tag(&coordination.token, "session"),
                     coordination.local_prediction_model,
                     coordination.local_prediction_confidence,
                 ),
@@ -515,6 +626,13 @@ pub(crate) async fn spawn_hard_hard_responder(
             && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
             && peers.hard_hard_register_session(record).await;
         if !registered {
+            hard_hard_a0_stage_log(
+                &peers,
+                "responder",
+                Some(&coordination.token),
+                HardHardA0Stage::SessionRegistration,
+                HardHardA0Reason::RegistrationRejected,
+            );
             let _ = record_hard_hard_pre_session_failure(
                 &peers,
                 &peer_id,
@@ -584,8 +702,8 @@ pub(crate) async fn spawn_hard_hard_responder(
                 Some(candidates.len()),
                 None,
                 format!(
-                    "role=responder token={} network_generation={} remote_candidate_epoch={} local_profile_generation={} remote_profile_generation={} punch_at_ms={} local_clock_ms={}",
-                    coordination.token,
+                    "role=responder session_tag={} network_generation={} remote_candidate_epoch={} local_profile_generation={} remote_profile_generation={} punch_at_ms={} local_clock_ms={}",
+                    hard_hard_anonymized_tag(&coordination.token, "session"),
                     current_plan.local_network_generation,
                     current_plan.remote_candidate_epoch,
                     current_plan.local_profile_generation,
@@ -595,16 +713,30 @@ pub(crate) async fn spawn_hard_hard_responder(
                 ),
             )
             .await;
-        let sent = if !cancellation.is_cancelled()
+        hard_hard_a0_stage_log(
+            &peers,
+            "responder",
+            Some(&coordination.token),
+            HardHardA0Stage::SessionRegistration,
+            HardHardA0Reason::Registered,
+        );
+        let can_submit_offer = !cancellation.is_cancelled()
             && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
             && peers
                 .try_consume_recovery_http_quota_for_identity(&peer_id, recovery_identity)
                 .await
             && !cancellation.is_cancelled()
-            && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
-        {
+            && peers.peer_session_is_current_sync(&peer_id, peer_session_generation);
+        let sent = if can_submit_offer {
+            hard_hard_a0_stage_log(
+                &peers,
+                "responder",
+                Some(&coordination.token),
+                HardHardA0Stage::OfferApiDispatch,
+                HardHardA0Reason::SubmitStarted,
+            );
             hard_hard_experiment_signal_delay(peers.hard_hard_experiment_only()).await;
-            matches!(
+            let accepted = matches!(
                 signal
                     .control
                     .send_fresh_peer_offer_with_session_and_punch_schedule(
@@ -619,8 +751,34 @@ pub(crate) async fn spawn_hard_hard_responder(
                     )
                     .await,
                 Ok(())
-            )
+            );
+            hard_hard_a0_stage_log(
+                &peers,
+                "responder",
+                Some(&coordination.token),
+                HardHardA0Stage::OfferApiDispatch,
+                if accepted {
+                    HardHardA0Reason::ApiReturnedOk
+                } else {
+                    HardHardA0Reason::ApiReturnedError
+                },
+            );
+            accepted
         } else {
+            let reason = if cancellation.is_cancelled() {
+                HardHardA0Reason::CancelledBeforeSubmit
+            } else if !peers.peer_session_is_current_sync(&peer_id, peer_session_generation) {
+                HardHardA0Reason::SessionChangedBeforeSubmit
+            } else {
+                HardHardA0Reason::RecoveryQuotaRejected
+            };
+            hard_hard_a0_stage_log(
+                &peers,
+                "responder",
+                Some(&coordination.token),
+                HardHardA0Stage::OfferApiDispatch,
+                reason,
+            );
             false
         };
         let signaled_candidate_count = candidate_contract.signaled_candidate_count;
@@ -783,6 +941,13 @@ pub(crate) async fn spawn_hard_hard_responder(
         // exact measured-socket handoff.
         let session_tag = hard_hard_anonymized_tag(&coordination.token, "session");
         let plan_tag = hard_hard_rendezvous_plan_tag(&coordination.token);
+        hard_hard_a0_stage_log(
+            &peers,
+            "responder",
+            Some(&coordination.token),
+            HardHardA0Stage::RendezvousSchedule,
+            HardHardA0Reason::Scheduled,
+        );
         let server_deadline_field = punch_at_server_ms
             .map_or_else(|| "unknown".to_string(), |deadline| deadline.to_string());
         let remote_network_generation = if sweep_record.remote_network_generation == 0 {
@@ -793,7 +958,6 @@ pub(crate) async fn spawn_hard_hard_responder(
         info!(
             event = "hard_hard_rendezvous_scheduled",
             role = "responder",
-            peer_id = %peer_id,
             network_generation = sweep_record.local_network_generation,
             peer_session_generation = peer_session_generation.value(),
             remote_candidate_epoch = sweep_record.remote_candidate_epoch,

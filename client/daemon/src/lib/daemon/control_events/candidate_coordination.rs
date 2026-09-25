@@ -29,9 +29,40 @@ enum FreshSignalVerdict {
     /// The payload carried conflicting fresh labels: rejected
     /// deterministically like a stale signal.
     Inconsistent,
+    /// A source claimed the fresh label namespace but was not canonical.
+    Malformed,
+    /// The signal is bound to a retired sender identity.
+    StaleIdentity,
     /// The bounded candidate owner must retain this exact signal and retry
     /// after a resource-contended non-queuing transaction attempt.
     Contended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshPunchRejection {
+    MalformedLabel,
+    ConflictingLabels,
+    StaleSenderIdentity,
+    StalePrediction,
+    PayloadMismatch,
+    CandidateSetNotApplied(CandidateSetApplyResult),
+    Superseded,
+    Contended,
+}
+
+fn hard_hard_fresh_rejection_reason(rejection: FreshPunchRejection) -> HardHardA0Reason {
+    match rejection {
+        FreshPunchRejection::MalformedLabel => HardHardA0Reason::FreshLabelMalformed,
+        FreshPunchRejection::ConflictingLabels => HardHardA0Reason::FreshLabelsConflicting,
+        FreshPunchRejection::StaleSenderIdentity => HardHardA0Reason::FreshSenderIdentityStale,
+        FreshPunchRejection::StalePrediction => HardHardA0Reason::FreshPredictionStale,
+        FreshPunchRejection::PayloadMismatch => HardHardA0Reason::FreshPayloadMismatch,
+        FreshPunchRejection::CandidateSetNotApplied(_) => {
+            HardHardA0Reason::FreshCandidateSetRejected
+        }
+        FreshPunchRejection::Superseded => HardHardA0Reason::FreshPredictionSuperseded,
+        FreshPunchRejection::Contended => HardHardA0Reason::FreshAdmissionContended,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,7 +451,7 @@ impl Daemon {
                         .await;
                 }
             }
-            FreshPunchDecision::None => {
+            FreshPunchDecision::None | FreshPunchDecision::Rejected(_) => {
                 if candidate_signal_starts_synchronized_punch(
                     &offer.handshake_init,
                     candidate_apply_result,
@@ -491,7 +522,7 @@ impl Daemon {
                         .await;
                 }
             }
-            FreshPunchDecision::None => {
+            FreshPunchDecision::None | FreshPunchDecision::Rejected(_) => {
                 if candidate_signal_starts_synchronized_punch(
                     &offer.handshake_init,
                     candidate_apply_result,
@@ -523,6 +554,20 @@ impl Daemon {
             return HardHardOfferHandling::NotHardHard;
         }
         let Some(coordination) = HardHardCoordination::parse(session_id) else {
+            hard_hard_a0_stage_log(
+                &self.peers,
+                "unclassified",
+                None,
+                HardHardA0Stage::PeerSignalReceived,
+                HardHardA0Reason::SignalReceived,
+            );
+            hard_hard_a0_stage_log(
+                &self.peers,
+                "unclassified",
+                None,
+                HardHardA0Stage::PeerSignalAdmission,
+                HardHardA0Reason::MalformedEnvelope,
+            );
             self.peers
                 .record_direct_event(
                     peer_id,
@@ -535,7 +580,36 @@ impl Daemon {
                 .await;
             return HardHardOfferHandling::Rejected;
         };
-        let FreshPunchDecision::Fresh(_id, frozen_targets) = fresh_punch else {
+        let local_role = match coordination.role {
+            HardHardRole::Initiator => "responder",
+            HardHardRole::Responder => "initiator",
+        };
+        hard_hard_a0_stage_log(
+            &self.peers,
+            local_role,
+            Some(&coordination.token),
+            HardHardA0Stage::PeerSignalReceived,
+            HardHardA0Reason::SignalReceived,
+        );
+        let (frozen_targets, fresh_rejection) = match fresh_punch {
+            FreshPunchDecision::Fresh(_, targets) => (Some(targets), None),
+            FreshPunchDecision::None => (None, Some(HardHardA0Reason::FreshLabelMissing)),
+            FreshPunchDecision::Degraded => {
+                (None, Some(HardHardA0Reason::FreshSnapshotUnavailable))
+            }
+            FreshPunchDecision::Rejected(rejection) => {
+                (None, Some(hard_hard_fresh_rejection_reason(rejection)))
+            }
+        };
+        let Some(frozen_targets) = frozen_targets else {
+            let reason = fresh_rejection.unwrap_or(HardHardA0Reason::MissingFreshPrediction);
+            hard_hard_a0_stage_log(
+                &self.peers,
+                local_role,
+                Some(&coordination.token),
+                HardHardA0Stage::PeerSignalAdmission,
+                reason,
+            );
             self.peers
                 .record_direct_event(
                     peer_id,
@@ -543,19 +617,40 @@ impl Daemon {
                     None,
                     None,
                     None,
-                    "Hard↔Hard session did not carry an admitted, unexpired fresh prediction window",
+                    format!(
+                        "Hard↔Hard session admission rejected fresh prediction ({})",
+                        reason.label()
+                    ),
                 )
                 .await;
             return HardHardOfferHandling::Rejected;
         };
-        if !self
+        let profile_binding = self
             .peers
-            .bind_remote_nat_profile_to_candidate_epoch(
+            .bind_remote_nat_profile_to_candidate_epoch_with_snapshot(
                 peer_id,
                 coordination.local_profile_generation,
             )
-            .await
-        {
+            .await;
+        if let RemoteNatProfileBindResult::Rejected { reason, snapshot } = profile_binding {
+            let stage_reason = match reason {
+                RemoteNatProfileBindFailure::PeerMissing => HardHardA0Reason::PeerMissing,
+                RemoteNatProfileBindFailure::ProfileMissing => HardHardA0Reason::ProfileMissing,
+                RemoteNatProfileBindFailure::ProfileExpired => HardHardA0Reason::ProfileExpired,
+                RemoteNatProfileBindFailure::ProfileGenerationMissing => {
+                    HardHardA0Reason::ProfileGenerationMissing
+                }
+                RemoteNatProfileBindFailure::ProfileGenerationMismatch => {
+                    HardHardA0Reason::ProfileGenerationMismatch
+                }
+            };
+            hard_hard_a0_profile_binding_rejection_log(
+                &self.peers,
+                local_role,
+                &coordination.token,
+                stage_reason,
+                snapshot,
+            );
             self.peers
                 .record_direct_event(
                     peer_id,
@@ -563,12 +658,26 @@ impl Daemon {
                     frozen_targets.first().copied(),
                     Some(frozen_targets.len()),
                     None,
-                    "Hard↔Hard profile generation was not current for the admitted candidate context",
+                    format!(
+                        "Hard↔Hard profile binding rejected: reason={reason:?} declared_generation={} observed_generation={:?} candidate_epoch={:?} profile_candidate_epoch={:?} profile_fresh={}",
+                        snapshot.declared_generation,
+                        snapshot.profile_generation,
+                        snapshot.candidate_epoch,
+                        snapshot.profile_candidate_epoch,
+                        snapshot.profile_fresh,
+                    ),
                 )
                 .await;
             return HardHardOfferHandling::Rejected;
         }
         let Some(punch_at_ms) = punch_at_ms else {
+            hard_hard_a0_stage_log(
+                &self.peers,
+                local_role,
+                Some(&coordination.token),
+                HardHardA0Stage::PeerSignalAdmission,
+                HardHardA0Reason::MissingPunchDeadline,
+            );
             self.peers
                 .record_direct_event(
                     peer_id,
@@ -582,9 +691,23 @@ impl Daemon {
             return HardHardOfferHandling::Rejected;
         };
         let Some(udp) = self.udp_transport.read().await.clone() else {
+            hard_hard_a0_stage_log(
+                &self.peers,
+                local_role,
+                Some(&coordination.token),
+                HardHardA0Stage::OwnerAdmission,
+                HardHardA0Reason::TransportUnavailable,
+            );
             return HardHardOfferHandling::Fallback;
         };
         let Some(signal) = self.hole_punch_signal_context().await else {
+            hard_hard_a0_stage_log(
+                &self.peers,
+                local_role,
+                Some(&coordination.token),
+                HardHardA0Stage::OwnerAdmission,
+                HardHardA0Reason::SignalContextUnavailable,
+            );
             return HardHardOfferHandling::Fallback;
         };
         match coordination.role {
@@ -628,6 +751,13 @@ impl Daemon {
                     .await
                 {
                     crate::peer::HardHardResponseAdmission::Rejected => {
+                        hard_hard_a0_stage_log(
+                            &self.peers,
+                            "initiator",
+                            Some(&coordination.token),
+                            HardHardA0Stage::ReciprocalResponseAdmission,
+                            HardHardA0Reason::ResponseFenced,
+                        );
                         self.peers
                             .record_direct_event(
                                 peer_id,
@@ -641,9 +771,24 @@ impl Daemon {
                         return HardHardOfferHandling::Rejected;
                     }
                     crate::peer::HardHardResponseAdmission::AlreadySweeping => {
+                        hard_hard_a0_stage_log(
+                            &self.peers,
+                            "initiator",
+                            Some(&coordination.token),
+                            HardHardA0Stage::ReciprocalResponseAdmission,
+                            HardHardA0Reason::ResponseAlreadySweeping,
+                        );
                         return HardHardOfferHandling::Started;
                     }
-                    crate::peer::HardHardResponseAdmission::Ready => {}
+                    crate::peer::HardHardResponseAdmission::Ready => {
+                        hard_hard_a0_stage_log(
+                            &self.peers,
+                            "initiator",
+                            Some(&coordination.token),
+                            HardHardA0Stage::ReciprocalResponseAdmission,
+                            HardHardA0Reason::ResponseAdmitted,
+                        );
+                    }
                 }
                 match spawn_hard_hard_initiator_response(
                     udp,

@@ -634,15 +634,40 @@ impl PeerManager {
     /// profile generation carried by the same authenticated Hard↔Hard
     /// envelope. A profile that is merely young, but belongs to an older
     /// candidate context, cannot be revived by this method.
+    #[cfg(test)]
     pub(crate) async fn bind_remote_nat_profile_to_candidate_epoch(
         &self,
         node_id: &str,
         profile_generation: u64,
     ) -> bool {
+        matches!(
+            self.bind_remote_nat_profile_to_candidate_epoch_with_snapshot(
+                node_id,
+                profile_generation,
+            )
+            .await,
+            RemoteNatProfileBindResult::Bound(_)
+        )
+    }
+
+    /// Check and bind the remote profile while holding the same connection
+    /// writer used to capture its candidate epoch and profile state. This is
+    /// diagnostic data for the existing Hard↔Hard admission fence; it does
+    /// not relax that fence or retry a rejected signal.
+    pub(crate) async fn bind_remote_nat_profile_to_candidate_epoch_with_snapshot(
+        &self,
+        node_id: &str,
+        profile_generation: u64,
+    ) -> RemoteNatProfileBindResult {
         let mut connections = self.connections.write().await;
-        connections.get_mut(node_id).is_some_and(|connection| {
-            connection.bind_remote_nat_profile_to_candidate_epoch(profile_generation)
-        })
+        match connections.get_mut(node_id) {
+            Some(connection) => connection
+                .bind_remote_nat_profile_to_candidate_epoch_with_snapshot(profile_generation),
+            None => RemoteNatProfileBindResult::Rejected {
+                reason: RemoteNatProfileBindFailure::PeerMissing,
+                snapshot: RemoteNatProfileBindSnapshot::missing_peer(profile_generation),
+            },
+        }
     }
 
     /// Bound probe rounds from the observed local NAT behavior.  Endpoint-

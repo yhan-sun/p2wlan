@@ -11,17 +11,52 @@ pub(crate) async fn spawn_hard_hard_initiator(
     invocation_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> HardHardInitiatorStart {
     if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::OwnerAdmission,
+            HardHardA0Reason::CancelledBeforeSubmit,
+        );
         return HardHardInitiatorStart::InvocationCancelled;
     }
     let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::PlannerEligibility,
+            HardHardA0Reason::PeerSessionUnavailable,
+        );
         return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::RecoverySuperseded);
     };
     if peers.hard_hard_session_is_active(&peer_id).await {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::OwnerAdmission,
+            HardHardA0Reason::ExistingOwner,
+        );
         return HardHardInitiatorStart::ExistingSession;
     }
     let Some(plan) = peers.hard_hard_plan_for_peer(&peer_id).await else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::PlannerEligibility,
+            HardHardA0Reason::PlanUnavailable,
+        );
         return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::PlanChanged);
     };
+    hard_hard_a0_stage_log(
+        &peers,
+        "initiator",
+        None,
+        HardHardA0Stage::PlannerEligibility,
+        HardHardA0Reason::PlanAvailable,
+    );
     peers
         .record_direct_event(
             &peer_id,
@@ -39,6 +74,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
         )
         .await;
     if signal.boot_epoch_ms == 0 {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::PlannerEligibility,
+            HardHardA0Reason::BootEpochUnavailable,
+        );
         peers
             .record_direct_event(
                 &peer_id,
@@ -54,6 +96,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
         );
     }
     if signal.stun_servers.len() < 3 {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::PlannerEligibility,
+            HardHardA0Reason::StunObserversInsufficient,
+        );
         peers
             .record_direct_event(
                 &peer_id,
@@ -69,16 +118,37 @@ pub(crate) async fn spawn_hard_hard_initiator(
         );
     }
     if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::OwnerAdmission,
+            HardHardA0Reason::CancelledBeforeSubmit,
+        );
         return HardHardInitiatorStart::InvocationCancelled;
     }
     let epoch = match peers.recovery_epoch_admit(&peer_id).await {
         RecoveryAdmission::Accepted { epoch } => epoch,
         RecoveryAdmission::Superseded => {
+            hard_hard_a0_stage_log(
+                &peers,
+                "initiator",
+                None,
+                HardHardA0Stage::OwnerAdmission,
+                HardHardA0Reason::RecoveryAdmissionRejected,
+            );
             return HardHardInitiatorStart::NotStarted(
                 HardHardInitiatorNotStarted::RecoverySuperseded,
             );
         }
         RecoveryAdmission::BudgetExhausted { .. } => {
+            hard_hard_a0_stage_log(
+                &peers,
+                "initiator",
+                None,
+                HardHardA0Stage::OwnerAdmission,
+                HardHardA0Reason::RecoveryAdmissionRejected,
+            );
             return HardHardInitiatorStart::NotStarted(
                 HardHardInitiatorNotStarted::RecoveryBudgetExhausted,
             );
@@ -88,6 +158,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
         .try_begin_hard_hard_generation_for_epoch(&peer_id, epoch)
         .await
     else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::OwnerAdmission,
+            HardHardA0Reason::GenerationQuotaExhausted,
+        );
         peers
             .record_direct_event(
                 &peer_id,
@@ -104,11 +181,25 @@ pub(crate) async fn spawn_hard_hard_initiator(
     };
     if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
         fresh_generation_reservation.refund().await;
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::OwnerAdmission,
+            HardHardA0Reason::CancelledBeforeSubmit,
+        );
         return HardHardInitiatorStart::InvocationCancelled;
     }
     let punch_at_ms = hard_hard_now_ms().saturating_add(HARD_HARD_PUNCH_LEAD.as_millis() as u64);
     let Some(punch_at_server_ms) = signal.control.hard_hard_server_deadline(punch_at_ms) else {
         fresh_generation_reservation.refund().await;
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::PlannerEligibility,
+            HardHardA0Reason::MissingPunchDeadline,
+        );
         peers
             .record_direct_event(
                 &peer_id,
@@ -134,6 +225,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
     .await
     {
         fresh_generation_reservation.refund().await;
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::OwnerAdmission,
+            HardHardA0Reason::GenerationOrProfileFence,
+        );
         return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::PlanChanged);
     }
     let Some(claim) = punch_deduplicator
@@ -150,6 +248,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
         .await
     else {
         fresh_generation_reservation.refund().await;
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            None,
+            HardHardA0Stage::OwnerAdmission,
+            HardHardA0Reason::ClaimRejected,
+        );
         return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::RecoverySuperseded);
     };
     let (session, recovery_identity) = match claim {
@@ -166,6 +271,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
             {
                 drop(session);
                 fresh_generation_reservation.refund().await;
+                hard_hard_a0_stage_log(
+                    &peers,
+                    "initiator",
+                    None,
+                    HardHardA0Stage::OwnerAdmission,
+                    HardHardA0Reason::GenerationOrProfileFence,
+                );
                 return HardHardInitiatorStart::NotStarted(
                     HardHardInitiatorNotStarted::PlanChanged,
                 );
@@ -176,6 +288,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
         }
         RendezvousPunchClaim::Deferred(deferred) => {
             fresh_generation_reservation.refund().await;
+            hard_hard_a0_stage_log(
+                &peers,
+                "initiator",
+                None,
+                HardHardA0Stage::OwnerAdmission,
+                HardHardA0Reason::ClaimDeferred,
+            );
             peers
                 .record_direct_event(
                     &peer_id,
@@ -184,8 +303,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
                     None,
                     None,
                     format!(
-                        "Hard↔Hard initiator folded behind session_id={} epoch={} reason={}",
-                        deferred.active_session_id,
+                        "Hard↔Hard initiator folded behind an active owner epoch={} reason={}",
                         deferred.active_epoch,
                         deferred.reason.label()
                     ),
@@ -195,6 +313,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
         }
         RendezvousPunchClaim::RejectedStalePeerSession => {
             fresh_generation_reservation.refund().await;
+            hard_hard_a0_stage_log(
+                &peers,
+                "initiator",
+                None,
+                HardHardA0Stage::OwnerAdmission,
+                HardHardA0Reason::ClaimRejected,
+            );
             return HardHardInitiatorStart::NotStarted(
                 HardHardInitiatorNotStarted::RecoverySuperseded,
             );
@@ -202,6 +327,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
     };
     let token = hard_hard_session_token(session.session_id());
     let coordination = hard_hard_coordination_from_plan(token, HardHardRole::Initiator, plan);
+    hard_hard_a0_stage_log(
+        &peers,
+        "initiator",
+        Some(&coordination.token),
+        HardHardA0Stage::OwnerAdmission,
+        HardHardA0Reason::OwnerClaimed,
+    );
     let cancellation = session.cancellation_handle();
     // Capture the authoritative Probe receive-session identity before the
     // deadline-sensitive rendezvous task exists.  The sweep must not perform
@@ -217,6 +349,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
         let session_owner = session;
         let mut pending_session_cancellation =
             PendingHardHardSessionCancellation::new(cancellation.clone());
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::LocalMeasurement,
+            HardHardA0Reason::Started,
+        );
         let mut measurement = match run_hard_hard_local_measurement(
             &udp,
             &peers,
@@ -228,8 +367,24 @@ pub(crate) async fn spawn_hard_hard_initiator(
         )
         .await
         {
-            Ok(measurement) => measurement,
+            Ok(measurement) => {
+                hard_hard_a0_stage_log(
+                    &peers,
+                    "initiator",
+                    Some(&coordination.token),
+                    HardHardA0Stage::LocalMeasurement,
+                    HardHardA0Reason::Completed,
+                );
+                measurement
+            }
             Err(rejection) => {
+                hard_hard_a0_stage_log(
+                    &peers,
+                    "initiator",
+                    Some(&coordination.token),
+                    HardHardA0Stage::LocalMeasurement,
+                    HardHardA0Reason::MeasurementRejected,
+                );
                 let failure_class = hard_hard_measurement_failure_class(&rejection);
                 let reason = rejection.label();
                 let _ = record_hard_hard_pre_session_failure(
@@ -369,8 +524,8 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 Some(candidates.len()),
                 None,
                 format!(
-                    "role=initiator token={} model={} confidence={} {}",
-                    coordination.token,
+                    "role=initiator session_tag={} model={} confidence={} {}",
+                    hard_hard_anonymized_tag(&coordination.token, "session"),
                     local_model,
                     local_confidence,
                     hard_hard_measurement_summary(&measurement),
@@ -426,6 +581,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
             && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
             && peers.hard_hard_register_session(record).await;
         if !registered {
+            hard_hard_a0_stage_log(
+                &peers,
+                "initiator",
+                Some(&coordination.token),
+                HardHardA0Stage::SessionRegistration,
+                HardHardA0Reason::RegistrationRejected,
+            );
             let _ = record_hard_hard_pre_session_failure(
                 &peers,
                 &peer_id,
@@ -485,8 +647,8 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 Some(candidates.len()),
                 None,
                 format!(
-                    "role=initiator token={} network_generation={} remote_candidate_epoch={} local_profile_generation={} remote_profile_generation={} punch_at_ms={} local_clock_ms={}",
-                    coordination.token,
+                    "role=initiator session_tag={} network_generation={} remote_candidate_epoch={} local_profile_generation={} remote_profile_generation={} punch_at_ms={} local_clock_ms={}",
+                    hard_hard_anonymized_tag(&coordination.token, "session"),
                     plan.local_network_generation,
                     plan.remote_candidate_epoch,
                     plan.local_profile_generation,
@@ -496,6 +658,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 ),
             )
             .await;
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::SessionRegistration,
+            HardHardA0Reason::Registered,
+        );
         pending_session_cancellation.disarm();
         // The manager ledger is now the authoritative active-session gate.
         // Release the measurement permit before publishing: the peer cannot
@@ -504,16 +673,23 @@ pub(crate) async fn spawn_hard_hard_initiator(
         // soon as such a response arrives.  Holding this permit through the
         // publish would fold and silently lose an extremely fast response.
         drop(session_owner);
-        let advertised = if !cancellation.is_cancelled()
+        let can_submit_offer = !cancellation.is_cancelled()
             && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
             && peers
                 .try_consume_recovery_http_quota_for_identity(&peer_id, recovery_identity)
                 .await
             && !cancellation.is_cancelled()
-            && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
-        {
+            && peers.peer_session_is_current_sync(&peer_id, peer_session_generation);
+        let advertised = if can_submit_offer {
             hard_hard_experiment_signal_delay(peers.hard_hard_experiment_only()).await;
-            matches!(
+            hard_hard_a0_stage_log(
+                &peers,
+                "initiator",
+                Some(&coordination.token),
+                HardHardA0Stage::OfferApiDispatch,
+                HardHardA0Reason::SubmitStarted,
+            );
+            let accepted = matches!(
                 signal
                     .control
                     .send_fresh_peer_offer_with_session_and_punch_schedule(
@@ -528,8 +704,34 @@ pub(crate) async fn spawn_hard_hard_initiator(
                     )
                     .await,
                 Ok(())
-            )
+            );
+            hard_hard_a0_stage_log(
+                &peers,
+                "initiator",
+                Some(&coordination.token),
+                HardHardA0Stage::OfferApiDispatch,
+                if accepted {
+                    HardHardA0Reason::ApiReturnedOk
+                } else {
+                    HardHardA0Reason::ApiReturnedError
+                },
+            );
+            accepted
         } else {
+            let reason = if cancellation.is_cancelled() {
+                HardHardA0Reason::CancelledBeforeSubmit
+            } else if !peers.peer_session_is_current_sync(&peer_id, peer_session_generation) {
+                HardHardA0Reason::SessionChangedBeforeSubmit
+            } else {
+                HardHardA0Reason::RecoveryQuotaRejected
+            };
+            hard_hard_a0_stage_log(
+                &peers,
+                "initiator",
+                Some(&coordination.token),
+                HardHardA0Stage::OfferApiDispatch,
+                reason,
+            );
             false
         };
         let signaled_candidate_count = candidate_contract.signaled_candidate_count;
@@ -596,6 +798,8 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 .await;
             return;
         }
+        // This records return from the local signaling API only. It does not
+        // assert that Control persisted the offer or that the peer received it.
         let candidate_signal_accepted_at_ms = peers.timeline_uptime_ms();
         measurement_observation.candidate_signal_accepted_at_ms = candidate_signal_accepted_at_ms;
         measurement_observation.advertised_candidate_count = signaled_candidate_count;
@@ -656,6 +860,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
         // perturb the very mapping generation being measured.
         let session_tag = hard_hard_anonymized_tag(&coordination.token, "session");
         let plan_tag = hard_hard_rendezvous_plan_tag(&coordination.token);
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::RendezvousSchedule,
+            HardHardA0Reason::Scheduled,
+        );
         let remote_network_generation = if coordination.remote_network_generation == 0 {
             "unknown".to_string()
         } else {
@@ -664,7 +875,6 @@ pub(crate) async fn spawn_hard_hard_initiator(
         info!(
             event = "hard_hard_rendezvous_scheduled",
             role = "initiator",
-            peer_id = %peer_id,
             network_generation = coordination.local_network_generation,
             peer_session_generation = peer_session_generation.value(),
             remote_candidate_epoch = coordination.remote_candidate_epoch,
@@ -748,19 +958,54 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
     remote_prediction: Vec<SocketAddr>,
     punch_at_ms: u64,
 ) -> HardHardRemoteStart {
+    hard_hard_a0_stage_log(
+        &peers,
+        "initiator",
+        Some(&coordination.token),
+        HardHardA0Stage::ReciprocalResponseAdmission,
+        HardHardA0Reason::SignalReceived,
+    );
     if coordination.role != HardHardRole::Responder {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::ReciprocalResponseAdmission,
+            HardHardA0Reason::InvalidRole,
+        );
         return HardHardRemoteStart::Rejected;
     }
     let Some(record) = peers
         .hard_hard_session_by_token(&peer_id, &coordination.token)
         .await
     else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::ReciprocalResponseAdmission,
+            HardHardA0Reason::ResponseFenced,
+        );
         return HardHardRemoteStart::Rejected;
     };
     let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::ReciprocalResponseAdmission,
+            HardHardA0Reason::ResponseFenced,
+        );
         return HardHardRemoteStart::Rejected;
     };
     let Some(current_plan) = peers.hard_hard_plan_for_peer(&peer_id).await else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::ReciprocalResponseAdmission,
+            HardHardA0Reason::PlanUnavailable,
+        );
         let _ = record_hard_hard_unexecuted_session_attempt(
             &peers,
             &peer_id,
@@ -796,6 +1041,21 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
             .saturating_add(HARD_HARD_SWEEP_DEADLINE.as_millis() as u64)
             < hard_hard_now_ms()
     {
+        let response_deadline_expired = record
+            .punch_at_ms
+            .saturating_add(HARD_HARD_SWEEP_DEADLINE.as_millis() as u64)
+            < hard_hard_now_ms();
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::ReciprocalResponseAdmission,
+            if response_deadline_expired {
+                HardHardA0Reason::DeadlineExpired
+            } else {
+                HardHardA0Reason::ResponseFenced
+            },
+        );
         peers
             .record_direct_event(
                 &peer_id,
@@ -806,11 +1066,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
                 "Hard↔Hard reciprocal response failed session/profile/time fencing; no stale ACK can promote Direct",
             )
             .await;
-        let terminal_reason = if record
-            .punch_at_ms
-            .saturating_add(HARD_HARD_SWEEP_DEADLINE.as_millis() as u64)
-            < hard_hard_now_ms()
-        {
+        let terminal_reason = if response_deadline_expired {
             "deadline"
         } else {
             "response_fenced"
@@ -835,6 +1091,13 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
     // expected reciprocal candidate transition. Any later transition means
     // this worker raced a newer candidate session and must be rejected.
     if current_epoch != record.remote_candidate_epoch {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::ReciprocalResponseAdmission,
+            HardHardA0Reason::GenerationOrProfileFence,
+        );
         peers
             .record_direct_event(
                 &peer_id,
@@ -861,6 +1124,13 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         return HardHardRemoteStart::Rejected;
     }
     if remote_prediction.is_empty() || remote_prediction.len() > HARD_HARD_MAX_BIRTHDAY_TARGETS {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::ReciprocalResponseAdmission,
+            HardHardA0Reason::InvalidPrediction,
+        );
         let _ = record_hard_hard_unexecuted_session_attempt(
             &peers,
             &peer_id,
@@ -874,6 +1144,13 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         return HardHardRemoteStart::Rejected;
     }
     let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::OwnerAdmission,
+            HardHardA0Reason::RecoveryAdmissionRejected,
+        );
         let _ = record_hard_hard_unexecuted_session_attempt(
             &peers,
             &peer_id,
@@ -897,6 +1174,13 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
     )
     .await
     else {
+        hard_hard_a0_stage_log(
+            &peers,
+            "initiator",
+            Some(&coordination.token),
+            HardHardA0Stage::OwnerAdmission,
+            HardHardA0Reason::ClaimRejected,
+        );
         let _ = record_hard_hard_unexecuted_session_attempt(
             &peers,
             &peer_id,
@@ -909,6 +1193,13 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         .await;
         return HardHardRemoteStart::Rejected;
     };
+    hard_hard_a0_stage_log(
+        &peers,
+        "initiator",
+        Some(&coordination.token),
+        HardHardA0Stage::ReciprocalResponseAdmission,
+        HardHardA0Reason::ResponseAdmitted,
+    );
     #[cfg(test)]
     pause_hard_hard_initiator_response_for_test().await;
     let Some(record) = peers

@@ -14,8 +14,14 @@ from pathlib import Path
 
 
 RUNNER = Path(__file__).with_name("run-hard-hard-matrix.py")
-SOURCE_SHA = "a" * 40
-BASELINE_SHA = "b" * 40
+REPOSITORY_ROOT = RUNNER.parents[2]
+SOURCE_SHA = subprocess.run(
+    ["git", "-C", str(REPOSITORY_ROOT), "rev-parse", "HEAD"],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.strip()
+BASELINE_SHA = SOURCE_SHA
 RUNNER_SPEC = importlib.util.spec_from_file_location("hard_hard_matrix_runner", RUNNER)
 assert RUNNER_SPEC is not None and RUNNER_SPEC.loader is not None
 MATRIX_RUNNER = importlib.util.module_from_spec(RUNNER_SPEC)
@@ -249,14 +255,112 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
         )
         self.assertEqual(listed.returncode, 0)
         self.assertIn("equal-step\tseed=42001", listed.stdout)
+        self.assertIn("loss-only\tseed=42101", listed.stdout)
+        self.assertIn("offer-dispatch-delay\tseed=42131", listed.stdout)
         self.assertIn("random-high-entropy-negative", listed.stdout)
+
+    def test_a0_fault_scenarios_are_isolated_and_control_delay_is_separate(self):
+        defaults = {
+            "LOSS": "0",
+            "REORDER": "0",
+            "DUPLICATE_RATE": "0",
+            "SIGNAL_DELAY_A_MS": "0",
+            "SIGNAL_DELAY_B_MS": "0",
+        }
+        expected = {
+            "equal-step": {},
+            "loss-only": {"LOSS": "0.08"},
+            "reorder-only": {"REORDER": "1"},
+            "duplicate-only": {
+                "DUPLICATE_RATE": "1.0",
+                "ALLOW_REPLAY_REJECTS": "1",
+            },
+            "loss-reorder-duplicate": {
+                "LOSS": "0.08",
+                "REORDER": "1",
+                "DUPLICATE_RATE": "1.0",
+                "ALLOW_REPLAY_REJECTS": "1",
+            },
+            "offer-dispatch-delay": {
+                "SIGNAL_DELAY_A_MS": "400",
+                "SIGNAL_DELAY_B_MS": "0",
+            },
+        }
+        for name, overrides in expected.items():
+            with self.subTest(scenario=name):
+                scenario = MATRIX_RUNNER.SCENARIO_BY_NAME[name]
+                configured = {**defaults, **scenario.env}
+                for key in defaults:
+                    self.assertEqual(configured[key], {**defaults, **overrides}.get(key, defaults[key]))
+                for key, value in overrides.items():
+                    self.assertEqual(configured[key], value)
+        self.assertIn(
+            "admitted by simulated public mappings",
+            MATRIX_RUNNER.SCENARIO_BY_NAME["loss-only"].description,
+        )
+        self.assertIn(
+            "STUN observer replies, Control, and TCP Relay are outside this hook",
+            MATRIX_RUNNER.SCENARIO_BY_NAME["reorder-only"].description,
+        )
+        self.assertIn("before its existing signaling API", MATRIX_RUNNER.SCENARIO_BY_NAME["offer-dispatch-delay"].description)
+
+    def test_a0_stage_parser_keeps_only_redacted_allowlisted_fields(self):
+        round_dir = self.directory / "a0-stage-parser"
+        round_dir.mkdir()
+        secret_marker = "peer_id=private-node endpoint=198.51.100.7:2345 opaque=raw-session-token"
+        for side, role in (("a", "initiator"), ("b", "responder")):
+            (round_dir / f"node-{side}.log").write_text(
+                'INFO event="hard_hard_attempt_stage" '
+                f'role="{role}" identity_scope="shared_session" '
+                'session_tag="0123456789abcdef" plan_tag="fedcba9876543210" '
+                'stage="local_measurement" reason_code="started" '
+                + secret_marker
+                + "\n",
+                encoding="utf-8",
+            )
+        with (round_dir / "node-a.log").open("a", encoding="utf-8") as log:
+            log.write(
+                'INFO event="hard_hard_attempt_stage" role="unclassified" '
+                'identity_scope="local_pre_session" session_tag="none" plan_tag="none" '
+                'stage="peer_signal_admission" reason_code="malformed_envelope"\n'
+            )
+            log.write(
+                'INFO event="hard_hard_attempt_stage" role="responder" '
+                'identity_scope="shared_session" session_tag="0123456789abcdef" '
+                'plan_tag="fedcba9876543210" stage="peer_signal_admission" '
+                'reason_code="profile_missing" candidate_epoch=8 '
+                'declared_profile_generation=7 profile_generation=none\n'
+            )
+        (round_dir / "server.log").write_text(
+            '2026/09/23 event=hard_hard_attempt_stage role=initiator '
+            'identity_scope=shared_session session_tag=0123456789abcdef '
+            'plan_tag=fedcba9876543210 stage=signal_persisted '
+            'reason_code=database_inserted raw_token=do-not-copy\n',
+            encoding="utf-8",
+        )
+        evidence = MATRIX_RUNNER.extract_a0_stage_evidence(round_dir)
+        self.assertEqual(evidence["schema_version"], 3)
+        self.assertEqual(evidence["record_count"], 5)
+        self.assertEqual(evidence["missing_sources"], [])
+        self.assertEqual(evidence["sides"]["a"]["records"][0]["stage"], "local_measurement")
+        self.assertEqual(evidence["sides"]["server"]["records"][0]["stage"], "signal_persisted")
+        self.assertEqual(
+            evidence["sides"]["a"]["records"][1]["reason_code"], "malformed_envelope"
+        )
+        self.assertEqual(
+            evidence["sides"]["a"]["records"][2]["reason_code"], "profile_missing"
+        )
+        self.assertNotIn("candidate_epoch", json.dumps(evidence))
+        self.assertNotIn(secret_marker, json.dumps(evidence))
+        self.assertNotIn("198.51.100.7", json.dumps(evidence))
+        self.assertNotIn("do-not-copy", json.dumps(evidence))
 
     def test_success_writes_schema_and_preserves_raw_evidence(self):
         output = self.directory / "success"
         result = subprocess.run(self.command(output), capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["schema_version"], 4)
         self.assertEqual(manifest["result"], "pass")
         self.assertEqual(manifest["source_head_sha"], SOURCE_SHA)
         self.assertEqual(manifest["summary"]["valid_rounds"], 1)
@@ -272,11 +376,101 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
             2,
         )
         self.assertEqual(manifest["summary"]["cleanup_duration_ms"]["p95"], 12)
+        duplicate_evidence = manifest["runs"][0]["rounds"][0]["duplicate_fault_evidence"]
+        self.assertEqual(duplicate_evidence["end_to_end_result"]["round_result"], "valid")
+        self.assertEqual(duplicate_evidence["legacy_round_verdict"], "valid")
+        self.assertTrue(manifest["summary"]["duplicate_fault_evidence"]["existing_end_to_end_verdicts_preserved"])
         attempts = manifest["runs"][0]["rounds"][0]["attempts"]
         self.assertEqual(attempts[0]["timeline"]["validation_to_first_business_ms"], 80)
         self.assertEqual(attempts[0]["timeline"]["business_ready_at_ms"], 3550)
         self.assertEqual(attempts[0]["experiment_outcome_class"], "direct_business_succeeded")
         self.assertTrue((output / "raw/equal-step/round-1/nat-trace.jsonl").is_file())
+
+    def test_probe_duplicate_does_not_count_as_wireguard_replay_evidence(self):
+        scenario = MATRIX_RUNNER.SCENARIO_BY_NAME["duplicate-only"]
+        with tempfile.TemporaryDirectory(prefix="p2wlan-duplicate-evidence-") as raw:
+            round_dir = Path(raw)
+            (round_dir / "nat-trace.jsonl").write_text(
+                json.dumps({"event": "packet_duplicated", "copies": 2}) + "\n",
+                encoding="utf-8",
+            )
+            evidence = MATRIX_RUNNER.extract_duplicate_fault_evidence(
+                round_dir, scenario, SOURCE_SHA, scenario.seed
+            )
+        self.assertTrue(evidence["fault_injection_requested"])
+        self.assertFalse(evidence["simulator_target_protocol_layer_hit"])
+        self.assertFalse(evidence["target_protocol_layer_hit"])
+        self.assertEqual(evidence["nat_sim_duplicate_events"], 1)
+        self.assertEqual(evidence["wireguard_transport_duplicate_events"], 0)
+        self.assertEqual(evidence["transport_replay_chain_complete_identities"], 0)
+        self.assertEqual(evidence["local_stage_evidence_validity"], "injection_missed_wireguard_transport")
+
+    def test_reorder_is_reported_as_transport_delay_without_claiming_packet_order(self):
+        scenario = MATRIX_RUNNER.SCENARIO_BY_NAME["reorder-only"]
+        identity = {
+            "payload_class": "wireguard_transport_v1",
+            "receiver_index": 17,
+            "wireguard_counter": 3,
+            "wire_fp": "0123456789abcdef",
+        }
+        with tempfile.TemporaryDirectory(prefix="p2wlan-reorder-evidence-") as raw:
+            round_dir = Path(raw)
+            trace_rows = [
+                {"event": "packet_delayed", "reorder_delay_injected": True, **identity},
+                {"event": "simulator_delivery", "duplicate_copy": 0, **identity},
+            ]
+            (round_dir / "nat-trace.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in trace_rows), encoding="utf-8"
+            )
+            evidence = MATRIX_RUNNER.extract_duplicate_fault_evidence(
+                round_dir, scenario, SOURCE_SHA, scenario.seed
+            )
+        self.assertTrue(evidence["fault_injection_requested"])
+        self.assertTrue(evidence["simulator_target_protocol_layer_hit"])
+        self.assertFalse(evidence["target_protocol_layer_hit"])
+        self.assertEqual(evidence["local_stage_evidence_validity"], "not_applicable_no_duplicate_requested")
+        self.assertEqual(
+            evidence["reorder_stage_evidence_validity"],
+            "wireguard_transport_delay_injected_no_order_claim",
+        )
+        self.assertEqual(evidence["actual_packet_order_evidence"], "not_recorded_by_nat_sim_trace")
+
+    def test_target_seed_override_is_limited_to_prebounded_single_round(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(RUNNER),
+                "--dry-run",
+                "--scenario",
+                "loss-reorder-duplicate",
+                "--target-seed",
+                "42072",
+                "--rounds",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["first_seed_by_scenario"], {"loss-reorder-duplicate": 42072})
+        invalid = subprocess.run(
+            [
+                sys.executable,
+                str(RUNNER),
+                "--dry-run",
+                "--scenario",
+                "loss-reorder-duplicate",
+                "--target-seed",
+                "42073",
+                "--rounds",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("pre-bounded A0 diagnostic seeds", invalid.stderr)
 
     def test_business_events_require_exact_attempt_identity_across_shared_generation(self):
         old_identity = {
@@ -466,6 +660,24 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("exceeding --max-executions=1", result.stderr)
+        self.assertFalse(output.exists())
+
+    def test_source_sha_must_match_head_before_creating_output(self):
+        output = self.directory / "source-sha-mismatch"
+        command = self.command(output)
+        command[command.index("--source-sha") + 1] = "f" * 40
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--source-sha must match the checked-out HEAD commit", result.stderr)
+        self.assertFalse(output.exists())
+
+    def test_baseline_sha_must_resolve_before_creating_output(self):
+        output = self.directory / "baseline-sha-missing"
+        command = self.command(output)
+        command[command.index("--baseline-sha") + 1] = "f" * 40
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--baseline-sha must resolve to a locally available commit", result.stderr)
         self.assertFalse(output.exists())
 
     def test_dry_run_prints_resolved_plan_without_creating_output(self):

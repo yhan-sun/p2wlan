@@ -54,6 +54,27 @@ def format_address(addr: Address) -> str:
     return f"{addr[0]}:{addr[1]}"
 
 
+def wireguard_transport_trace_fields(data: bytes) -> Dict[str, object]:
+    """Return bounded identity fields only for syntactically typed WG data.
+
+    This classifies the UDP envelope, not its authenticity. A daemon's
+    decrypt-success/replay result is still required before calling a packet a
+    valid current-session ciphertext.
+    """
+    if len(data) < 16 or data[:4] != b"\x04\x00\x00\x00":
+        return {}
+    fingerprint = 0xCBF29CE484222325
+    for byte in data:
+        fingerprint ^= byte
+        fingerprint = (fingerprint * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return {
+        "payload_class": "wireguard_transport_v1",
+        "receiver_index": int.from_bytes(data[4:8], "little"),
+        "wireguard_counter": int.from_bytes(data[8:16], "little"),
+        "wire_fp": f"{fingerprint:016x}",
+    }
+
+
 class NatTrace:
     """Optional sanitized event trace for deterministic traversal analysis."""
 
@@ -604,18 +625,26 @@ class Nat:
                     nat=self.name,
                     receiver_endpoint=f"{self.public_ip}:{mapping.port}",
                     bytes=len(data),
+                    **wireguard_transport_trace_fields(data),
                 )
             return
         delay_seconds = self.delivery_delay_ms / 1000.0
-        if self.reorder and self.rng.random() < 0.25:
+        reorder_delay_injected = self.reorder and self.rng.random() < 0.25
+        if reorder_delay_injected:
             delay_seconds += 0.02
         duplicate = self.duplicate_rate > 0 and self.rng.random() < self.duplicate_rate
         if delay_seconds > 0:
             if self.loop is not None:
-                self.loop.create_task(self._delayed_delivery(mapping, data, addr, delay_seconds))
+                self.loop.create_task(
+                    self._delayed_delivery(
+                        mapping, data, addr, delay_seconds, duplicate_copy=0
+                    )
+                )
                 if duplicate:
                     self.loop.create_task(
-                        self._delayed_delivery(mapping, data, addr, delay_seconds + 0.001)
+                        self._delayed_delivery(
+                            mapping, data, addr, delay_seconds + 0.001, duplicate_copy=1
+                        )
                     )
             if self.fabric is not None:
                 self.fabric.record(
@@ -623,8 +652,19 @@ class Nat:
                     nat=self.name,
                     delay_ms=round(delay_seconds * 1000),
                     duplicated=duplicate,
+                    reorder_delay_injected=reorder_delay_injected,
                     bytes=len(data),
+                    **wireguard_transport_trace_fields(data),
                 )
+                if duplicate:
+                    self.fabric.record(
+                        "packet_duplicated",
+                        nat=self.name,
+                        receiver_endpoint=f"{self.public_ip}:{mapping.port}",
+                        bytes=len(data),
+                        copies=2,
+                        **wireguard_transport_trace_fields(data),
+                    )
             return
         if self.fabric is not None:
             self.fabric.record(
@@ -634,8 +674,9 @@ class Nat:
                 expected_source=format_address(mapping.destination),
                 actual_source=format_address(addr),
                 bytes=len(data),
+                **wireguard_transport_trace_fields(data),
             )
-        self._deliver(mapping, data, addr)
+        self._deliver(mapping, data, addr, duplicate_copy=0)
         if duplicate:
             if self.fabric is not None:
                 self.fabric.record(
@@ -643,10 +684,26 @@ class Nat:
                     nat=self.name,
                     receiver_endpoint=f"{self.public_ip}:{mapping.port}",
                     bytes=len(data),
+                    copies=2,
+                    **wireguard_transport_trace_fields(data),
                 )
-            self._deliver(mapping, data, addr)
+            self._deliver(mapping, data, addr, duplicate_copy=1)
 
-    def _deliver(self, mapping: Mapping, data: bytes, source: Address) -> None:
+    def _deliver(
+        self,
+        mapping: Mapping,
+        data: bytes,
+        source: Address,
+        duplicate_copy: int = 0,
+    ) -> None:
+        if self.fabric is not None:
+            self.fabric.record(
+                "simulator_delivery",
+                nat=self.name,
+                duplicate_copy=duplicate_copy,
+                bytes=len(data),
+                **wireguard_transport_trace_fields(data),
+            )
         peer_mapping = (
             self.fabric.mapping_for_public_endpoint(self, source)
             if self.fabric is not None
@@ -671,9 +728,16 @@ class Nat:
         if mapping.transport is not None:
             mapping.transport.sendto(data, client)
 
-    async def _delayed_delivery(self, mapping: Mapping, data: bytes, source: Address, delay: float) -> None:
+    async def _delayed_delivery(
+        self,
+        mapping: Mapping,
+        data: bytes,
+        source: Address,
+        delay: float,
+        duplicate_copy: int = 0,
+    ) -> None:
         await asyncio.sleep(delay)
-        self._deliver(mapping, data, source)
+        self._deliver(mapping, data, source, duplicate_copy=duplicate_copy)
 
 
 def main() -> None:

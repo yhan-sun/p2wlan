@@ -1,6 +1,25 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[test]
+fn hard_hard_a0_control_tags_match_the_shared_session_identity() {
+    let token = "a01face0-1234abcd";
+    let envelope = format!("hh1:i:{token}:1:2:3:4");
+    let (role, parsed_token) = hard_hard_a0_control_identity(&envelope)
+        .expect("valid Hard-Hard envelope must expose bounded local identity");
+    assert_eq!(role, "initiator");
+    assert_eq!(parsed_token, token);
+    assert_eq!(
+        hard_hard_a0_control_tag(parsed_token, "session"),
+        "a8d6d3fb9b4788de"
+    );
+    assert_eq!(
+        hard_hard_a0_control_tag(parsed_token, "rendezvous-plan"),
+        "91a49269735e274e"
+    );
+    assert!(hard_hard_a0_control_identity("hh1:i:not-hex:1:2").is_none());
+}
+
 fn test_config() -> Config {
     Config::generate_default("https://ctrl.test", "net1").unwrap()
 }

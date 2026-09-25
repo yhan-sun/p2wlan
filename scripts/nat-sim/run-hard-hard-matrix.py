@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -21,17 +22,107 @@ import resource
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 ATTEMPT_SCHEMA_VERSION = 2
+A0_STAGE_SCHEMA_VERSION = 3
 REPOSITORY = "yhan-sun/p2wlan"
 MAX_MATRIX_EXECUTIONS = 32
+MAX_A0_STAGE_EVENTS_PER_SIDE = 128
+PREBOUNDED_TARGET_SEEDS = {
+    ("loss-reorder-duplicate", 42072),
+    ("negative-wrap", 42022),
+    ("reorder-only", 42111),
+}
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+WIRE_FP_FIELD = re.compile(r"\bwire_fp=(?:\"?)([0-9a-f]{16})")
+EVENT_FIELD = re.compile(r'\bevent=(?:"([A-Za-z0-9_]+)"|([A-Za-z0-9_]+))')
+STAGE_EVENT_MARKER = re.compile(
+    r'\bevent=(?:"hard_hard_attempt_stage"|hard_hard_attempt_stage)(?=\s|$)'
+)
+STAGE_FIELD_PATTERN = re.compile(
+    r'\b(role|session_tag|plan_tag|identity_scope|stage|reason_code)=(?:"([^"]*)"|([A-Za-z0-9_.-]+))'
+)
+STAGE_LABELS = {
+    "planner_eligibility",
+    "peer_signal_received",
+    "peer_signal_admission",
+    "owner_admission",
+    "local_measurement",
+    "session_registration",
+    "offer_api_dispatch",
+    "offer_http_attempt",
+    "signal_persisted",
+    "reciprocal_response_admission",
+    "rendezvous_schedule",
+}
+STAGE_REASONS = {
+    "owner_claimed",
+    "signal_received",
+    "malformed_envelope",
+    "awaiting_peer_signal",
+    "peer_session_unavailable",
+    "existing_owner",
+    "plan_unavailable",
+    "plan_available",
+    "boot_epoch_unavailable",
+    "stun_observers_insufficient",
+    "recovery_admission_rejected",
+    "generation_quota_exhausted",
+    "claim_rejected",
+    "claim_deferred",
+    "started",
+    "completed",
+    "measurement_rejected",
+    "generation_or_profile_fence",
+    "peer_missing",
+    "profile_missing",
+    "profile_expired",
+    "profile_generation_missing",
+    "profile_generation_mismatch",
+    "invalid_role",
+    "invalid_prediction",
+    "missing_fresh_prediction",
+    "fresh_label_missing",
+    "fresh_label_malformed",
+    "fresh_labels_conflicting",
+    "fresh_sender_identity_stale",
+    "fresh_prediction_stale",
+    "fresh_payload_mismatch",
+    "fresh_candidate_set_rejected",
+    "fresh_prediction_superseded",
+    "fresh_snapshot_unavailable",
+    "fresh_admission_contended",
+    "missing_punch_deadline",
+    "offer_window_too_late",
+    "offer_window_expired",
+    "deadline_expired",
+    "transport_unavailable",
+    "signal_context_unavailable",
+    "registered",
+    "registration_rejected",
+    "submit_started",
+    "api_returned_ok",
+    "api_returned_error",
+    "cancelled_before_submit",
+    "session_changed_before_submit",
+    "recovery_quota_rejected",
+    "scheduled",
+    "response_admitted",
+    "response_already_sweeping",
+    "response_fenced",
+    "database_inserted",
+    "enqueued",
+    "queue_full",
+    "channel_closed",
+    "request_started",
+}
+STAGE_TAG = re.compile(r"^[0-9a-f]{16}$")
 
 
 @dataclass(frozen=True)
@@ -112,10 +203,31 @@ SCENARIOS = (
         },
     ),
     Scenario(
+        "loss-only",
+        42101,
+        "delivery",
+        "Seeded loss on inbound peer UDP admitted by simulated public mappings; not STUN observer replies, Control, or TCP Relay.",
+        env={"LOSS": "0.08"},
+    ),
+    Scenario(
+        "reorder-only",
+        42111,
+        "delivery",
+        "Seeded 20ms delay on a subset of inbound peer UDP admitted by simulated public mappings; packet order is not measured, and STUN observer replies, Control, and TCP Relay are outside this hook.",
+        env={"REORDER": "1"},
+    ),
+    Scenario(
+        "duplicate-only",
+        42121,
+        "delivery",
+        "Deterministic duplication on inbound peer UDP admitted by simulated public mappings; not STUN observer replies, Control, or TCP Relay.",
+        env={"DUPLICATE_RATE": "1.0", "ALLOW_REPLAY_REJECTS": "1"},
+    ),
+    Scenario(
         "loss-reorder-duplicate",
         42071,
         "delivery",
-        "Seeded packet loss and reordering with bounded deterministic duplication.",
+        "Seeded loss, subset-specific 20ms delay, and deterministic duplication on inbound peer UDP admitted by simulated public mappings; packet order is not measured, and STUN observer replies, Control, and TCP Relay are outside this hook.",
         env={
             "LOSS": "0.08",
             "REORDER": "1",
@@ -124,6 +236,13 @@ SCENARIOS = (
             "DUPLICATE_RATE": "1.0",
             "ALLOW_REPLAY_REJECTS": "1",
         },
+    ),
+    Scenario(
+        "offer-dispatch-delay",
+        42131,
+        "signaling-delay",
+        "Hold only node A's Hard-Hard offer before its existing signaling API call; no NAT UDP fault injection.",
+        env={"SIGNAL_DELAY_A_MS": "400", "SIGNAL_DELAY_B_MS": "0"},
     ),
     Scenario(
         "random-high-entropy-negative",
@@ -640,8 +759,8 @@ def validate_round(
     required_files = (
         "node-a.status.json",
         "node-b.status.json",
-        "node-a.log",
-        "node-b.log",
+    "node-a.log",
+    "node-b.log",
         "nat-evidence.json",
         "nat-trace.jsonl",
         "cleanup.json",
@@ -680,6 +799,7 @@ def validate_round(
     validate_shared_plan_pair(attempts_a, attempts_b)
     attempts = [dict(side="a", **report) for report in attempts_a]
     attempts.extend(dict(side="b", **report) for report in attempts_b)
+    a0_stage_evidence = extract_a0_stage_evidence(round_dir)
     if first_a["path"] == "direct":
         for side, side_attempts in (("a", attempts_a), ("b", attempts_b)):
             successful = [attempt for attempt in side_attempts if attempt["direct_confirmed"]]
@@ -709,6 +829,9 @@ def validate_round(
         first_a["within_direct_first_protection"] is True
         and first_b["within_direct_first_protection"] is True
     )
+    raw_files = {name: str(round_dir / name) for name in required_files}
+    if (round_dir / "server.log").is_file():
+        raw_files["server.log"] = str(round_dir / "server.log")
     return {
         "round": round_number,
         "seed": seed,
@@ -728,7 +851,95 @@ def validate_round(
             "all_reaped": True,
         },
         "attempts": attempts,
-        "raw": {name: str(round_dir / name) for name in required_files},
+        "a0_stage_evidence": a0_stage_evidence,
+        "raw": raw_files,
+    }
+
+
+def extract_a0_stage_evidence(round_dir: Path) -> dict[str, Any]:
+    """Extract only fixed A0 fields from node/server logs; never copy raw lines."""
+    sides: dict[str, Any] = {}
+    missing_sources: list[str] = []
+    malformed_records = 0
+    truncated = False
+    total_records = 0
+    for side in ("a", "b", "server"):
+        path = round_dir / ("server.log" if side == "server" else f"node-{side}.log")
+        records: list[dict[str, Any]] = []
+        if not path.is_file():
+            missing_sources.append(side)
+            sides[side] = {"log_present": False, "record_count": 0, "records": []}
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as log:
+                side_total_records = 0
+                for line_number, line in enumerate(log, start=1):
+                    if STAGE_EVENT_MARKER.search(line) is None:
+                        continue
+                    fields = {
+                        key: quoted if quoted else plain
+                        for key, quoted, plain in STAGE_FIELD_PATTERN.findall(line)
+                    }
+                    role = fields.get("role")
+                    session_tag = fields.get("session_tag")
+                    plan_tag = fields.get("plan_tag")
+                    identity_scope = fields.get("identity_scope")
+                    stage = fields.get("stage")
+                    reason_code = fields.get("reason_code")
+                    valid = (
+                        role in {"initiator", "responder", "unclassified"}
+                        and identity_scope in {"local_pre_session", "shared_session"}
+                        and stage in STAGE_LABELS
+                        and reason_code in STAGE_REASONS
+                        and (
+                            (identity_scope == "local_pre_session" and session_tag == "none" and plan_tag == "none")
+                            or (
+                                identity_scope == "shared_session"
+                                and isinstance(session_tag, str)
+                                and STAGE_TAG.fullmatch(session_tag) is not None
+                                and isinstance(plan_tag, str)
+                                and STAGE_TAG.fullmatch(plan_tag) is not None
+                            )
+                        )
+                    )
+                    if not valid:
+                        malformed_records += 1
+                        continue
+                    total_records += 1
+                    side_total_records += 1
+                    if len(records) < MAX_A0_STAGE_EVENTS_PER_SIDE:
+                        records.append(
+                            {
+                                "log_line": line_number,
+                                "role": role,
+                                "identity_scope": identity_scope,
+                                "session_tag": session_tag,
+                                "plan_tag": plan_tag,
+                                "stage": stage,
+                                "reason_code": reason_code,
+                            }
+                        )
+                    else:
+                        truncated = True
+        except OSError:
+            missing_sources.append(side)
+            sides[side] = {"log_present": False, "record_count": 0, "records": []}
+            continue
+        if not records:
+            missing_sources.append(side)
+        sides[side] = {
+            "log_present": True,
+            "record_count": side_total_records,
+            "records": records,
+        }
+    return {
+        "schema_version": A0_STAGE_SCHEMA_VERSION,
+        "record_count": total_records,
+        "malformed_records": malformed_records,
+        "truncated": truncated,
+        "missing_sources": missing_sources,
+        "sides": sides,
+        "interpretation": "stage order is local to each log source; session and plan tags are the cross-source grouping keys",
     }
 
 
@@ -837,6 +1048,227 @@ def extract_partial_attempt_reports(
         if found == 0:
             errors.append(f"{side}_attempt_report_missing")
     return attempts, errors
+
+
+def extract_duplicate_fault_evidence(
+    round_dir: Path,
+    scenario: Scenario,
+    source_sha: str,
+    seed: int,
+) -> dict[str, Any]:
+    """Classify injection and transport replay evidence without changing the round verdict."""
+    duplicate_requested = float(scenario.env.get("DUPLICATE_RATE", "0")) > 0
+    reorder_requested = float(scenario.env.get("REORDER", "0")) > 0
+    loss_requested = float(scenario.env.get("LOSS", "0")) > 0
+    injection_requested = duplicate_requested or reorder_requested or loss_requested
+    duplicate_event_count = 0
+    target_duplicate_count = 0
+    reorder_delay_event_count = 0
+    target_reorder_delay_count = 0
+    loss_drop_event_count = 0
+    target_loss_drop_count = 0
+    target_identities: set[tuple[str, int, int]] = set()
+    delivery_copies: dict[tuple[str, int, int], set[int]] = {}
+    malformed_trace_rows = 0
+    trace_path = round_dir / "nat-trace.jsonl"
+    try:
+        with trace_path.open(encoding="utf-8") as trace:
+            for line in trace:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    malformed_trace_rows += 1
+                    continue
+                if not isinstance(row, dict):
+                    malformed_trace_rows += 1
+                    continue
+                event = row.get("event")
+                fp = row.get("wire_fp")
+                counter = row.get("wireguard_counter")
+                receiver_index = row.get("receiver_index")
+                valid_identity = (
+                    row.get("payload_class") == "wireguard_transport_v1"
+                    and isinstance(fp, str)
+                    and re.fullmatch(r"[0-9a-f]{16}", fp)
+                    and type(counter) is int
+                    and counter >= 0
+                    and type(receiver_index) is int
+                    and receiver_index >= 0
+                )
+                if event == "packet_duplicated":
+                    duplicate_event_count += 1
+                    if valid_identity:
+                        identity = (fp, counter, receiver_index)
+                        target_duplicate_count += 1
+                        if len(target_identities) < 128:
+                            target_identities.add(identity)
+                elif event == "packet_delayed":
+                    if row.get("reorder_delay_injected") is True:
+                        reorder_delay_event_count += 1
+                        if valid_identity:
+                            target_reorder_delay_count += 1
+                            if len(target_identities) < 128:
+                                target_identities.add((fp, counter, receiver_index))
+                elif event == "packet_dropped_loss":
+                    loss_drop_event_count += 1
+                    if valid_identity:
+                        target_loss_drop_count += 1
+                        if len(target_identities) < 128:
+                            target_identities.add((fp, counter, receiver_index))
+                elif event == "simulator_delivery":
+                    copy_index = row.get("duplicate_copy")
+                    if (
+                        valid_identity
+                        and type(copy_index) is int
+                        and copy_index in (0, 1)
+                    ):
+                        identity = (fp, counter, receiver_index)
+                        if identity in target_identities or len(target_identities) < 128:
+                            target_identities.add(identity)
+                            delivery_copies.setdefault(identity, set()).add(copy_index)
+    except OSError:
+        trace_path_present = False
+    else:
+        trace_path_present = True
+
+    boundary_arrivals: dict[tuple[str, int, int], int] = {}
+    decrypt_successes: dict[tuple[str, int, int], list[int | None]] = {}
+    replay_rejections: dict[tuple[str, int, int], list[int | None]] = {}
+
+    def parse_optional_field(line: str, name: str) -> int | None:
+        match = re.search(rf"\b{name}=(?:Some\()?([0-9]+)", line)
+        return int(match.group(1)) if match else None
+
+    for side in ("a", "b"):
+        log_path = round_dir / f"node-{side}.log"
+        try:
+            source = log_path.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with source:
+            for line in source:
+                event_match = EVENT_FIELD.search(line)
+                event = (event_match.group(1) or event_match.group(2)) if event_match else None
+                if event not in {
+                    "wireguard_inbound_envelope_received",
+                    "wireguard_inbound_decrypt_succeeded",
+                    "hedge_duplicate_replay",
+                }:
+                    continue
+                fp_match = WIRE_FP_FIELD.search(line)
+                counter = parse_optional_field(
+                    line,
+                    "wireguard_counter" if event == "hedge_duplicate_replay" else "counter",
+                )
+                if fp_match is None or counter is None:
+                    continue
+                receiver_index = parse_optional_field(line, "receiver_index")
+                if receiver_index is None:
+                    continue
+                identity = (fp_match.group(1), counter, receiver_index)
+                if identity not in target_identities:
+                    continue
+                session_instance = parse_optional_field(line, "session_instance")
+                if event == "wireguard_inbound_envelope_received":
+                    boundary_arrivals[identity] = boundary_arrivals.get(identity, 0) + 1
+                elif event == "wireguard_inbound_decrypt_succeeded":
+                    decrypt_successes.setdefault(identity, []).append(session_instance)
+                else:
+                    replay_rejections.setdefault(identity, []).append(session_instance)
+
+    replay_chain_complete: list[tuple[str, int, int]] = []
+    for identity in target_identities:
+        success = decrypt_successes.get(identity, [])
+        replay = replay_rejections.get(identity, [])
+        sessions = {session for session in success + replay if session is not None}
+        if (
+            delivery_copies.get(identity) == {0, 1}
+            and boundary_arrivals.get(identity, 0) >= 2
+            and len(success) == 1
+            and len(replay) == 1
+            and len(success + replay) == 2
+            and len(sessions) == 1
+        ):
+            replay_chain_complete.append(identity)
+
+    stage_validity = "not_requested"
+    if duplicate_requested:
+        if not trace_path_present or malformed_trace_rows:
+            stage_validity = "injection_trace_incomplete"
+        elif duplicate_event_count == 0:
+            stage_validity = "injection_insufficient"
+        elif target_duplicate_count == 0:
+            stage_validity = "injection_missed_wireguard_transport"
+        elif not target_identities or not delivery_copies:
+            stage_validity = "simulator_delivery_incomplete"
+        elif not boundary_arrivals:
+            stage_validity = "daemon_boundary_missing"
+        elif not decrypt_successes:
+            stage_validity = "decrypt_success_missing"
+        elif not replay_rejections:
+            stage_validity = "replay_rejection_missing"
+        elif not replay_chain_complete:
+            stage_validity = "receiver_or_session_identity_incomplete"
+        else:
+            stage_validity = "transport_replay_chain_complete"
+    elif injection_requested:
+        stage_validity = (
+            "injection_trace_incomplete"
+            if not trace_path_present or malformed_trace_rows
+            else "not_applicable_no_duplicate_requested"
+        )
+
+    reorder_status = "not_requested"
+    if reorder_requested:
+        if not trace_path_present or malformed_trace_rows:
+            reorder_status = "injection_trace_incomplete"
+        elif reorder_delay_event_count == 0:
+            reorder_status = "reorder_delay_not_observed"
+        elif target_reorder_delay_count == 0:
+            reorder_status = "reorder_delay_missed_wireguard_transport"
+        else:
+            reorder_status = "wireguard_transport_delay_injected_no_order_claim"
+
+    identity_tags = [
+        hashlib.sha256(
+            f"p2wlan-duplicate-scope-v1:{source_sha}:{scenario.name}:{seed}:{fp}:{counter}:{receiver_index}".encode()
+        ).hexdigest()[:16]
+        for fp, counter, receiver_index in sorted(replay_chain_complete)[:16]
+    ]
+    return {
+        "schema_version": 1,
+        "fault_injection_requested": injection_requested,
+        "duplicate_injection_requested": duplicate_requested,
+        "reorder_injection_requested": reorder_requested,
+        "loss_injection_requested": loss_requested,
+        "simulator_target_protocol_layer_hit": bool(
+            target_duplicate_count or target_reorder_delay_count or target_loss_drop_count
+        ),
+        "target_protocol_layer_hit": bool(boundary_arrivals),
+        "nat_sim_duplicate_events": duplicate_event_count,
+        "wireguard_transport_duplicate_events": target_duplicate_count,
+        "nat_sim_reorder_delay_events": reorder_delay_event_count,
+        "wireguard_transport_reorder_delay_events": target_reorder_delay_count,
+        "nat_sim_loss_drop_events": loss_drop_event_count,
+        "wireguard_transport_loss_drop_events": target_loss_drop_count,
+        "reorder_stage_evidence_validity": reorder_status,
+        "actual_packet_order_evidence": "not_recorded_by_nat_sim_trace",
+        "wireguard_identity_count": len(target_identities),
+        "simulator_delivery_identity_count": len(delivery_copies),
+        "daemon_decrypt_boundary_arrivals": sum(boundary_arrivals.values()),
+        "daemon_authenticated_decrypt_successes": sum(
+            len(items) for items in decrypt_successes.values()
+        ),
+        "daemon_replay_rejections": sum(len(items) for items in replay_rejections.values()),
+        "transport_replay_chain_complete_identities": len(replay_chain_complete),
+        "complete_identity_scope_tags": identity_tags,
+        "application_delivery_count": None,
+        "application_delivery_evidence": "not_exported_by_matrix_daemon_logs",
+        "local_stage_evidence_validity": stage_validity,
+        "trace_malformed_rows": malformed_trace_rows,
+        "legacy_round_verdict": None,
+        "end_to_end_result": None,
+    }
 
 
 def cost_summary(
@@ -965,6 +1397,69 @@ def aggregate_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
         execution_results[label] = execution_results.get(label, 0) + 1
     all_requested_costs = cost_summary(rounds, attempts)
     valid_only_costs = cost_summary(valid, valid_attempts)
+    stage_reason_counts: dict[str, int] = {}
+    missing_stage_source_rounds = {"a": 0, "b": 0, "server": 0}
+    shared_identity_roles: dict[tuple[str, str], set[str]] = {}
+    stage_record_count = 0
+    stage_rounds_with_records = 0
+    stage_malformed_records = 0
+    stage_truncated_rounds = 0
+    local_pre_session_records = 0
+    for item in rounds:
+        evidence = item.get("a0_stage_evidence")
+        if not isinstance(evidence, dict):
+            continue
+        if evidence.get("record_count", 0):
+            stage_rounds_with_records += 1
+        stage_record_count += evidence.get("record_count", 0)
+        stage_malformed_records += evidence.get("malformed_records", 0)
+        stage_truncated_rounds += int(evidence.get("truncated") is True)
+        for source in evidence.get("missing_sources", []):
+            if source in missing_stage_source_rounds:
+                missing_stage_source_rounds[source] += 1
+        sides = evidence.get("sides", {})
+        for side in ("a", "b", "server"):
+            side_record = sides.get(side, {}) if isinstance(sides, dict) else {}
+            for event in side_record.get("records", []) if isinstance(side_record, dict) else []:
+                role = event.get("role")
+                stage = event.get("stage")
+                reason = event.get("reason_code")
+                key = f"{role}:{stage}:{reason}"
+                stage_reason_counts[key] = stage_reason_counts.get(key, 0) + 1
+                if event.get("identity_scope") == "local_pre_session":
+                    local_pre_session_records += 1
+                elif event.get("identity_scope") == "shared_session":
+                    identity = (event.get("session_tag"), event.get("plan_tag"))
+                    if all(isinstance(part, str) for part in identity):
+                        shared_identity_roles.setdefault(identity, set()).add(role)
+    paired_shared_stage_identities = sum(
+        roles == {"initiator", "responder"}
+        for roles in shared_identity_roles.values()
+    )
+    unpaired_shared_stage_identities = sum(
+        roles != {"initiator", "responder"}
+        for roles in shared_identity_roles.values()
+    )
+    duplicate_evidence_records = [
+        item.get("duplicate_fault_evidence")
+        for item in rounds
+        if isinstance(item.get("duplicate_fault_evidence"), dict)
+    ]
+    duplicate_stage_counts: dict[str, int] = {}
+    reorder_stage_counts: dict[str, int] = {}
+    for evidence in duplicate_evidence_records:
+        duplicate_stage = str(evidence.get("local_stage_evidence_validity", "unknown"))
+        duplicate_stage_counts[duplicate_stage] = duplicate_stage_counts.get(duplicate_stage, 0) + 1
+        reorder_stage = str(evidence.get("reorder_stage_evidence_validity", "unknown"))
+        reorder_stage_counts[reorder_stage] = reorder_stage_counts.get(reorder_stage, 0) + 1
+    preserved_end_to_end_results = all(
+        isinstance(evidence.get("end_to_end_result"), dict)
+        and evidence["end_to_end_result"].get("round_result") == item.get("result")
+        and evidence.get("legacy_round_verdict") == item.get("result")
+        for item in rounds
+        for evidence in [item.get("duplicate_fault_evidence")]
+        if isinstance(evidence, dict)
+    )
     return {
         "requested": {
             "scenario_runs": len(runs),
@@ -983,6 +1478,29 @@ def aggregate_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
                 "invalid_or_missing_evidence": len(rounds) - len(valid),
             },
         },
+        "duplicate_fault_evidence": {
+            "schema_version": 1,
+            "rounds_with_evidence": len(duplicate_evidence_records),
+            "fault_injection_requested_rounds": sum(
+                evidence.get("fault_injection_requested") is True
+                for evidence in duplicate_evidence_records
+            ),
+            "simulator_target_layer_hit_rounds": sum(
+                evidence.get("simulator_target_protocol_layer_hit") is True
+                for evidence in duplicate_evidence_records
+            ),
+            "daemon_decrypt_boundary_hit_rounds": sum(
+                evidence.get("target_protocol_layer_hit") is True
+                for evidence in duplicate_evidence_records
+            ),
+            "complete_transport_replay_identities": sum(
+                int(evidence.get("transport_replay_chain_complete_identities", 0))
+                for evidence in duplicate_evidence_records
+            ),
+            "local_stage_evidence_validity_counts": duplicate_stage_counts,
+            "reorder_stage_evidence_validity_counts": reorder_stage_counts,
+            "existing_end_to_end_verdicts_preserved": preserved_end_to_end_results,
+        },
         "requested_rounds": len(rounds),
         "valid_rounds": len(valid),
         "invalid_rounds": len(rounds) - len(valid),
@@ -998,6 +1516,19 @@ def aggregate_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "paired_shared_plan_samples": all_requested_costs["paired_shared_plan_samples"],
         "attempt_failure_classes": failures,
         "attempt_terminal_reasons": terminal_reasons,
+        "a0_stage_evidence": {
+            "schema_version": A0_STAGE_SCHEMA_VERSION,
+            "rounds_with_records": stage_rounds_with_records,
+            "record_count": stage_record_count,
+            "record_limit_per_side_per_round": MAX_A0_STAGE_EVENTS_PER_SIDE,
+            "malformed_records": stage_malformed_records,
+            "truncated_rounds": stage_truncated_rounds,
+            "missing_source_rounds": missing_stage_source_rounds,
+            "local_pre_session_records": local_pre_session_records,
+            "paired_shared_session_plan_identities": paired_shared_stage_identities,
+            "unpaired_shared_session_plan_identities": unpaired_shared_stage_identities,
+            "role_stage_reason_counts": stage_reason_counts,
+        },
         "attempt_timeline_ms": {
             "measurement_age_at_send": distribution(
                 timeline_values("measurement_age_at_send_ms", valid_attempts)
@@ -1086,9 +1617,57 @@ def execute_scenario(
     stdout_path = output / "runner-logs" / f"{scenario.name}.stdout.log"
     stderr_path = output / "runner-logs" / f"{scenario.name}.stderr.log"
     env = os.environ.copy()
+    dynamic_ports = ("PORT", "RELAY_PORT", "RELAY_METRICS_PORT", "DIAG_A_PORT", "DIAG_B_PORT")
+    for dynamic_port in dynamic_ports:
+        env.pop(dynamic_port, None)
     selected_env = {
+        # Pin every traversal/fault input used by this matrix so inherited
+        # shell settings cannot contaminate an isolated A0 scenario.
         "MODE": "hard-hard",
         "ROUNDS": str(rounds),
+        "NETWORK_ID": "default",
+        "RELAY_COUNT": "1",
+        "STEP_A": "1",
+        "STEP_B": "1",
+        "BASE_A": "16000",
+        "BASE_B": "26000",
+        "CONSUME_A": "0",
+        "CONSUME_B": "0",
+        "STRICT_FILTERING": "0",
+        "STRICT_FILTERING_A": "0",
+        "STRICT_FILTERING_B": "0",
+        "MAPPING_MODE_A": "step",
+        "MAPPING_MODE_B": "step",
+        "DELAY_A_MS": "0",
+        "DELAY_B_MS": "0",
+        "STUN_DELAY_A_MS": "0",
+        "STUN_DELAY_B_MS": "0",
+        "SIGNAL_DELAY_A_MS": "0",
+        "SIGNAL_DELAY_B_MS": "0",
+        "PREPARE_DELAY_A_MS": "0",
+        "PREPARE_DELAY_B_MS": "0",
+        "LOSS": "0",
+        "REORDER": "0",
+        "DUPLICATE_RATE": "0",
+        "ALLOW_REPLAY_REJECTS": "0",
+        "HARD_HARD_GATE_MAX_SKEW_MS": "250",
+        "UNASSIGNED_EGRESS_LISTENERS": "32",
+        "FRESH_MAPPING_PUNCH": "1",
+        "PREDICTED_CANDIDATES": "1",
+        "BIRTHDAY_PROBING": "1",
+        "SOCKET_POOL": "",
+        "DIRECT_TIMEOUT_S": "60",
+        "OVERLAY_TIMEOUT_S": "30",
+        "ROUND_TIMEOUT_S": "90",
+        "OVERLAY_BURST": "0",
+        "RELAY_DELAY_MS": "0",
+        "RELAY_KILL_RESTART": "0",
+        "RELAY_FAILOVER": "0",
+        "STATUS_FAILURE_INJECTION": "0",
+        "METRICS_FAILURE_INJECTION": "0",
+        "STATUS_SCHEMA_INJECTION": "0",
+        "P2WLAN_A0_SIGNAL_TRACE": "0",
+        "NAT_SIM_RUST_LOG": "info,p2pnet_daemon::diagnostics=debug,p2pnet_daemon::transport::inbound=debug,p2pnet_daemon::transport::sessions::decryption=debug",
         "NAT_SEED_BASE": str(scenario.seed - 1),
         "NAT_SIM_ARTIFACT_DIR": str(raw_dir),
         "NAT_SIM_RUN_ID": f"hard-hard-{scenario.name}",
@@ -1113,35 +1692,52 @@ def execute_scenario(
     errors: list[str] = []
     round_records: list[dict[str, Any]] = []
     for number in range(1, rounds + 1):
+        round_dir = raw_dir / f"round-{number}"
         try:
-            round_records.append(
-                validate_round(
-                    raw_dir / f"round-{number}",
-                    scenario,
-                    number,
-                    source_sha,
-                    baseline_sha,
-                )
+            round_record = validate_round(
+                round_dir,
+                scenario,
+                number,
+                source_sha,
+                baseline_sha,
             )
         except EvidenceError as exc:
             errors.append(f"round-{number}:{exc}")
             partial_attempts, partial_errors = extract_partial_attempt_reports(
-                raw_dir / f"round-{number}",
+                round_dir,
                 scenario,
                 scenario.seed + number - 1,
                 source_sha,
                 baseline_sha,
             )
-            round_records.append(
-                {
-                    "round": number,
-                    "seed": scenario.seed + number - 1,
-                    "result": "invalid",
-                    "reason": str(exc),
-                    "partial_attempts": partial_attempts,
-                    "partial_report_errors": partial_errors,
-                }
-            )
+            round_record = {
+                "round": number,
+                "seed": scenario.seed + number - 1,
+                "result": "invalid",
+                "reason": str(exc),
+                "partial_attempts": partial_attempts,
+                "partial_report_errors": partial_errors,
+                "a0_stage_evidence": extract_a0_stage_evidence(round_dir),
+            }
+        duplicate_evidence = extract_duplicate_fault_evidence(
+            round_dir,
+            scenario,
+            source_sha,
+            scenario.seed + number - 1,
+        )
+        duplicate_evidence["legacy_round_verdict"] = round_record["result"]
+        end_to_end = {
+            "round_result": round_record["result"],
+            "first_usable_path": round_record.get("first_usable_path"),
+            "direct_within_protection": round_record.get("direct_within_protection"),
+            "final_path_a": round_record.get("final_path_a"),
+            "final_path_b": round_record.get("final_path_b"),
+        }
+        if "reason" in round_record:
+            end_to_end["reason"] = round_record["reason"]
+        duplicate_evidence["end_to_end_result"] = end_to_end
+        round_record["duplicate_fault_evidence"] = duplicate_evidence
+        round_records.append(round_record)
     if completed.returncode != 0:
         errors.append(f"smoke_exit_code:{completed.returncode}")
     result = "pass" if not errors else "fail"
@@ -1182,6 +1778,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list", action="store_true", help="list fixed scenarios and exit")
     parser.add_argument("--scenario", action="append", choices=sorted(SCENARIO_BY_NAME))
     parser.add_argument("--rounds", type=int, default=1, help="rounds per scenario (default: 1)")
+    parser.add_argument(
+        "--target-seed",
+        type=int,
+        help="one pre-bounded diagnostic seed; requires one scenario, one round, and an approved seed",
+    )
     parser.add_argument("--output", type=Path, help="new absolute directory outside the repository")
     parser.add_argument("--source-sha", help="exact 40-character source commit (default: HEAD)")
     parser.add_argument("--baseline-sha", help="exact B1 baseline commit (default: merge-base with origin/main)")
@@ -1226,6 +1827,13 @@ def main(argv: list[str] | None = None) -> int:
     scenarios = resolve_scenarios(args.scenario)
     if args.rounds < 1:
         parser.error("--rounds must be positive")
+    if args.target_seed is not None:
+        if len(scenarios) != 1 or args.rounds != 1:
+            parser.error("--target-seed requires exactly one scenario and --rounds 1")
+        target = (scenarios[0].name, args.target_seed)
+        if target not in PREBOUNDED_TARGET_SEEDS:
+            parser.error("--target-seed is limited to the three pre-bounded A0 diagnostic seeds")
+        scenarios = [replace(scenarios[0], seed=args.target_seed)]
     if args.max_executions < 1 or args.max_executions > MAX_MATRIX_EXECUTIONS:
         parser.error(f"--max-executions must be between 1 and {MAX_MATRIX_EXECUTIONS}")
     execution_count = len(scenarios) * args.rounds
@@ -1236,10 +1844,19 @@ def main(argv: list[str] | None = None) -> int:
     if not SAFE_NAME.fullmatch(args.variant):
         parser.error("--variant must be a lowercase bounded label")
 
-    source_sha = args.source_sha or git_output(root, "rev-parse", "HEAD")
+    head_sha = git_output(root, "rev-parse", "HEAD")
+    source_sha = args.source_sha or head_sha
     baseline_sha = args.baseline_sha or git_output(root, "merge-base", "HEAD", "origin/main")
     if SHA1.fullmatch(source_sha) is None or SHA1.fullmatch(baseline_sha) is None:
         parser.error("source and baseline SHA values must be lowercase 40-character hex commits")
+    if source_sha != head_sha:
+        parser.error("--source-sha must match the checked-out HEAD commit")
+    try:
+        resolved_baseline_sha = git_output(root, "rev-parse", "--verify", f"{baseline_sha}^{{commit}}")
+    except subprocess.CalledProcessError:
+        parser.error("--baseline-sha must resolve to a locally available commit")
+    if resolved_baseline_sha != baseline_sha:
+        parser.error("--baseline-sha must be the canonical full commit SHA")
     smoke_script = (args.smoke_script or root / "scripts/nat-sim/nat-sim-smoke.sh").resolve()
     if not smoke_script.is_file() or not os.access(smoke_script, os.X_OK):
         parser.error(f"smoke script is not executable: {smoke_script}")
@@ -1251,6 +1868,7 @@ def main(argv: list[str] | None = None) -> int:
         "rounds_per_scenario": args.rounds,
         "execution_count": execution_count,
         "scenarios": [scenario.name for scenario in scenarios],
+        "first_seed_by_scenario": {scenario.name: scenario.seed for scenario in scenarios},
         "smoke_script": str(smoke_script),
     }
     if args.dry_run:
@@ -1292,6 +1910,9 @@ def main(argv: list[str] | None = None) -> int:
                 "hard_hard_punch_lead_ms": 3500,
                 "strategy_changed_by_observability": False,
                 "diagnostic_retries": 0,
+                "hard_hard_experiment_only": True,
+                "a0_stage_evidence_schema_version": A0_STAGE_SCHEMA_VERSION,
+                "a0_stage_identity": "hashed session_tag and plan_tag when the hh1 envelope exists; local_pre_session otherwise",
             },
             "environment": {
                 "python": platform.python_version(),

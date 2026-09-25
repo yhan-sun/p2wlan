@@ -637,35 +637,44 @@ fn fresh_prediction_from_sources_parses_incarnation_and_rejects_conflicts() {
         })
     };
     let mut sources = HashMap::new();
-    assert_eq!(fresh_prediction_from_sources(&sources), Ok(None));
+    assert_eq!(
+        fresh_prediction_from_sources(&sources),
+        FreshPredictionSources::None
+    );
 
     // Ordinary ICE gathering emits plain "predicted" labels: not a signal.
     sources.insert("203.0.113.10:40001".to_string(), "predicted".to_string());
-    assert_eq!(fresh_prediction_from_sources(&sources), Ok(None));
+    assert_eq!(
+        fresh_prediction_from_sources(&sources),
+        FreshPredictionSources::None
+    );
 
     // A genuinely fresh prediction carries incarnation + generation.
     sources.insert("203.0.113.10:40002".to_string(), label(39));
     assert_eq!(
         fresh_prediction_from_sources(&sources),
-        Ok(Some(FreshPredictionId {
+        FreshPredictionSources::Valid(FreshPredictionId {
             boot_epoch: boot,
             generation: 39,
-        }))
+        })
     );
 
     // A second identical label does not conflict.
     sources.insert("203.0.113.10:40003".to_string(), label(39));
     assert_eq!(
         fresh_prediction_from_sources(&sources),
-        Ok(Some(FreshPredictionId {
+        FreshPredictionSources::Valid(FreshPredictionId {
             boot_epoch: boot,
             generation: 39,
-        }))
+        })
     );
 
     // Two different valid labels are inconsistent: deterministic rejection.
     sources.insert("203.0.113.10:40004".to_string(), label(40));
-    assert_eq!(fresh_prediction_from_sources(&sources), Err(()));
+    assert_eq!(
+        fresh_prediction_from_sources(&sources),
+        FreshPredictionSources::Conflicting
+    );
 
     // Generation 0 is a legacy/unknown signal: degrade to ordinary and never
     // claim fresh priority.
@@ -674,20 +683,29 @@ fn fresh_prediction_from_sources_parses_incarnation_and_rejects_conflicts() {
         "203.0.113.10:40005".to_string(),
         format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}{boot}:0"),
     );
-    assert_eq!(fresh_prediction_from_sources(&zero_sources), Ok(None));
+    assert_eq!(
+        fresh_prediction_from_sources(&zero_sources),
+        FreshPredictionSources::Malformed
+    );
 
-    // Malformed labels are ignored (old single-number labels included).
+    // Malformed labels are distinguished from signals without a fresh label.
     let mut malformed = HashMap::new();
     malformed.insert(
         "203.0.113.10:40006".to_string(),
         format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}garbage"),
     );
-    assert_eq!(fresh_prediction_from_sources(&malformed), Ok(None));
+    assert_eq!(
+        fresh_prediction_from_sources(&malformed),
+        FreshPredictionSources::Malformed
+    );
     malformed.insert(
         "203.0.113.10:40007".to_string(),
         format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}39"),
     );
-    assert_eq!(fresh_prediction_from_sources(&malformed), Ok(None));
+    assert_eq!(
+        fresh_prediction_from_sources(&malformed),
+        FreshPredictionSources::Malformed
+    );
 
     // The canonical label round-trips and stays under the 64-byte wire bound.
     let canonical = fresh_prediction_source_label(FreshPredictionId {
@@ -2185,6 +2203,48 @@ async fn stale_fresh_signal_never_pollutes_candidate_set_end_to_end() {
         !conn.candidates.contains(&"198.51.100.9:44445".to_string())
             && !conn.candidates.contains(&"198.51.100.9:44446".to_string()),
         "inconsistent signal candidates must never be applied"
+    );
+
+    control
+        .event_sender()
+        .send(ControlEvent::PeerOffer {
+            from_node_id: "node-b".to_string(),
+            candidates: vec!["198.51.100.9:44447".to_string()],
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            candidate_sources: HashMap::from([(
+                "198.51.100.9:44447".to_string(),
+                format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}garbage"),
+            )]),
+            candidate_generation: 4,
+            candidates_expires_at_ms: None,
+            handshake_init: Vec::new(),
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            sender_public_key: None,
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if peers
+                .get_connection("node-b")
+                .await
+                .unwrap()
+                .direct_events
+                .iter()
+                .any(|event| event.stage == "fresh_prediction_label_malformed")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the malformed fresh label must be separately rejected");
+    let conn = peers.get_connection("node-b").await.unwrap();
+    assert!(
+        !conn.candidates.contains(&"198.51.100.9:44447".to_string()),
+        "a malformed fresh label must not apply its candidate payload"
     );
 
     handle.abort();

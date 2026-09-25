@@ -527,6 +527,229 @@ async fn remote_candidate_refresh_cancels_direct_validation_owner() {
 }
 
 #[tokio::test]
+async fn lost_validation_restarts_after_candidate_handover_with_relay_active() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers.add_peer(&peer("peer-b", "10.20.0.2", None)).await;
+    peers
+        .record_relay_success("peer-b", "relay.test:443", true)
+        .await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let first_endpoint: SocketAddr = "198.51.100.20:51820".parse().unwrap();
+    let next_endpoint: SocketAddr = "198.51.100.20:51821".parse().unwrap();
+    let reflexive_endpoint: SocketAddr = "198.51.100.20:51822".parse().unwrap();
+    assert!(matches!(
+        peers
+            .add_candidates_with_metadata(
+                "peer-b",
+                &[first_endpoint.to_string()],
+                &HashMap::new(),
+                10,
+                Some(u64::MAX),
+            )
+            .await,
+        crate::peer::CandidateSetApplyResult::Applied
+    ));
+    let deadline = peers
+        .try_next_direct_first_deadline()
+        .unwrap()
+        .expect("the DirectFirst window must have a fixed deadline");
+    assert_eq!(peers.try_advance_direct_first_deadlines_at(deadline), Ok(1));
+    assert_eq!(
+        peers.get_connection("peer-b").await.unwrap().state,
+        ConnectionState::Relay
+    );
+    let generation = peers.current_network_generation().await;
+    let session = peers.peer_session_generation_sync("peer-b").unwrap();
+    let first_epoch = peers
+        .current_remote_candidate_epoch("peer-b")
+        .await
+        .unwrap();
+    let first_owner = match udp
+        .begin_or_merge_direct_validation("peer-b", first_endpoint, generation)
+        .await
+    {
+        DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+        _ => panic!("first Direct request must own validation"),
+    };
+    let first_validation = DirectValidationIdentity::owned(
+        crate::peer::PathEpoch::new(generation, session, first_epoch),
+        first_owner,
+        Some(0x5101),
+        Some(first_endpoint),
+    );
+    assert!(
+        peers
+            .mark_direct_validation_started("peer-b", first_validation)
+            .await
+    );
+    assert!(
+        udp.expect_direct_validation_ack_owned_on_socket(
+            "peer-b",
+            0x5101,
+            generation,
+            first_owner,
+            first_endpoint,
+            Some(0),
+        )
+        .await
+    );
+    // No ACK for the first request. A newer candidate set cancels its UDP
+    // owner and must also retire the reducer's in-flight Direct identity.
+    assert!(matches!(
+        peers
+            .add_candidates_with_metadata(
+                "peer-b",
+                &[next_endpoint.to_string()],
+                &HashMap::new(),
+                11,
+                Some(u64::MAX),
+            )
+            .await,
+        crate::peer::CandidateSetApplyResult::Applied
+    ));
+    let new_epoch = peers
+        .current_remote_candidate_epoch("peer-b")
+        .await
+        .unwrap();
+    assert!(new_epoch > first_epoch);
+    assert!(udp.direct_validation_target("peer-b").await.is_none());
+    assert!(!udp.has_direct_validation_expectation("peer-b").await);
+    assert!(
+        !peers
+            .mark_direct_validation_started("peer-b", first_validation)
+            .await
+    );
+    assert_eq!(
+        peers.get_connection("peer-b").await.unwrap().state,
+        ConnectionState::Relay
+    );
+
+    let new_owner = match udp
+        .begin_or_merge_direct_validation("peer-b", next_endpoint, generation)
+        .await
+    {
+        DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+        _ => panic!("candidate handover must grant a replacement validation owner"),
+    };
+    let new_validation = DirectValidationIdentity::owned(
+        crate::peer::PathEpoch::new(generation, session, new_epoch),
+        new_owner,
+        Some(0x5102),
+        Some(next_endpoint),
+    );
+    assert!(
+        peers
+            .mark_direct_validation_started("peer-b", new_validation)
+            .await
+    );
+    assert!(
+        udp.expect_direct_validation_ack_owned_on_socket(
+            "peer-b",
+            0x5102,
+            generation,
+            new_owner,
+            next_endpoint,
+            Some(0),
+        )
+        .await
+    );
+    assert!(
+        peers
+            .learn_authenticated_endpoint("peer-b", reflexive_endpoint)
+            .await
+    );
+    assert!(udp
+        .consume_direct_validation_ack(
+            "peer-b",
+            0x5102,
+            generation,
+            new_owner,
+            generation,
+            reflexive_endpoint,
+            Some(1),
+            true,
+        )
+        .await
+        .is_err());
+    assert!(udp.has_direct_validation_expectation("peer-b").await);
+    assert!(udp
+        .consume_direct_validation_ack(
+            "peer-b",
+            0x5101,
+            generation,
+            first_owner,
+            generation,
+            first_endpoint,
+            Some(0),
+            true,
+        )
+        .await
+        .is_err());
+    assert!(
+        !peers
+            .mark_direct_validation_started(
+                "peer-b",
+                DirectValidationIdentity::owned(
+                    crate::peer::PathEpoch::new(
+                        generation,
+                        PeerSessionGeneration::for_test(session.value() + 1),
+                        new_epoch,
+                    ),
+                    new_owner,
+                    Some(0x5102),
+                    Some(next_endpoint),
+                ),
+            )
+            .await
+    );
+    let expectation = udp
+        .consume_direct_validation_ack(
+            "peer-b",
+            0x5102,
+            generation,
+            new_owner,
+            generation,
+            reflexive_endpoint,
+            Some(0),
+            true,
+        )
+        .await
+        .expect("authenticated ACK on the request socket must match the new owner");
+    let epoch_gate = peers.network_epoch_gate();
+    let epoch_guard = epoch_gate.lock().await;
+    assert!(peers
+        .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch_for_remote_epoch(
+            &epoch_guard,
+            "peer-b",
+            Some(reflexive_endpoint),
+            generation,
+            udp.local_addr().ok(),
+            None,
+            Some(expectation.remote_candidate_epoch),
+            Some(DirectValidationIdentity::authenticated_ack(
+                crate::peer::PathEpoch::new(
+                    expectation.generation,
+                    expectation.peer_session_generation,
+                    expectation.remote_candidate_epoch,
+                ),
+                expectation.owner_token,
+                expectation.request_id,
+                expectation.endpoint,
+                reflexive_endpoint,
+            )),
+        )
+        .await);
+    drop(epoch_guard);
+    let connection = peers.get_connection("peer-b").await.unwrap();
+    assert_eq!(connection.state, ConnectionState::Direct);
+    assert_eq!(connection.endpoint, Some(reflexive_endpoint));
+}
+
+#[tokio::test]
 async fn stale_udp_offline_and_key_change_cleanup_cancel_replacement_validation_owner() {
     // Offline and public-key-change events use the same lifecycle cleanup
     // with `remove_connection = false`. Exercise both after a rebind so the
