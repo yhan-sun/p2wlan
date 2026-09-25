@@ -140,7 +140,7 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
   const graph = new dagre.graphlib.Graph()
   graph.setDefaultEdgeLabel(() => ({}))
   graph.setGraph({ rankdir: 'LR', ranksep: 112, nodesep: 38, edgesep: 24, marginx: 56, marginy: 56 })
-  for (const node of visibleSourceNodes) graph.setNode(node.id, dimensions[node.kind])
+  for (const node of visibleSourceNodes) graph.setNode(node.id, { ...dimensions[node.kind] })
   for (const edge of visibleEdges) {
     if (edge.kind !== 'pending_signal') graph.setEdge(edge.source, edge.target)
   }
