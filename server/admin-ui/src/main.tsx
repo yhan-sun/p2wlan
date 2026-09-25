@@ -6,6 +6,7 @@ import './styles.css'
 import './polish.css'
 import './connections.css'
 import './connection-health.css'
+import './modern.css'
 import App from './App'
 
 const queryClient = new QueryClient({
