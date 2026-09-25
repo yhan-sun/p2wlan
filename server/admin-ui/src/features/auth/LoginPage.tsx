@@ -30,14 +30,14 @@ export function Login({ onSuccess }: { onSuccess: () => void }) {
 
   return <main className="login-page-v2">
     <section className="login-brand-side">
-      <div className="brand-lockup large"><div className="brand-symbol"><Waypoints size={22} /></div><div><strong>P2WLAN</strong><span>Control</span></div></div>
-      <div className="login-brand-copy"><span className="eyebrow-v2">SELF-HOSTED CONTROL PLANE</span><h1>资源关系和真实路径，<br />各自说清楚。</h1><p>Control 资源关系与 daemon 权威连接观测分开呈现，保持只读运维边界。</p></div>
+      <div className="brand-lockup large"><div className="brand-symbol"><Waypoints size={22} /></div><div><strong>P2WLAN</strong><span>控制平面</span></div></div>
+      <div className="login-brand-copy"><span className="eyebrow-v2">自托管控制平面</span><h1>资源关系和真实路径，<br />各自说清楚。</h1><p>Control 资源关系与 daemon 权威连接观测分开呈现，保持只读运维边界。</p></div>
       <div className="login-security"><ShieldCheck size={17} /><span>管理权限与用户 JWT / 设备凭据完全隔离</span></div>
     </section>
     <section className="login-form-side">
       <form className="login-card-v2" onSubmit={submit}>
-        <div className="mobile-brand"><div className="brand-symbol"><Waypoints size={20} /></div><strong>P2WLAN Control</strong></div>
-        <span className="eyebrow-v2">ADMIN CONSOLE</span>
+        <div className="mobile-brand"><div className="brand-symbol"><Waypoints size={20} /></div><strong>P2WLAN 控制台</strong></div>
+        <span className="eyebrow-v2">管理控制台</span>
         <h2>登录控制台</h2>
         <p>输入部署时配置的 <code>CONTROL_ADMIN_TOKEN</code>。</p>
         <label htmlFor="admin-token">管理员令牌</label>
