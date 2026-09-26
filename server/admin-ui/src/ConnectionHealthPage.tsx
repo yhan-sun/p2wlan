@@ -1,5 +1,8 @@
-import { type ReactNode, useMemo, useState } from 'react'
+import { tr } from './i18n'
+import { getLocale } from './i18n'
+import { type ReactNode, useMemo } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
+import { useSearchParams } from 'react-router-dom'
 import {
   Activity,
   AlertTriangle,
@@ -11,9 +14,13 @@ import {
   RadioTower,
   RefreshCw,
   Route,
+  X,
 } from 'lucide-react'
 import { adminApi } from './api'
 import { ConnectionDrawer } from './ConnectionsPage'
+import { ConnectionTrends } from './ConnectionTrends'
+import { QueryStatus, useAutoRefresh } from './refresh'
+import { clearHealthScope, readHealthSearch, selectHealthDirection, type HealthDirection } from './trends'
 import type { AdminConnectionHealthAlert } from './types'
 
 const HEALTH_ALERT_LIMIT = 100
@@ -27,17 +34,25 @@ const WINDOW_OPTIONS = [
 function formatAgo(unix?: number): string {
   if (!unix) return '—'
   const seconds = Math.max(0, Math.floor(Date.now() / 1000) - unix)
-  if (seconds < 45) return '刚刚'
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`
-  return `${Math.floor(seconds / 86400)} 天前`
+  const locale = getLocale()
+  if (seconds < 45) return tr('刚刚')
+  if (seconds < 3600) {
+    const count = Math.max(1, Math.floor(seconds / 60))
+    return locale === 'zh-CN' ? `${count} 分钟前` : `${count} min ago`
+  }
+  if (seconds < 86400) {
+    const count = Math.floor(seconds / 3600)
+    return locale === 'zh-CN' ? `${count} 小时前` : `${count} hr ago`
+  }
+  const count = Math.floor(seconds / 86400)
+  return locale === 'zh-CN' ? `${count} 天前` : `${count} days ago`
 }
 
 function pathLabel(path?: string | null): string {
-  if (!path) return 'None'
-  if (path === 'direct') return 'Direct'
-  if (path === 'relay') return 'Relay'
-  return path.replaceAll('_', ' ')
+  if (!path) return tr('None')
+  if (path === 'direct') return tr('Direct')
+  if (path === 'relay') return tr('Relay')
+  return tr(path.replaceAll('_', ' '))
 }
 
 function signalLabel(signal: string): string {
@@ -48,16 +63,16 @@ function signalLabel(signal: string): string {
     frequent_path_switching: '路径频繁切换',
     repeated_path_failures: '路径失败重复发生',
   }
-  return labels[signal] ?? signal.replaceAll('_', ' ')
+  return tr(labels[signal] ?? signal.replaceAll('_', ' '))
 }
 
 function LoadingBlock({ label = '加载中…' }: { label?: string }) {
-  return <div className="loading-block"><div className="spinner" />{label}</div>
+  return <div className="loading-block" role="status"><div className="spinner" />{tr(label)}</div>
 }
 
 function ErrorBlock({ error }: { error: unknown }) {
   const message = error instanceof Error ? error.message : '加载失败'
-  return <div className="error-block"><CircleAlert size={18} /><div><strong>无法加载数据</strong><span>{message}</span></div></div>
+  return <div className="error-block"><CircleAlert size={18} /><div><strong>{tr("无法加载数据")}</strong><span>{tr(message)}</span></div></div>
 }
 
 function HealthMetric({
@@ -99,10 +114,10 @@ function HealthAlertRow({
       {alert.signals.map((signal) => <span className={`health-signal-chip ${alert.severity === 'warning' ? 'warning' : ''}`} key={signal}>{signalLabel(signal)}</span>)}
     </span>
     <span className="health-alert-facts">
-      <span><strong>{pathLabel(alert.current_path)}</strong><small>{alert.freshness}</small></span>
-      <span><strong>{alert.recent_path_switches}</strong><small>切换</small></span>
-      <span><strong>{failureCount}</strong><small>失败</small></span>
-      <span><strong>{alert.last_validation_rtt_ms === undefined ? '—' : `${alert.last_validation_rtt_ms} ms`}</strong><small>验证 RTT</small></span>
+      <span><strong>{pathLabel(alert.current_path)}</strong><small>{tr(alert.freshness)}</small></span>
+      <span><strong>{alert.recent_path_switches}</strong><small>{tr("切换")}</small></span>
+      <span><strong>{failureCount}</strong><small>{tr("失败")}</small></span>
+      <span><strong>{alert.last_validation_rtt_ms === undefined ? '—' : `${alert.last_validation_rtt_ms} ms`}</strong><small>{tr("验证 RTT")}</small></span>
     </span>
     <span className="health-alert-tail">
       <strong>{alert.network_name}</strong>
@@ -112,17 +127,27 @@ function HealthAlertRow({
 }
 
 export function ConnectionHealthPage() {
-  const [networkId, setNetworkId] = useState('')
-  const [windowSeconds, setWindowSeconds] = useState<number>(3600)
-  const [selectedAlert, setSelectedAlert] = useState<AdminConnectionHealthAlert | null>(null)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const { networkId, accountId, deviceId, windowSeconds, trendHours, direction: selectedAlert } = readHealthSearch(searchParams)
+  const hasNarrowScope = Boolean(accountId || deviceId)
+  const refreshInterval = useAutoRefresh()
+  const selectedRefreshInterval = useAutoRefresh(10_000)
+  const setSelectedAlert = (direction: HealthDirection | null) => setSearchParams((current) => selectHealthDirection(current, direction))
+  const clearScope = (scope: 'account_id' | 'device_id' | 'all' = 'all') => setSearchParams((current) => clearHealthScope(current, scope))
+  const updateFilter = (name: string, value: string, clearSelection = false) => setSearchParams((current) => {
+    const next = clearSelection ? selectHealthDirection(current, null) : new URLSearchParams(current)
+    if (value) next.set(name, value)
+    else next.delete(name)
+    return next
+  })
 
   const networks = useInfiniteQuery({
     queryKey: ['health', 'networks'],
-    queryFn: ({ pageParam }) => adminApi.networks(100, pageParam),
+    queryFn: ({ pageParam, signal }) => adminApi.networks(100, pageParam, signal),
     initialPageParam: 0,
     getNextPageParam: (lastPage) => {
       const nextOffset = lastPage.offset + lastPage.items.length
-      return nextOffset < lastPage.total ? nextOffset : undefined
+      return lastPage.items.length > 0 && nextOffset < lastPage.total ? nextOffset : undefined
     },
     staleTime: 60_000,
   })
@@ -132,9 +157,9 @@ export function ConnectionHealthPage() {
   )
 
   const health = useQuery({
-    queryKey: ['connection-health', networkId, windowSeconds],
-    queryFn: () => adminApi.connectionHealth({ networkId, windowSeconds }, HEALTH_ALERT_LIMIT),
-    refetchInterval: 15_000,
+    queryKey: ['connection-health', networkId, windowSeconds, accountId, deviceId],
+    queryFn: ({ signal }) => adminApi.connectionHealth({ networkId, accountId, deviceId, windowSeconds }, HEALTH_ALERT_LIMIT, signal),
+    refetchInterval: refreshInterval,
   })
 
   const selectedConnection = useQuery({
@@ -144,113 +169,137 @@ export function ConnectionHealthPage() {
       selectedAlert?.reporting_device_id,
       selectedAlert?.remote_device_id,
     ],
-    queryFn: () => adminApi.connections({
+    queryFn: ({ signal }) => adminApi.connections({
       networkId: selectedAlert!.network_id,
       reportingDeviceId: selectedAlert!.reporting_device_id,
       remoteDeviceId: selectedAlert!.remote_device_id,
-    }, 1, 0),
+    }, 1, 0, signal),
     enabled: Boolean(selectedAlert),
-    refetchInterval: 10_000,
+    refetchInterval: selectedRefreshInterval,
   })
 
   const summary = health.data?.summary
   const thresholds = health.data?.thresholds
-  const selected = selectedConnection.data?.items[0]
+  const selected = selectedAlert ? selectedConnection.data?.items[0] : undefined
 
   return <div className="page-stack connection-health-page">
     <div className="page-intro connection-health-intro">
       <div>
-        <h2>Connection Health</h2>
-        <p>只读聚合 daemon 权威路径观测与受限迁移历史。这里没有综合健康分，Relay 本身也不会被判定为故障。</p>
+        <h2>{tr("Connection Health")}</h2>
+        <p>{tr("只读汇总由守护进程权威报告的路径观测和有上限的切换历史。这里不生成综合健康分，也不会把 Relay 路径本身判定为故障。")}</p>
       </div>
-      <div className="health-window-switch" role="group" aria-label="健康窗口">
+      <div className="health-window-switch" role="group" aria-label={tr("健康窗口")}>
         {WINDOW_OPTIONS.map((option) => <button
           key={option.value}
           className={windowSeconds === option.value ? 'active' : ''}
-          onClick={() => setWindowSeconds(option.value)}
+          aria-pressed={windowSeconds === option.value}
+          onClick={() => updateFilter('window_seconds', String(option.value), true)}
         >{option.label}</button>)}
       </div>
     </div>
 
     <div className="connections-toolbar health-toolbar">
-      <select className="select-field" value={networkId} onChange={(event) => setNetworkId(event.target.value)} aria-label="按网络过滤健康信号">
-        <option value="">全部网络</option>
+      <select className="select-field" value={networkId} onChange={(event) => updateFilter('network_id', event.target.value, true)} aria-label={tr("按网络过滤健康信号")}>
+        <option value="">{tr("全部网络")}</option>
+        {networkId && !networkItems.some((network) => network.id === networkId) && <option value={networkId}>{networkId}</option>}
         {networkItems.map((network) => <option key={network.id} value={network.id}>{network.name}</option>)}
       </select>
       {networks.hasNextPage && <button className="button secondary compact" onClick={() => networks.fetchNextPage()} disabled={networks.isFetchingNextPage}>
-        {networks.isFetchingNextPage ? '加载中…' : '加载更多网络'}
+        {networks.isFetchingNextPage ? tr('加载中…') : tr('加载更多网络')}
       </button>}
-      <span className="health-toolbar-note"><Clock3 size={14} />窗口内切换/失败统计来自每方向最多 50 条保留历史。</span>
+      <span className="health-toolbar-note"><Clock3 size={14} />{tr("窗口内切换/失败统计来自每方向最多 50 条保留历史。")}</span>
     </div>
+    {hasNarrowScope && <div className="health-scope-filters" aria-label={tr('当前筛选范围')}>
+      {accountId && <span className="health-scope-chip"><span>{tr('账号')}：<code>{accountId}</code></span><button type="button" aria-label={`${tr('清除账号范围')}: ${accountId}`} onClick={() => clearScope('account_id')}><X size={14} aria-hidden /></button></span>}
+      {deviceId && <span className="health-scope-chip"><span>{tr('设备')}：<code>{deviceId}</code></span><button type="button" aria-label={`${tr('清除设备范围')}: ${deviceId}`} onClick={() => clearScope('device_id')}><X size={14} aria-hidden /></button></span>}
+    </div>}
+    {(networks.error || networks.fetchStatus === 'paused') && <QueryStatus queries={[networks]} />}
+    <QueryStatus queries={[health]} />
 
-    {health.isPending ? <LoadingBlock label="正在聚合连接健康…" /> : health.error ? <ErrorBlock error={health.error} /> : health.data && summary ? <>
+    {!health.data && health.fetchStatus === 'paused' ? <ErrorBlock error={new Error('浏览器当前离线，无法访问控制面。网络恢复后会自动重新请求。')} /> : !health.data && health.isPending ? <LoadingBlock label={tr("正在聚合连接健康…")} /> : !health.data && health.error ? <ErrorBlock error={health.error} /> : health.data && summary ? <>
       <section className="connection-health-metrics">
         <HealthMetric
           icon={<AlertTriangle size={17} />}
-          label="Needs attention"
+          label={tr("Needs attention")}
           value={health.data.alerts_total}
-          meta={health.data.alerts_total > health.data.alerts.length ? `仅展示前 ${health.data.alerts.length} 条` : '当前派生信号'}
+          meta={health.data.alerts_total > health.data.alerts.length
+            ? getLocale() === 'zh-CN' ? `仅展示前 ${health.data.alerts.length} 条` : `Showing the first ${health.data.alerts.length}`
+            : tr('当前派生信号')}
         />
         <HealthMetric
           icon={<Activity size={17} />}
-          label="Fresh observations"
-          value={<>{summary.fresh_observations}/{summary.total_observations}</>}
-          meta={<>{summary.stale_observations} stale · {summary.reporter_offline_observations} reporter offline</>}
+          label={tr("Fresh observations")}
+          value={<>{summary.fresh_observations}{tr("/")}{summary.total_observations}</>}
+          meta={getLocale() === 'zh-CN'
+            ? <>{summary.stale_observations} 过期 · {summary.reporter_offline_observations} 上报端离线</>
+            : <>{summary.stale_observations} stale · {summary.reporter_offline_observations} reporter offline</>}
         />
         <HealthMetric
           icon={<Route size={17} />}
-          label="Fresh paths"
-          value={<>{summary.fresh_direct} / {summary.fresh_relay}</>}
-          meta={<>Direct / Relay · {summary.fresh_online_no_path} online no-path</>}
+          label={tr("Fresh paths")}
+          value={<>{summary.fresh_direct} {tr("/ ")}{summary.fresh_relay}</>}
+          meta={<>{tr("Direct / Relay · ")}{summary.fresh_online_no_path} {tr("在线但暂无路径")}</>}
         />
         <HealthMetric
           icon={<RefreshCw size={17} />}
-          label="Recent transitions"
+          label={tr("Recent transitions")}
           value={summary.recent_path_switches}
-          meta={<>{summary.recent_direct_failures + summary.recent_relay_failures} explicit path failures</>}
+          meta={<>{summary.recent_direct_failures + summary.recent_relay_failures} {tr("explicit path failures")}</>}
         />
         <HealthMetric
           icon={<Gauge size={17} />}
-          label="Validation RTT"
+          label={tr("Validation RTT")}
           value={summary.average_validation_rtt_ms === undefined ? '—' : `${summary.average_validation_rtt_ms} ms`}
-          meta={summary.validation_rtt_samples ? `${summary.validation_rtt_samples} samples · max ${summary.max_validation_rtt_ms ?? '—'} ms` : '没有 fresh validation sample'}
+          meta={summary.validation_rtt_samples
+            ? getLocale() === 'zh-CN'
+              ? `${summary.validation_rtt_samples} 个样本 · 最大 ${summary.max_validation_rtt_ms ?? '—'} ms`
+              : `${summary.validation_rtt_samples} samples · max ${summary.max_validation_rtt_ms ?? '—'} ms`
+            : tr('没有有效的 RTT 验证样本')}
         />
       </section>
 
       <section className="health-threshold-strip">
-        <div><RadioTower size={15} /><strong>显式阈值</strong></div>
-        <span>频繁切换 ≥ {thresholds?.frequent_path_switches ?? '—'}</span>
-        <span>重复路径失败 ≥ {thresholds?.repeated_path_failures ?? '—'}</span>
-        <span>history cap {health.data.history_limit_per_direction}/方向</span>
-        <span>生成于 {formatAgo(health.data.generated_at)}</span>
+        <div><RadioTower size={15} /><strong>{tr("显式阈值")}</strong></div>
+        <span>{tr("频繁切换 ≥ ")}{thresholds?.frequent_path_switches ?? '—'}</span>
+        <span>{tr("重复路径失败 ≥ ")}{thresholds?.repeated_path_failures ?? '—'}</span>
+        <span>{tr("每个方向最多保留 ")}{health.data.history_limit_per_direction}{tr(" 条切换记录")}</span>
+        <span>{tr("生成于 ")}{formatAgo(health.data.generated_at)}</span>
       </section>
 
       <section className="panel-v2 health-attention-panel">
         <header className="panel-v2-header">
-          <div><h2>Needs attention</h2><p>每一项都来自固定 signal；点击查看对应方向的当前 Connection 与切换历史。</p></div>
-          <span className={`badge ${health.data.alerts_total ? 'warning' : 'success'}`}><span />{health.data.alerts_total} 条</span>
+          <div><h2>{tr("Needs attention")}</h2><p>{tr("每项提醒都来自明确的信号；选择后可查看该方向的当前连接和切换历史。")}</p></div>
+          <span className={`badge ${health.data.alerts_total ? 'warning' : 'success'}`}><span />{health.data.alerts_total} {tr("条")}</span>
         </header>
         {health.data.alerts.length === 0
-          ? <div className="health-empty"><CircleCheck size={19} /><div><strong>当前窗口没有 attention signal</strong><span>稳定 Relay 不会被当成异常；此结果也不等于目标业务端口已经验证可达。</span></div></div>
+          ? <div className="health-empty"><CircleCheck size={19} /><div><strong>{tr("当前时间窗口没有待关注信号")}</strong><span>{tr("稳定的 Relay 路径不会被视为异常；此结果也不能证明目标业务端口已验证可达。")}</span></div></div>
           : <div className="health-alert-list">{health.data.alerts.map((alert) => <HealthAlertRow
             key={`${alert.network_id}:${alert.reporting_device_id}:${alert.remote_device_id}`}
             alert={alert}
             onSelect={setSelectedAlert}
           />)}</div>}
         {health.data.alerts_total > health.data.alerts.length && <div className="connection-partial-warning">
-          <CircleAlert size={15} />当前共有 {health.data.alerts_total} 条 attention connection，页面按 API 上界展示前 {health.data.alerts.length} 条；请使用 Network scope 收窄范围。
-        </div>}
+          <CircleAlert size={15} />{tr("当前共有 ")}{health.data.alerts_total} {tr("条待关注连接，页面按接口上限展示前 ")}{health.data.alerts.length} {tr("条；请缩小网络范围。")}</div>}
       </section>
 
       <div className="truth-notice health-truth-notice">
         <CircleAlert size={15} />
-        <span>Connection Health 是请求时派生视图，不会反写 daemon，也不是长期 SLA。验证 RTT 是已有 observation 的最近验证样本；最终业务可达性仍需虚拟 IP 流量验证。</span>
+        <span>{tr("连接健康是请求时生成的派生视图，不会回写守护进程，也不代表长期服务等级。验证 RTT 使用已有观测中的最近样本；仍需通过虚拟 IP 流量确认业务可达性。")}</span>
       </div>
-    </> : <ErrorBlock error={new Error('Control 未返回 Connection Health。')} />}
+    </> : <ErrorBlock error={new Error('控制面未返回连接健康数据。')} />}
 
-    {selectedAlert && selectedConnection.isPending && <div className="health-selection-loading"><div className="spinner" />正在打开 directional connection…</div>}
-    {selectedAlert && selectedConnection.error && <div className="health-selection-error"><CircleAlert size={15} />无法读取该连接的最新快照；它可能已被移除。</div>}
-    {selectedAlert && selectedConnection.data && selectedConnection.data.items.length === 0 && <div className="health-selection-error"><CircleAlert size={15} />该 directional observation 已不存在；刷新 Health 后会移除这条旧 attention item。</div>}
+    {hasNarrowScope ? <section className="panel-v2 health-trend-scope-notice">
+      <CircleAlert size={18} aria-hidden /><p>{tr('历史趋势仅支持按网络汇总；清除账号和设备范围后查看。')}</p>
+      <button type="button" className="button secondary compact" onClick={() => clearScope()}>{tr('清除账号和设备范围')}</button>
+    </section> : <ConnectionTrends networkId={networkId} windowHours={trendHours} onWindowChange={(hours) => updateFilter('window_hours', String(hours), true)} />}
+
+    {selectedAlert && !selected && <div className={`health-selection-${selectedConnection.error ? 'error' : 'loading'}`} role="status">
+      {selectedConnection.fetchStatus === 'paused' ? <span>{tr('浏览器当前离线，无法访问控制面。网络恢复后会自动重新请求。')}</span>
+        : selectedConnection.isPending ? <><div className="spinner" />{tr('正在打开单向连接…')}</>
+          : selectedConnection.error ? <><CircleAlert size={15} /><span>{tr('无法读取该连接的最新快照；它可能已被移除。')}</span><button type="button" className="button secondary compact" onClick={() => selectedConnection.refetch()}>{tr('重试')}</button></>
+            : <span>{tr('该方向的权威观测已不存在；刷新连接健康页面后会移除这条旧提醒。')}</span>}
+      <button type="button" className="button secondary compact" onClick={() => setSelectedAlert(null)}>{tr('关闭')}</button>
+    </div>}
     {selected && <ConnectionDrawer connection={selected} onClose={() => setSelectedAlert(null)} />}
   </div>
 }

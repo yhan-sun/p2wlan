@@ -289,7 +289,7 @@ func (db *DB) AdminAccount(accountID string) (*AdminAccountDetail, error) {
 	}
 
 	networkRows, err := db.Query(`SELECT
-		n.id, n.name, n.cidr,
+		n.id, n.name, n.cidr, n.owner_id,
 		COALESCE(NULLIF(owner.username, ''), owner.email),
 		(SELECT COUNT(*) FROM network_memberships m2 WHERE m2.network_id = n.id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id = n.id),
@@ -307,7 +307,7 @@ func (db *DB) AdminAccount(accountID string) (*AdminAccountDetail, error) {
 	for networkRows.Next() {
 		var item AdminNetworkSummary
 		var isRoom int
-		if err := networkRows.Scan(&item.ID, &item.Name, &item.CIDR, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &isRoom, &item.CreatedAt); err != nil {
+		if err := networkRows.Scan(&item.ID, &item.Name, &item.CIDR, &item.OwnerID, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &isRoom, &item.CreatedAt); err != nil {
 			networkRows.Close()
 			return nil, fmt.Errorf("scan admin account network: %w", err)
 		}
@@ -322,7 +322,7 @@ func (db *DB) AdminAccount(accountID string) (*AdminAccountDetail, error) {
 	}
 
 	roomRows, err := db.Query(`SELECT
-		r.network_id, r.room_code, n.name, n.cidr,
+		r.network_id, r.room_code, n.name, n.cidr, r.owner_id,
 		COALESCE(NULLIF(owner.username, ''), owner.email),
 		(SELECT COUNT(*) FROM network_memberships m2 WHERE m2.network_id = r.network_id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id),
@@ -340,7 +340,7 @@ func (db *DB) AdminAccount(accountID string) (*AdminAccountDetail, error) {
 	for roomRows.Next() {
 		var item AdminRoomSummary
 		var locked int
-		if err := roomRows.Scan(&item.ID, &item.Code, &item.Name, &item.CIDR, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &locked, &item.CreatedAt); err != nil {
+		if err := roomRows.Scan(&item.ID, &item.Code, &item.Name, &item.CIDR, &item.OwnerID, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &locked, &item.CreatedAt); err != nil {
 			roomRows.Close()
 			return nil, fmt.Errorf("scan admin account room: %w", err)
 		}

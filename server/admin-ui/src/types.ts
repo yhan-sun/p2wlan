@@ -21,6 +21,7 @@ export interface AdminRuntime {
 
 export interface AdminDevice {
   id: string
+  owner_id?: string
   username: string
   device_name: string
   platform: string
@@ -36,6 +37,7 @@ export interface AdminDevice {
 
 export interface AdminNetwork {
   id: string
+  owner_id?: string
   name: string
   cidr: string
   owner_username: string
@@ -48,6 +50,7 @@ export interface AdminNetwork {
 
 export interface AdminRoom {
   id: string
+  owner_id?: string
   code: string
   name: string
   cidr: string

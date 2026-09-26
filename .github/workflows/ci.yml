@@ -134,6 +134,9 @@ jobs:
       - name: Typecheck admin UI
         working-directory: server/admin-ui
         run: npm run typecheck
+      - name: Test admin UI contracts
+        working-directory: server/admin-ui
+        run: npm test
       - name: Build admin UI
         working-directory: server/admin-ui
         run: npm run build
@@ -143,9 +146,8 @@ jobs:
           name: admin-ui-build-${{ github.sha }}
           path: |
             server/admin-ui/package-lock.json
-            server/admin/web/index.html
-            server/admin/web/app.js
-            server/admin/web/app.css
+            server/admin/web/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
       - name: Verify embedded artifacts match the committed build
@@ -158,6 +160,13 @@ jobs:
           # failure leaves exact, reproducible diagnostics instead of forcing a
           # developer to recreate the runner locally.
           git diff --exit-code -- server/admin/web
+          # git diff omits untracked files; a new chunk must also be committed
+          # so local Go builds embed the same complete artifact set as CI.
+          if test -n "$(git ls-files --others -- server/admin/web)"; then
+            echo "Untracked admin UI build artifacts must be committed:" >&2
+            git ls-files --others -- server/admin/web
+            exit 1
+          fi
 
   repository_policy:
     name: Repository policy and security scan

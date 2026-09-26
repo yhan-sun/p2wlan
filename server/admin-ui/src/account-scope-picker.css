@@ -1,0 +1,20 @@
+.account-scope-picker { position: relative; min-width: 158px; }
+.account-scope-trigger { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; padding-right: 10px; text-align: left; }
+.account-scope-trigger > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.account-scope-trigger > svg { flex-shrink: 0; }
+.account-scope-panel { position: absolute; z-index: 50; top: calc(100% + 8px); right: 0; width: min(340px, calc(100vw - 32px)); padding: 12px; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--panel, #fff); color: var(--text); box-shadow: 0 12px 36px #10182826; }
+.account-scope-panel > header, .account-scope-panel > footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.account-scope-panel > header { margin-bottom: 10px; }
+.account-scope-panel > footer { padding-top: 10px; border-top: 1px solid var(--border); font-size: 12px; }
+.account-scope-panel > .search-field { width: 100%; margin-bottom: 8px; }
+.account-scope-option { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; padding: 9px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--text); text-align: left; }
+.account-scope-option:hover, .account-scope-option[aria-pressed='true'] { background: var(--surface-hover, #edf3ff); }
+.account-scope-option > span { min-width: 0; }
+.account-scope-option strong, .account-scope-option small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-scope-option small { margin-top: 3px; color: var(--text-2); }
+.account-scope-results { max-height: min(300px, 38vh); overflow-y: auto; margin: 6px 0 10px; }
+.account-scope-results > p, .account-scope-results > div { padding: 10px; color: var(--text-2); font-size: 12px; }
+:root[data-theme='dark'] .account-scope-panel { background: #111b2a; }
+:root[data-theme='dark'] .account-scope-option:hover, :root[data-theme='dark'] .account-scope-option[aria-pressed='true'] { background: #203a5e; }
+@media (max-width: 900px) { .account-scope-picker { flex: 1 1 150px; } }
+@media (max-width: 650px) { .account-scope-picker { width: 100%; flex: auto; } .account-scope-panel { width: 100%; } }

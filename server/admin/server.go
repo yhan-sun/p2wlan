@@ -29,6 +29,7 @@ type Store interface {
 	AdminTopology(accountID string) (*database.AdminTopology, error)
 	AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget int) (*database.AdminTopologyPage, error)
 	AdminDevices(query, status string, limit, offset int) (*database.AdminDevicePage, error)
+	AdminDevicesCursor(query, status, cursor string, limit int) (*database.AdminDeviceCursorPage, error)
 	AdminNetworks(limit, offset int) (*database.AdminNetworkPage, error)
 	AdminRooms(limit, offset int) (*database.AdminRoomPage, error)
 	AdminConnections(filter database.AdminConnectionFilter, limit, offset int) (*database.AdminConnectionPage, error)
@@ -104,6 +105,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/v1/accounts/{id}", s.requireAdmin(s.account))
 	mux.HandleFunc("GET /admin/api/v1/topology", s.requireAdmin(s.topology))
 	mux.HandleFunc("GET /admin/api/v1/devices", s.requireAdmin(s.devices))
+	mux.HandleFunc("GET /admin/api/v1/devices/cursor", s.requireAdmin(s.devicesCursor))
 	mux.HandleFunc("GET /admin/api/v1/networks", s.requireAdmin(s.networks))
 	mux.HandleFunc("GET /admin/api/v1/rooms", s.requireAdmin(s.rooms))
 	mux.HandleFunc("GET /admin/api/v1/connections", s.requireAdmin(s.connections))
@@ -133,17 +135,24 @@ func (s *Server) serveConsole(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
 	asset := strings.TrimPrefix(r.URL.Path, "/admin/")
-	switch asset {
-	case "", "index.html":
+	if asset == "" {
 		asset = "index.html"
-	case "app.css", "app.js":
-		// Static build artifacts are served as-is.
-	default:
+	} else if !fs.ValidPath(asset) {
+		http.NotFound(w, r)
+		return
+	} else if info, err := fs.Stat(embeddedWeb, "web/"+asset); err == nil {
+		// Serve every real build artifact, including lazy-loaded chunks. Never
+		// expose a directory listing or invent an asset from an SPA fallback.
+		if info.IsDir() {
+			http.NotFound(w, r)
+			return
+		}
+	} else {
 		// BrowserRouter uses clean paths such as /admin/accounts/:id. Any path
 		// without a file extension is an SPA route and must receive index.html so
 		// refresh/deep-link navigation works. Unknown asset-looking paths remain
 		// 404 instead of accidentally serving HTML as JavaScript or CSS.
-		if strings.Contains(asset, ".") {
+		if !errors.Is(err, fs.ErrNotExist) || strings.Contains(asset, ".") {
 			http.NotFound(w, r)
 			return
 		}
