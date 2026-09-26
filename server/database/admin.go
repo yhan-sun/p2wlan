@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -32,6 +31,7 @@ type AdminOverview struct {
 
 type AdminDeviceSummary struct {
 	ID          string `json:"id"`
+	OwnerID     string `json:"owner_id"`
 	Username    string `json:"username"`
 	DeviceName  string `json:"device_name"`
 	Platform    string `json:"platform"`
@@ -49,6 +49,7 @@ type AdminNetworkSummary struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	CIDR          string `json:"cidr"`
+	OwnerID       string `json:"owner_id"`
 	OwnerUsername string `json:"owner_username"`
 	MemberCount   int    `json:"member_count"`
 	DeviceCount   int    `json:"device_count"`
@@ -62,6 +63,7 @@ type AdminRoomSummary struct {
 	Code          string `json:"code"`
 	Name          string `json:"name"`
 	CIDR          string `json:"cidr"`
+	OwnerID       string `json:"owner_id"`
 	OwnerUsername string `json:"owner_username"`
 	MemberCount   int    `json:"member_count"`
 	DeviceCount   int    `json:"device_count"`
@@ -126,6 +128,7 @@ func adminDeviceOnline(online, lastSeen int64, cutoff int64) bool {
 
 func adminDeviceColumns() string {
 	return `d.id,
+		d.user_id,
 		COALESCE(NULLIF(u.username, ''), u.email),
 		d.device_name,
 		d.platform,
@@ -145,6 +148,7 @@ func scanAdminDevice(row interface{ Scan(...any) error }, cutoff int64) (AdminDe
 	var relayRTT sql.NullInt64
 	err := row.Scan(
 		&item.ID,
+		&item.OwnerID,
 		&item.Username,
 		&item.DeviceName,
 		&item.Platform,
@@ -230,30 +234,12 @@ func (db *DB) AdminOverviewSnapshot() (*AdminOverview, error) {
 // metadata.
 func (db *DB) AdminDevices(query, status string, limit, offset int) (*AdminDevicePage, error) {
 	limit, offset = normalizeAdminPage(limit, offset)
-	query = strings.TrimSpace(query)
-	status = strings.ToLower(strings.TrimSpace(status))
-
-	where := []string{"1 = 1"}
-	args := make([]any, 0, 8)
+	query, status, err := normalizeAdminDeviceFilter(query, status)
+	if err != nil {
+		return nil, err
+	}
 	cutoff := adminOnlineCutoff()
-	if query != "" {
-		where = append(where, `(d.device_name LIKE ? ESCAPE '!' OR COALESCE(NULLIF(u.username, ''), u.email) LIKE ? ESCAPE '!' OR d.virtual_ip LIKE ? ESCAPE '!' OR COALESCE(n.name, '') LIKE ? ESCAPE '!')`)
-		escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(query)
-		pattern := "%" + escaped + "%"
-		args = append(args, pattern, pattern, pattern, pattern)
-	}
-	switch status {
-	case "online":
-		where = append(where, adminOnlineLeaseSQL("d"))
-		args = append(args, cutoff)
-	case "offline":
-		where = append(where, "NOT "+adminOnlineLeaseSQL("d"))
-		args = append(args, cutoff)
-	case "", "all":
-	default:
-		return nil, ErrInvalidAdminDeviceStatus
-	}
-	clause := strings.Join(where, " AND ")
+	clause, args := adminDeviceFilterSQL(query, status, cutoff)
 
 	var total int
 	countArgs := append([]any(nil), args...)
@@ -303,6 +289,7 @@ func (db *DB) AdminNetworks(limit, offset int) (*AdminNetworkPage, error) {
 		n.id,
 		n.name,
 		n.cidr,
+		n.owner_id,
 		COALESCE(NULLIF(u.username, ''), u.email),
 		(SELECT COUNT(*) FROM network_memberships m WHERE m.network_id = n.id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id = n.id),
@@ -322,7 +309,7 @@ func (db *DB) AdminNetworks(limit, offset int) (*AdminNetworkPage, error) {
 	for rows.Next() {
 		var item AdminNetworkSummary
 		var isRoom int
-		if err := rows.Scan(&item.ID, &item.Name, &item.CIDR, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &isRoom, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.CIDR, &item.OwnerID, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &isRoom, &item.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan admin network: %w", err)
 		}
 		item.IsRoom = isRoom == 1
@@ -346,6 +333,7 @@ func (db *DB) AdminRooms(limit, offset int) (*AdminRoomPage, error) {
 		r.room_code,
 		n.name,
 		n.cidr,
+		r.owner_id,
 		COALESCE(NULLIF(u.username, ''), u.email),
 		(SELECT COUNT(*) FROM network_memberships m WHERE m.network_id = r.network_id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id),
@@ -365,7 +353,7 @@ func (db *DB) AdminRooms(limit, offset int) (*AdminRoomPage, error) {
 	for rows.Next() {
 		var item AdminRoomSummary
 		var joinLocked int
-		if err := rows.Scan(&item.ID, &item.Code, &item.Name, &item.CIDR, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &joinLocked, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Code, &item.Name, &item.CIDR, &item.OwnerID, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &joinLocked, &item.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan admin room: %w", err)
 		}
 		item.JoinLocked = joinLocked == 1

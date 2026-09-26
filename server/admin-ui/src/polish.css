@@ -40,7 +40,7 @@
   font-size: 27px;
 }
 
-.identity-cell strong,
+.identity-cell > div > strong,
 .primary-secondary strong,
 .ratio-cell strong,
 .recent-account-main strong,
@@ -48,7 +48,7 @@
   font-size: 12px;
 }
 
-.identity-cell span,
+.identity-cell > div > span,
 .primary-secondary span,
 .ratio-cell span,
 .recent-account-main span,
@@ -106,7 +106,7 @@
   position: absolute;
   z-index: 9;
   top: 12px;
-  right: 52px;
+  right: 12px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -128,6 +128,16 @@
   font-size: 10px;
   font-weight: 650;
   transition: border-color .14s ease, background .14s ease, color .14s ease, box-shadow .14s ease;
+}
+
+.topology-canvas-actions .topology-fullscreen-button {
+  position: static;
+  top: auto;
+  right: auto;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  border-radius: 8px;
 }
 
 .topology-filter-button:hover {
@@ -278,6 +288,10 @@
   .data-table th,
   .data-table td {
     font-size: 10px;
+  }
+
+  .topology-canvas .react-flow__minimap {
+    display: none !important;
   }
 
   .topology-canvas-actions {
@@ -505,3 +519,814 @@
     justify-self: start;
   }
 }
+
+/* Network-first relationship explorer: keep the high-level view scannable and
+   open a bounded graph only after the operator chooses a network. */
+.topology-toolbar {
+  align-items: flex-end;
+  min-height: 78px;
+}
+
+.topology-toolbar h2 {
+  font-size: 22px;
+  letter-spacing: -.035em;
+}
+
+.topology-toolbar p {
+  max-width: 560px;
+  color: #667085;
+  line-height: 1.55;
+}
+
+.topology-toolbar-controls {
+  flex: 0 1 auto;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.topology-toolbar-controls .search-field {
+  width: min(300px, 30vw);
+}
+
+.topology-toolbar-controls .select-field {
+  min-width: 158px;
+  max-width: 210px;
+}
+
+.topology-page-stack > .topology-main-panel {
+  border-color: #e5eaf1;
+  box-shadow: 0 2px 5px rgba(16, 24, 40, .025), 0 12px 30px rgba(16, 24, 40, .035);
+}
+
+.topology-truth {
+  padding: 11px 16px;
+  border-bottom-color: #e6edf7;
+  background: #f6f9fe;
+  color: #526581;
+  font-size: 12px;
+}
+
+.topology-page-progress {
+  min-height: 48px;
+  padding: 8px 16px;
+  background: #fff;
+  color: #667085;
+  font-size: 12px;
+}
+
+.topology-page-progress .badge {
+  font-size: 11px;
+}
+
+.network-overview {
+  padding: 22px 24px 26px;
+}
+
+.network-overview-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.network-overview-heading h3 {
+  margin: 3px 0 4px;
+  color: #182230;
+  font-size: 18px;
+  letter-spacing: -.025em;
+}
+
+.network-overview-heading p {
+  margin: 0;
+  color: #667085;
+  font-size: 12px;
+}
+
+.section-kicker {
+  color: #98a2b3;
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .12em;
+}
+
+.network-total {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid #e5eaf1;
+  border-radius: 999px;
+  background: #fff;
+  color: #667085;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.network-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.network-overview-card {
+  min-width: 0;
+  min-height: 150px;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  padding: 17px;
+  border: 1px solid #e5eaf1;
+  border-radius: 12px;
+  background: #fff;
+  color: #344054;
+  text-align: left;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, .025);
+  transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease;
+}
+
+.network-overview-card:hover {
+  transform: translateY(-1px);
+  border-color: #b9cdf4;
+  box-shadow: 0 8px 22px rgba(16, 24, 40, .07);
+}
+
+.network-overview-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #dce7fb;
+  border-radius: 11px;
+  background: #f2f6ff;
+  color: #2f6fec;
+}
+
+.network-overview-icon.room {
+  border-color: #e8dcff;
+  background: #f8f4ff;
+  color: #7a43d1;
+}
+
+.network-overview-copy {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 5px;
+}
+
+.network-kind-label {
+  color: #98a2b3;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.network-overview-copy strong {
+  overflow: hidden;
+  color: #1d2939;
+  font-size: 14px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.network-cidr {
+  overflow: hidden;
+  color: #667085;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.network-overview-stats {
+  display: grid;
+  justify-items: end;
+  gap: 3px;
+  padding-top: 1px;
+}
+
+.network-overview-stats strong {
+  color: #16803d;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.network-overview-stats i {
+  color: #98a2b3;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 500;
+}
+
+.network-overview-stats > span {
+  color: #98a2b3;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.network-overview-footer {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding-top: 11px;
+  border-top: 1px solid #f0f2f5;
+  color: #667085;
+  font-size: 10px;
+}
+
+.network-overview-footer > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.network-open-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  color: #245fca;
+  font-weight: 650;
+}
+
+.network-overview-empty {
+  min-height: 220px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 7px;
+  color: #98a2b3;
+  text-align: center;
+}
+
+.network-overview-empty strong {
+  color: #344054;
+  font-size: 13px;
+}
+
+.network-overview-empty span {
+  font-size: 11px;
+}
+
+.network-graph-heading {
+  min-height: 60px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 14px;
+  border-bottom: 1px solid #eaecf0;
+  background: #fff;
+}
+
+.network-graph-heading > div:not(.network-view-tabs) {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.network-graph-heading strong {
+  color: #1d2939;
+  font-size: 13px;
+}
+
+.network-graph-heading span {
+  color: #667085;
+  font-size: 11px;
+}
+
+.network-view-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  padding: 3px;
+  border: 1px solid #e5eaf1;
+  border-radius: 9px;
+  background: #f8fafc;
+}
+
+.network-view-tabs button {
+  min-height: 30px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #667085;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.network-view-tabs button:hover {
+  color: #344054;
+}
+
+.network-view-tabs button.active {
+  background: #fff;
+  color: #175cd3;
+  box-shadow: 0 1px 3px rgba(16, 24, 40, .1);
+}
+
+.network-resource-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  padding: 18px;
+  background: #f8fafc;
+}
+
+.network-resource-panel {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid #e5eaf1;
+  border-radius: 11px;
+  background: #fff;
+}
+
+.network-resource-panel > header {
+  min-height: 61px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 15px;
+  border-bottom: 1px solid #eaecf0;
+}
+
+.network-resource-panel > header h3 {
+  margin: 0 0 3px;
+  color: #1d2939;
+  font-size: 13px;
+}
+
+.network-resource-panel > header span {
+  color: #98a2b3;
+  font-size: 10px;
+}
+
+.network-resource-panel > header b {
+  color: #667085;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.network-resource-list {
+  display: grid;
+  max-height: 610px;
+  overflow: auto;
+}
+
+.network-resource-row {
+  min-height: 66px;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 14px;
+  border-bottom: 1px solid #f0f2f5;
+}
+
+.network-resource-row:last-child {
+  border-bottom: 0;
+}
+
+.network-resource-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.network-resource-copy strong,
+.network-resource-copy span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.network-resource-copy strong {
+  color: #344054;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.network-resource-copy > span {
+  margin-top: 3px;
+  color: #667085;
+  font-size: 10px;
+}
+
+.network-role {
+  flex: 0 0 auto;
+  color: #667085;
+  font-size: 10px;
+}
+
+.network-role.owner {
+  color: #175cd3;
+  font-weight: 650;
+}
+
+.network-device-icon {
+  width: 31px;
+  height: 31px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid #e5eaf1;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #667085;
+}
+
+.network-resource-row .status-label {
+  flex: 0 0 auto;
+  font-size: 10px;
+}
+
+.network-resource-empty {
+  min-height: 110px;
+  display: grid;
+  place-items: center;
+  color: #98a2b3;
+  font-size: 11px;
+}
+
+.topology-canvas {
+  height: min(720px, calc(100vh - 300px));
+  min-height: 510px;
+  background: #f8fafc;
+}
+
+.topology-node-content {
+  gap: 11px;
+  padding: 12px 14px;
+}
+
+.topology-node-title-row strong {
+  min-width: 0;
+  flex: 1 1 auto;
+  color: #182230;
+  font-size: 13px;
+}
+
+.topology-node-copy > span {
+  color: #667085;
+  font-size: 11px;
+}
+
+.topology-node-icon {
+  width: 38px;
+  height: 38px;
+}
+
+.topology-canvas .react-flow__background {
+  background-color: #f8fafc;
+}
+
+.topology-canvas .react-flow__controls-button {
+  color: #475467;
+  background: #fff;
+}
+
+.topology-canvas .react-flow__controls-button:hover {
+  background: #f5f8ff;
+}
+
+.topology-canvas .react-flow__minimap {
+  background: rgba(255, 255, 255, .96) !important;
+}
+
+@media (max-width: 1250px) {
+  .network-overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .topology-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .topology-toolbar-controls {
+    justify-content: flex-start;
+  }
+
+  .topology-toolbar-controls .search-field {
+    width: min(350px, 42vw);
+  }
+}
+
+@media (max-width: 900px) {
+  .topology-toolbar-controls {
+    width: 100%;
+  }
+
+  .topology-toolbar-controls .search-field {
+    width: auto;
+    flex: 1 1 240px;
+  }
+
+  .topology-toolbar-controls .select-field {
+    flex: 1 1 150px;
+    max-width: none;
+  }
+}
+
+@media (max-width: 650px) {
+  .network-overview {
+    padding: 18px 14px 20px;
+  }
+
+  .network-overview-grid {
+    grid-template-columns: 1fr;
+    gap: 9px;
+  }
+
+  .network-overview-card {
+    min-height: 136px;
+    padding: 14px;
+  }
+
+  .network-graph-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .network-view-tabs {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .network-view-tabs button {
+    flex: 1;
+  }
+
+  .network-resource-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .network-graph-heading > div:not(.network-view-tabs) {
+    padding-left: 3px;
+  }
+
+  .topology-toolbar-controls {
+    align-items: stretch;
+  }
+
+  .topology-toolbar-controls .search-field,
+  .topology-toolbar-controls .select-field {
+    width: 100%;
+    flex: auto;
+  }
+
+  .topology-canvas {
+    height: calc(100vh - 300px);
+    min-height: 460px;
+  }
+}
+
+/* Keep supporting information readable. The previous muted gray worked as
+   decoration, but failed when used for account identifiers and live signals. */
+.brand-lockup span,
+.nav-group-label,
+.sidebar-runtime small,
+.topbar-eyebrow,
+.user-menu-copy small,
+.metric-copy p,
+.panel-v2-header p,
+.health-runtime-big span,
+.recent-account-main span,
+.recent-account-stat span,
+.control-summary-grid small,
+.identity-cell > div > span,
+.primary-secondary span,
+.ratio-cell span,
+.account-hero-stats span,
+.table-empty,
+.pagination-v2,
+.topology-node-copy > span,
+.topology-legend-heading,
+.legend-more,
+.topology-detail-owner,
+.topology-detail dt,
+.system-hero > div > span,
+.system-metrics span,
+.section-kicker,
+.network-kind-label,
+.network-overview-stats i,
+.network-overview-stats > span,
+.network-resource-panel > header span,
+.network-resource-empty,
+.network-overview-empty,
+.connection-detail-list dd small,
+.connection-section-title > span,
+.connection-transition-meta small,
+.connection-health-metric small,
+.health-alert-facts small,
+.health-alert-tail small {
+  color: #667085;
+}
+
+.brand-lockup span,
+.nav-group-label,
+.sidebar-runtime small,
+.topbar-eyebrow,
+.user-menu-copy small,
+.metric-copy p,
+.panel-v2-header p,
+.health-runtime-big span,
+.recent-account-main span,
+.recent-account-stat span,
+.control-summary-grid small,
+.identity-cell > div > span,
+.primary-secondary span,
+.ratio-cell span,
+.account-hero-stats span,
+.pagination-v2,
+.topology-node-copy > span,
+.topology-legend-heading,
+.legend-more,
+.topology-detail-owner,
+.topology-detail dt,
+.system-hero > div > span,
+.system-metrics span,
+.network-kind-label,
+.network-overview-stats > span,
+.network-resource-panel > header span,
+.network-resource-empty,
+.connection-detail-list dd small,
+.connection-section-title > span,
+.connection-transition-meta small,
+.health-alert-facts small,
+.health-alert-tail small {
+  font-size: 10px;
+}
+
+.topology-node-copy > span,
+.topology-detail-owner,
+.topology-detail dt {
+  font-size: 10px;
+}
+
+.system-hero > div > span,
+.topology-legend-heading,
+.legend-more {
+  font-size: 9px;
+}
+
+.data-table-container {
+  width: 100%;
+  min-width: 0;
+}
+
+.data-mobile-list {
+  display: none;
+}
+
+.data-mobile-card {
+  min-width: 0;
+  display: grid;
+  gap: 11px;
+  padding: 13px;
+  border: 1px solid #e4e7ec;
+  border-radius: 10px;
+  background: #fff;
+  color: #344054;
+  font: inherit;
+  text-align: left;
+}
+
+button.data-mobile-card {
+  width: 100%;
+  cursor: pointer;
+}
+
+.data-mobile-card.clickable:hover,
+.data-mobile-card.clickable:focus-visible {
+  border-color: #a9c4f5;
+  background: #fbfdff;
+  box-shadow: 0 2px 8px rgba(16, 24, 40, .06);
+}
+
+.data-mobile-card.clickable:focus-visible {
+  outline: 2px solid #3978e8;
+  outline-offset: 2px;
+}
+
+.data-mobile-card-primary {
+  min-width: 0;
+  color: #1d2939;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.data-mobile-card-primary .identity-cell,
+.data-mobile-card-primary .primary-secondary {
+  min-width: 0;
+  white-space: normal;
+}
+
+.data-mobile-card-primary .identity-cell > div,
+.data-mobile-card-primary .primary-secondary {
+  overflow-wrap: anywhere;
+}
+
+.data-mobile-facts {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px 12px;
+  padding-top: 10px;
+  border-top: 1px solid #eef0f3;
+}
+
+.data-mobile-fact {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 3px;
+}
+
+.data-mobile-fact > span {
+  color: #667085;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.data-mobile-fact > div {
+  min-width: 0;
+  color: #344054;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.data-mobile-fact .badge {
+  white-space: nowrap;
+}
+
+.data-mobile-empty {
+  display: grid;
+  min-height: 100px;
+  place-items: center;
+  padding: 18px;
+  border: 1px solid #e4e7ec;
+  border-radius: 10px;
+  background: #fff;
+  color: #667085;
+  font-size: 12px;
+  text-align: center;
+}
+
+@media (max-width: 760px) {
+  .data-table-container > .data-table-wrap {
+    display: none;
+  }
+
+  .data-table-container > .data-mobile-list {
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .pagination-v2 {
+    align-items: flex-start;
+    flex-direction: column;
+    padding: 11px;
+  }
+
+  .pagination-v2 > div {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 380px) {
+  .data-mobile-card {
+    padding: 11px;
+  }
+
+  .data-mobile-facts {
+    gap: 9px;
+  }
+
+  .account-hero-stats div {
+    padding-right: 6px;
+    padding-left: 6px;
+  }
+}
+
+/* Resource links retain their affordance in tables and compact cards. */
+.detail-navigation { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.primary-secondary > a, .network-resource-copy > a { font-weight: 650; color: var(--accent, #2563eb); text-decoration: none; }
+.primary-secondary > a:hover, .network-resource-copy > a:hover, .data-table td > a:hover { text-decoration: underline; }
+.data-table td > a { color: var(--accent, #2563eb); }
+.network-graph-heading { flex-wrap: wrap; }
+@media (max-width: 650px) { .topbar-actions-v2 { flex-wrap: wrap; } }

@@ -1,8 +1,14 @@
 package admin
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -81,6 +87,10 @@ func (fakeStore) AdminTopologyPage(after string, accountLimit, nodeBudget int) (
 
 func (fakeStore) AdminDevices(_ string, _ string, limit, offset int) (*database.AdminDevicePage, error) {
 	return &database.AdminDevicePage{Total: 1, Limit: limit, Offset: offset, Items: []database.AdminDeviceSummary{{ID: "d1", DeviceName: "desktop"}}}, nil
+}
+
+func (fakeStore) AdminDevicesCursor(_ string, _ string, _ string, limit int) (*database.AdminDeviceCursorPage, error) {
+	return &database.AdminDeviceCursorPage{Total: 1, Limit: limit, Items: []database.AdminDeviceSummary{{ID: "d1", OwnerID: "u1", DeviceName: "desktop"}}}, nil
 }
 
 func (fakeStore) AdminNetworks(limit, offset int) (*database.AdminNetworkPage, error) {
@@ -223,6 +233,105 @@ func TestConsoleServesEmbeddedUIWithSecurityHeaders(t *testing.T) {
 	}
 }
 
+func TestConsoleServesEveryBuildArtifactAndReferencedModule(t *testing.T) {
+	server := testServer(t, strings.Repeat("a", 32))
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	webRoot, err := fs.Sub(embeddedWeb, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test the real embedded release files, rather than a fixed list that can
+	// silently omit newly generated vendor or lazy-loaded modules.
+	assertAsset := func(assetURL *url.URL) []byte {
+		t.Helper()
+		if assetURL.IsAbs() || !strings.HasPrefix(assetURL.Path, "/admin/") {
+			t.Fatalf("build asset escaped the admin origin: %s", assetURL)
+		}
+		asset := strings.TrimPrefix(assetURL.Path, "/admin/")
+		if asset == "" {
+			asset = "index.html"
+		}
+		expected, err := fs.ReadFile(webRoot, asset)
+		if err != nil {
+			t.Fatalf("referenced asset %s is not embedded: %v", assetURL, err)
+		}
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			res := httptest.NewRecorder()
+			mux.ServeHTTP(res, httptest.NewRequest(method, assetURL.String(), nil))
+			if res.Code != http.StatusOK {
+				t.Fatalf("%s %s: expected 200, got %d", method, assetURL, res.Code)
+			}
+			if method == http.MethodGet && !bytes.Equal(res.Body.Bytes(), expected) {
+				t.Fatalf("%s: response differs from embedded asset (possible HTML fallback)", assetURL)
+			}
+			if method == http.MethodHead && res.Body.Len() != 0 {
+				t.Fatalf("HEAD %s returned a response body", assetURL)
+			}
+			if res.Header().Get("Cache-Control") != "no-store" || res.Header().Get("X-Content-Type-Options") != "nosniff" {
+				t.Fatalf("%s: missing asset cache/security headers", assetURL)
+			}
+			if strings.HasSuffix(assetURL.Path, ".js") && !strings.Contains(res.Header().Get("Content-Type"), "javascript") {
+				t.Fatalf("%s: expected JavaScript MIME type, got %q", assetURL, res.Header().Get("Content-Type"))
+			}
+		}
+		return expected
+	}
+
+	htmlReferences := regexp.MustCompile(`(?:src|href)=["']([^"']+)["']`)
+	moduleReferences := regexp.MustCompile(`(?:\bfrom\s*|\bimport\s*(?:\(\s*)?)["']((?:\./|\.\./|/admin/)[^"']+)["']`)
+	artifactCount, referenceCount := 0, 0
+	err = fs.WalkDir(webRoot, ".", func(asset string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		artifactCount++
+		assetURL := &url.URL{Path: "/admin/" + asset}
+		body := assertAsset(assetURL)
+		var references [][]byte
+		for _, match := range moduleReferences.FindAllSubmatch(body, -1) {
+			references = append(references, match[1])
+		}
+		if strings.HasSuffix(asset, ".html") {
+			for _, match := range htmlReferences.FindAllSubmatch(body, -1) {
+				references = append(references, match[1])
+			}
+		}
+		for _, reference := range references {
+			referenceURL, err := url.Parse(string(reference))
+			if err != nil {
+				t.Fatalf("%s contains an invalid asset reference: %v", asset, err)
+			}
+			assertAsset(assetURL.ResolveReference(referenceURL))
+			referenceCount++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifactCount < 3 || referenceCount < 2 {
+		t.Fatalf("expected a complete UI build and asset references, got %d files / %d references", artifactCount, referenceCount)
+	}
+}
+
+func TestConsoleRejectsMissingAssetsAndInvalidFilePaths(t *testing.T) {
+	server := testServer(t, strings.Repeat("a", 32))
+	for _, path := range []string{
+		"/admin/missing.js", "/admin/assets/missing.js", "/admin/missing.css", "/admin/app.js.map",
+		"/admin/.", "/admin/../server.go", "/admin/assets/../../server.go", "/admin//app.js",
+	} {
+		res := httptest.NewRecorder()
+		// Exercise the file boundary directly as well as the ServeMux tests
+		// above; ServeMux normally canonicalizes dot segments before routing.
+		server.serveConsole(res, httptest.NewRequest(http.MethodGet, path, nil))
+		if res.Code != http.StatusNotFound {
+			t.Errorf("%s: expected 404, got %d", path, res.Code)
+		}
+	}
+}
+
 func TestAdminAPIRequiresBearerToken(t *testing.T) {
 	token := strings.Repeat("b", 32)
 	server := testServer(t, token)
@@ -272,6 +381,78 @@ func TestAdminAccountCursorRoute(t *testing.T) {
 	mux.ServeHTTP(badRes, bad)
 	if badRes.Code != http.StatusBadRequest {
 		t.Fatalf("expected oversized cursor to fail, got %d", badRes.Code)
+	}
+}
+
+func TestAdminAccountCursorFindsAccountsBeyondFifty(t *testing.T) {
+	db, err := database.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := 1; i <= 76; i++ {
+		username := fmt.Sprintf("account-%03d", i)
+		if i == 76 {
+			username = "张 工+&%_"
+		}
+		if _, err := db.Exec(`INSERT INTO users (id, email, password_hash, created_at, username) VALUES (?, ?, 'x', 1, ?)`,
+			fmt.Sprintf("user-%03d", i), fmt.Sprintf("account-%03d@example.test", i), username); err != nil {
+			t.Fatal(err)
+		}
+	}
+	token := strings.Repeat("a", 32)
+	server, err := New(db, Config{Token: token})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	requestPage := func(query, cursor string) database.AdminAccountCursorPage {
+		t.Helper()
+		params := url.Values{"q": {query}, "limit": {"25"}}
+		if cursor != "" {
+			params.Set("cursor", cursor)
+		}
+		req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/accounts/cursor?"+params.Encode(), nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		res := httptest.NewRecorder()
+		mux.ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("account cursor returned %d: %s", res.Code, res.Body.String())
+		}
+		var page database.AdminAccountCursorPage
+		if err := json.Unmarshal(res.Body.Bytes(), &page); err != nil {
+			t.Fatal(err)
+		}
+		return page
+	}
+
+	seen := make(map[string]bool)
+	cursor := ""
+	for pageIndex, expectedCount := range []int{25, 25, 25, 1} {
+		page := requestPage("", cursor)
+		if page.Total != 76 || page.Limit != 25 || len(page.Items) != expectedCount {
+			t.Fatalf("page %d: incorrect pagination totals/counts: %+v", pageIndex, page)
+		}
+		for _, account := range page.Items {
+			if seen[account.ID] {
+				t.Fatalf("account repeated across cursor pages: %s", account.ID)
+			}
+			seen[account.ID] = true
+		}
+		if (pageIndex < 3) != (page.NextCursor != "") {
+			t.Fatalf("page %d: incorrect next cursor: %q", pageIndex, page.NextCursor)
+		}
+		cursor = page.NextCursor
+	}
+	if len(seen) != 76 || !seen["user-076"] {
+		t.Fatalf("pagination missed accounts beyond the previous 50-account limit: %d", len(seen))
+	}
+	for _, query := range []string{"张 工+&%_", "account-076@example.test"} {
+		page := requestPage(query, "")
+		if page.Total != 1 || len(page.Items) != 1 || page.Items[0].ID != "user-076" || page.NextCursor != "" {
+			t.Fatalf("search %q failed to find the final account: %+v", query, page)
+		}
 	}
 }
 
