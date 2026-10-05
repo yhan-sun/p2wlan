@@ -111,6 +111,36 @@ Rooms are useful when a network needs its own boundary: a Minecraft survival ser
 
 **Choose P2WLAN when you want a graphical room workflow for friends, home devices, and development machines, with your own Control and Relay infrastructure.**
 
+### NAT pairs: hole-punching support at a glance
+
+**Find your NAT in the row and the peer's NAT in the column.** This matrix shows P2WLAN's IPv4 UDP traversal paths under classic NAT behavior. Both devices must reach the same Control, UDP must be allowed, public IPs must remain stable, mappings must stay active, and host firewalls must permit traffic.
+
+**🟢 Standard support**: ordinary UDP probes and authenticated source-address learning can establish a direct path. **🟡 Conditional support**: requires measured allocation behavior, compatible filtering, and coordinated probes; otherwise use a reachable Relay automatically. These labels describe supported paths, not measured success rates or guarantees.
+
+| Local ↓ / Peer → | Full cone | Restricted cone | Port-restricted cone | Symmetric NAT |
+| --- | --- | --- | --- | --- |
+| **Full cone** | 🟢 Standard | 🟢 Standard | 🟢 Standard | 🟢 Standard |
+| **Restricted cone** | 🟢 Standard | 🟢 Standard | 🟢 Standard | 🟢 Standard |
+| **Port-restricted cone** | 🟢 Standard | 🟢 Standard | 🟢 Standard | 🟡 Conditional |
+| **Symmetric NAT** | 🟢 Standard | 🟢 Standard | 🟡 Conditional | 🟡 Both ends conditional |
+
+| NAT type | Mapping and inbound rules | Effect on traversal |
+| --- | --- | --- |
+| **Full cone** | A local port keeps the same public mapping; inbound sources are unrestricted while it exists. | A symmetric peer can send to that stable endpoint; the receiver learns its actual source address and replies. |
+| **Restricted cone** | A stable public mapping accepts packets from previously contacted IPs, regardless of source port. | After contacting the peer's public IP, it can receive a symmetric peer's probe even if its source port changes. |
+| **Port-restricted cone** | A stable public mapping accepts packets only from a previously contacted IP and port. | Cone pairs can open mappings mutually; a symmetric pairing needs the actual target port. |
+| **Symmetric NAT** | The public mapping changes with the destination; the classic model permits replies only from the contacted IP and port. | Two symmetric endpoints need coordination of both actual mappings and filtering windows. |
+
+**P2WLAN does not abandon direct connectivity just because a NAT is labeled symmetric.** Conditional pairs use measured capabilities to select port prediction, fixed-anchor, or bounded birthday probes. With high-entropy random mappings and strict filtering at both ends, Relay takes priority; new direct-path evidence can trigger recovery. Relay availability depends on a configured, reachable Relay.
+
+| Other network conditions | Connection path |
+| --- | --- |
+| One reachable public IPv4 endpoint with UDP and firewall access | The other device can initiate toward that endpoint without both sides predicting NAT ports. |
+| Both endpoints have reachable public IPv6 with UDP allowed | Try IPv6 direct connectivity first, bypassing IPv4 NAT. |
+| IPv4 UDP is blocked and no other direct path is available | 🔴 No hole punching over that UDP path; use a reachable TLS Relay. |
+
+Multiple NAT layers, CGNAT, campus networks, and mobile networks describe deployment environments, not a definitive matrix category. The table uses [RFC 3489's classic names](https://www.rfc-editor.org/rfc/rfc3489#section-5) for explanation; actual strategies measure [RFC 4787 mapping and filtering behavior](https://www.rfc-editor.org/rfc/rfc4787) separately. NAT1–NAT4 labels are not a shared standard across products. See the [network documentation](docs/reference/networking.md) for details.
+
 ### Hole-punching success: compare network conditions
 
 Success depends on **both endpoints' mapping and filtering, UDP reachability, port allocation, retry windows, and load**. This comparison does not include measurements of all four products using the same real networks, specified versions, and observation window. The table compares implemented or documented strategies rather than ranking success rates.
