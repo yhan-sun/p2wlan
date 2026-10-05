@@ -5,7 +5,9 @@ core.
 
 The supported toolchain is Flutter 3.47.2 with Dart 3.13.2. The repository-root
 `.fvmrc` is the source of truth for local FVM, CI, and release builds.
-This baseline supports Android API 24+, iOS 15+, and macOS 12+.
+Public client support covers Windows, macOS 12+, Linux, and Android API 24+.
+iOS is outside the current support scope; retained iOS build files do not imply
+a supported public client.
 
 The split is:
 

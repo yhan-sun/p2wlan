@@ -32,7 +32,7 @@
     ping <对端虚拟 IP>
     ssh <对端虚拟 IP>
 
-路径优先级是 LAN Direct、Public UDP Direct、Encrypted Relay。Direct 受 NAT、防火墙和云安全组影响；Relay 可用也依赖 Control 和 Relay 的 TLS 配置。
+路径优先级是 LAN Direct、IPv6 / IPv4 UDP Direct、Encrypted Relay。Direct 受 NAT、防火墙和云安全组影响；Relay 可用也依赖 Control 和 Relay 的 TLS 配置。
 
 ## 出现问题时
 

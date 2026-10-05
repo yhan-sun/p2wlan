@@ -1,6 +1,6 @@
 # 安全报告
 
-P2WLAN 当前处于 Preview，尚未完成独立安全审计；不要把它当作已认证的安全产品。
+P2WLAN 提供公开发布的客户端与可自托管服务。项目尚未完成独立安全审计，不声明安全认证；加密实现、CI 检查与发布清单不能替代独立审计。
 
 请通过 GitHub 的 [Security Advisories 私密报告入口](https://github.com/yhan-sun/p2wlan/security/advisories/new) 报告可被利用的漏洞。报告中只提供复现所需的最小信息，不要在公开 Issue、PR、日志或诊断包中粘贴私钥、JWT、设备凭据、Relay 票据或真实主机信息。
 

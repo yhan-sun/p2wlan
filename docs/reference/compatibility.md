@@ -8,7 +8,8 @@
 | Linux x64 | GUI、CLI/daemon 包 | CLI/daemon 适合无桌面服务 |
 | Linux arm64 | CLI/daemon 包 | 以对应 Release 归档为准 |
 | Android 7.0+ arm64 | arm64 APK | 受系统 VPN、生命周期和后台策略影响 |
-| iOS 15+ arm64 | unsigned IPA | 需要用户自己的签名与系统配置，属于实验性支持 |
+
+当前公开支持范围为 Windows、macOS、Linux 和 Android。iOS 暂不纳入支持范围；已有 unsigned IPA 构建入口不作为当前受支持客户端的下载或兼容性承诺。
 
 客户端和服务端使用独立的版本命名空间：客户端是 `vX.Y.Z`，服务端是 `server-vX.Y.Z`。即使两个标签具有相同的数字后缀，也不表示它们指向同一个源码提交、同一次构建或同一组发布产物。自托管部署和问题定位应分别记录客户端 tag + commit、服务端 tag + commit，不能只记录 `X.Y.Z`。
 

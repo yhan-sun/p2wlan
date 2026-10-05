@@ -5,7 +5,7 @@
 <div align="center">
   <h1>P2WLAN</h1>
   <p><strong>Connect remote devices as if they were on the same LAN.</strong></p>
-  <p>P2P first · NAT traversal · Relay fallback · Cross-platform · Rooms · Self-hostable</p>
+  <p>Remote gaming · Private access · P2P first · Encrypted relay · Free and open source · Self-hostable</p>
 
   <p>
     <a href="README.md">简体中文</a>
@@ -13,8 +13,10 @@
   </p>
 
   <p>
-    <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>Download</strong></a>
+    <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>Download a release</strong></a>
     · <a href="#quick-start">Quick Start</a>
+    · <a href="#why-choose-p2wlan">Why P2WLAN</a>
+    · <a href="#compare-with-similar-software">Compare</a>
     · <a href="#screenshots">Screenshots</a>
     · <a href="#use-cases">Use Cases</a>
     · <a href="#how-it-works">How It Works</a>
@@ -35,24 +37,20 @@
 
 ## What is P2WLAN?
 
-P2WLAN is an open-source, P2P-first, self-hostable virtual LAN. It gives devices private virtual IP addresses so machines on home broadband, mobile networks, campus networks, cloud servers, and other remote networks can communicate as if they were on the same LAN.
+P2WLAN is **free, open-source virtual LAN software** for multiplayer games, remote access, and connecting devices across networks. Play Minecraft with friends, reach your home NAS while away, or connect to a remote development machine through one private network. It supports **Windows, macOS, Linux, and Android**, with graphical clients and a CLI for servers.
 
-When establishing a connection, P2WLAN prefers **LAN Direct / public UDP P2P**. If NAT, firewalls, or the current network prevent a direct path, it automatically falls back to an **Encrypted Relay**. Applications keep using the same virtual IP, without requiring a separate public port, DDNS entry, or custom route for every device.
+Participating devices receive private virtual IPs. P2WLAN prefers **LAN / IPv6 / IPv4 UDP direct connections**, then automatically uses an **end-to-end encrypted relay** when a direct path is unavailable. Applications keep using the same virtual IP, without a separate public port or DDNS entry for each service.
 
-> [!IMPORTANT]
-> P2WLAN is currently a **Preview** project intended for real-network testing, self-hosting, and development validation. It has not completed an independent security audit. P2WLAN is not an official WireGuard implementation and does not claim WireGuard interoperability.
+**Get started:** [Download a client](https://github.com/yhan-sun/p2wlan/releases) → use an administrator's Control address or [host your own service](docs/guides/self-hosting.md) → sign in and connect your personal network or a room → play or access services through virtual IPs.
 
-## At a glance
+## Why choose P2WLAN
 
-| Capability | What it means |
-| --- | --- |
-| **P2P First** | Prefer local and public UDP direct paths before using a relay. |
-| **NAT Traversal** | Probe network conditions and attempt UDP hole punching; complex NAT environments are not guaranteed to succeed. |
-| **Relay Fallback** | Automatically move to an encrypted relay when Direct is unavailable. |
-| **End-to-End Encryption** | Peer traffic is carried in encrypted sessions; relays forward ciphertext only. |
-| **Rooms** | Organize a fixed or temporary group of devices for game sessions, collaboration, or private services. |
-| **Cross-platform** | GUI clients cover Windows, macOS, Linux, and Android; iOS remains experimental; CLI / daemon builds support servers and headless systems. |
-| **Self-hosted** | Run the Control Plane, SQLite database, and Relay on infrastructure you control. |
+- **Bring friends together in a room.** Manage room codes, invitations, members, and devices in the client. Keep games, collaboration, and maintenance environments in separate networks.
+- **Prefer direct paths and avoid relay detours.** Use local paths on the same LAN and try IPv6 or UDP hole punching across networks. Once direct connectivity is established, application traffic does not consume relay bandwidth.
+- **Keep a fallback for restrictive networks.** Automatically use an encrypted relay when needed and keep trying to recover a direct path. Applications retain their virtual IP endpoint.
+- **Reach multiple services through one private network.** Connect to SSH, RDP, NAS services, web panels, and game servers by virtual IP and service port.
+- **See how devices connect.** View availability, Direct / Relay paths, latency, and traffic information, with built-in diagnostics for troubleshooting.
+- **Control your infrastructure.** Client, Control, and Relay source code is available under MIT. Choose server locations and manage accounts and data yourself. Hosting, bandwidth, and domain costs remain the deployer's responsibility.
 
 ## Screenshots
 
@@ -100,6 +98,36 @@ Installing P2WLAN does not automatically connect other devices on the same home 
 
 Rooms are useful when a network needs its own boundary: a Minecraft survival server, a temporary game session, a set of NAS maintenance devices, or a development environment. The client can present members, availability, virtual IPs, active paths, and latency without mixing every device into a single view.
 
+## Compare with similar software
+
+### Strengths and practical tradeoffs
+
+| Software | Main strengths | Practical tradeoffs |
+| --- | --- | --- |
+| **P2WLAN** | Rooms, graphical clients, direct-first paths, and encrypted relay fallback; MIT client and server code for gaming, NAS access, and development. | Requires an administrator's Control or self-hosting. Uses layer-3 TUN networking: install a client on each participating device and connect by virtual IP; Ethernet layer-2 broadcast bridging is not provided. |
+| **Tailscale** | Hosted coordination, WireGuard, access policies, and device management for personal or organizational access. | Use the hosted service or deploy Headscale separately and check its feature scope. Double hard NAT requires Peer Relay / DERP. |
+| **ZeroTier** | Virtual Ethernet, layer-2 bridging, and a self-hostable network controller. | Configure membership and network rules; physical bridging needs additional setup. Symmetric or multiple NAT layers can force relaying. |
+| **EasyTier** | Decentralized mesh, multiple transports, subnet proxying, automatic routing, and documented NAT4↔NAT4 traversal. | Configure consistent network identities and secrets plus reachable entry nodes; manage routing and relay topology for the deployment. |
+
+**Choose P2WLAN when you want a graphical room workflow for friends, home devices, and development machines, with your own Control and Relay infrastructure.**
+
+### Hole-punching success: compare network conditions
+
+Success depends on **both endpoints' mapping and filtering, UDP reachability, port allocation, retry windows, and load**. This comparison does not include measurements of all four products using the same real networks, specified versions, and observation window. The table compares implemented or documented strategies rather than ranking success rates.
+
+| Network condition | P2WLAN | Tailscale | ZeroTier | EasyTier |
+| --- | --- | --- | --- | --- |
+| Typical home NAT with bidirectional UDP | Automatic UDP punching | Automatic traversal | Automatic UDP punching | Automatic UDP punching |
+| Both ends restricted, including destination-dependent mapping and strict filtering | Measured prediction, fixed-anchor, or birthday probing; outcome depends on allocation and filtering | Documented double hard NAT prevents direct paths; relay fallback | Symmetric NAT hinders P2P; relaying may be needed | Documents NAT4↔NAT4 support; specific mapping/filtering combinations need measurement |
+| Reachable public IPv6 with UDP allowed | IPv6 direct | IPv6 direct | IPv6 direct | IPv6 direct |
+| UDP blocked, forwarding endpoints reachable | TLS encrypted Relay | DERP / reachable Peer Relay | TCP fallback | Configured TCP / WSS forwarding nodes |
+
+**P2WLAN combines direct-first selection, multiple probing strategies, and automatic fallback.** High-entropy random mappings with strict filtering can still require Relay. Public IPv6 bypasses IPv4 NAT and is not an IPv4 hole-punching success. Relay latency and throughput depend on location, routing, and bandwidth.
+
+For measurements, report **UDP hole-punching success** (rounds with bidirectional business traffic established through IPv4 NAT within the deadline / all punching rounds), **overall direct connectivity** (including LAN / IPv6), and **business availability** (including Relay) separately. Keep failures and report time to first usable traffic, RTT, and throughput. See the [network rules](docs/reference/networking.md) and [path observability](docs/reference/path-observability.md) for P2WLAN's evidence definitions.
+
+Sources: [Tailscale connections](https://tailscale.com/docs/reference/connection-types), [access policies](https://tailscale.com/docs/features/access-control/acls), [Headscale](https://github.com/juanfont/headscale), [ZeroTier router tips](https://docs.zerotier.com/routertips/), [protocol and virtual Ethernet](https://docs.zerotier.com/protocol/), [self-hosted controller](https://docs.zerotier.com/controller/), and [EasyTier's official README](https://github.com/EasyTier/EasyTier). Refer to each project's current documentation for features and conditions.
+
 ## Quick Start
 
 **Prepare a Control address first.** Fresh installs do not contain or contact a project-operated Control Plane or Relay, and do not automatically register an account. Obtain a trusted Control address from your administrator, or complete [self-hosting setup](docs/guides/self-hosting.md) first. Devices that need to communicate should use the same Control; different accounts connect through a shared room.
@@ -116,7 +144,6 @@ Choose the appropriate platform artifact from a client **`vX.Y.Z`** release on [
 | Linux x64 | `p2wlan-linux-x64.tar.gz` (GUI) / `p2wlan-linux-x64-cli.tar.gz` (CLI + daemon) | Supported |
 | Linux arm64 | `p2wlan-linux-arm64-cli.tar.gz` (CLI + daemon) | Supported |
 | Android 7.0+ (API 24+) arm64 | `p2wlan-android-arm64-release.apk` | Supported |
-| iOS 15+ arm64 | `p2wlan-ios-arm64-unsigned.ipa` | Experimental, requires signing |
 
 For headless Linux, choose the CLI package or use the installer with a fixed version. Replace `vX.Y.Z` with an actual client Release tag:
 
@@ -212,9 +239,9 @@ flowchart LR
 
 The path strategy can be summarized as:
 
-**LAN Direct → Public UDP Direct → Encrypted Relay**
+**LAN Direct → IPv6 / IPv4 UDP Direct → Encrypted Relay**
 
-Direct connectivity depends on both real network environments. NAT, CGNAT, firewalls, and cloud security groups may prevent a direct path. Relay is the fallback path, not a guarantee that P2P will succeed across every NAT topology.
+The default policy reserves a 5-second direct window while preparing Relay. Once it expires, a confirmed encrypted Relay may carry traffic. If an established Direct path fails, Relay can take over while direct recovery continues. NAT, CGNAT, firewalls, and cloud security groups affect path selection; see the [path policy](docs/reference/configuration.md#客户端路径策略).
 
 ## Connection Status
 
@@ -255,9 +282,7 @@ The detailed guides are currently in Chinese:
 - Device traffic uses an encrypted data plane between endpoints.
 - Relays forward ciphertext and do not decrypt private payloads.
 - Relays may still observe connection metadata such as node identifiers, timing, and packet sizes.
-- The project is in **Preview** and has **not completed an independent security audit**.
 - P2P connectivity is not guaranteed across arbitrary NAT environments; Relay availability also depends on the Control Plane and Relay being reachable.
-- Perform your own security assessment before sensitive production deployment.
 
 Credential boundaries and security limitations are documented in [SECURITY.md](SECURITY.md), [PRIVACY.md](PRIVACY.md), and the [security model](docs/explanation/security-model.md). Published-asset identity is defined in the [release contract](docs/reference/release-contract.md).
 
