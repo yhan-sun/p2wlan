@@ -257,6 +257,14 @@ class DaemonController {
       '${_defaultLogDir().path}${Platform.pathSeparator}p2wlan-daemon.log';
 
   Future<DaemonCommandResult> start(AppSettings settings) async {
+    final connectionError = settings.connectionRequirementError;
+    if (connectionError != null) {
+      return DaemonCommandResult(
+        ok: false,
+        message: connectionError,
+        failureCode: DaemonStartupFailureCode.startupConfigInvalid,
+      );
+    }
     if (roomInstanceId != null) {
       if (Platform.isAndroid ||
           Platform.isIOS ||
@@ -372,7 +380,6 @@ class DaemonController {
     final pidPath = '${logDir.path}${Platform.pathSeparator}p2wlan-daemon.pid';
     final authToken = settings.authToken.trim();
     final deviceName = settings.deviceName.trim();
-    final useManualMode = settings.manualMode || authToken.isEmpty;
     final udpAdvertise = settings.udpAdvertise.trim();
     final relayServers = settings.relayServers.trim();
 
@@ -437,7 +444,7 @@ class DaemonController {
     }
 
     await startupTrace?.stageStart(6, 'launch_token');
-    if (!useManualMode && (requiresElevation || Platform.isWindows)) {
+    if (requiresElevation || Platform.isWindows) {
       if (Platform.isWindows) {
         // Stage 05 is the sole owner of the runtime-directory DACL. Rewriting
         // it here can fail independently and used to be misreported as a
@@ -536,9 +543,7 @@ class DaemonController {
         '--diagnostics-client-sid',
         windowsClientSid,
       ],
-      if (useManualMode)
-        '--manual'
-      else if (tokenFile != null) ...[
+      if (tokenFile != null) ...[
         '--managed',
         '--token-file',
         tokenFile.path,
@@ -611,15 +616,6 @@ class DaemonController {
     }
 
     final elevatedShell = _buildElevatedShell(binary: binary, args: args);
-    // Managed launches include an auth token. Never expose a token-bearing
-    // command in UI error messages or the clipboard.
-    final manualCommand = useManualMode
-        ? _manualCommandForPlatform(
-            elevatedShell: elevatedShell,
-            binary: binary,
-            args: args,
-          )
-        : null;
 
     int? launchPid;
     await startupTrace?.stageStart(8, 'uac');
@@ -646,7 +642,7 @@ class DaemonController {
         final process = await _startDetached(
           binary: binary,
           args: args,
-          stdinToken: tokenFile == null && !useManualMode ? authToken : null,
+          stdinToken: tokenFile == null ? authToken : null,
         );
         launchPid = process.pid;
         if (Platform.isWindows) {
@@ -695,7 +691,6 @@ class DaemonController {
             logFailure?.message ??
             childFailure?.message ??
             _startFailureMessage(error),
-        manualCommand: manualCommand,
       );
     }
 
@@ -739,24 +734,17 @@ class DaemonController {
         return DaemonCommandResult(
           ok: false,
           message: '登录已过期，请重新登录。${failure.message}',
-          manualCommand: manualCommand,
           failureCode: failure.code,
         );
       }
       return DaemonCommandResult(
         ok: false,
         message: '[${failure.codeValue}] ${failure.message} 请查看日志：$logPath',
-        manualCommand: manualCommand,
         failureCode: failure.code,
       );
     }
     await startupTrace?.stageOk(11, 'health_wait');
-    return DaemonCommandResult(
-      ok: true,
-      message: useManualMode
-          ? 'p2wlan-daemon started in manual/offline mode. Add a control token in Settings to join the managed P2WLAN network.'
-          : 'p2wlan-daemon started.',
-    );
+    return DaemonCommandResult(ok: true, message: 'p2wlan-daemon started.');
   }
 
   Future<DaemonCommandResult> stop(String diagnosticsUrl) async {

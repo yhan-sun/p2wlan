@@ -10,7 +10,6 @@ import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
 import '../../core/api/control_api.dart';
 import '../../core/capabilities/platform_capabilities.dart';
-import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/widgets/windows_window_controls.dart';
@@ -54,7 +53,6 @@ class _LoginPageState extends State<LoginPage> {
   var _register = false;
   var _submitting = false;
   var _showPassword = false;
-  var _showAdvanced = false;
 
   @override
   void initState() {
@@ -66,10 +64,6 @@ class _LoginPageState extends State<LoginPage> {
     _controlServerController = TextEditingController(
       text: settings.controlServer,
     );
-    // A fresh install has no control server by design. Keep the required
-    // server field visible so the first action is configuration, not a
-    // failed login followed by hunting through Advanced options.
-    _showAdvanced = settings.controlServer.trim().isEmpty;
     _emailController = TextEditingController();
     _passwordController = TextEditingController();
   }
@@ -91,7 +85,6 @@ class _LoginPageState extends State<LoginPage> {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
     final desktopCopy = _capabilities.canActAsLocalVpnNode;
-    final usingCustomServer = _usesCustomServer;
     return Scaffold(
       body: Stack(
         children: [
@@ -174,6 +167,21 @@ class _LoginPageState extends State<LoginPage> {
                             crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
                               TextField(
+                                key: const ValueKey('login-server'),
+                                controller: _controlServerController,
+                                decoration: InputDecoration(
+                                  labelText: strings.loginServerAddress,
+                                  helperText: strings.loginServerRequiredHelper,
+                                  helperMaxLines: 3,
+                                  prefixIcon: const Icon(Icons.dns_outlined),
+                                ),
+                                keyboardType: TextInputType.url,
+                                textInputAction: TextInputAction.next,
+                                enabled: !_submitting,
+                              ),
+                              const SizedBox(height: AppTokens.space12),
+                              TextField(
+                                key: const ValueKey('login-identifier'),
                                 controller: _emailController,
                                 decoration: InputDecoration(
                                   labelText: _register
@@ -191,6 +199,7 @@ class _LoginPageState extends State<LoginPage> {
                               ),
                               const SizedBox(height: AppTokens.space12),
                               TextField(
+                                key: const ValueKey('login-password'),
                                 controller: _passwordController,
                                 decoration: InputDecoration(
                                   labelText: strings.password,
@@ -258,76 +267,6 @@ class _LoginPageState extends State<LoginPage> {
                                       : strings.noAccountYet,
                                 ),
                               ),
-                              const Divider(height: 24),
-                              _AdvancedDisclosure(
-                                open: _showAdvanced,
-                                onToggle: _submitting
-                                    ? null
-                                    : () => setState(
-                                        () => _showAdvanced = !_showAdvanced,
-                                      ),
-                                title: strings.advancedOptions,
-                                subtitle: strings.advancedOptionsSubtitle,
-                                trailingHint: usingCustomServer
-                                    ? strings.usingCustomServer
-                                    : null,
-                                child: Column(
-                                  crossAxisAlignment:
-                                      CrossAxisAlignment.stretch,
-                                  children: [
-                                    TextField(
-                                      controller: _controlServerController,
-                                      decoration: InputDecoration(
-                                        labelText: strings.selfHostedServer,
-                                        prefixIcon: const Icon(
-                                          Icons.dns_outlined,
-                                        ),
-                                      ),
-                                      keyboardType: TextInputType.url,
-                                      textInputAction: TextInputAction.next,
-                                      onSubmitted: (_) =>
-                                          _submitting ? null : _submit(),
-                                    ),
-                                    const SizedBox(height: AppTokens.space12),
-                                    Row(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Icon(
-                                          Icons.offline_bolt_outlined,
-                                          size: 18,
-                                          color: theme
-                                              .colorScheme
-                                              .onSurfaceVariant,
-                                        ),
-                                        const SizedBox(width: AppTokens.space8),
-                                        Expanded(
-                                          child: Text(
-                                            strings.manualOfflineModeHelper,
-                                            style: TextStyle(
-                                              fontSize: 12,
-                                              height: 1.4,
-                                              color: theme
-                                                  .colorScheme
-                                                  .onSurfaceVariant,
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                    const SizedBox(height: AppTokens.space12),
-                                    OutlinedButton.icon(
-                                      onPressed: _submitting
-                                          ? null
-                                          : _continueOffline,
-                                      icon: const Icon(
-                                        Icons.offline_bolt_outlined,
-                                      ),
-                                      label: Text(strings.continueOffline),
-                                    ),
-                                  ],
-                                ),
-                              ),
                             ],
                           ),
                         ),
@@ -343,14 +282,18 @@ class _LoginPageState extends State<LoginPage> {
     );
   }
 
-  bool get _usesCustomServer {
-    final saved = widget.settingsStore.settings.controlServer.trim();
-    return saved.isNotEmpty && saved != defaultControlServer;
-  }
-
   Future<void> _submit() async {
     if (_submitting) return;
     final strings = AppStringsScope.of(context);
+    if (_controlServerController.text.trim().isEmpty) {
+      _presentError(
+        _LoginError(
+          title: strings.loginServerRequiredTitle,
+          body: strings.loginServerRequiredHelper,
+        ),
+      );
+      return;
+    }
     final email = _emailController.text.trim();
     final password = _passwordController.text;
     if (email.isEmpty) {
@@ -408,7 +351,6 @@ class _LoginPageState extends State<LoginPage> {
               : accountEmail.toLowerCase(),
           accountUsername: accountUsername ?? settings.accountUsername,
           deviceName: deviceName,
-          manualMode: false,
         ),
       );
       await widget.statusStore.refresh();
@@ -422,41 +364,6 @@ class _LoginPageState extends State<LoginPage> {
                   body: error.message,
                 )
               : _errorTextFor(strings, error),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _submitting = false);
-      }
-    }
-  }
-
-  Future<void> _continueOffline() async {
-    if (_submitting) return;
-    final strings = AppStringsScope.of(context);
-    setState(() => _submitting = true);
-    try {
-      final settings = widget.settingsStore.settings;
-      await widget.settingsStore.updateSettings(
-        settings.copyWith(
-          authToken: '',
-          accountEmail: '',
-          accountUsername: '',
-          manualMode: true,
-          deviceName: settings.deviceName.trim().isEmpty
-              ? await resolveDefaultDeviceName()
-              : settings.deviceName.trim(),
-        ),
-      );
-      await widget.statusStore.refresh();
-      widget.onAuthenticated();
-    } catch (_) {
-      if (mounted) {
-        _presentError(
-          _LoginError(
-            title: strings.loginErrorManualModeTitle,
-            body: strings.loginErrorManualModeBody,
-          ),
         );
       }
     } finally {
@@ -576,94 +483,6 @@ class _LoginErrorBanner extends StatelessWidget {
           ],
         ),
       ),
-    );
-  }
-}
-
-class _AdvancedDisclosure extends StatelessWidget {
-  const _AdvancedDisclosure({
-    required this.open,
-    required this.onToggle,
-    required this.title,
-    required this.subtitle,
-    required this.child,
-    this.trailingHint,
-  });
-
-  final bool open;
-  final VoidCallback? onToggle;
-  final String title;
-  final String subtitle;
-  final Widget child;
-  final String? trailingHint;
-
-  @override
-  Widget build(BuildContext context) {
-    final strings = AppStringsScope.of(context);
-    final theme = Theme.of(context);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        InkWell(
-          onTap: onToggle,
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        title,
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                          color: theme.colorScheme.onSurface,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        subtitle,
-                        style: TextStyle(
-                          fontSize: 12,
-                          height: 1.3,
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                      if (trailingHint != null) ...[
-                        const SizedBox(height: 2),
-                        Text(
-                          trailingHint!,
-                          style: TextStyle(
-                            fontSize: 12,
-                            height: 1.3,
-                            color: theme.colorScheme.primary,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-                const SizedBox(width: AppTokens.space8),
-                Icon(
-                  open ? Icons.expand_less_rounded : Icons.expand_more_rounded,
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
-              ],
-            ),
-          ),
-        ),
-        if (open) ...[const SizedBox(height: AppTokens.space4), child],
-        const SizedBox(height: AppTokens.space4),
-        TextButton(
-          onPressed: onToggle,
-          child: Text(
-            open ? strings.disclosureCollapse : strings.disclosureExpand,
-          ),
-        ),
-      ],
     );
   }
 }

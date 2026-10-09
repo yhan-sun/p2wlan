@@ -496,20 +496,12 @@ extension DaemonControllerPids on DaemonController {
     }
   }
 
-  String _windowsCommandLineArgQuote(String value) {
-    return windowsCommandLineArgQuote(value);
-  }
-
   String _powershellSingleQuote(String value) {
     return value.replaceAll("'", "''");
   }
 
   String _powershellSingleQuoted(String value) {
     return "'${_powershellSingleQuote(value)}'";
-  }
-
-  String _powershellDoubleQuote(String value) {
-    return '"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"';
   }
 
   bool _equalsIgnoreCase(String left, String right) =>

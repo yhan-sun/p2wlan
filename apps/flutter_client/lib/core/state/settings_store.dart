@@ -68,15 +68,6 @@ class SettingsStore extends ChangeNotifier {
           }
           var restoredSettings = (await _migrateSettings(loadedSettings))
               .copyWith(authToken: effectiveToken);
-          if (restoredSettings.manualMode &&
-              restoredSettings.authToken.trim().isNotEmpty) {
-            // Older settings flows could save a credential while leaving the
-            // offline flag enabled. That combination makes the launcher use
-            // --manual and the legacy config profile forever. Treat the
-            // stored credential as the user's durable intent to use managed
-            // mode and repair the flag during load.
-            restoredSettings = restoredSettings.copyWith(manualMode: false);
-          }
           final encryptedAdminPassword = loadedSettings
               .macosAdminPasswordCiphertext
               .trim();
@@ -161,7 +152,6 @@ class SettingsStore extends ChangeNotifier {
     required String networkId,
     required String virtualIp,
     required String deviceName,
-    required bool manualMode,
     required String overlayCidr,
     required String tunInterface,
     required int mtu,
@@ -173,6 +163,9 @@ class SettingsStore extends ChangeNotifier {
   }) async {
     final normalizedDiagnosticsUrl = normalizeDiagnosticsUrl(diagnosticsUrl);
     final normalizedControlServer = normalizeControlServer(controlServer);
+    if (normalizedControlServer.isEmpty) {
+      throw const FormatException('请输入服务器地址并登录后才能使用 P2WLAN。');
+    }
     final normalizedNetworkId = networkId.trim().isEmpty
         ? defaultNetworkId
         : networkId.trim();
@@ -181,27 +174,18 @@ class SettingsStore extends ChangeNotifier {
         ? await resolveDefaultDeviceName()
         : deviceName.trim();
     final enteredToken = authToken.trim();
-    // The Account & Connection form is also the recovery path from an old
-    // offline session. Entering a credential is an explicit request to join
-    // the managed network, so do not let a stale manual-mode flag override
-    // that request.
-    final normalizedManualMode = manualMode && enteredToken.isEmpty;
+    // An empty token draft preserves the secure credential. Only explicit
+    // logout clears it; connection settings cannot enable an offline mode.
     final resolvedAuthToken = enteredToken.isNotEmpty
         ? enteredToken
-        : (normalizedManualMode
-              ? '' // manual/offline mode intentionally has no control token
-              : _settings.authToken); // managed: empty means "keep stored"
+        : _settings.authToken;
     final nextSettings = _settings.copyWith(
       diagnosticsUrl: normalizedDiagnosticsUrl,
       controlServer: normalizedControlServer,
-      // The token field is never prefilled with the stored value, so an empty
-      // entry in managed mode preserves it; explicit clearing happens via
-      // logout or manual mode.
       authToken: resolvedAuthToken,
       networkId: normalizedNetworkId,
       virtualIp: virtualIp.trim(),
       deviceName: normalizedDeviceName,
-      manualMode: normalizedManualMode,
       overlayCidr: overlayCidr.trim().isEmpty
           ? defaultOverlayCidr
           : overlayCidr.trim(),
@@ -272,12 +256,6 @@ class SettingsStore extends ChangeNotifier {
       relayServers: settings.relayServers.trim(),
       closeBehavior: normalizeCloseBehavior(settings.closeBehavior),
     );
-    if (normalizedSettings.manualMode &&
-        normalizedSettings.authToken.trim().isNotEmpty) {
-      // Keep the persisted state self-consistent even for callers that use
-      // updateSettings directly (for example logout/offline migrations).
-      normalizedSettings = normalizedSettings.copyWith(authToken: '');
-    }
     final errors = validateAppSettings(normalizedSettings);
     if (errors.isNotEmpty) {
       throw FormatException(errors.join('\n'));
@@ -286,16 +264,13 @@ class SettingsStore extends ChangeNotifier {
     final sessionChanged =
         accountSessionKey(previous) != accountSessionKey(normalizedSettings);
     if (sessionChanged) {
-      if (!normalizedSettings.manualMode) {
-        if (isRoomNetwork(normalizedSettings.networkId)) {
-          normalizedSettings = personalNetworkSettings(normalizedSettings);
-        }
-        normalizedSettings = normalizedSettings.copyWith(
-          virtualIp: '',
-          personalVirtualIp: '',
-          manualMode: false,
-        );
+      if (isRoomNetwork(normalizedSettings.networkId)) {
+        normalizedSettings = personalNetworkSettings(normalizedSettings);
       }
+      normalizedSettings = normalizedSettings.copyWith(
+        virtualIp: '',
+        personalVirtualIp: '',
+      );
     }
     Future<void> commit() async {
       _settings = normalizedSettings;
@@ -516,6 +491,10 @@ class SettingsStore extends ChangeNotifier {
   }
 
   bool _hasLegacyFields(Map<String, dynamic> json) {
+    if (json.containsKey('manualMode') ||
+        json.containsKey('personalManualMode')) {
+      return true;
+    }
     return json.containsKey('auth_token') ||
         json.containsKey('token') ||
         (json['authToken'] is String &&
@@ -712,8 +691,8 @@ List<String> validateAppSettings(AppSettings settings) {
   if (virtualIp.isNotEmpty && !_isIpv4Address(virtualIp)) {
     errors.add('Virtual IP must look like 10.20.0.42');
   }
-  if (settings.deviceName.trim().isEmpty && !settings.manualMode) {
-    errors.add('Device name is required outside manual/offline mode');
+  if (settings.deviceName.trim().isEmpty) {
+    errors.add('Device name is required');
   }
   final overlay = settings.overlayCidr.trim();
   if (!_isIpv4Cidr(overlay)) {

@@ -38,8 +38,7 @@ extension StatusStoreAccountSession on StatusStore {
             );
           }
         }
-        _accountRequiresRestart =
-            !next.manualMode && next.authToken.trim().isNotEmpty;
+        _accountRequiresRestart = next.authToken.trim().isNotEmpty;
         _healthReachable = false;
         _routeHealthy = false;
         _clearSnapshot();

@@ -183,7 +183,7 @@ void main() {
       '${dir.path}${Platform.pathSeparator}rooms${Platform.pathSeparator}${roomProfileId(room)}${Platform.pathSeparator}p2wlan-config.json',
     );
     expect(
-      networkConfigFile(legacy, account.copyWith(manualMode: true)).path,
+      networkConfigFile(legacy, account.copyWith(authToken: '')).path,
       legacy.path,
     );
     expect(
@@ -197,9 +197,7 @@ void main() {
     () async {
       final legacy = File('${dir.path}/p2wlan-config.json');
       await legacy.writeAsString('offline-private-identity');
-      await settings.updateSettings(
-        settings.settings.copyWith(authToken: '', manualMode: true),
-      );
+      await settings.updateSettings(settings.settings.copyWith(authToken: ''));
       final current = settings.settings;
 
       await settings.updateConnectionSettings(
@@ -209,7 +207,6 @@ void main() {
         networkId: current.networkId,
         virtualIp: current.virtualIp,
         deviceName: current.deviceName,
-        manualMode: true,
         overlayCidr: current.overlayCidr,
         tunInterface: current.tunInterface,
         mtu: current.mtu,
@@ -220,7 +217,7 @@ void main() {
         closeBehavior: current.closeBehavior,
       );
 
-      expect(settings.settings.manualMode, isFalse);
+      expect(settings.settings.toJson(), isNot(contains('manualMode')));
       expect(settings.settings.authToken, _token('b'));
       final managed = networkConfigFile(legacy, settings.settings);
       expect(managed.path, isNot(legacy.path));
@@ -420,9 +417,7 @@ void main() {
   test(
     'manual mode permits diagnostics refresh without requiring startDaemon',
     () async {
-      await settings.updateSettings(
-        settings.settings.copyWith(manualMode: true, authToken: ''),
-      );
+      await settings.updateSettings(settings.settings.copyWith(authToken: ''));
       expect(daemon.stops, 1);
       await status.refresh();
       expect(status.daemonReachable, isTrue);

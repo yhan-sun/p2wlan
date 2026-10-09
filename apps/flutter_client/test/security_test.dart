@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/security/local_config_secret.dart';
 import 'package:p2wlan_flutter_client/core/security/redactor.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
@@ -256,7 +257,7 @@ void main() {
       expect(await secure.read(), isNull);
     });
 
-    test('saving manual mode clears a previously managed credential', () async {
+    test('legacy offline settings cannot clear a managed credential', () async {
       final tmp = await Directory.systemTemp.createTemp('p2wlan_manual_');
       addTearDown(() async => tmp.delete(recursive: true));
       final secure = InMemorySecureTokenRepository();
@@ -269,11 +270,59 @@ void main() {
         store.settings.copyWith(authToken: 'managed-token'),
       );
 
-      await store.updateSettings(store.settings.copyWith(manualMode: true));
+      await store.updateSettings(
+        AppSettings.fromJson({
+          ...store.settings.toJson(),
+          'manualMode': true,
+          'personalManualMode': true,
+        }),
+      );
 
-      expect(store.settings.manualMode, isTrue);
-      expect(store.settings.authToken, isEmpty);
-      expect(await secure.read(), isNull);
+      expect(store.settings.toJson(), isNot(contains('manualMode')));
+      expect(store.settings.toJson(), isNot(contains('personalManualMode')));
+      expect(store.settings.authToken, 'managed-token');
+      expect(await secure.read(), 'managed-token');
+    });
+
+    test('rejects clearing the server without changing the session', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_server_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final file = File('${tmp.path}/settings.json');
+      final secure = InMemorySecureTokenRepository();
+      final store = SettingsStore(settingsFile: file, tokenRepository: secure);
+      await store.updateSettings(
+        const AppSettings(
+          controlServer: 'https://control.example.com',
+          authToken: 'managed-token',
+          deviceName: 'test-client',
+        ),
+      );
+      final current = store.settings;
+      final persisted = await file.readAsString();
+
+      await expectLater(
+        store.updateConnectionSettings(
+          diagnosticsUrl: current.diagnosticsUrl,
+          controlServer: '  ',
+          authToken: '',
+          networkId: current.networkId,
+          virtualIp: current.virtualIp,
+          deviceName: current.deviceName,
+          overlayCidr: current.overlayCidr,
+          tunInterface: current.tunInterface,
+          mtu: current.mtu,
+          udpBind: current.udpBind,
+          udpAdvertise: current.udpAdvertise,
+          socketPool: current.socketPool,
+          relayServers: current.relayServers,
+          closeBehavior: current.closeBehavior,
+        ),
+        throwsA(isA<FormatException>()),
+      );
+
+      expect(store.settings, same(current));
+      expect(await file.readAsString(), persisted);
+      expect(await secure.read(), 'managed-token');
     });
 
     test(
@@ -294,11 +343,11 @@ void main() {
 
         await store.load();
 
-        expect(store.settings.manualMode, isFalse);
+        expect(store.settings.toJson(), isNot(contains('manualMode')));
         expect(store.settings.authToken, 'managed-token');
         final raw = await settingsFile.readAsString();
         final persisted = jsonDecode(raw) as Map<String, dynamic>;
-        expect(persisted['manualMode'], isFalse);
+        expect(persisted, isNot(contains('manualMode')));
         expect(persisted['authToken'], isEmpty);
       },
     );
@@ -316,7 +365,13 @@ void main() {
           tokenRepository: secure,
         );
         await store.load();
-        await store.updateSettings(store.settings.copyWith(manualMode: true));
+        await store.updateSettings(
+          AppSettings.fromJson({
+            ...store.settings.toJson(),
+            'manualMode': true,
+            'personalManualMode': true,
+          }),
+        );
         final current = store.settings;
 
         await store.updateConnectionSettings(
@@ -326,7 +381,6 @@ void main() {
           networkId: current.networkId,
           virtualIp: current.virtualIp,
           deviceName: current.deviceName,
-          manualMode: true,
           overlayCidr: current.overlayCidr,
           tunInterface: current.tunInterface,
           mtu: current.mtu,
@@ -337,7 +391,7 @@ void main() {
           closeBehavior: current.closeBehavior,
         );
 
-        expect(store.settings.manualMode, isFalse);
+        expect(store.settings.toJson(), isNot(contains('manualMode')));
         expect(store.settings.authToken, 'managed-token');
         expect(await secure.read(), 'managed-token');
       },

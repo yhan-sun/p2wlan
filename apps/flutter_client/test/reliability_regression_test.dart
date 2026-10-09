@@ -205,10 +205,7 @@ void main() {
   test(
     'startup catalog retries health failures until the service binds',
     () async {
-      final harness = await _Harness.create(
-        authToken: 'fixture-token',
-        manualMode: false,
-      );
+      final harness = await _Harness.create(authToken: 'fixture-token');
       addTearDown(harness.dispose);
       harness.api.healthResponses.addAll([false, false, true]);
       await harness.store.refreshUntilPeerCatalogSettled();
@@ -366,10 +363,7 @@ class _Harness {
   final _Api api;
   final StatusStore store;
 
-  static Future<_Harness> create({
-    String authToken = '',
-    bool manualMode = true,
-  }) async {
+  static Future<_Harness> create({String authToken = ''}) async {
     final directory = await Directory.systemTemp.createTemp(
       'p2wlan_reliability_',
     );
@@ -378,12 +372,9 @@ class _Harness {
       tokenRepository: InMemorySecureTokenRepository(),
     );
     await settings.load();
-    if (authToken.isNotEmpty || !manualMode) {
+    if (authToken.isNotEmpty) {
       await settings.updateSettings(
-        settings.settings.copyWith(
-          authToken: authToken,
-          manualMode: manualMode,
-        ),
+        settings.settings.copyWith(authToken: authToken),
       );
     }
     final raw = jsonDecode(

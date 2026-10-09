@@ -24,8 +24,8 @@ extension _SettingsPageActions on _SettingsPageState {
             _virtualIpController.text.trim() != settings.virtualIp.trim();
       case SettingsCategory.advancedNetwork:
         final mtuText = _mtuController.text.trim();
-        return _manualMode != settings.manualMode ||
-            _overlayCidrController.text.trim() != settings.overlayCidr.trim() ||
+        return _overlayCidrController.text.trim() !=
+                settings.overlayCidr.trim() ||
             _tunInterfaceController.text.trim() !=
                 settings.effectiveTunInterface.trim() ||
             int.tryParse(mtuText) != settings.mtu ||
@@ -84,7 +84,6 @@ extension _SettingsPageActions on _SettingsPageState {
       var networkId = current.networkId;
       var virtualIp = current.virtualIp;
       var deviceName = current.deviceName;
-      var manualMode = current.manualMode;
       var overlayCidr = current.overlayCidr;
       var tunInterface = current.tunInterface;
       var mtu = current.mtu;
@@ -104,10 +103,8 @@ extension _SettingsPageActions on _SettingsPageState {
           networkId = _networkIdController.text;
           virtualIp = _virtualIpController.text;
         case SettingsCategory.advancedNetwork:
-          // Empty delegates credential preservation/clearing to SettingsStore:
-          // managed mode preserves, manual mode clears.
+          // Preserve the secure credential when saving network settings.
           authToken = '';
-          manualMode = _manualMode;
           overlayCidr = _overlayCidrController.text;
           tunInterface = _tunInterfaceController.text;
           mtu = int.tryParse(_mtuController.text.trim()) ?? defaultMtu;
@@ -137,7 +134,6 @@ extension _SettingsPageActions on _SettingsPageState {
         networkId: networkId,
         virtualIp: virtualIp,
         deviceName: deviceName,
-        manualMode: manualMode,
         overlayCidr: overlayCidr,
         tunInterface: tunInterface,
         mtu: mtu,
@@ -231,7 +227,6 @@ extension _SettingsPageActions on _SettingsPageState {
         before.networkId != after.networkId ||
         before.virtualIp != after.virtualIp ||
         before.deviceName != after.deviceName ||
-        before.manualMode != after.manualMode ||
         before.tunInterface != after.tunInterface ||
         before.overlayCidr != after.overlayCidr ||
         before.mtu != after.mtu ||
@@ -292,9 +287,7 @@ extension _SettingsPageActions on _SettingsPageState {
     );
     final settings = widget.settingsStore.settings;
     final authToken = settings.authToken.trim();
-    if (settings.manualMode ||
-        authToken.isEmpty ||
-        isAuthTokenExpired(authToken)) {
+    if (authToken.isEmpty || isAuthTokenExpired(authToken)) {
       _showSnackBar(strings.logsUploadRequiresLogin);
       return;
     }
@@ -448,7 +441,6 @@ extension _SettingsPageActions on _SettingsPageState {
         _networkIdController.text = saved.networkId;
         _virtualIpController.text = saved.virtualIp;
       case SettingsCategory.advancedNetwork:
-        _manualMode = saved.manualMode;
         _socketPool = saved.socketPool;
         _tunInterfaceController.text = saved.effectiveTunInterface;
         _mtuController.text = saved.mtu.toString();

@@ -913,7 +913,6 @@ class StatusStore extends ChangeNotifier {
         }
         previousSignature = currentSignature;
         if (!_shouldSettlePeerCatalog()) break;
-        if (currentSnapshot != null && settingsStore.settings.manualMode) break;
         if (currentSnapshot?.health.controlConnected == true &&
             refreshCount >= _startupCatalogMinRefreshes &&
             stableCatalogCount >= 1) {
@@ -1143,7 +1142,7 @@ class StatusStore extends ChangeNotifier {
   bool _shouldSettlePeerCatalog() {
     final settings = settingsStore.settings;
     return (_daemonStarting && _snapshot == null) ||
-        (!settings.manualMode && settings.authToken.trim().isNotEmpty);
+        (settings.authToken.trim().isNotEmpty);
   }
 
   static String _peerCatalogSignature(DiagnosticsSnapshot? snapshot) {
@@ -1160,9 +1159,9 @@ class StatusStore extends ChangeNotifier {
     final accountChanged = nextSession != _lastAccountSession;
     if (accountChanged) {
       _lastAccountSession = nextSession;
-      _accountRequiresRestart =
-          !settingsStore.settings.manualMode &&
-          settingsStore.settings.authToken.trim().isNotEmpty;
+      _accountRequiresRestart = settingsStore.settings.authToken
+          .trim()
+          .isNotEmpty;
       unawaited(parallelRooms.credentialsChanged());
       _clearAccountHistory();
     }

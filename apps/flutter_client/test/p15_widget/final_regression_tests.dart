@@ -443,7 +443,7 @@ void _registerFinalRegressionTests() {
   }
 }
 
-/// A store on the permission step (manual mode, daemon down, elevation
+/// A store on the permission step (authenticated account, daemon down, elevation
 /// preflight), optionally with a failing daemon controller.
 Future<_Stores> _permissionStepStores(
   WidgetTester tester, {
@@ -458,7 +458,7 @@ Future<_Stores> _permissionStepStores(
   final stores = (await tester.runAsync(
     () => _makeStores(
       api: api,
-      manualMode: true,
+      authToken: 'test-account-token',
       daemonController: failingDaemon
           ? _FailingDaemonController(api)
           : _FakeDaemonController(api),
@@ -468,7 +468,7 @@ Future<_Stores> _permissionStepStores(
   return stores;
 }
 
-/// A store on the completion step (manual mode, satisfied permissions, daemon
+/// A store on the completion step (authenticated account, satisfied permissions, daemon
 /// healthy, virtual IP + peers present) whose persistence throws on save.
 Future<_Stores> _completionStepStores(WidgetTester tester) async {
   final api = _FakeDiagnosticsApi(
@@ -487,8 +487,9 @@ Future<_Stores> _completionStepStores(WidgetTester tester) async {
   await tester.runAsync(
     () => settingsStore.updateSettings(
       settingsStore.settings.copyWith(
+        controlServer: 'https://control.example.com',
+        authToken: 'test-account-token',
         languageCode: AppLanguage.english.code,
-        manualMode: true,
       ),
     ),
   );

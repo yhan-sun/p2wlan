@@ -511,13 +511,9 @@ class AppStrings {
   String get controlServer => isZh ? '控制面服务器' : 'Control server';
   String get authToken => isZh ? '认证 Token' : 'Auth token';
   String get authTokenHelper => isZh
-      ? '留空时会以手动/离线模式启动，只用于本机诊断和本地 TUN 验证。'
-      : 'Leave empty to start in manual/offline mode for local diagnostics and TUN validation.';
+      ? '留空保留已保存的登录凭据；连接前必须登录服务器。'
+      : 'Leave empty to keep the saved credential. Sign in to the server before connecting.';
   String get deviceName => isZh ? '设备名称' : 'Device name';
-  String get manualMode => isZh ? '手动/离线模式' : 'Manual/offline mode';
-  String get manualModeHelper => isZh
-      ? '开启后不连接控制面；关闭且提供 Token 后加入托管 P2WLAN 网络。'
-      : 'When enabled, the daemon skips control-plane registration. Disable it and provide a token to join the managed P2WLAN network.';
   String get save => isZh ? '保存' : 'Save';
   String get restoreDefaultUrl => isZh ? '恢复默认 URL' : 'Restore default URL';
   String localSettingsFile(String path) =>
@@ -640,8 +636,7 @@ class AppStrings {
   String get credentialSectionTitle => isZh ? '认证凭据' : 'Authentication';
   String get credentialSaved => isZh ? '已安全保存' : 'Securely saved';
   String get credentialNotSaved => isZh ? '未保存凭据' : 'No credential saved';
-  String get credentialManualMode =>
-      isZh ? '手动模式无需凭据' : 'Manual mode, no credential needed';
+
   String get changeCredential => isZh ? '更换凭据' : 'Change credential';
   String get hideCredential => isZh ? '收起' : 'Hide';
   String get credentialChangeHelper => isZh
@@ -744,18 +739,13 @@ class AppStrings {
       isZh ? '没有账号？创建账号' : "Don't have an account? Create one";
   String get alreadyHaveAccount =>
       isZh ? '已有账号？登录' : 'Already have an account? Sign in';
-  String get advancedOptions => isZh ? '高级选项' : 'Advanced options';
-  String get advancedOptionsSubtitle =>
-      isZh ? '自托管服务器、手动 / 离线模式' : 'Self-hosted server, manual / offline mode';
-  String get selfHostedServer => isZh ? '自托管服务器' : 'Self-hosted server';
-  String get usingCustomServer =>
-      isZh ? '正在使用自托管服务器' : 'Using a self-hosted server';
-  String get manualOfflineMode => isZh ? '手动 / 离线模式' : 'Manual / offline mode';
-  String get manualOfflineModeHelper => isZh
-      ? '不连接控制服务器，仅用于本地网络测试和诊断。'
-      : 'Does not connect to a control server; for local network testing and diagnostics only.';
-  String get continueOffline =>
-      isZh ? '继续使用手动 / 离线模式' : 'Continue in manual / offline mode';
+  String get loginServerAddress =>
+      isZh ? '服务器地址（必填）' : 'Server address (required)';
+  String get loginServerRequiredTitle =>
+      isZh ? '请输入服务器地址' : 'Server address required';
+  String get loginServerRequiredHelper => isZh
+      ? '请输入服务器地址并登录后才能使用 P2WLAN，中继配置会自动获取。'
+      : 'Enter a server address and sign in to use P2WLAN. Relay settings are provided automatically.';
   String get showPassword => isZh ? '显示密码' : 'Show password';
   String get hidePassword => isZh ? '隐藏密码' : 'Hide password';
   String get loginIdentifier => isZh ? '邮箱或用户名' : 'Email or username';
@@ -768,11 +758,6 @@ class AppStrings {
   String get loginErrorInvalidServerBody => isZh
       ? '请输入完整的 HTTP 或 HTTPS 地址，例如 https://example.com'
       : 'Enter a complete HTTP or HTTPS URL, for example https://example.com';
-  String get loginErrorManualModeTitle =>
-      isZh ? '无法进入手动模式' : 'Could not enter manual mode';
-  String get loginErrorManualModeBody => isZh
-      ? '无法保存本地配置，请重试。'
-      : 'Local settings could not be saved. Please try again.';
   String get loginFailedTitle => isZh ? '无法登录' : 'Sign in failed';
   String get loginErrorAuthenticationBody =>
       isZh ? '邮箱或密码不正确。' : 'Incorrect email or password.';

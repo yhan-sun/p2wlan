@@ -43,7 +43,7 @@ String managedNetworkProfileId(AppSettings settings) {
 }
 
 File networkConfigFile(File legacy, AppSettings settings) {
-  if (settings.manualMode || settings.authToken.trim().isEmpty) return legacy;
+  if (settings.authToken.trim().isEmpty) return legacy;
   final scope = isRoomNetwork(settings.networkId) ? 'rooms' : 'accounts';
   return File(
     [
@@ -55,11 +55,8 @@ File networkConfigFile(File legacy, AppSettings settings) {
   );
 }
 
-String accountSessionKey(AppSettings settings) => jsonEncode([
-  settings.controlServer,
-  settings.authToken,
-  settings.manualMode,
-]);
+String accountSessionKey(AppSettings settings) =>
+    jsonEncode([settings.controlServer, settings.authToken]);
 
 AppSettings selectRoomSettings(AppSettings current, FriendRoom room) {
   if (!isRoomNetwork(room.id) || !validRoomCidr(room.cidr)) {
@@ -72,13 +69,9 @@ AppSettings selectRoomSettings(AppSettings current, FriendRoom room) {
         ? current.personalOverlayCidr
         : current.overlayCidr,
     personalVirtualIp: inRoom ? current.personalVirtualIp : current.virtualIp,
-    personalManualMode: inRoom
-        ? current.personalManualMode
-        : current.manualMode,
     networkId: room.id,
     overlayCidr: room.cidr,
     virtualIp: '',
-    manualMode: false,
   );
 }
 
@@ -89,6 +82,5 @@ AppSettings personalNetworkSettings(AppSettings current) {
         : current.personalNetworkId,
     overlayCidr: current.personalOverlayCidr,
     virtualIp: current.personalVirtualIp,
-    manualMode: current.personalManualMode,
   );
 }

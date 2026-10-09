@@ -144,25 +144,6 @@ extension DaemonControllerElevation on DaemonController {
     }
   }
 
-  String _manualSudoCommand(String elevatedShell) {
-    return 'sudo /bin/sh -c ${_shellQuote(elevatedShell)}';
-  }
-
-  String? _manualCommandForPlatform({
-    required String elevatedShell,
-    required File binary,
-    required List<String> args,
-  }) {
-    if ((Platform.isMacOS || Platform.isLinux) && !_isRootUser()) {
-      return _manualSudoCommand(elevatedShell);
-    }
-    if (Platform.isWindows) {
-      final argLine = args.map(_windowsCommandLineArgQuote).join(' ');
-      return 'powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath ${_powershellDoubleQuote(binary.path)} -ArgumentList ${_powershellDoubleQuote(argLine)}"';
-    }
-    return null;
-  }
-
   Future<void> _startLinuxElevated({
     required File binary,
     required List<String> args,

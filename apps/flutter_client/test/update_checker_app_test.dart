@@ -24,8 +24,9 @@ void main() {
         await settingsStore.load();
         await settingsStore.updateSettings(
           settingsStore.settings.copyWith(
+            controlServer: 'https://control.example.com',
+            authToken: 'test-account-token',
             languageCode: 'en',
-            manualMode: true,
             onboardingCompleted: true,
           ),
         );

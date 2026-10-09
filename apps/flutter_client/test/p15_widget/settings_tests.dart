@@ -139,7 +139,7 @@ void _registerSettingsTests() {
 
     expect(find.text('Interface name'), findsOneWidget);
     expect(find.text('UDP advertise'), findsOneWidget);
-    expect(find.text('Manual/offline mode'), findsOneWidget);
+    expect(find.text('Manual/offline mode'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
@@ -526,12 +526,12 @@ void _registerSettingsTests() {
 
     await tester.runAsync(
       () => stores.settingsStore.updateSettings(
-        stores.settingsStore.settings.copyWith(manualMode: true),
+        stores.settingsStore.settings.copyWith(authToken: ''),
       ),
     );
     await tester.pump();
 
-    expect(find.text('手动模式无需凭据'), findsOneWidget);
+    expect(find.text('未保存凭据'), findsOneWidget);
     expect(find.text('已安全保存'), findsNothing);
   });
 

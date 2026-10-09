@@ -25,7 +25,6 @@ enum OnboardingStep { auth, permission, daemon, virtualIp, discover, done }
 class OnboardingFacts {
   const OnboardingFacts({
     this.hasCredential = false,
-    this.manualMode = false,
     this.permissionGranted = false,
     this.daemonReachable = false,
     this.virtualIp = '',
@@ -35,9 +34,6 @@ class OnboardingFacts {
   /// Whether a control credential is stored (managed mode). True also for a
   /// user who has already signed in.
   final bool hasCredential;
-
-  /// Offline / self-hosted manual mode — no control credential is required.
-  final bool manualMode;
 
   /// Whether the platform elevation/permission prompt has been satisfied
   /// (meaningful only on desktop).
@@ -56,7 +52,6 @@ class OnboardingFacts {
   /// Return a copy with the given fields overridden.
   OnboardingFacts copy({
     bool? hasCredential,
-    bool? manualMode,
     bool? permissionGranted,
     bool? daemonReachable,
     String? virtualIp,
@@ -64,7 +59,6 @@ class OnboardingFacts {
   }) {
     return OnboardingFacts(
       hasCredential: hasCredential ?? this.hasCredential,
-      manualMode: manualMode ?? this.manualMode,
       permissionGranted: permissionGranted ?? this.permissionGranted,
       daemonReachable: daemonReachable ?? this.daemonReachable,
       virtualIp: virtualIp ?? this.virtualIp,
@@ -90,9 +84,8 @@ class OnboardingModel {
   OnboardingStep step(OnboardingFacts facts) {
     if (!isLocalNodeFlow) return OnboardingStep.done;
 
-    // 1. Authentication (managed) or explicit manual mode.
-    final authed = facts.manualMode || facts.hasCredential;
-    if (!authed) return OnboardingStep.auth;
+    // 1. A configured server and authenticated account are required.
+    if (!facts.hasCredential) return OnboardingStep.auth;
 
     // 2. Platform permission / elevation for local node work.
     if (capabilities.canRequestElevation && !facts.permissionGranted) {

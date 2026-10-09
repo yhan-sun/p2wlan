@@ -115,7 +115,6 @@ Future<Map<String, dynamic>> _runUiStopCycle(
     await settingsStore.updateSettings(
       settingsStore.settings.copyWith(
         diagnosticsUrl: baseUrl,
-        manualMode: true,
         tunInterface: 'p2wlan-lifecycle',
       ),
     );
