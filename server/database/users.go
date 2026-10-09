@@ -86,8 +86,12 @@ func (db *DB) GetUserByLoginIdentifier(identifier string) (*User, error) {
 	if identifier == "" {
 		return nil, sql.ErrNoRows
 	}
-	if user, err := db.GetUserByEmail(strings.ToLower(identifier)); err == nil {
+	user, err := db.GetUserByEmail(strings.ToLower(identifier))
+	if err == nil {
 		return user, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
 	}
 
 	rows, err := db.Query(`

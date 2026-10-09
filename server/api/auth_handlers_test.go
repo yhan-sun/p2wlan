@@ -49,3 +49,27 @@ func TestLoginAcceptsEmailAndAccountUsername(t *testing.T) {
 		t.Fatalf("identifier login failed: code=%d body=%v", code, body)
 	}
 }
+
+func TestLoginStorageFailureDoesNotReportInvalidPassword(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "login-unavailable.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(auth.NewService("test-login-secret", db), nil, db)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/login", bytes.NewBufferString(`{"email":"account@example.test","password":"password123"}`))
+	w := httptest.NewRecorder()
+	s.Login(w, r)
+	if w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("storage outage must be retryable, got HTTP %d", w.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["error_code"] != "authentication_unavailable" {
+		t.Fatal("storage outage missing stable reason code")
+	}
+}
