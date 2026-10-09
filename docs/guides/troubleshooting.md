@@ -27,6 +27,8 @@
 
 排查双对称网络始终 Relay 时，先确认同一 session 的协商接纳、profile 绑定、实际扫描和确认阶段。`candidate_not_executed`、租约重投、代际取消与已发送但无响应是不同问题，不能只凭候选数量判断端口预测是否有效。摘要缺失字段表示未知；缓存状态和单侧日志不能证明双方在同一时间窗执行了同一计划。
 
+排查 Direct 使用一段时间后转为 Relay 时，同时查看路径转换原因和 `dplpmtud_probe_send_failed`。`LocalPacketTooLarge` 表示本机拒绝发送该尺寸的 UDP 包，不等于 NAT 映射失效；已确认的业务 MTU 失效后，流量可暂由已确认的 Relay 承载，Direct 继续探测。Windows 的 Direct UDP socket 使用 `IP_PMTUDISC_PROBE`，保持禁止分片并按接口 MTU 发出探测，避免系统缓存的路径 MTU 阻止重新验证；业务尺寸仍须经过加密 ACK 确认。若基础探测仍持续失败，应检查物理接口 MTU、路由和 VPN。日志有 `p2wlan-log-gap` 时，不能仅凭缺失的转换记录断言回退原因。
+
 Relay 关闭原因区分 `peer_closed`、`partial_frame`、`local_closed`、`connection_reset`、`idle_timeout` 和兜底的 `read_error`；正常 EOF/本地关闭不计入 frame error。关闭原因只说明传输如何结束，不能单独推断 NAT 打洞或路径提升失败。
 
 桌面启动记录保留阶段和失败代码；日志目录无法写入时，本次启动仍在内存中保留最多 64 条、每条最多 1024 字符的诊断记录。macOS/Linux 的默认运行目录可在权限拒绝时请求一次提权恢复。应用目录之外的父目录须已存在且归当前用户所有；自定义路径或不安全链接需要先由管理员检查，客户端不会扩大访问权限来继续启动。
