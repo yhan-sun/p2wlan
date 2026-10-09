@@ -789,6 +789,18 @@ impl PeerManager {
         self.local_nat_profile.read().await.clone()
     }
 
+    /// Observer reachability/RTT hints from the authoritative live gather.
+    /// These may only order configured STUN destinations. Cached mappings are
+    /// never evidence for a fresh socket or permission to send/promote a path.
+    pub(crate) async fn local_stun_observation_hints(&self) -> Vec<p2pnet_nat::StunObservation> {
+        self.local_nat_profile
+            .read()
+            .await
+            .as_ref()
+            .map(|profile| profile.observations.clone())
+            .unwrap_or_default()
+    }
+
     /// Current local network generation.
     pub async fn current_network_generation(&self) -> u64 {
         *self.network_generation.read().await

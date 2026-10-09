@@ -53,6 +53,25 @@ fn grid_timeout_changes_the_remaining_share_without_renewing_the_budget() {
 }
 
 #[test]
+fn hard_hard_sample_timeout_can_use_spare_time_but_not_extend_the_deadline() {
+    let configured = Duration::from_secs(1);
+    assert_eq!(
+        ordered_mapping_request_timeout(configured, 100, 100, 3),
+        Some(Duration::from_millis(400))
+    );
+    assert_eq!(
+        ordered_mapping_request_timeout(configured, 100, 420, 1),
+        Some(Duration::from_millis(880))
+    );
+    assert_eq!(
+        ordered_mapping_request_timeout(Duration::from_millis(100), 100, 420, 1),
+        Some(Duration::from_millis(100)),
+        "the user's configured timeout remains an upper bound"
+    );
+    assert!(ordered_mapping_request_timeout(configured, 100, 1300, 1).is_none());
+}
+
+#[test]
 fn primary_fallback_never_reuses_unknown_or_failed_pairs() {
     let observers = observers();
     let primary = "192.0.2.1:5000".parse().unwrap();

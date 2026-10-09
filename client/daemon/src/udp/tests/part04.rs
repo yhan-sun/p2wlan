@@ -112,6 +112,14 @@ async fn reserve_linear_forwarders(
 
 impl SimulatedNat {
     async fn start(step: i16, consume_before_punch: bool) -> Self {
+        Self::start_with_observer_delays(step, consume_before_punch, [Duration::ZERO; 3]).await
+    }
+
+    async fn start_with_observer_delays(
+        step: i16,
+        consume_before_punch: bool,
+        observer_delays: [Duration; 3],
+    ) -> Self {
         let nat_ip = IpAddr::V4(Ipv4Addr::from(NAT_IP));
         let (base_port, reserved_forwarders) = reserve_linear_forwarders(nat_ip, step).await;
         let mut observer_holders = Vec::new();
@@ -287,7 +295,13 @@ impl SimulatedNat {
             let next_port = nat.next_port.clone();
             let step = nat.step;
             let nat_ip = nat.nat_ip;
-            for (observer, socket) in nat.observers.iter().copied().zip(observer_holders) {
+            for ((observer, socket), delay) in nat
+                .observers
+                .iter()
+                .copied()
+                .zip(observer_holders)
+                .zip(observer_delays)
+            {
                 let mappings = mappings.clone();
                 let next_port = next_port.clone();
                 tasks.push(tokio::spawn(async move {
@@ -307,6 +321,9 @@ impl SimulatedNat {
                         };
                         if let Ok(request) = StunMessage::decode(&data) {
                             if request.msg_type == p2pnet_nat::BINDING_REQUEST {
+                                if !delay.is_zero() {
+                                    sleep(delay).await;
+                                }
                                 let mut response = StunMessage::with_transaction_id(
                                     p2pnet_nat::BINDING_RESPONSE,
                                     request.transaction_id,
@@ -406,9 +423,14 @@ async fn hard_nat_profile() -> CandidateGatherReport {
 /// Shared measure-then-punch environment: a hard-NAT peer manager, a bound
 /// transport with an inbound channel, and a fresh simulated NAT.
 async fn generation_env() -> (Arc<PeerManager>, Arc<UdpTransport>, SimulatedNat) {
+    generation_env_with_nat(SimulatedNat::start(1, false).await).await
+}
+
+async fn generation_env_with_nat(
+    nat: SimulatedNat,
+) -> (Arc<PeerManager>, Arc<UdpTransport>, SimulatedNat) {
     let local_identity = NodeIdentity::generate();
     let peer_identity = NodeIdentity::generate();
-    let nat = SimulatedNat::start(1, false).await;
 
     let peers = Arc::new(PeerManager::new(config_for_identity(
         &local_identity,

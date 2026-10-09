@@ -272,6 +272,51 @@ fn regular_allocation_measurement(
     .is_ok()
 }
 
+/// Choose measurement destinations, never mapping evidence. Prefer a complete
+/// primary tail over a four-observer grid with a known-unresponsive endpoint.
+/// Cold/incomplete gathers retain configured observers so stale hints cannot
+/// prevent a new measurement. Every selected endpoint is measured again.
+fn select_measurement_observers(
+    configured: &[SocketAddr],
+    hints: &[p2pnet_nat::StunObservation],
+) -> Vec<SocketAddr> {
+    let mut seen = HashSet::new();
+    let mut ranked = configured
+        .iter()
+        .copied()
+        .filter(|addr| addr.is_ipv4() && seen.insert(*addr))
+        .map(|addr| {
+            let hint = hints
+                .iter()
+                .find(|hint| hint.server.parse::<SocketAddr>().ok() == Some(addr));
+            let rank = match hint {
+                Some(hint) if hint.mapped_address.is_some() && hint.error.is_none() => 0,
+                None => 1,
+                Some(_) => 2,
+            };
+            (
+                addr,
+                rank,
+                hint.and_then(|hint| hint.rtt_ms).unwrap_or(u64::MAX),
+            )
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(_, rank, rtt)| (*rank, *rtt));
+    let responsive = ranked.iter().take_while(|(_, rank, _)| *rank == 0).count();
+    if responsive >= 3 {
+        ranked.truncate(responsive);
+    }
+    // Cross-address observations help prove allocator scope in a complete
+    // grid. A three-observer primary tail needs no secondary-socket ordering.
+    if ranked.len() >= 4 {
+        let first_ip = ranked[0].0.ip();
+        if let Some(other) = ranked.iter().position(|(addr, ..)| addr.ip() != first_ip) {
+            ranked.swap(1, other);
+        }
+    }
+    ranked.into_iter().take(4).map(|(addr, ..)| addr).collect()
+}
+
 pub(super) struct HardHardGridMeasurement {
     pub(super) observations_by_socket: Vec<Vec<MappingObservation>>,
     pub(super) samples: Vec<AllocationSample>,
@@ -287,30 +332,28 @@ impl UdpTransport {
         stun_timeout: Duration,
         keep_measuring: impl Fn() -> bool,
     ) -> HardHardGridMeasurement {
-        let mut seen = HashSet::new();
-        let mut observers = observers
-            .iter()
-            .copied()
-            .filter(|addr| seen.insert(*addr))
-            .collect::<Vec<_>>();
-        if let Some(first) = observers.first().copied() {
-            if let Some(other) = observers.iter().position(|addr| addr.ip() != first.ip()) {
-                observers.swap(1, other);
-            }
-        }
-        observers.truncate(4);
+        let hints = self.peers.local_stun_observation_hints().await;
+        let selected = select_measurement_observers(observers, &hints);
         let mut pairs = Vec::new();
-        if sockets.len() >= 2 && observers.len() >= 4 {
+        if sockets.len() >= 2 && selected.len() >= 4 {
             // The last grid send is A1. A2/A3 then extend that same socket's
             // ordered tail without another socket consuming an allocation.
             pairs.extend([(0, 0), (1, 0), (1, 1), (0, 1), (0, 2), (0, 3)]);
         } else if !sockets.is_empty() {
-            pairs.extend((0..observers.len()).map(|observer| (0, observer)));
+            pairs.extend((0..selected.len()).map(|observer| (0, observer)));
         }
         let requests = pairs
             .iter()
-            .map(|(socket, observer)| (sockets[*socket].1.clone(), observers[*observer]))
+            .map(|(socket, observer)| (sockets[*socket].1.clone(), selected[*observer]))
             .collect::<Vec<_>>();
+        info!(
+            event = "hard_hard_measurement_plan",
+            configured_observer_count = observers.len(),
+            selected_observer_count = selected.len(),
+            measurement_request_count = requests.len(),
+            measurement_budget_ms = FRESH_MAPPING_MEASURE_BUDGET.as_millis() as u64,
+            "Prepared bounded fresh STUN measurement"
+        );
         let measurement = self
             .measure_ordered_mapping_requests_with_primary_fallback(
                 &requests,
@@ -484,6 +527,93 @@ pub(super) fn prepared_prediction(
 mod tests {
     use super::*;
     use p2pnet_nat::AllocationAttemptOutcome as Outcome;
+
+    #[test]
+    fn observer_hints_preserve_a_complete_fast_to_slow_primary_tail() {
+        let configured = (1..=5)
+            .map(|host| format!("203.0.113.{host}:3478").parse().unwrap())
+            .collect::<Vec<SocketAddr>>();
+        let hints = configured
+            .iter()
+            .zip([None, Some(450), None, Some(30), Some(20)])
+            .map(|(addr, rtt)| p2pnet_nat::StunObservation {
+                server: addr.to_string(),
+                mapped_address: rtt.map(|_| "198.51.100.1:40000".into()),
+                rtt_ms: rtt,
+                error: rtt.is_none().then(|| "timeout".into()),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            select_measurement_observers(&configured, &hints),
+            [configured[4], configured[3], configured[1]],
+            "a slow third primary sample need not move into the grid's second position"
+        );
+    }
+
+    #[test]
+    fn cold_or_incomplete_observer_hints_keep_configured_fallbacks() {
+        let configured = (1..=5)
+            .map(|host| format!("203.0.113.{host}:3478").parse().unwrap())
+            .collect::<Vec<SocketAddr>>();
+        assert_eq!(
+            select_measurement_observers(&configured, &[]),
+            configured[..4]
+        );
+        let hint = p2pnet_nat::StunObservation {
+            server: configured[0].to_string(),
+            mapped_address: None,
+            rtt_ms: None,
+            error: Some("old timeout".into()),
+        };
+        assert_eq!(
+            select_measurement_observers(&configured, &[hint]),
+            configured[1..],
+            "unknown configured destinations must remain eligible for live measurement"
+        );
+    }
+
+    #[test]
+    fn observer_hints_cannot_add_endpoints_or_duplicate_measurements() {
+        let a = "203.0.113.1:3478".parse().unwrap();
+        let b = "203.0.113.2:3478".parse().unwrap();
+        let c = "203.0.113.3:3478".parse().unwrap();
+        let hint = p2pnet_nat::StunObservation {
+            server: "203.0.113.99:3478".into(),
+            mapped_address: Some("198.51.100.1:40000".into()),
+            rtt_ms: Some(1),
+            error: None,
+        };
+        assert_eq!(
+            select_measurement_observers(
+                &[a, a, "[2001:db8::1]:3478".parse().unwrap(), b, c],
+                &[hint]
+            ),
+            [a, b, c]
+        );
+    }
+
+    #[test]
+    fn four_responsive_observers_retain_cross_address_grid_measurement() {
+        let configured = [
+            "203.0.113.1:3478".parse().unwrap(),
+            "203.0.113.1:3479".parse().unwrap(),
+            "203.0.113.2:3478".parse().unwrap(),
+            "203.0.113.3:3478".parse().unwrap(),
+        ];
+        let hints = configured
+            .iter()
+            .map(|addr: &SocketAddr| p2pnet_nat::StunObservation {
+                server: addr.to_string(),
+                mapped_address: Some("198.51.100.1:40000".into()),
+                rtt_ms: Some(5),
+                error: None,
+            })
+            .collect::<Vec<_>>();
+        let selected = select_measurement_observers(&configured, &hints);
+        assert_eq!(selected.len(), 4);
+        assert_ne!(selected[0].ip(), selected[1].ip());
+        assert!(configured.iter().all(|addr| selected.contains(addr)));
+    }
 
     #[test]
     fn regular_measurement_preference_rejects_gaps_and_unobserved_allocations() {
