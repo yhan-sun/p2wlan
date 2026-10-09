@@ -23,17 +23,19 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def request(port, path, body, token=None):
-    data = json.dumps(body).encode("utf-8")
+def request(port, path, body=None, token=None, method="POST"):
+    data = None if body is None else json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if token is not None:
-        data = gzip.compress(data)
-        headers.update({"Content-Encoding": "gzip", "Authorization": f"Bearer {token}"})
+        headers["Authorization"] = f"Bearer {token}"
+        if path == "support/logs":
+            data = gzip.compress(data)
+            headers["Content-Encoding"] = "gzip"
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/v1/{path}",
         data=data,
         headers=headers,
-        method="POST",
+        method=method,
     )
     # Neither deployment proxies nor redirects may send this synthetic test
     # account or its token anywhere beyond the local Compose control endpoint.
@@ -172,10 +174,15 @@ def main():
     if control_uid() != uid:
         raise RuntimeError("control process identity changed after restart")
     assert_private_upload(upload_path, uid)
+    # Reusing the original token is the login-preservation contract. A new
+    # password login alone would not detect an accidentally rotated JWT key.
+    profile = request(port, "profile", token=token, method="GET")
+    if profile.get("user", {}).get("email") != account["email"]:
+        raise RuntimeError("existing login did not survive container restart")
     logged_in = request(port, "login", account)
     if not isinstance(logged_in.get("token"), str) or not logged_in["token"]:
         raise RuntimeError("persisted account was not usable after container restart")
-    print("PASS: non-root control retained a private support log and authenticated account after restart")
+    print("PASS: non-root control retained private support logs, accounts and the existing login after restart")
 
 
 if __name__ == "__main__":

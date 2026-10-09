@@ -4,9 +4,11 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -49,7 +51,10 @@ type Claims struct {
 func (s *Service) Login(identifier, password string) (string, *database.User, error) {
 	user, err := s.db.GetUserByLoginIdentifier(identifier)
 	if err != nil {
-		return "", nil, ErrInvalidCredentials
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil, ErrInvalidCredentials
+		}
+		return "", nil, fmt.Errorf("read login account: %w", err)
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
@@ -198,90 +203,6 @@ func GenerateNodeToken() string {
 	return hex.EncodeToString(b)
 }
 
-// RequireAnyAuth is middleware that accepts either a user JWT or a device credential.
-func RequireAnyAuth(authService *Service, db interface {
-	ValidateDeviceCredential(token string) (*database.DeviceCredential, *database.Device, error)
-}) func(http.HandlerFunc) http.HandlerFunc {
-	return func(next http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" {
-				http.Error(w, `{"error":"missing authorization header"}`, http.StatusUnauthorized)
-				return
-			}
-
-			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-			if tokenStr == authHeader {
-				http.Error(w, `{"error":"invalid authorization format"}`, http.StatusUnauthorized)
-				return
-			}
-
-			// Try device credential first
-			cred, device, err := db.ValidateDeviceCredential(tokenStr)
-			if err == nil {
-				claims := &DeviceClaims{
-					DeviceID:     device.ID,
-					NetworkID:    device.NetworkID,
-					UserID:       device.UserID,
-					CredentialID: cred.ID,
-					ExpiresAt:    cred.ExpiresAt,
-				}
-				ctx := context.WithValue(r.Context(), DeviceClaimsKey, claims)
-				next(w, r.WithContext(ctx))
-				return
-			}
-
-			// Fall back to user JWT
-			userClaims, err := authService.ValidateToken(tokenStr)
-			if err == nil {
-				ctx := context.WithValue(r.Context(), UserClaimsKey, userClaims)
-				next(w, r.WithContext(ctx))
-				return
-			}
-
-			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-		}
-	}
-}
-
-// RequireDeviceAuth is middleware that requires a valid device credential token.
-func RequireDeviceAuth(db interface {
-	ValidateDeviceCredential(token string) (*database.DeviceCredential, *database.Device, error)
-}) func(http.HandlerFunc) http.HandlerFunc {
-	return func(next http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" {
-				http.Error(w, `{"error":"missing authorization header"}`, http.StatusUnauthorized)
-				return
-			}
-
-			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-			if tokenStr == authHeader {
-				http.Error(w, `{"error":"invalid authorization format"}`, http.StatusUnauthorized)
-				return
-			}
-
-			cred, device, err := db.ValidateDeviceCredential(tokenStr)
-			if err != nil {
-				http.Error(w, `{"error":"invalid device credential"}`, http.StatusUnauthorized)
-				return
-			}
-
-			claims := &DeviceClaims{
-				DeviceID:     device.ID,
-				NetworkID:    device.NetworkID,
-				UserID:       device.UserID,
-				CredentialID: cred.ID,
-				ExpiresAt:    cred.ExpiresAt,
-			}
-
-			ctx := context.WithValue(r.Context(), DeviceClaimsKey, claims)
-			next(w, r.WithContext(ctx))
-		}
-	}
-}
-
 // RequireCurrentDeviceRegistrationSession fences device-token requests to the
 // currently registered daemon process.  A device credential remains valid
 // across daemon restarts so a dropped registration response cannot strand the
@@ -309,7 +230,11 @@ func RequireCurrentDeviceRegistrationSession(db interface {
 
 			device, err := db.GetDevice(claims.DeviceID)
 			if err != nil {
-				writeRegistrationLifecycleConflict(w, nil)
+				if errors.Is(err, sql.ErrNoRows) {
+					writeRegistrationLifecycleConflict(w, nil)
+				} else {
+					WriteAuthenticationUnavailable(w)
+				}
 				return
 			}
 			if device.RegistrationIncarnation <= 0 {

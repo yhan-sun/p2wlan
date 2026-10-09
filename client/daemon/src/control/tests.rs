@@ -289,6 +289,7 @@ include!("tests/messages.rs");
 include!("tests/client.rs");
 include!("tests/commands.rs");
 include!("tests/recovery.rs");
+include!("tests/server_restart.rs");
 
 include!("tests/capabilities.rs");
 include!("tests/hard_hard_signal.rs");

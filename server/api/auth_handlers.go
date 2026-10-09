@@ -3,9 +3,11 @@ package api
 import (
 	"encoding/json"
 	"errors"
-	"github.com/yhan-sun/p2wlan/server/database"
 	"net/http"
 	"strings"
+
+	"github.com/yhan-sun/p2wlan/server/auth"
+	"github.com/yhan-sun/p2wlan/server/database"
 )
 
 // ---- Auth endpoints ----
@@ -40,7 +42,11 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 
 	token, user, err := s.auth.Login(identifier, req.Password)
 	if err != nil {
-		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
+		if errors.Is(err, auth.ErrInvalidCredentials) {
+			http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
+		} else {
+			auth.WriteAuthenticationUnavailable(w)
+		}
 		return
 	}
 

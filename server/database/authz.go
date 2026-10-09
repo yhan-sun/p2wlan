@@ -174,44 +174,6 @@ func (db *DB) UpdateDeviceEd25519PublicKey(deviceID, ed25519PublicKey string) er
 	return err
 }
 
-// ValidateDeviceCredential validates a credential token and returns the credential and device.
-func (db *DB) ValidateDeviceCredential(token string) (*DeviceCredential, *Device, error) {
-	hash := hashToken(token)
-
-	var cred DeviceCredential
-	var revoked int
-	err := db.QueryRow(`SELECT id, device_id, token_hash, expires_at, revoked, created_at
-		FROM device_credentials WHERE token_hash = ?`, hash).
-		Scan(&cred.ID, &cred.DeviceID, &cred.TokenHash, &cred.ExpiresAt, &revoked, &cred.CreatedAt)
-	if err != nil {
-		return nil, nil, fmt.Errorf("invalid credential: %w", err)
-	}
-	cred.Revoked = revoked == 1
-
-	if cred.Revoked {
-		return nil, nil, fmt.Errorf("credential revoked")
-	}
-	if time.Now().Unix() > cred.ExpiresAt {
-		return nil, nil, fmt.Errorf("credential expired")
-	}
-
-	device, err := db.GetDevice(cred.DeviceID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("device not found: %w", err)
-	}
-
-	if strings.HasPrefix(device.NetworkID, "room-") {
-		allowed, err := db.UserHasNetworkAccess(device.UserID, device.NetworkID)
-		if err != nil || !allowed {
-			return nil, nil, ErrRoomAccess
-		}
-	}
-	if allowed, err := db.RoomDeviceAllowed(device); err != nil || !allowed {
-		return nil, nil, ErrRoomAccess
-	}
-	return &cred, device, nil
-}
-
 // HasActiveDeviceCredential reports whether a device has moved to the modern
 // device-auth flow. User-JWT endpoint updates for such a device are management
 // metadata changes, not proof that its daemon is currently alive.
