@@ -33,4 +33,4 @@ Relay 关闭原因区分 `peer_closed`、`partial_frame`、`local_closed`、`con
 
 Windows 在身份校验前记录系统返回的子进程 PID，并使用原生进程查询区分正在运行、已退出和查询不可用。查询不可用会保留失败操作与 Win32 错误码；提前退出会报告 `DAEMON_EXITED_DURING_STARTUP`，并在 daemon 日志已有明确原因时显示对应的 Wintun、凭据或认证错误。排查时同时查看客户端启动日志和 daemon 日志；管理员权限本身不能证明后台进程已成功启动。
 
-选择手动 / 离线模式时可以不配置 Control 地址。启动参数校验失败会记录 `STARTUP_CONFIG_INVALID` 和无效参数名称，客户端提示检查启动配置；日志不回显该参数的原始值。daemon 的 `--relay` 接受 `[region@]tls://host:port`、`tcp://host:port` 和兼容的 `host:port` 格式，TLS 与明文传输仍受原有安全策略约束。
+图形客户端必须填写服务器地址并登录，不提供离线启动。缺少服务器地址或登录凭据时，先按提示完成登录；中继配置会自动获取。daemon 启动参数校验失败会记录 `STARTUP_CONFIG_INVALID` 和无效参数名称，客户端提示检查启动配置；日志不回显该参数的原始值。daemon 的 `--relay` 接受 `[region@]tls://host:port`、`tcp://host:port` 和兼容的 `host:port` 格式，TLS 与明文传输仍受原有安全策略约束。

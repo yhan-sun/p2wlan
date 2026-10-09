@@ -18,7 +18,7 @@ const defaultCloseBehavior = 'keep-running';
 /// Return whether a JWT-shaped user token is expired.
 ///
 /// This is only a local UX guard; the control server remains authoritative.
-/// Opaque/manual credentials and malformed tokens are left alone so custom
+/// Opaque credentials and malformed tokens are left alone so custom
 /// deployments are not rejected before the server can validate them.
 bool isAuthTokenExpired(String token, {DateTime? now}) {
   final parts = token.trim().split('.');
@@ -97,10 +97,8 @@ class AppSettings {
     this.personalNetworkId = defaultNetworkId,
     this.personalOverlayCidr = defaultOverlayCidr,
     this.personalVirtualIp = '',
-    this.personalManualMode = false,
     this.virtualIp = '',
     this.deviceName = '',
-    this.manualMode = false,
     this.overlayCidr = defaultOverlayCidr,
     this.tunInterface = '',
     this.mtu = defaultMtu,
@@ -136,10 +134,8 @@ class AppSettings {
   final String personalNetworkId;
   final String personalOverlayCidr;
   final String personalVirtualIp;
-  final bool personalManualMode;
   final String virtualIp;
   final String deviceName;
-  final bool manualMode;
   final String overlayCidr;
   final String tunInterface;
   final int mtu;
@@ -155,6 +151,23 @@ class AppSettings {
   /// Persisted so a restart resumes at the shell rather than re-running
   /// first-run. Managed-mode users who have never signed in see it as false.
   final bool onboardingCompleted;
+
+  /// The same guard applies before desktop process launch and Android VPN
+  /// permission work. Legacy offline flags are ignored by JSON decoding.
+  String? get connectionRequirementError {
+    if (controlServer.trim().isEmpty) {
+      return '请输入服务器地址并登录后才能使用 P2WLAN。';
+    }
+    if (authToken.trim().isEmpty) {
+      return '请先登录服务器后再连接 P2WLAN。';
+    }
+    if (isAuthTokenExpired(authToken)) {
+      return '登录状态已过期，请重新登录后再连接 P2WLAN。';
+    }
+    return null;
+  }
+
+  bool get hasAuthenticatedConnection => connectionRequirementError == null;
 
   String get effectiveTunInterface {
     final trimmed = tunInterface.trim();
@@ -173,10 +186,8 @@ class AppSettings {
     String? personalNetworkId,
     String? personalOverlayCidr,
     String? personalVirtualIp,
-    bool? personalManualMode,
     String? virtualIp,
     String? deviceName,
-    bool? manualMode,
     String? overlayCidr,
     String? tunInterface,
     int? mtu,
@@ -202,10 +213,8 @@ class AppSettings {
       personalNetworkId: personalNetworkId ?? this.personalNetworkId,
       personalOverlayCidr: personalOverlayCidr ?? this.personalOverlayCidr,
       personalVirtualIp: personalVirtualIp ?? this.personalVirtualIp,
-      personalManualMode: personalManualMode ?? this.personalManualMode,
       virtualIp: virtualIp ?? this.virtualIp,
       deviceName: deviceName ?? this.deviceName,
-      manualMode: manualMode ?? this.manualMode,
       overlayCidr: overlayCidr ?? this.overlayCidr,
       tunInterface: tunInterface ?? this.tunInterface,
       mtu: mtu ?? this.mtu,
@@ -245,10 +254,8 @@ class AppSettings {
         defaultOverlayCidr,
       ),
       personalVirtualIp: _string(json['personalVirtualIp']),
-      personalManualMode: _bool(json['personalManualMode']),
       virtualIp: _string(json['virtualIp']),
       deviceName: _string(json['deviceName']),
-      manualMode: _bool(json['manualMode']),
       overlayCidr: _string(json['overlayCidr'], defaultOverlayCidr),
       tunInterface: _string(json['tunInterface'], defaultTunInterface),
       mtu: _int(json['mtu'], defaultMtu),
@@ -280,10 +287,8 @@ class AppSettings {
     'personalNetworkId': personalNetworkId,
     'personalOverlayCidr': personalOverlayCidr,
     'personalVirtualIp': personalVirtualIp,
-    'personalManualMode': personalManualMode,
     'virtualIp': virtualIp,
     'deviceName': deviceName,
-    'manualMode': manualMode,
     'overlayCidr': overlayCidr,
     'tunInterface': effectiveTunInterface,
     'mtu': mtu,

@@ -70,9 +70,9 @@ void main() {
     expect(find.text('Password'), findsOneWidget);
     expect(find.text('Sign in'), findsOneWidget);
     expect(find.text("Don't have an account? Create one"), findsOneWidget);
-    expect(find.text('Advanced options'), findsOneWidget);
-    expect(find.text('Self-hosted server'), findsOneWidget);
-    expect(find.text('Continue in manual / offline mode'), findsOneWidget);
+    expect(find.text('Advanced options'), findsNothing);
+    expect(find.text('Server address (required)'), findsOneWidget);
+    expect(find.text('Continue in manual / offline mode'), findsNothing);
   });
 
   testWidgets('sign in requires an explicitly configured control server', (
@@ -83,18 +83,22 @@ void main() {
     final fake = _FakeControlApi();
 
     await _pumpLogin(tester, stores, controlApi: fake);
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'a@example.com',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
     await tester.tap(find.text('Sign in'));
     await tester.pumpAndSettle();
 
     expect(fake.authenticateCalls, 0);
-    expect(find.text('Invalid control server address'), findsOneWidget);
+    expect(find.text('Server address required'), findsOneWidget);
     expect(
-      find.text(
-        'Enter a complete HTTP or HTTPS URL, for example https://example.com',
-      ),
-      findsOneWidget,
+      find.textContaining('Enter a server address and sign in'),
+      findsWidgets,
     );
   });
 
@@ -112,23 +116,22 @@ void main() {
 
     await _pumpLogin(tester, stores, controlApi: fake);
 
-    expect(find.text('Using a self-hosted server'), findsOneWidget);
-    if (find.text('Self-hosted server').evaluate().isEmpty) {
-      await tester.tap(find.text('Advanced options'));
-      await tester.pumpAndSettle();
-    }
     expect(
       tester
-          .widget<TextField>(
-            find.widgetWithText(TextField, 'Self-hosted server'),
-          )
+          .widget<TextField>(find.byKey(const ValueKey('login-server')))
           .controller!
           .text,
       'https://custom.example.com',
     );
 
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'a@example.com',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
     await tester.tap(find.text('Sign in'));
     await _waitFor(tester, () => fake.authenticateCalls == 1);
 
@@ -142,21 +145,29 @@ void main() {
     addTearDown(stores.dispose);
 
     await _pumpLogin(tester, stores);
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'a@example.com',
+    );
     await tester.tap(find.text("Don't have an account? Create one"));
     await tester.pumpAndSettle();
 
     expect(find.text('Create account'), findsOneWidget);
     expect(find.text('Already have an account? Sign in'), findsOneWidget);
     expect(
-      tester.widget<TextField>(find.byType(TextField).at(1)).autofillHints,
+      tester
+          .widget<TextField>(find.byKey(const ValueKey('login-password')))
+          .autofillHints,
       contains(AutofillHints.newPassword),
     );
 
     await tester.tap(find.text('Already have an account? Sign in'));
     await tester.pumpAndSettle();
     expect(
-      tester.widget<TextField>(find.byType(TextField).at(0)).controller!.text,
+      tester
+          .widget<TextField>(find.byKey(const ValueKey('login-identifier')))
+          .controller!
+          .text,
       'a@example.com',
     );
   });
@@ -166,7 +177,7 @@ void main() {
     addTearDown(stores.dispose);
 
     await _pumpLogin(tester, stores);
-    final passwordField = find.byType(TextField).at(1);
+    final passwordField = find.byKey(const ValueKey('login-password'));
     expect(tester.widget<TextField>(passwordField).obscureText, isTrue);
 
     await tester.tap(find.byIcon(Icons.visibility_outlined));
@@ -228,8 +239,14 @@ void main() {
       controlApi: fake,
       controlServer: 'https://control.example.com',
     );
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'a@example.com',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
     await tester.tap(find.text('Sign in'));
     await _waitFor(tester, () => fake.authenticateCalls == 1);
     await tester.pumpAndSettle();
@@ -252,8 +269,14 @@ void main() {
       controlApi: fake,
       controlServer: 'https://control.example.com',
     );
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'a@example.com',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
     await tester.tap(find.text('Sign in'));
     await _waitFor(tester, () => fake.authenticateCalls == 1);
     await tester.pumpAndSettle();
@@ -279,8 +302,14 @@ void main() {
       controlApi: fake,
       controlServer: 'https://control.example.com',
     );
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'a@example.com',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
     await tester.tap(find.text('Sign in'));
     await _waitFor(tester, () => fake.authenticateCalls == 1);
     await tester.pumpAndSettle();
@@ -296,15 +325,26 @@ void main() {
     addTearDown(stores.dispose);
     final fake = _FakeControlApi();
 
-    await _pumpLogin(tester, stores, controlApi: fake);
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
+    await _pumpLogin(
+      tester,
+      stores,
+      controlApi: fake,
+      controlServer: 'https://control.example.com',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'a@example.com',
+    );
     await tester.tap(find.text('Sign in'));
     await tester.pumpAndSettle();
     expect(find.text('Password must be at least 6 characters'), findsOneWidget);
     expect(fake.authenticateCalls, 0);
 
-    await tester.enterText(find.byType(TextField).at(0), '');
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.enterText(find.byKey(const ValueKey('login-identifier')), '');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
     await tester.tap(find.text('Sign in'));
     await tester.pumpAndSettle();
     expect(find.text('Enter your email or username'), findsOneWidget);
@@ -323,8 +363,14 @@ void main() {
       controlServer: 'https://control.example.com',
       languageCode: 'zh-Hans',
     );
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'a@example.com',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
     await tester.tap(find.text('登录'));
     await _waitFor(tester, () => fake.authenticateCalls == 1);
     await tester.pumpAndSettle();
@@ -355,8 +401,14 @@ void main() {
         authenticated += 1;
       },
     );
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'a@example.com',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
     await tester.tap(find.text('Sign in'));
     await _waitFor(tester, () => authenticated == 1);
     await tester.pumpAndSettle();
@@ -366,46 +418,33 @@ void main() {
     expect(settings.controlServer, 'https://cs.example.com');
     expect(settings.accountEmail, 'account@example.com');
     expect(settings.accountUsername, 'pyu');
-    expect(settings.manualMode, isFalse);
+    expect(settings.toJson(), isNot(contains('manualMode')));
     expect(authenticated, 1);
     expect(find.textContaining('test-token'), findsNothing);
   });
 
-  testWidgets('manual / offline mode clears token and proceeds', (
+  testWidgets('no offline action can authenticate an unconfigured client', (
     tester,
   ) async {
     final stores = (await tester.runAsync(_makeStores))!;
     addTearDown(stores.dispose);
+    final fake = _FakeControlApi();
     var authenticated = 0;
-
     await _pumpLogin(
       tester,
       stores,
-      onAuthenticated: () {
-        authenticated += 1;
-      },
+      controlApi: fake,
+      onAuthenticated: () => authenticated += 1,
     );
-    if (find.text('Self-hosted server').evaluate().isEmpty) {
-      await tester.tap(find.text('Advanced options'));
-      await tester.pumpAndSettle();
-    }
-    expect(
-      find.text(
-        'Does not connect to a control server; for local network testing and diagnostics only.',
-      ),
-      findsOneWidget,
-    );
-    final offlineButton = find.text('Continue in manual / offline mode');
-    await tester.ensureVisible(offlineButton);
-    await tester.pump();
-    await tester.tap(offlineButton);
-    await _waitFor(tester, () => authenticated == 1);
-
-    final settings = stores.settingsStore.settings;
-    expect(settings.authToken, '');
-    expect(settings.accountEmail, '');
-    expect(settings.manualMode, isTrue);
-    expect(authenticated, 1);
+    expect(find.text('Continue in manual / offline mode'), findsNothing);
+    expect(find.text('Advanced options'), findsNothing);
+    expect(find.byIcon(Icons.offline_bolt_outlined), findsNothing);
+    await tester.tap(find.text('Sign in'));
+    await tester.pumpAndSettle();
+    expect(find.text('Server address required'), findsOneWidget);
+    expect(fake.authenticateCalls, 0);
+    expect(authenticated, 0);
+    expect(stores.settingsStore.settings.authToken, isEmpty);
   });
 
   testWidgets('duplicate taps do not submit twice', (tester) async {
@@ -423,8 +462,14 @@ void main() {
         authenticated += 1;
       },
     );
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'a@example.com',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
     await tester.tap(find.text('Sign in'));
     await tester.pump();
 
@@ -465,8 +510,14 @@ void main() {
       controlApi: fake,
       controlServer: 'https://control.example.com',
     );
-    await tester.enterText(find.byType(TextField).at(0), 'pyu');
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'pyu',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
     final before = tester.getTopLeft(find.byType(FilledButton)).dy;
     await tester.tap(find.text('Sign in'));
     await _waitFor(tester, () => fake.authenticateCalls == 1);
@@ -491,8 +542,14 @@ void main() {
       controlApi: fake,
       controlServer: 'https://control.example.com',
     );
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'a@example.com',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
     await tester.tap(find.text('Sign in'));
     await tester.pump();
 
@@ -534,63 +591,64 @@ void main() {
     expect(fake.authenticateCalls, 0);
   });
 
-  testWidgets('manual mode settings failure shows localized error', (
-    tester,
-  ) async {
-    final tempDir = await tester.runAsync(
-      () => Directory.systemTemp.createTemp('p2wlan_login_test_'),
-    );
-    addTearDown(() {
-      tempDir?.deleteSync(recursive: true);
-    });
-    final settingsStore = SettingsStore(
-      settingsFile: File('${tempDir!.path}/settings.json'),
-      tokenRepository: _ThrowingTokenRepository(),
-    );
-    await tester.runAsync(settingsStore.load);
-    final diagnosticsApi = _OfflineDiagnosticsApi();
-    final statusStore = StatusStore(
-      settingsStore: settingsStore,
-      diagnosticsApi: diagnosticsApi,
-      daemonController: _FakeDaemonController(diagnosticsApi),
-    );
-    addTearDown(() {
-      statusStore.dispose();
-      settingsStore.dispose();
-    });
-    var authenticated = 0;
+  testWidgets(
+    'login persistence failure stays on the configured sign-in page',
+    (tester) async {
+      final tempDir = await tester.runAsync(
+        () => Directory.systemTemp.createTemp('p2wlan_login_test_'),
+      );
+      addTearDown(() {
+        tempDir?.deleteSync(recursive: true);
+      });
+      final settingsStore = SettingsStore(
+        settingsFile: File('${tempDir!.path}/settings.json'),
+        tokenRepository: _ThrowingTokenRepository(),
+      );
+      await tester.runAsync(settingsStore.load);
+      final diagnosticsApi = _OfflineDiagnosticsApi();
+      final statusStore = StatusStore(
+        settingsStore: settingsStore,
+        diagnosticsApi: diagnosticsApi,
+        daemonController: _FakeDaemonController(diagnosticsApi),
+      );
+      addTearDown(() {
+        statusStore.dispose();
+        settingsStore.dispose();
+      });
+      var authenticated = 0;
 
-    await _pumpLogin(
-      tester,
-      _Stores(tempDir, settingsStore, statusStore),
-      onAuthenticated: () {
-        authenticated += 1;
-      },
-    );
-    final offlineButton = find.text('Continue in manual / offline mode');
-    await tester.ensureVisible(offlineButton);
-    await tester.pump();
-    await tester.tap(offlineButton);
-    await _waitFor(
-      tester,
-      () => find.text('Could not enter manual mode').evaluate().isNotEmpty,
-    );
-    await tester.pump();
-
-    expect(authenticated, 0);
-    expect(find.text('Could not enter manual mode'), findsOneWidget);
-    expect(
-      find.text('Local settings could not be saved. Please try again.'),
-      findsOneWidget,
-    );
-    expect(find.textContaining('SecureTokenStorageException'), findsNothing);
-    expect(find.textContaining('FileSystemException'), findsNothing);
-    expect(tester.takeException(), isNull);
-    final button = tester.widget<OutlinedButton>(
-      find.ancestor(of: offlineButton, matching: find.byType(OutlinedButton)),
-    );
-    expect(button.onPressed, isNotNull);
-  });
+      await _pumpLogin(
+        tester,
+        _Stores(tempDir, settingsStore, statusStore),
+        controlServer: 'https://control.example.com',
+        controlApi: _FakeControlApi(),
+        onAuthenticated: () {
+          authenticated += 1;
+        },
+      );
+      await tester.enterText(
+        find.byKey(const ValueKey('login-identifier')),
+        'a@example.com',
+      );
+      await tester.enterText(
+        find.byKey(const ValueKey('login-password')),
+        'secret123',
+      );
+      await tester.tap(find.text('Sign in'));
+      await _waitFor(
+        tester,
+        () => find
+            .text('Sign in failed. Please try again.')
+            .evaluate()
+            .isNotEmpty,
+      );
+      expect(authenticated, 0);
+      expect(find.textContaining('token write failed'), findsNothing);
+      expect(find.text('Continue in manual / offline mode'), findsNothing);
+      expect(find.byKey(const ValueKey('login-server')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   for (final size in const [Size(390, 844), Size(700, 1000), Size(1280, 900)]) {
     testWidgets('layout fits ${size.width.toInt()}x${size.height.toInt()}', (
@@ -609,10 +667,6 @@ void main() {
       );
       expect(tester.takeException(), isNull);
 
-      if (find.text('Self-hosted server').evaluate().isEmpty) {
-        await tester.tap(find.text('Advanced options'));
-        await tester.pumpAndSettle();
-      }
       expect(tester.takeException(), isNull);
     });
   }
@@ -657,16 +711,18 @@ Future<void> _enterInvalidServerAndSubmit(
   WidgetTester tester,
   String server,
 ) async {
-  if (find.text('Self-hosted server').evaluate().isEmpty) {
-    await tester.tap(find.text('Advanced options'));
-    await tester.pumpAndSettle();
-  }
-  final serverField = find.widgetWithText(TextField, 'Self-hosted server');
+  final serverField = find.byKey(const ValueKey('login-server'));
   await tester.ensureVisible(serverField);
   await tester.pump();
   await tester.enterText(serverField, server);
-  await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
-  await tester.enterText(find.byType(TextField).at(1), 'secret123');
+  await tester.enterText(
+    find.byKey(const ValueKey('login-identifier')),
+    'a@example.com',
+  );
+  await tester.enterText(
+    find.byKey(const ValueKey('login-password')),
+    'secret123',
+  );
   final signIn = find.text('Sign in');
   await tester.ensureVisible(signIn);
   await tester.pumpAndSettle();
@@ -722,7 +778,9 @@ class _ThrowingTokenRepository implements SecureTokenRepository {
 
   @override
   Future<void> write(String token) async {
-    throw const SecureTokenStorageException('token write failed');
+    if (token.trim().isNotEmpty) {
+      throw const SecureTokenStorageException('token write failed');
+    }
   }
 
   @override

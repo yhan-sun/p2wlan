@@ -715,8 +715,7 @@ void _registerPhase7Tests() {
         await tester.pumpAndSettle();
 
         // Verify Advanced Network fields are reachable via scroll.
-        await tester.ensureVisible(find.text('Manual/offline mode'));
-        expect(find.text('Manual/offline mode'), findsOneWidget);
+        expect(find.text('Manual/offline mode'), findsNothing);
         await tester.ensureVisible(find.text('Interface name'));
         expect(find.text('Interface name'), findsOneWidget);
         await tester.ensureVisible(find.text('MTU'));

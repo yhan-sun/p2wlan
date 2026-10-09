@@ -133,7 +133,6 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _formError;
   SettingsCategory? _formErrorCategory;
   var _saving = false;
-  var _manualMode = false;
   var _socketPool = defaultSocketPool;
   var _restartRequired = false;
   var _closeBehavior = defaultCloseBehavior;
@@ -224,7 +223,6 @@ class _SettingsPageState extends State<SettingsPage> {
     _relayServersController = TextEditingController(
       text: settings.relayServers,
     );
-    _manualMode = settings.manualMode;
     _socketPool = normalizeSocketPool(settings.socketPool);
     _closeBehavior = normalizeCloseBehavior(settings.closeBehavior);
     widget.controller?._attach(_handleBackRequest);
@@ -379,9 +377,6 @@ class _SettingsPageState extends State<SettingsPage> {
   /// Describes credential state for display without ever revealing the token.
   String _describeCredential(AppStrings strings) {
     final settings = widget.settingsStore.settings;
-    if (settings.manualMode) {
-      return strings.credentialManualMode;
-    }
     return settings.authToken.trim().isEmpty
         ? strings.credentialNotSaved
         : strings.credentialSaved;
@@ -396,8 +391,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ? strings.deviceName
             : _deviceNameController.text.trim(),
       SettingsCategory.accountNetwork => _describeCredential(strings),
-      SettingsCategory.advancedNetwork =>
-        _manualMode ? strings.manualMode : 'MTU ${_mtuController.text.trim()}',
+      SettingsCategory.advancedNetwork => 'MTU ${_mtuController.text.trim()}',
       SettingsCategory.developer => _developerSummary(strings),
     };
   }

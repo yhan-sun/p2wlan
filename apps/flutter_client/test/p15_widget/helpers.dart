@@ -24,7 +24,6 @@ Future<_Stores> _makeStores({
   bool enableFreshnessTimer = false,
   Duration maxSnapshotAge = StatusStore.defaultMaxSnapshotAge,
   DaemonController? daemonController,
-  bool manualMode = false,
   SecureTokenRepository? tokenRepository,
   String authToken = '',
   String? deviceName,
@@ -38,8 +37,8 @@ Future<_Stores> _makeStores({
   await settingsStore.load();
   await settingsStore.updateSettings(
     settingsStore.settings.copyWith(
+      controlServer: 'https://control.example.com',
       languageCode: AppLanguage.english.code,
-      manualMode: manualMode,
       authToken: authToken,
       deviceName: deviceName ?? settingsStore.settings.deviceName,
     ),

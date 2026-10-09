@@ -504,7 +504,11 @@ Future<void> _pumpTestApp(WidgetTester tester) async {
     // Complete onboarding so these shell tests reach the main UI (the
     // onboarding flow is covered by onboarding_page_test.dart).
     await settingsStore.updateSettings(
-      const AppSettings(manualMode: true, onboardingCompleted: true),
+      const AppSettings(
+        controlServer: 'https://control.example.com',
+        authToken: 'test-account-token',
+        onboardingCompleted: true,
+      ),
     );
   });
   addTearDown(() {

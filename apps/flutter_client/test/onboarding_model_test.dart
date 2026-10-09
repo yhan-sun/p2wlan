@@ -66,14 +66,21 @@ void main() {
     },
   );
 
-  test('manual mode skips auth (no credential required)', () {
+  test('permission and daemon facts never replace authentication', () {
     expect(
-      desktop.step(none().copy(manualMode: true)),
-      OnboardingStep.permission,
+      desktop.step(none().copy(permissionGranted: true)),
+      OnboardingStep.auth,
     );
     expect(
-      desktop.step(none().copy(manualMode: true, permissionGranted: true)),
-      OnboardingStep.daemon,
+      desktop.step(
+        none().copy(
+          permissionGranted: true,
+          daemonReachable: true,
+          virtualIp: '10.20.0.7',
+          onlinePeerCount: 2,
+        ),
+      ),
+      OnboardingStep.auth,
     );
   });
 

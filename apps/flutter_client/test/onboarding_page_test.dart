@@ -255,7 +255,8 @@ Future<SettingsStore> _makeSettings(WidgetTester tester, bool completed) {
         await store.load();
         await store.updateSettings(
           AppSettings(
-            manualMode: true,
+            controlServer: 'https://control.example.com',
+            authToken: 'test-account-token',
             languageCode: 'zh-Hans',
             onboardingCompleted: completed,
           ),
@@ -420,7 +421,11 @@ void main() {
     'done completes onboarding once and persists across app restart',
     (tester) async {
       final memory = _SettingsMemory(
-        const AppSettings(manualMode: true, languageCode: 'zh-Hans'),
+        const AppSettings(
+          controlServer: 'https://control.example.com',
+          authToken: 'test-account-token',
+          languageCode: 'zh-Hans',
+        ),
       );
       final settings = _MemorySettingsStore(memory);
       final status = _makeStatus(settings, api: _ReadyDiagnosticsApi());

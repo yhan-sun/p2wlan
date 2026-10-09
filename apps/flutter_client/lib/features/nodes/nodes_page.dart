@@ -353,10 +353,7 @@ class _NodesPageState extends State<NodesPage> {
     if (result == null || !_acceptsAccount(settings)) return;
 
     final nodeId = snapshot?.nodeId.trim() ?? '';
-    final canSync =
-        !settings.manualMode &&
-        settings.authToken.trim().isNotEmpty &&
-        nodeId.isNotEmpty;
+    final canSync = settings.authToken.trim().isNotEmpty && nodeId.isNotEmpty;
     var savedName = result.deviceName;
     var savedVirtualIp = result.virtualIp;
     try {

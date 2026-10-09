@@ -16,22 +16,6 @@ class _AdvancedNetworkSection extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _SettingsGroup(
-          title: strings.connectionSettings,
-          children: [
-            _PreferenceRow(
-              label: strings.manualMode,
-              subtitle: strings.manualModeHelper,
-              trailing: Switch.adaptive(
-                value: state._manualMode,
-                onChanged: saving
-                    ? null
-                    : (value) =>
-                          state._updateState(() => state._manualMode = value),
-              ),
-            ),
-          ],
-        ),
-        _SettingsGroup(
           title: strings.virtualNetwork,
           children: [
             _SettingsField(

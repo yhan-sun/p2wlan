@@ -15,7 +15,6 @@ import '../app/p2wlan_colors.dart';
 import '../core/api/diagnostics_api.dart';
 import '../core/capabilities/platform_capabilities.dart';
 import '../core/daemon/daemon_controller.dart';
-import '../core/models/diagnostics_models.dart';
 import '../core/platform/windows_startup_registration.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
@@ -121,12 +120,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     writeDesktopTrayLifecycleTrace('bootstrap.begin');
     await _settingsStore.load();
     writeDesktopTrayLifecycleTrace('bootstrap.settings-loaded');
-    final authToken = _settingsStore.settings.authToken.trim();
-    final hasValidSession =
-        !_settingsStore.settings.manualMode &&
-        authToken.isNotEmpty &&
-        !isAuthTokenExpired(authToken);
-    _authenticated = _settingsStore.settings.manualMode || hasValidSession;
+    _authenticated = _settingsStore.settings.hasAuthenticatedConnection;
     if (mounted) {
       setState(() => _ready = true);
     }
@@ -183,7 +177,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     }
     if (shouldConnectAfterLoginStartup(
       wasLaunchedAtLogin: widget.connectAfterLoginStartup,
-      hasValidSession: hasValidSession,
+      hasValidSession: _settingsStore.settings.hasAuthenticatedConnection,
       onboardingComplete: !_needsOnboarding,
       canActAsLocalVpnNode: canPollLocalDaemon,
     )) {
@@ -280,12 +274,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
         (isRoomNetwork(settings.networkId)
                 ? personalNetworkSettings(settings)
                 : settings)
-            .copyWith(
-              authToken: '',
-              accountEmail: '',
-              accountUsername: '',
-              manualMode: false,
-            ),
+            .copyWith(authToken: '', accountEmail: '', accountUsername: ''),
       );
     } on AccountSessionChangeException catch (error) {
       if (!mounted) return;

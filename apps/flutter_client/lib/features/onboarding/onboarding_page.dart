@@ -76,8 +76,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
     final snapshot = widget.statusStore.snapshot;
     final onlinePeers = snapshot?.peers.where((p) => p.online).length ?? 0;
     return OnboardingFacts(
-      hasCredential: settings.authToken.trim().isNotEmpty,
-      manualMode: settings.manualMode,
+      hasCredential: settings.hasAuthenticatedConnection,
       // Runtime proof must include a healthy daemon snapshot and an actual
       // route verification. Health alone is not evidence that TUN/route setup
       // succeeded.
@@ -301,9 +300,7 @@ class _OnboardingStepper extends StatelessWidget {
   bool _done(OnboardingStep s) {
     switch (s) {
       case OnboardingStep.permission:
-        return !model.capabilities.canRequestElevation ||
-            facts.manualMode ||
-            permissionGranted;
+        return !model.capabilities.canRequestElevation || permissionGranted;
       case OnboardingStep.daemon:
         return facts.daemonReachable;
       case OnboardingStep.virtualIp:
@@ -311,7 +308,7 @@ class _OnboardingStepper extends StatelessWidget {
       case OnboardingStep.discover:
         return facts.onlinePeerCount > 0;
       case OnboardingStep.auth:
-        return facts.hasCredential || facts.manualMode;
+        return facts.hasCredential;
       case OnboardingStep.done:
         return true;
     }

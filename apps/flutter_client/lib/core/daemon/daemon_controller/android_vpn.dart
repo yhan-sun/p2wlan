@@ -19,12 +19,6 @@ const _androidWifiLowLatency = bool.fromEnvironment(
 
 extension DaemonControllerAndroidVpn on DaemonController {
   Future<DaemonCommandResult> _startAndroidVpn(AppSettings settings) async {
-    if (!settings.manualMode && isAuthTokenExpired(settings.authToken)) {
-      return const DaemonCommandResult(
-        ok: false,
-        message: 'Android VPN 启动失败：登录状态已过期，请重新登录。',
-      );
-    }
     // Stop a previous service/runtime first. This makes repeated starts safe
     // across hot restart, debug/release installs, and stale foreground
     // services holding the previous TUN fd.
@@ -129,10 +123,10 @@ extension DaemonControllerAndroidVpn on DaemonController {
           : settings.networkId.trim(),
       'auth_token': settings.authToken,
       'device_name': settings.deviceName,
-      if (!settings.manualMode && settings.authToken.trim().isNotEmpty)
+      if (settings.authToken.trim().isNotEmpty)
         'profile_id': managedNetworkProfileId(settings),
       'virtual_ip': settings.virtualIp,
-      'manual_mode': settings.manualMode,
+      'manual_mode': false,
       'overlay_cidr': settings.overlayCidr,
       'mtu': settings.mtu,
       'udp_bind': settings.udpBind,

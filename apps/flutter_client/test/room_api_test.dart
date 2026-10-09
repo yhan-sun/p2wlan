@@ -164,14 +164,13 @@ void main() {
         networkId: 'personal-net',
         overlayCidr: '10.20.0.0/16',
         virtualIp: '10.20.0.8',
-        manualMode: true,
       );
       final first = selectRoomSettings(
         personal,
         FriendRoom.fromJson(roomJson()),
       );
       expect(first.virtualIp, isEmpty);
-      expect(first.manualMode, isFalse);
+      expect(first.toJson(), isNot(contains('manualMode')));
       final second = selectRoomSettings(
         first.copyWith(virtualIp: '10.21.1.8'),
         FriendRoom.fromJson({
@@ -186,7 +185,7 @@ void main() {
       expect(restored.networkId, personal.networkId);
       expect(restored.virtualIp, personal.virtualIp);
       expect(restored.overlayCidr, personal.overlayCidr);
-      expect(restored.manualMode, personal.manualMode);
+      expect(restored.networkId, personal.networkId);
     },
   );
 
