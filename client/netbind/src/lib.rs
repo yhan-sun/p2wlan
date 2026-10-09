@@ -301,11 +301,14 @@ fn configure_ipv4_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
 fn configure_ipv4_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
     #[cfg(windows)]
     {
+        // DF alone still allows Windows' cached path MTU to reject later
+        // probes locally. PROBE keeps DF set but uses the interface MTU,
+        // leaving path-size confirmation to authenticated DPLPMTUD ACKs.
         return set_and_verify_windows_option(
             _socket,
             windows_sys::Win32::Networking::WinSock::IPPROTO_IP,
-            windows_sys::Win32::Networking::WinSock::IP_DONTFRAGMENT,
-            1,
+            windows_sys::Win32::Networking::WinSock::IP_MTU_DISCOVER,
+            windows_sys::Win32::Networking::WinSock::IP_PMTUDISC_PROBE,
         );
     }
 
@@ -344,9 +347,8 @@ fn read_ipv4_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
         return read_windows_option(
             _socket,
             windows_sys::Win32::Networking::WinSock::IPPROTO_IP,
-            windows_sys::Win32::Networking::WinSock::IP_DONTFRAGMENT,
-        )
-        .is_some_and(|value| value != 0);
+            windows_sys::Win32::Networking::WinSock::IP_MTU_DISCOVER,
+        ) == Some(windows_sys::Win32::Networking::WinSock::IP_PMTUDISC_PROBE);
     }
 
     #[allow(unreachable_code)]
@@ -396,12 +398,19 @@ fn configure_ipv6_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
 fn configure_ipv6_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
     #[cfg(windows)]
     {
-        return set_and_verify_windows_option(
+        let dontfrag = set_and_verify_windows_option(
             _socket,
             windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6,
             windows_sys::Win32::Networking::WinSock::IPV6_DONTFRAG,
             1,
         );
+        let pmtudisc = set_and_verify_windows_option(
+            _socket,
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6,
+            windows_sys::Win32::Networking::WinSock::IPV6_MTU_DISCOVER,
+            windows_sys::Win32::Networking::WinSock::IP_PMTUDISC_PROBE,
+        );
+        return dontfrag && pmtudisc && read_ipv6_no_fragment(_socket);
     }
 
     #[allow(unreachable_code)]
@@ -443,12 +452,18 @@ fn read_ipv6_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
 fn read_ipv6_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
     #[cfg(windows)]
     {
-        return read_windows_option(
+        let pmtudisc = read_windows_option(
+            _socket,
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6,
+            windows_sys::Win32::Networking::WinSock::IPV6_MTU_DISCOVER,
+        ) == Some(windows_sys::Win32::Networking::WinSock::IP_PMTUDISC_PROBE);
+        let dontfrag = read_windows_option(
             _socket,
             windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6,
             windows_sys::Win32::Networking::WinSock::IPV6_DONTFRAG,
         )
         .is_some_and(|value| value != 0);
+        return pmtudisc && dontfrag;
     }
 
     #[allow(unreachable_code)]
@@ -862,3 +877,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_probe_tests;

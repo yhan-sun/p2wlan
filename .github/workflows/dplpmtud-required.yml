@@ -239,6 +239,8 @@ jobs:
           }
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - name: Verify native Windows UDP probe socket profile
+        run: cargo test --locked -p p2pnet-netbind --lib
       - name: Run reducer and wire tests
         run: python3 scripts/quality/run_rust_tests.py dplpmtud
       - name: Run final path/boundary tests
