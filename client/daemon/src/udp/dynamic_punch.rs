@@ -61,7 +61,7 @@ fn primary_mapping_tail_after_gap(
 }
 
 fn ordered_mapping_request_timeout(
-    stun_timeout: Duration,
+    per_sample_cap: Duration,
     started_ms: u64,
     now_ms: u64,
     remaining_requests: usize,
@@ -69,13 +69,11 @@ fn ordered_mapping_request_timeout(
     let remaining_ms = FRESH_MAPPING_MEASURE_BUDGET
         .as_millis()
         .saturating_sub(u128::from(now_ms.saturating_sub(started_ms)));
-    let timeout = stun_timeout
-        .min(FRESH_MAPPING_STUN_TIMEOUT)
-        .min(Duration::from_millis(
-            remaining_ms
-                .checked_div(remaining_requests as u128)?
-                .min(u128::from(u64::MAX)) as u64,
-        ));
+    let timeout = per_sample_cap.min(Duration::from_millis(
+        remaining_ms
+            .checked_div(remaining_requests as u128)?
+            .min(u128::from(u64::MAX)) as u64,
+    ));
     (!timeout.is_zero()).then_some(timeout)
 }
 
@@ -217,7 +215,7 @@ impl UdpTransport {
         self.measure_ordered_mapping_requests_with_primary_fallback(
             requests,
             None,
-            stun_timeout,
+            stun_timeout.min(FRESH_MAPPING_STUN_TIMEOUT),
             keep_measuring,
         )
         .await
@@ -226,6 +224,9 @@ impl UdpTransport {
     /// A failed early grid observation may spend the remaining SAME budget on
     /// a primary-socket tail. It never retries an attempted pair, adds requests,
     /// discards unknown sends, or grants shared-allocator evidence on a gap.
+    /// The configured sample cap is also divided over the remaining requests
+    /// within the original absolute deadline. Hard/Hard may use that spare
+    /// time for a slow observer; ordinary fresh mapping keeps its 350 ms cap.
     pub(super) async fn measure_ordered_mapping_requests_with_primary_fallback(
         &self,
         requests: &[(Arc<UdpSocket>, SocketAddr)],
