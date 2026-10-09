@@ -420,10 +420,11 @@ pub(super) async fn encrypt_then_send(
             reason_code: REASON_DIRECT_BUDGET_STALE,
             reason,
         },
-        SendOutcome::RetryableLocalBackpressure { reason } => {
+        SendOutcome::RetryableLocalBackpressure { reason, socket } => {
             EncryptSendOutcome::RetryableLocalBackpressure {
                 packet: retry_packet,
                 reason,
+                socket,
             }
         }
         SendOutcome::LocalMtuFailure {
@@ -673,6 +674,7 @@ pub(super) async fn send_encrypted_packet_once(
                 Err(DirectBusinessUdpSendError::WouldBlock) => {
                     SendOutcome::RetryableLocalBackpressure {
                         reason: "exact UDP socket would block before handoff".to_string(),
+                        socket: plan.prepared.socket.clone(),
                     }
                 }
                 Err(DirectBusinessUdpSendError::LocalPacketTooLarge) => {

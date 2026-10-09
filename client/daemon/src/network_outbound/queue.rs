@@ -837,6 +837,8 @@ pub(super) async fn flush_one_peer(
     timeline: Arc<ConnectionTimeline>,
 ) -> (String, PeerPendingQueue) {
     let mut flushed = 0usize;
+    let mut writable_retries = 0usize;
+    let mut writable_retry_deadline = None;
     while flushed < MAX_FLUSH_PER_PEER_PER_TICK {
         if !queue.queue.is_empty()
             && queue
@@ -971,7 +973,11 @@ pub(super) async fn flush_one_peer(
                 .await;
                 break;
             }
-            EncryptSendOutcome::RetryableLocalBackpressure { packet, reason } => {
+            EncryptSendOutcome::RetryableLocalBackpressure {
+                packet,
+                reason,
+                socket,
+            } => {
                 let next_backpressure_retries = local_backpressure_retries.saturating_add(1);
                 record_retry_and_repark(
                     &transport,
@@ -991,10 +997,34 @@ pub(super) async fn flush_one_peer(
                     Some("direct"),
                     Some(REASON_DIRECT_LOCAL_BACKPRESSURE),
                     Some(format!(
-                        "peer={peer_id} direct_budget_reroutes={direct_budget_reroutes} local_backpressure_retries={next_backpressure_retries} retry_after_ms={}",
+                        "peer={peer_id} direct_budget_reroutes={direct_budget_reroutes} local_backpressure_retries={next_backpressure_retries} retry_after_ms={} writable_retries={writable_retries}",
                         OUTBOUND_RETRY_DELAY.as_millis(),
                     )),
                 );
+                if writable_retries < MAX_DIRECT_WRITABLE_RETRIES_PER_FLUSH {
+                    // Only the exact socket's readiness escapes the send
+                    // operation: ciphertext, emit/epoch guards and the old
+                    // budget token are already gone. Wake promptly instead
+                    // of rounding a brief WouldBlock up to a maintenance tick.
+                    // False positives share one bounded window and cannot
+                    // restart this FIFO's original delivery deadline.
+                    let retry_deadline = *writable_retry_deadline
+                        .get_or_insert_with(|| Instant::now() + OUTBOUND_RETRY_DELAY);
+                    let wait = queue
+                        .delivery_deadline
+                        .unwrap_or(retry_deadline)
+                        .min(retry_deadline)
+                        .saturating_duration_since(Instant::now());
+                    if !wait.is_zero()
+                        && matches!(timeout(wait, socket.writable()).await, Ok(Ok(())))
+                    {
+                        writable_retries += 1;
+                        queue.retry_after = None;
+                        // Start again from plaintext, revalidating generation,
+                        // path and budget and allocating a fresh counter.
+                        continue;
+                    }
+                }
                 break;
             }
             EncryptSendOutcome::Terminal {
@@ -1450,3 +1480,7 @@ pub(super) async fn drop_all_pending_queues(
 #[cfg(test)]
 #[path = "tests/queue.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/backpressure.rs"]
+mod backpressure_tests;
