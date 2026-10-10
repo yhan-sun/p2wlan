@@ -448,27 +448,14 @@ public static class P2WlanLifecycleNative {
 
 function Send-ConsoleCtrlC {
     param([Parameter(Mandatory = $true)][int]$ProcessId)
-    $injectorPath = Join-Path $runRoot 'send-ctrl-c.ps1'
-    if (-not (Test-Path -LiteralPath $injectorPath)) {
-        @'
-param([Parameter(Mandatory = $true)][int]$ProcessId)
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public static class P2WlanCtrlCInjector {
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GenerateConsoleCtrlEvent(uint type, uint group);
-  public static void Send(int processId) {
-    FreeConsole();
-    if (!AttachConsole((uint)processId)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-    if (!GenerateConsoleCtrlEvent(0, 0)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-  }
-}
-"@
-[P2WlanCtrlCInjector]::Send($ProcessId)
-'@ | Set-Content -LiteralPath $injectorPath -Encoding utf8
-    }
+    $injectorPath = Join-Path $PSScriptRoot 'send_console_ctrl_c.ps1'
+    $evidenceRoot = if ($env:P2WLAN_TRAY_DIAGNOSTICS_DIR) {
+        Join-Path $env:P2WLAN_TRAY_DIAGNOSTICS_DIR 'ctrl-c'
+    } else { Join-Path $runRoot 'ctrl-c' }
+    New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
+    $requestId = [guid]::NewGuid().ToString('N')
+    $evidencePath = Join-Path $evidenceRoot "injector-$requestId.json"
+    if (Test-Path -LiteralPath $evidencePath) { throw 'Ctrl+C evidence path already exists' }
     $pwshPath = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $pwshPath
@@ -484,26 +471,41 @@ public static class P2WlanCtrlCInjector {
             '-File',
             $injectorPath,
             '-ProcessId',
-            $ProcessId.ToString()
+            $ProcessId.ToString(),
+            '-RequestId',
+            $requestId,
+            '-EvidencePath',
+            $evidencePath
         )) {
         $null = $startInfo.ArgumentList.Add($argument)
     }
     $injector = [System.Diagnostics.Process]::new()
     $injector.StartInfo = $startInfo
     if (-not $injector.Start()) { throw 'failed to start Ctrl+C injector' }
+    $forcedInjector = $false
     $result = Wait-ProcessExited -Process $injector -TimeoutSeconds 5
     if (-not $result.exited) {
-        # The injector attaches to the daemon console, so it also receives the
-        # CTRL_C_EVENT it broadcast. Its own lifetime is a helper concern and
-        # not the assertion -- the daemon's graceful exit is. Reap it under a
-        # bounded budget, record the outcome, and let the daemon decide.
+        # Reap the helper within the existing budget, but forced helper
+        # cleanup cannot establish that a native broadcast succeeded.
         try { Stop-Process -Id $injector.Id -Force -ErrorAction SilentlyContinue } catch {}
+        $forcedInjector = $true
         $result = Wait-ProcessExited -Process $injector -TimeoutSeconds 10
         if (-not $result.exited) {
             throw 'Ctrl+C injector could not be reaped after the broadcast'
         }
     }
-    [pscustomobject]@{ injector_exited = $true }
+    if ($forcedInjector -or $result.exit_code -ne 0) {
+        throw "Ctrl+C injector failed (exit=$($result.exit_code), forced=$forcedInjector)"
+    }
+    if (-not (Test-Path -LiteralPath $evidencePath)) {
+        throw 'Ctrl+C injector did not write native broadcast evidence'
+    }
+    $native = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
+    if ($native.request_id -cne $requestId -or $native.target_process_id -ne $ProcessId -or
+        $native.broadcast_succeeded -isnot [bool] -or -not $native.broadcast_succeeded) {
+        throw "Ctrl+C injector did not prove the target broadcast: $($native.detail)"
+    }
+    [pscustomobject]@{ injector_exited = $true; injector_exit_code = $result.exit_code; broadcast_succeeded = $true }
 }
 
 function Invoke-ProductionCycle {
@@ -648,6 +650,8 @@ function Invoke-ProductionCycle {
         # diagnosable instead of only reporting that something remained.
         surviving_child_pids = @($survivingChildPids)
         ctrl_c_injector_exited = if ($ctrlCResult) { $ctrlCResult.injector_exited } else { $null }
+        ctrl_c_injector_exit_code = if ($ctrlCResult) { $ctrlCResult.injector_exit_code } else { $null }
+        ctrl_c_broadcast_succeeded = if ($ctrlCResult) { $ctrlCResult.broadcast_succeeded } else { $null }
         diagnostics_port_released = $portReleased
         auth_token_removed = $authRemoved
         wintun_stale = $wintunStale
