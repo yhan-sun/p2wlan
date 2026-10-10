@@ -31,9 +31,11 @@ fn pending_packet(sequence: u8, queued_at: Instant) -> PendingPacket {
     }
 }
 
-fn context() -> (PeerManager, Arc<ConnectionTimeline>) {
+fn context() -> (Arc<PeerManager>, Arc<ConnectionTimeline>) {
     (
-        PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap()),
+        Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        )),
         ConnectionTimeline::new("pending-profile", 0),
     )
 }
@@ -139,7 +141,7 @@ async fn b03_unusable_flush_path_keeps_pending_interval_running() {
         "peer-a".to_string(),
         queue,
         transport,
-        Arc::new(peers),
+        peers,
         true,
         Arc::new(RwLock::new(None)),
         Arc::new(RwLock::new(None)),

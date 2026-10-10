@@ -425,48 +425,6 @@ fn hard_hard_elapsed_ms(start_at_ms: Option<u64>, end_at_ms: Option<u64>) -> Opt
         .and_then(|(start, end)| end.checked_sub(start))
 }
 
-fn hard_hard_attempt_failure_class(
-    report: &PunchSendReport,
-    probe_rx: UdpProbeRxSnapshot,
-    direct_confirmed: bool,
-    terminal_reason: &str,
-) -> &'static str {
-    if direct_confirmed {
-        return "encrypted_validation_completed";
-    }
-    if matches!(
-        terminal_reason,
-        "network_generation_changed"
-            | "candidate_epoch_changed"
-            | "profile_generation_changed"
-            | "peer_session_changed"
-            | "session_retired"
-            | "session_cancelled"
-    ) {
-        return "cancelled_generation_changed";
-    }
-    if report.budget_skipped > 0 && report.logical_probes_attempted == 0 {
-        return "budget_rejected";
-    }
-    if report.physical_send_errors > 0 && report.physical_datagrams_sent == 0 {
-        return "send_error";
-    }
-    if report.logical_probes_attempted == 0 {
-        return if terminal_reason == "deadline" {
-            "missed_schedule"
-        } else {
-            "candidate_not_executed"
-        };
-    }
-    if probe_rx.authenticated_probe_packets_received > 0 || probe_rx.probe_acks_received > 0 {
-        return "probe_hit_validation_failed";
-    }
-    if report.physical_datagrams_sent > 0 {
-        return "no_response";
-    }
-    "unknown"
-}
-
 fn hard_hard_measurement_failure_class(rejection: &FreshMappingRejection) -> &'static str {
     match rejection {
         FreshMappingRejection::UnpredictableSequence => "model_unpredictable",
@@ -755,6 +713,7 @@ fn build_hard_hard_attempt_report(
         direct_confirmed,
         failure_class: hard_hard_attempt_failure_class(
             punch_report,
+            planned_logical_probes,
             probe_rx,
             direct_confirmed,
             terminal_reason,
@@ -1362,20 +1321,19 @@ async fn hard_hard_wait_and_sweep(
     } else {
         targets.len()
     };
-    let birthday_progress = birthday_socket_indices.as_ref().map(|_| {
-        Arc::new(tokio::sync::Mutex::new(BirthdaySweepProgress {
-            birthday: BirthdaySweepReport {
-                requested_level,
-                generated_candidate_count,
-                signaled_candidate_count,
-                effective_target_count: targets.len().min(crate::MAX_SIGNAL_CANDIDATES),
-                requested_socket_count: hard_hard_birthday_socket_count(requested_level),
-                ..BirthdaySweepReport::default()
-            },
-            aggregate: PunchSendReport::default(),
-            ..BirthdaySweepProgress::default()
-        }))
-    });
+    // One live ledger survives cancellation of either sweep mode.
+    let sweep_progress = Some(Arc::new(tokio::sync::Mutex::new(BirthdaySweepProgress {
+        birthday: BirthdaySweepReport {
+            requested_level,
+            generated_candidate_count,
+            signaled_candidate_count,
+            effective_target_count: targets.len().min(crate::MAX_SIGNAL_CANDIDATES),
+            requested_socket_count: hard_hard_birthday_socket_count(requested_level),
+            ..BirthdaySweepReport::default()
+        },
+        aggregate: PunchSendReport::default(),
+        ..BirthdaySweepProgress::default()
+    })));
     let delay = session_plan.as_ref().map_or_else(
         || Duration::from_millis(punch_at_ms.saturating_sub(hard_hard_now_ms())),
         |plan| {
@@ -1492,7 +1450,7 @@ async fn hard_hard_wait_and_sweep(
         )
         .await;
     let mut report = None;
-    let birthday_progress_for_work = birthday_progress.clone();
+    let sweep_progress_for_work = sweep_progress.clone();
     let discovery_deadline = tokio::time::Instant::from_std(
         session_plan
             .as_ref()
@@ -1521,7 +1479,7 @@ async fn hard_hard_wait_and_sweep(
                             peer_session_generation,
                             profile_generations,
                             &session_token,
-                            birthday_progress_for_work,
+                            sweep_progress_for_work,
                         )
                         .await
                     } else {
@@ -1535,12 +1493,12 @@ async fn hard_hard_wait_and_sweep(
                             peer_session_generation,
                             profile_generations,
                             &session_token,
-                            birthday_progress_for_work,
+                            sweep_progress_for_work,
                         )
                         .await
                     }
                 } else {
-                    udp.punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
+                    udp.punch_candidates_from_dynamic_socket_index_with_progress(
                         &peer_id,
                         socket_index,
                         targets.clone(),
@@ -1548,6 +1506,7 @@ async fn hard_hard_wait_and_sweep(
                         HARD_HARD_SWEEP_ATTEMPTS,
                         Some(profile_generations),
                         Some(&session_token),
+                        sweep_progress_for_work,
                     )
                     .await
                 },
@@ -1821,7 +1780,12 @@ async fn hard_hard_wait_and_sweep(
             direct_confirmed
         }
         (PunchSessionOutcome::Completed, Some(Err(_error))) => {
-            let partial_report = birthday_terminal_report(&birthday_progress, "send_error").await;
+            let partial_report = hard_hard_terminal_report(
+                &sweep_progress,
+                "send_error",
+                birthday_socket_indices.is_some(),
+            )
+            .await;
             let stop_reason = partial_report
                 .as_ref()
                 .and_then(|report| report.birthday.as_ref())
@@ -1874,7 +1838,12 @@ async fn hard_hard_wait_and_sweep(
             false
         }
         (PunchSessionOutcome::DeadlineExceeded, _) => {
-            let partial_report = birthday_terminal_report(&birthday_progress, "deadline").await;
+            let partial_report = hard_hard_terminal_report(
+                &sweep_progress,
+                "deadline",
+                birthday_socket_indices.is_some(),
+            )
+            .await;
             let stop_reason = partial_report
                 .as_ref()
                 .and_then(|report| report.birthday.as_ref())
@@ -1940,8 +1909,12 @@ async fn hard_hard_wait_and_sweep(
                 .cancellation_reason()
                 .map(PunchCancellationReason::label)
                 .unwrap_or("unknown");
-            let partial_report =
-                birthday_terminal_report(&birthday_progress, "session_cancelled").await;
+            let partial_report = hard_hard_terminal_report(
+                &sweep_progress,
+                "session_cancelled",
+                birthday_socket_indices.is_some(),
+            )
+            .await;
             let stop_reason = partial_report
                 .as_ref()
                 .and_then(|report| report.birthday.as_ref())
@@ -2302,9 +2275,10 @@ async fn record_hard_hard_birthday_sweep_summary(
         .await;
 }
 
-async fn birthday_terminal_report(
+async fn hard_hard_terminal_report(
     progress: &Option<Arc<tokio::sync::Mutex<BirthdaySweepProgress>>>,
     stop_reason: &str,
+    include_birthday: bool,
 ) -> Option<PunchSendReport> {
     let progress = progress.as_ref()?;
     let (mut report, mut birthday, live) = {
@@ -2341,6 +2315,6 @@ async fn birthday_terminal_report(
             .saturating_sub(report.targets_attempted),
     );
     update_birthday_sweep_counters(&mut birthday, &report);
-    report.birthday = Some(birthday);
+    report.birthday = include_birthday.then_some(birthday);
     Some(report)
 }

@@ -33,6 +33,13 @@ struct ProbeSendFailure {
 }
 
 impl ProbeSendFailure {
+    fn retryable_not_sent(&self) -> bool {
+        matches!(
+            self.kind,
+            ProbeSendFailureKind::PhysicalSend | ProbeSendFailureKind::PreHandoffTimeout
+        )
+    }
+
     fn new(kind: ProbeSendFailureKind, error: DaemonError) -> Self {
         Self {
             error,
@@ -1208,7 +1215,16 @@ impl UdpTransport {
             )
             .await
         } else {
-            self.send_probe_datagram(&socket, &bytes, peer_addr).await
+            self.send_probe_datagram(&socket, &bytes, peer_addr)
+                .await
+                .map_err(|error| {
+                    ProbeSendFailure::with_physical_send_error(
+                        DaemonError::Network(format!(
+                            "UDP probe send to {peer_addr} failed: {error}"
+                        )),
+                        bytes.len(),
+                    )
+                })
         };
         let first_send_at_ms = match send_result {
             Ok(_) => {
@@ -1229,28 +1245,19 @@ impl UdpTransport {
                 wait_for_probe_post_send_gate_for_test().await;
                 Some(sent_at_ms)
             }
-            Err(error) => {
-                if hh2 && error.kind() == std::io::ErrorKind::PermissionDenied {
-                    self.pending_probes.lock().await.remove(&nonce);
-                    self.clear_hard_hard_pending_probe_token(nonce).await;
-                    return Err(ProbeSendFailure::new(
-                        ProbeSendFailureKind::SocketRevoked,
-                        DaemonError::Network(error.to_string()),
-                    ));
-                }
+            Err(failure) => {
                 // The primary send failed, but the physical error must still
                 // survive a cancellation racing the pending-probe cleanup.
-                if let Some(recorder) = live_recorder.as_ref() {
-                    recorder.record_primary_error(bytes.len());
+                if failure.kind == ProbeSendFailureKind::PhysicalSend {
+                    if let Some(recorder) = live_recorder.as_ref() {
+                        recorder.record_primary_error(bytes.len());
+                    }
+                    #[cfg(test)]
+                    wait_for_probe_post_send_gate_for_test().await;
                 }
-                #[cfg(test)]
-                wait_for_probe_post_send_gate_for_test().await;
                 self.pending_probes.lock().await.remove(&nonce);
                 self.clear_hard_hard_pending_probe_token(nonce).await;
-                return Err(ProbeSendFailure::with_physical_send_error(
-                    DaemonError::Network(format!("UDP probe send to {peer_addr} failed: {error}")),
-                    bytes.len(),
-                ));
+                return Err(failure);
             }
         };
         // The send completed: release the in-flight send lease.  The pending

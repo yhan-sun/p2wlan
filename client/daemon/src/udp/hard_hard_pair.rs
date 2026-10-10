@@ -167,7 +167,7 @@ impl UdpTransport {
                 // HH2 sends exactly one primary datagram and no compatibility
                 // burst. This returned error proves that handoff failed; it
                 // is different from cancellation while awaiting its result.
-                Err(failure) if failure.kind == ProbeSendFailureKind::PhysicalSend => {
+                Err(failure) if failure.retryable_not_sent() => {
                     HardHardPairSendOutcome::RetryableNotSent
                 }
                 Err(_) => HardHardPairSendOutcome::Stopped,

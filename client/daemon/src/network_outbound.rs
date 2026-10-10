@@ -54,15 +54,17 @@
 
 //! generation, the queue is flushed event-driven on RelayPeerConfirmed /
 
-//! DirectConfirmed, and all loss is structured-counted into the peer manager's
+//! DirectConfirmed. Loss decisions carry structured events. Aggregate drops
 
-//! `/status.stats.outbound_drops` (queue overflow, deadline expiry, peer
+//! in `/status.stats.outbound_drops` and detailed peer/generation attribution
 
-//! offline, generation change, session-queue loss) plus the observable
+//! are attempted within the report owner's deadline; unfinished accounting
 
-//! `outbound_send_failures` attempts map.
+//! is explicitly unknown. Transient attempts use `outbound_send_failures`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 
 use std::net::SocketAddr;
 
@@ -184,8 +186,9 @@ pub(crate) async fn run_direct_first_deadline_loop(
 
 /// Bound a single path send so a stalled relay TCP write can never block the
 /// shared outbound worker (per-peer waits are already event-driven; this
-/// bounds the per-packet SEND).  The per-peer emit lock is held for at most
-/// this long, which also bounds how long a control probe can be locked out.
+/// bounds the physical operation). Preparation has its own bounded admission
+/// phase; the per-peer emit guard can span both phases. Once physical handoff
+/// starts, its timeout is terminal and never replays the same ciphertext.
 const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A packet that has reached a usable-path actor may not remain in retry
@@ -197,14 +200,16 @@ pub(crate) const OUTBOUND_DELIVERY_DEADLINE: Duration = Duration::from_secs(3);
 /// offline / generation-change cancellation, paced retries).
 pub(crate) const OUTBOUND_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Per-peer pending queue bounds.  A not-yet-usable peer cannot build
-/// unbounded memory pressure while it waits for a path.
+/// Bounds for each FIFO owner of a peer. The actor may hold live arrivals
+/// while the sole per-peer task owns the older batch, so two bounded batches
+/// can coexist. Completion merges them under these same limits; these are
+/// not a combined whole-peer or whole-pipeline resource ceiling.
 // A relay validation round can contain one 256-packet request burst and the
 // matching 256-packet echo burst.  The flush task owns part of the FIFO while
 // new TUN packets continue arriving, so the live ingress queue needs room for
 // the complete bidirectional burst without evicting its tail. Control and
 // handshake packets use a separate lane, so they consume none of this bound.
-// The independent 2 MiB cap prevents a peer from filling the limit with
+// The independent 2 MiB cap prevents one owner from filling the limit with
 // maximum-size IP packets.
 const MAX_PENDING_PACKETS_PER_PEER: usize = 512;
 
@@ -251,6 +256,8 @@ pub(crate) const REASON_RELAY_DELIVERY_UNCERTAIN: &str = "relay_delivery_uncerta
 pub(crate) const REASON_DIRECT_DELIVERY_UNCERTAIN: &str = "direct_delivery_uncertain";
 
 pub(crate) const REASON_OUTBOUND_ENCRYPT_FAILED: &str = "outbound_encrypt_failed";
+
+pub(crate) const REASON_OUTBOUND_ADMISSION_TIMEOUT: &str = "outbound_pre_handoff_admission_timeout";
 
 pub(crate) const REASON_OUTBOUND_SESSION_NOT_READY: &str = "outbound_session_not_ready";
 
@@ -346,10 +353,6 @@ struct DirectBusinessSendPlan {
     prepared: PreparedDirectBusinessSend,
 }
 
-use fast_path::DirectFastPathEntry;
-
-use fast_path::FastPathEligibilityToken;
-
 use fast_path::FastPathAttempt;
 
 impl RetryableSendFailure {
@@ -403,7 +406,7 @@ enum EncryptSendOutcome {
     },
 }
 
-use send::encrypt_then_send;
+use send::encrypt_then_send_with_deadline;
 
 use direct::direct_business_budget_ready_for_active_path;
 

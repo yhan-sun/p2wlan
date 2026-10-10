@@ -37,6 +37,7 @@ use crate::transport::{
 };
 
 mod probe_budget;
+pub(crate) use probe_budget::OutboundProbeSweepStop;
 use probe_budget::{
     default_global_outbound_probe_budget, default_global_relay_backoff_heartbeat_budget,
     outbound_probe_admission_reason, retain_live_budget_entries, GlobalOutboundProbeBudget,
@@ -50,6 +51,32 @@ use probe_budget::{
     OUTBOUND_PROBE_PERSISTENT_WINDOW,
 };
 include!("udp/state.rs");
+
+#[cfg(test)]
+pub(crate) fn hard_hard_report_with_epoch_credit_stop_for_test(
+    mut report: PunchSendReport,
+) -> PunchSendReport {
+    report.sweep_budget_stop = Some(probe_budget::OutboundProbeSweepStop::EpochCreditExhausted);
+    report.epoch_budget_exhausted = true;
+    report
+}
+
+#[cfg(test)]
+pub(crate) fn hard_hard_report_with_confirmation_reserve_stop_for_test(
+    mut report: PunchSendReport,
+) -> PunchSendReport {
+    report.sweep_budget_stop =
+        Some(probe_budget::OutboundProbeSweepStop::ConfirmationCreditReserved);
+    report
+}
+
+#[cfg(test)]
+pub(crate) fn hard_hard_report_with_stale_recovery_stop_for_test(
+    mut report: PunchSendReport,
+) -> PunchSendReport {
+    report.sweep_budget_stop = Some(probe_budget::OutboundProbeSweepStop::RecoveryIdentityStale);
+    report
+}
 
 mod stun_waiter;
 use stun_waiter::StunWaiters;

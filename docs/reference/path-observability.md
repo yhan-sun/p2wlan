@@ -108,7 +108,9 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 生日扫描的正式报告可带 `birthday_sweep`，保留同一终态快照中的 socket 可用性、计划与完成波次、目标覆盖、按 socket 的物理发送量、错误和停止原因；辅助事件环缺项不再承担这些计数的唯一存储。该对象缺失表示旧版本或没有生日扫描明细，不能解释为零发送。其 `first_send_at_ms` / `last_send_at_ms` 保留原扫描账本的本端墙钟口径；过程耗时仍使用报告 `timeline` 中的单调时间，不混用两种时钟。
 
-`target_order_tags` 保留实际目标顺序，重复目标仍重复出现；`confirmed_target_rank` 在加密验证选中的远端地址属于该计划时记录其从 0 开始的位置，不暴露地址，空值表示未确认 Direct 或确认的是计划外学习地址。`candidate_cap` 与 `truncation_reason` 说明裁剪边界。分类包括 `measurement_insufficient`、`model_unpredictable`、`budget_rejected`、`send_error`、`missed_schedule`、`candidate_not_executed`、`no_response`、`probe_hit_validation_failed`、`cancelled_generation_changed`、`encrypted_validation_completed` 和证据不足时的 `unknown`。最后一个验证阶段不是业务成功；采集器只有在真实业务 ingress 存在时才派生 `direct_business_succeeded`。探测命中不等于加密验证，验证也不等于业务已可用。
+`target_order_tags` 保留实际目标顺序，重复目标仍重复出现；`confirmed_target_rank` 在加密验证选中的远端地址属于该计划时记录其从 0 开始的位置，不暴露地址，空值表示未确认 Direct 或确认的是计划外学习地址。`candidate_cap` 与 `truncation_reason` 说明裁剪边界。分类包括 `measurement_insufficient`、`model_unpredictable`、`budget_rejected`、`send_error`、`missed_schedule`、`candidate_not_executed`、`execution_incomplete`、`no_response`、`probe_hit_validation_failed`、`cancelled_generation_changed`、`encrypted_validation_completed` 和证据不足时的 `unknown`。最后一个验证阶段不是业务成功；采集器只有在真实业务 ingress 存在时才派生 `direct_business_succeeded`。探测命中不等于加密验证，验证也不等于业务已可用。
+
+`failure_class` 是终态诊断主类，不授予发送、路径提升或负学习许可。`no_response` 要求本地计划完整执行、成功物理发送、无错误/跳过/取消/精确预算停止，且原会话没有认证 Probe、匹配 ACK 或未匹配认证 ACK；它不证明远端已准备或 NAT 不可达。路径/注册失败、发送前等待超时、开始执行后的 pacing/outer deadline 或缺少完整执行证据归 `execution_incomplete`；零执行的 deadline 仍归 `missed_schedule`。HH2 发送前 owner/readiness 等待超时不记物理错误；明确 syscall 错误及兼容副本部分失败保留原物理成本。`send_error` 可以与已成功 datagram 并存，`budget_rejected` 可以表示剩余计划被预算阻止，均不能反推零发送。过期恢复身份归生命周期失效，原成本和终止原因保持。认证 Probe/匹配 ACK 命中优先保留验证阶段事实；完整执行且没有更高优先级本地失败原因时，仅未匹配认证 ACK 归证据不足。多原因并存时，主类不提供每种原因的精确因果量。矩阵的 `planned_minus_attempted_by_reason` 按终态主类或 deadline 粗分缺失工作，不能当作各原因的精确计数；未落入这些桶的缺失工作及未采到的成本保持未知。
 
 `timeline` 时间字段来自同一 daemon 进程的单调时钟。`planned_send_at_ms` 在 `hh2` 完成最终首发协商时更新为约定时间，发送偏差不再与此前的最晚截止比较。`candidate_signal_accepted_at_ms` 表示本端发布流程获得接受证据的观察时刻：证据可以是信令 API 成功返回，也可以是同一 `hh2` 轮次已通过身份检查的后续消息。它不是服务端持久化或对端实际接收的时间戳，也不表示双方已经完成整个交换，不能用它计算 HTTP RTT。`probe_last_hit_at_ms` 与 `probe_last_hit_source` 表示验证前最后一次认证 Probe 或匹配 ACK，不是首次命中。`measurement_age_at_send_ms`、`measurement_to_first_send_ms`、`last_probe_hit_to_validation_ms` 使用非负差值；缺时间或顺序逆置时为空，不把异常压成零。它们分别描述测量新鲜度、测量到首发、最后命中到验证。最终 SYNC_ACK 的本地入队、服务端接受与对端实际接收是不同证据；本地入队不会授予 Direct，也不能单独作为无响应策略失败的依据。
 
@@ -222,7 +224,11 @@ python3 scripts/nat-sim/benchmark_campaign.py summarize \
 
 汇总的成功率分母为全部预定轮次，包括失败、超时、缺失 manifest 和尚未收集的批次；Wilson 95% 区间沿用同一预定分母。`complete` 只表示两个 variant 的全部预定结果已被计入，失败或缺失 manifest 也可以完成计数，不表示实验通过或 candidate 改善。
 
-当前范围为 `synthetic_ipv4_udp_normal_join`：mock TUN、同主机进程和人工网络条件。成功可经 Direct 或 Relay；`direct_at_10s`、`first_business_ms`、`application_p99_ms` 保持 `null` 并给出未知原因。启动二进制及配置摘要尚未构成完整运行身份，不能从该汇总声称发布产物性能、真实运营商成功率或 Minecraft 交互延迟。不同种子也不构成独立真实网络样本。
+每轮构建后将 daemon、Control、Relay 及使用的 UDP shim 复制到私有 `artifacts/`，目录权限为 `0700`，快照权限为 `0500`。最终 exec 包装器在 shim 之后复核快照大小和 SHA-256，再记录源码身份、组件、角色、PID 与本机单调时钟；实际 exec 使用同一快照。`exec_requested` 只表示已请求执行，成功仍须满足既有就绪、双向业务和回收门禁。采集和汇总重新核对原始启动记录、artifact-set 与快照；缺失、篡改或身份不一致使该轮无效，仍保留在预定分母中。
+
+配置身份范围为 `argv_and_allowlisted_environment`：对实际参数、明确列出的环境变量以及启动时存在的指定配置文件计算摘要，不保存原始参数或环境值，不读取授权 stdin。配置文件尚不存在时记录 `absent_at_launch`，后续自动生成的文件不能替代启动时事实。`configuration_identity_scope` 明示这份输入范围，`resolved_runtime_configuration_sha256` 保持未知；生成后的运行配置、未列出的宿主环境和 stdin 授权不由该摘要覆盖。
+
+当前范围为 `synthetic_ipv4_udp_normal_join`：mock TUN、同主机进程和人工网络条件。成功可经 Direct 或 Relay；`direct_at_10s`、`first_business_ms`、`application_p99_ms` 保持 `null` 并给出未知原因。启动身份不能据此证明发布产物性能、真实运营商成功率或 Minecraft 交互延迟。不同种子也不构成独立真实网络样本。
 
 ## 活动路径遥测契约（path_telemetry_v1）
 

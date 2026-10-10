@@ -1,3 +1,100 @@
+/// Derive one diagnostic class from the existing terminal ledger. This never
+/// grants send admission, Direct promotion, or negative strategy evidence.
+fn hard_hard_attempt_failure_class(
+    report: &PunchSendReport,
+    planned: usize,
+    probe_rx: UdpProbeRxSnapshot,
+    direct_confirmed: bool,
+    terminal_reason: &str,
+) -> &'static str {
+    use crate::udp::OutboundProbeSweepStop;
+
+    if direct_confirmed {
+        return "encrypted_validation_completed";
+    }
+    let lifecycle_failure = matches!(
+        report.failure_kind,
+        Some(
+            BirthdaySweepFailureKind::NetworkGenerationChanged
+                | BirthdaySweepFailureKind::CandidateEpochChanged
+                | BirthdaySweepFailureKind::ProfileGenerationChanged
+                | BirthdaySweepFailureKind::PeerSessionChanged
+                | BirthdaySweepFailureKind::SessionRetired
+                | BirthdaySweepFailureKind::SocketRevoked
+        )
+    );
+    if lifecycle_failure
+        || report.sweep_budget_stop == Some(OutboundProbeSweepStop::RecoveryIdentityStale)
+        || matches!(
+            terminal_reason,
+            "network_generation_changed"
+                | "candidate_epoch_changed"
+                | "profile_generation_changed"
+                | "peer_session_changed"
+                | "session_retired"
+                | "session_cancelled"
+        )
+    {
+        return "cancelled_generation_changed";
+    }
+    if probe_rx.authenticated_probe_packets_received > 0 || probe_rx.probe_acks_received > 0 {
+        return "probe_hit_validation_failed";
+    }
+    // A successful primary and a failed compatibility copy remain both true.
+    // This class says a syscall failed, not that every datagram failed.
+    if report.physical_send_errors > 0 || report.partial_physical_send_errors > 0 {
+        return "send_error";
+    }
+    if report.failure_kind.is_some() || report.worker_failed || report.probe_path_errors > 0 {
+        return "execution_incomplete";
+    }
+    if matches!(
+        report.sweep_budget_stop,
+        Some(
+            OutboundProbeSweepStop::EpochCreditExhausted
+                | OutboundProbeSweepStop::ConfirmationCreditReserved
+        )
+    ) || report.epoch_budget_exhausted
+        || report.candidate_iteration_capped
+    {
+        return "budget_rejected";
+    }
+    if report.pacing_deadline_reached || terminal_reason == "deadline" {
+        return if report.logical_probes_attempted == 0 && report.physical_datagrams_sent == 0 {
+            "missed_schedule"
+        } else {
+            "execution_incomplete"
+        };
+    }
+    // A paced retry can increment budget_skipped when its clock expires.
+    // Only reach generic admission skips after the exact stop/deadline checks.
+    if report.budget_skipped > 0 {
+        return "budget_rejected";
+    }
+    if report.logical_probes_attempted == 0 && report.physical_datagrams_sent == 0 {
+        return "candidate_not_executed";
+    }
+    // Evaluate local execution independently of received evidence. Otherwise
+    // an unmatched authenticated ACK would masquerade as incomplete sending.
+    let execution_complete = report.physical_datagrams_sent > 0
+        && report.logical_probes_attempted as usize >= planned
+        && report.sweep_budget_stop.is_none()
+        && hard_hard_complete_unanswered_exploration(
+            report,
+            planned,
+            UdpProbeRxSnapshot::default(),
+        );
+    if !execution_complete {
+        return "execution_incomplete";
+    }
+    if probe_rx.authenticated_probe_acks_observed > 0
+        || probe_rx.authenticated_probe_acks_unmatched > 0
+    {
+        return "unknown";
+    }
+    "no_response"
+}
+
 /// Observation only: this guard never owns or mutates a candidate/session.
 /// It lives in the existing bounded worker and emits once even when its
 /// future is dropped. No lock guard is retained across the logging call.

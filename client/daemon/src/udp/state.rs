@@ -1656,6 +1656,9 @@ pub(crate) struct BirthdaySweepReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeSendFailureKind {
     PhysicalSend,
+    /// The bounded readiness/owner-lock wait expired before kernel handoff.
+    /// No successful datagram or physical syscall error belongs to this cost.
+    PreHandoffTimeout,
     NetworkGenerationChanged,
     CandidateEpochChanged,
     LocalProfileGenerationChanged,
@@ -1671,6 +1674,7 @@ pub(crate) enum ProbeSendFailureKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BirthdaySweepFailureKind {
     Send,
+    PreHandoffTimeout,
     WorkerJoin,
     NetworkGenerationChanged,
     CandidateEpochChanged,
@@ -1687,6 +1691,7 @@ impl BirthdaySweepFailureKind {
     pub(crate) const fn stop_reason(self) -> &'static str {
         match self {
             Self::Send => "send_error",
+            Self::PreHandoffTimeout => "probe_pre_handoff_timeout",
             Self::WorkerJoin => "worker_failed",
             Self::NetworkGenerationChanged => "network_generation_changed",
             Self::CandidateEpochChanged => "candidate_epoch_changed",
@@ -1703,6 +1708,7 @@ impl BirthdaySweepFailureKind {
     pub(crate) const fn from_probe_failure(kind: ProbeSendFailureKind) -> Self {
         match kind {
             ProbeSendFailureKind::PhysicalSend => Self::Send,
+            ProbeSendFailureKind::PreHandoffTimeout => Self::PreHandoffTimeout,
             ProbeSendFailureKind::NetworkGenerationChanged => Self::NetworkGenerationChanged,
             ProbeSendFailureKind::CandidateEpochChanged => Self::CandidateEpochChanged,
             ProbeSendFailureKind::LocalProfileGenerationChanged
@@ -1721,6 +1727,7 @@ impl BirthdaySweepFailureKind {
     pub(crate) fn from_stop_reason(reason: &str) -> Option<Self> {
         match reason {
             "send_error" => Some(Self::Send),
+            "probe_pre_handoff_timeout" => Some(Self::PreHandoffTimeout),
             "worker_failed" => Some(Self::WorkerJoin),
             "network_generation_changed" => Some(Self::NetworkGenerationChanged),
             "candidate_epoch_changed" => Some(Self::CandidateEpochChanged),

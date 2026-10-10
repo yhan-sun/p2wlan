@@ -1175,6 +1175,8 @@ echo "[nat-sim] mode=$MODE isolated network id: $NETWORK_ID"
 echo "[nat-sim] exact_head_sha=${NAT_TOPOLOGY_HEAD_SHA:-unknown} replica=${NAT_TOPOLOGY_REPLICA:-1}"
 echo "[nat-sim] reserved control port base: $PORT"
 echo "[nat-sim] traversal flags: strict_filtering_a=$STRICT_FILTERING_A strict_filtering_b=$STRICT_FILTERING_B mapping_a=$MAPPING_MODE_A mapping_b=$MAPPING_MODE_B delay_a_ms=$DELAY_A_MS delay_b_ms=$DELAY_B_MS stun_delay_a_ms=$STUN_DELAY_A_MS stun_delay_b_ms=$STUN_DELAY_B_MS signal_delay_a_ms=$SIGNAL_DELAY_A_MS signal_delay_b_ms=$SIGNAL_DELAY_B_MS prepare_delay_a_ms=$PREPARE_DELAY_A_MS prepare_delay_b_ms=$PREPARE_DELAY_B_MS duplicate_rate=$DUPLICATE_RATE unassigned_egress_listeners=$UNASSIGNED_EGRESS_LISTENERS fresh_mapping=$FRESH_MAPPING_PUNCH predicted_candidates=$PREDICTED_CANDIDATES birthday=$BIRTHDAY_PROBING socket_pool=${SOCKET_POOL:-default}"
+python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" source \
+  --repository "$ROOT_DIR" --output "$BASE_DIR/source-at-build.json"
 if [[ "$EGRESS_CAPTURE" == shim ]]; then
   python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --build "$BASE_DIR/udp-egress-shim.so"
 fi
@@ -1186,6 +1188,21 @@ echo "[nat-sim] building control server, relay and daemon..."
 )
 cargo build -p p2wlan-daemon --manifest-path "$ROOT_DIR/client/daemon/Cargo.toml" >/dev/null
 DAEMON_TARGET_DIR=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT_DIR/client/daemon/Cargo.toml" | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+SNAPSHOT_ARGS=(prepare --base-dir "$BASE_DIR" --repository "$ROOT_DIR" \
+  --source-file "$BASE_DIR/source-at-build.json" \
+  --daemon "$DAEMON_TARGET_DIR/debug/p2wlan-daemon" \
+  --control "$BASE_DIR/control-server" --relay "$BASE_DIR/relay-server")
+if [[ "$EGRESS_CAPTURE" == shim ]]; then SNAPSHOT_ARGS+=(--udp-shim "$BASE_DIR/udp-egress-shim.so"); fi
+python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" "${SNAPSHOT_ARGS[@]}"
+ARTIFACT_SET="$BASE_DIR/artifact-set.json"
+DAEMON_IDENTITY_ENV=(
+  --env-key P2WLAN_DISABLE_TUN --env-key P2WLAN_TEST_RUN_ID \
+  --env-key P2WLAN_EXPERIMENT_BASELINE_SHA --env-key P2WLAN_EXPERIMENT_VARIANT \
+  --env-key P2WLAN_EXPERIMENT_SCENARIO --env-key P2WLAN_EXPERIMENT_SEED \
+  --env-key P2WLAN_EXPERIMENT_SIGNAL_DELAY_MS --env-key P2WLAN_A0_SIGNAL_TRACE \
+  --env-key RUST_LOG --env-key LD_PRELOAD --env-key DYLD_INSERT_LIBRARIES \
+  --env-key P2WLAN_NAT_SIM_GATEWAY_PORT --env-key P2WLAN_NAT_SIM_EGRESS_STATS
+)
 
 # One relay keypair for the whole run (tickets are per-device). The helper
 # uses only Go's standard library, so the harness does not depend on Python
@@ -1202,7 +1219,7 @@ for round in $(seq 1 "$ROUNDS"); do
   ROUND_DIR="$BASE_DIR/round-$round"
   NODE_A_RUNTIME="$ROUND_DIR/node-a-runtime"
   NODE_B_RUNTIME="$ROUND_DIR/node-b-runtime"
-  mkdir -p "$ROUND_DIR" "$NODE_A_RUNTIME" "$NODE_B_RUNTIME"
+  mkdir -p "$ROUND_DIR" "$NODE_A_RUNTIME" "$NODE_B_RUNTIME" "$ROUND_DIR/launches"
   NAT_SEED=$((NAT_SEED_BASE + round))
   ROUND_RUN_ID="${NAT_SIM_RUN_ID}-round-${round}"
 
@@ -1277,8 +1294,16 @@ for round in $(seq 1 "$ROUNDS"); do
     exit 1
   fi
 
-  DAEMON_A_CMD=("$DAEMON_TARGET_DIR/debug/p2wlan-daemon")
-  DAEMON_B_CMD=("$DAEMON_TARGET_DIR/debug/p2wlan-daemon")
+  # The shim execs this recorder first; the recorder's final exec uses only
+  # the private daemon snapshot and does not consume its token-stdin pipe.
+  DAEMON_A_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
+    --artifact-set "$ARTIFACT_SET" --component daemon --role node-a \
+    --record "$ROUND_DIR/launches/node-a.json" --config-file "$NODE_A_RUNTIME/config.json" \
+    --stdin-authorization "${DAEMON_IDENTITY_ENV[@]}" --)
+  DAEMON_B_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
+    --artifact-set "$ARTIFACT_SET" --component daemon --role node-b \
+    --record "$ROUND_DIR/launches/node-b.json" --config-file "$NODE_B_RUNTIME/config.json" \
+    --stdin-authorization "${DAEMON_IDENTITY_ENV[@]}" --)
   if [[ "$EGRESS_CAPTURE" == shim ]]; then
     EGRESS_A_PORT=$(sed -n 's/^EGRESS_A_PORT=//p' "$ROUND_DIR/nat-sim.out")
     EGRESS_B_PORT=$(sed -n 's/^EGRESS_B_PORT=//p' "$ROUND_DIR/nat-sim.out")
@@ -1286,8 +1311,8 @@ for round in $(seq 1 "$ROUNDS"); do
       echo "[nat-sim] round $round: FAIL reason_code=egress_gateway_missing" >&2
       exit 1
     fi
-    DAEMON_A_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --library "$BASE_DIR/udp-egress-shim.so" --port "$EGRESS_A_PORT" --stats "$ROUND_DIR/node-a.egress-stats" -- "${DAEMON_A_CMD[@]}")
-    DAEMON_B_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --library "$BASE_DIR/udp-egress-shim.so" --port "$EGRESS_B_PORT" --stats "$ROUND_DIR/node-b.egress-stats" -- "${DAEMON_B_CMD[@]}")
+    DAEMON_A_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --library "$BASE_DIR/artifacts/udp-shim" --port "$EGRESS_A_PORT" --stats "$ROUND_DIR/node-a.egress-stats" -- "${DAEMON_A_CMD[@]}")
+    DAEMON_B_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --library "$BASE_DIR/artifacts/udp-shim" --port "$EGRESS_B_PORT" --stats "$ROUND_DIR/node-b.egress-stats" -- "${DAEMON_B_CMD[@]}")
   fi
 
   # Relay(s) (safety net; TCP, bypasses the NATs).  Multiple relays offer a
@@ -1305,7 +1330,11 @@ for round in $(seq 1 "$ROUNDS"); do
     if [[ "$relay_idx" -gt 1 ]]; then
       R_AUDIENCE="relay-sim-$relay_idx"
     fi
-    RELAY_AUDIENCE="$R_AUDIENCE" RELAY_REGION="$R_REGION" "$BASE_DIR/relay-server" \
+    RELAY_AUDIENCE="$R_AUDIENCE" RELAY_REGION="$R_REGION" \
+      python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
+      --artifact-set "$ARTIFACT_SET" --component relay --role "relay-$relay_idx" \
+      --record "$ROUND_DIR/launches/relay-$relay_idx.json" \
+      --env-key RELAY_AUDIENCE --env-key RELAY_REGION -- \
       -bind "127.0.0.1:$R_PORT" \
       -ticket-keyring "$KEYRING_JSON" -require-auth -allow-insecure-plaintext \
       -metrics-bind "127.0.0.1:$R_METRICS" \
@@ -1329,7 +1358,12 @@ for round in $(seq 1 "$ROUNDS"); do
     P2WLAN_A0_SIGNAL_TRACE \
     RELAY_TICKET_SIGNER_JSON="{\"active\":{\"kid\":\"relay-sim\",\"private_key\":\"$RELAY_SEED\"}}" \
     RELAY_CATALOG_JSON="[$RELAY_ENDPOINTS]"
-  "$BASE_DIR/control-server" >"$ROUND_DIR/server.log" 2>&1 &
+  python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
+    --artifact-set "$ARTIFACT_SET" --component control --role control \
+    --record "$ROUND_DIR/launches/control.json" \
+    --env-key PORT --env-key DB_PATH --env-key JWT_SECRET --env-key P2WLAN_A0_SIGNAL_TRACE \
+    --env-key RELAY_TICKET_SIGNER_JSON --env-key RELAY_CATALOG_JSON -- \
+    >"$ROUND_DIR/server.log" 2>&1 &
   SERVER_PID=$!
   PIDS+=($SERVER_PID)
 
@@ -2269,7 +2303,11 @@ except Exception:
     wait "${RELAY_PIDS[0]}" 2>/dev/null || true
     deadline_pause 1 || true
     KEYRING_JSON="{\"relay-sim\":\"$RELAY_PUB\"}"
-    RELAY_AUDIENCE="relay-sim" RELAY_REGION="local" "$BASE_DIR/relay-server" \
+    RELAY_AUDIENCE="relay-sim" RELAY_REGION="local" \
+      python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
+      --artifact-set "$ARTIFACT_SET" --component relay --role relay-1-restart-1 \
+      --record "$ROUND_DIR/launches/relay-1-restart-1.json" \
+      --env-key RELAY_AUDIENCE --env-key RELAY_REGION -- \
       -bind "127.0.0.1:$RELAY_PORT" \
       -ticket-keyring "$KEYRING_JSON" -require-auth -allow-insecure-plaintext \
       -metrics-bind "127.0.0.1:$RELAY_METRICS_PORT" \

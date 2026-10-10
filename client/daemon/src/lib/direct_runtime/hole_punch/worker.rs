@@ -241,18 +241,46 @@ async fn spawn_hole_punch_task_with_lifecycle(
     {
         return;
     }
-    let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
-        peers
-            .record_direct_event(
-                &peer_id,
-                "punch_suppressed_superseded",
-                None,
-                None,
-                None,
-                "suppressed punch trigger: peer is Direct, offline or gone",
-            )
-            .await;
+    let admission = peers.recovery_epoch_admit(&peer_id).await;
+    if peers.current_network_generation_sync() != network_generation
+        || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+    {
         return;
+    }
+    let epoch = match admission {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        RecoveryAdmission::Superseded => {
+            peers
+                .record_direct_event_for_generation_with_socket(
+                    &peer_id,
+                    network_generation,
+                    "punch_suppressed_superseded",
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    "suppressed punch trigger: peer is Direct, offline or gone",
+                )
+                .await;
+            return;
+        }
+        RecoveryAdmission::BudgetExhausted { epoch } => {
+            // A frozen epoch remains current. Do not describe quota/backoff
+            // rejection as path convergence, or create another recovery owner.
+            peers
+                .record_direct_event_for_generation_with_socket(
+                    &peer_id,
+                    network_generation,
+                    "punch_suppressed_budget_exhausted",
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    format!("suppressed ordinary punch: recovery_epoch={epoch} budget is exhausted; awaiting existing bounded recovery backoff"),
+                )
+                .await;
+            return;
+        }
     };
     let claim_priority = if fresh_prediction.is_some() {
         PUNCH_PRIORITY_FRESH_PREDICTION
