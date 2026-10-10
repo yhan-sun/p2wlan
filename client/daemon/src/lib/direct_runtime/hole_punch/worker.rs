@@ -127,13 +127,17 @@ async fn spawn_hole_punch_task_with_lifecycle(
     {
         return;
     }
-    // Hard↔Hard is a planner-gated replacement for the ordinary first punch
-    // only on the deterministic initiator side.  The initiator measures a
-    // fresh socket and publishes the first prediction; the responder is
-    // entered exclusively by the matching `hh1` fresh signal.  Other NAT
-    // strategies continue through the existing scheduler below.
+    // Give production cold starts the ordinary bounded candidate path first.
+    // The existing recovery retry can admit HH after same-epoch ordinary
+    // feedback; only the isolated experiment replaces the first punch with HH.
+    // The responder still requires the matching authenticated control context
+    // and the existing owned encrypted validation before Direct promotion.
     let local_is_hard_hard_initiator = peers.local_node_id_for_traversal() < peer_id;
-    if fresh_prediction.is_none() && frozen_targets.is_none() && local_is_hard_hard_initiator {
+    if hard_hard_experiment_only
+        && fresh_prediction.is_none()
+        && frozen_targets.is_none()
+        && local_is_hard_hard_initiator
+    {
         if let Some(plan) = peers.hard_hard_plan_for_peer(&peer_id).await {
             if let Some(signal) = signal.clone() {
                 peers
