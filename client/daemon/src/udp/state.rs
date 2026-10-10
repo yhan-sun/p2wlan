@@ -1295,7 +1295,7 @@ pub(crate) enum FreshMappingRejection {
     /// (attempts=0 or all completed calls failed). The returned fixed-size
     /// summary retains actual classified failures and outer stop causes.
     /// Explicit cancellation still returns the unit `Superseded` variant.
-    NoProbesSent(FreshMappingProbeSummary),
+    NoProbesSent(Box<FreshMappingProbeSummary>),
 }
 
 impl FreshMappingRejection {

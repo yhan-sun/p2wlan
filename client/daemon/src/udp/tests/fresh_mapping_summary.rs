@@ -146,10 +146,10 @@ fn returned_summary(outcome: FreshMappingOutcome) -> FreshMappingProbeSummary {
     match outcome {
         FreshMappingOutcome::Rejected(FreshMappingRejection::NoProbesSent(summary)) => {
             assert_eq!(
-                FreshMappingRejection::NoProbesSent(summary).label(),
+                FreshMappingRejection::NoProbesSent(summary.clone()).label(),
                 "no_probes_sent"
             );
-            summary
+            *summary
         }
         other => panic!("expected completed zero-success typed payload, got {other:?}"),
     }
