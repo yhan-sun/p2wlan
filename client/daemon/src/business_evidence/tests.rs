@@ -8,6 +8,38 @@ use std::time::Duration;
 
 const FILLER_BYTES: usize = 37;
 
+#[test]
+fn wg_evidence_owner_exhaustion_never_wraps_or_reuses_an_owner() {
+    let counter = AtomicU64::new(u64::MAX - 1);
+    assert_eq!(WgEvidenceOwnerId::allocate_from(&counter).0, u64::MAX - 1);
+    assert_eq!(WgEvidenceOwnerId::allocate_from(&counter).0, 0);
+    assert_eq!(WgEvidenceOwnerId::allocate_from(&counter).0, 0);
+    assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+}
+
+#[test]
+fn concurrent_wg_evidence_owner_allocation_is_unique_and_contiguous() {
+    let counter = AtomicU64::new(1);
+    let mut owners = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    (0..128)
+                        .map(|_| WgEvidenceOwnerId::allocate_from(&counter).0)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    owners.sort_unstable();
+    assert_eq!(owners, (1..=1024).collect::<Vec<_>>());
+    assert_eq!(counter.load(Ordering::Relaxed), 1025);
+}
+
 fn scope() -> CaptureScope {
     CaptureScope {
         capture_id: [0x11; 16],

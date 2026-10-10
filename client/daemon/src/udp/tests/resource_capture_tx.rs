@@ -89,8 +89,10 @@ fn assert_icmp(raw: &[u8], src: Ipv4Addr, dst: Ipv4Addr, id: u16, body: &[u8]) {
     // Independent read-only checksum verification; no normalization or send
     // implementation is reproduced, and no fixture buffer is observed.
     let mut sum = icmp
-        .chunks_exact(2)
-        .map(|pair| u32::from(u16::from_be_bytes([pair[0], pair[1]])))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u32::from(u16::from_be_bytes(*pair)))
         .sum::<u32>();
     if !icmp.len().is_multiple_of(2) {
         sum += u32::from(*icmp.last().unwrap()) << 8;

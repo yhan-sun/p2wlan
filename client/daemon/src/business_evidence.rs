@@ -174,13 +174,23 @@ pub(crate) struct WgEvidenceOwnerId(u64);
 
 impl WgEvidenceOwnerId {
     pub(crate) fn allocate() -> Self {
+        Self::allocate_from(&NEXT_WG_EVIDENCE_OWNER)
+    }
+
+    fn allocate_from(counter: &AtomicU64) -> Self {
         // Constructor only. Exhaustion becomes missing evidence rather than
         // silently reusing a previously assigned owner.
-        Self(
-            NEXT_WG_EVIDENCE_OWNER
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-                .unwrap_or(0),
-        )
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(1) else {
+                return Self(0);
+            };
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(previous) => return Self(previous),
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 

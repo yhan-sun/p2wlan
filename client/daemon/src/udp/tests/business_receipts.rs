@@ -166,8 +166,10 @@ fn request_packet() -> Vec<u8> {
     raw[12..16].copy_from_slice(&[10, 20, 0, 1]);
     raw[16..20].copy_from_slice(&[10, 20, 0, 2]);
     let mut checksum = raw[..20]
-        .chunks_exact(2)
-        .map(|pair| u32::from(u16::from_be_bytes([pair[0], pair[1]])))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u32::from(u16::from_be_bytes(*pair)))
         .sum::<u32>();
     while checksum >> 16 != 0 {
         checksum = (checksum & 0xffff) + (checksum >> 16);

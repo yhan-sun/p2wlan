@@ -67,8 +67,10 @@ fn registered_packet() -> Vec<u8> {
     body[61..63].copy_from_slice(&8_u16.to_be_bytes());
     body[63..].fill(0xa5);
     let mut sum = raw[..20]
-        .chunks_exact(2)
-        .map(|pair| u32::from(u16::from_be_bytes([pair[0], pair[1]])))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u32::from(u16::from_be_bytes(*pair)))
         .sum::<u32>();
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
