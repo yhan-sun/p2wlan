@@ -31,6 +31,9 @@ pub struct InboundPacket {
     /// the bounded WireGuard overlap window, but they are never path or
     /// first-usable evidence for the current session.
     pub from_previous_session: bool,
+    /// Original opt-in auth facts; default None is one pointer wide.
+    pub(crate) authenticated_ingress:
+        Option<Arc<crate::business_evidence::AuthenticatedIngressContext>>,
     /// Low-frequency userspace latency context, attached only by the live
     /// decrypt worker before the packet is written to TUN.
     pub(crate) trace: Option<DataplaneRxTrace>,
@@ -38,6 +41,12 @@ pub struct InboundPacket {
 
 /// Reads packets from a virtual interface and routes them by destination IP.
 pub struct DataPlane<T> {
+    resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
+    /// Default-disabled evidence scope; never packet acceptance authority.
+    #[allow(dead_code)]
+    rx_business_capture: Option<Arc<crate::business_evidence::CaptureOwner>>,
+    #[allow(dead_code)]
+    tun_evidence_identity: Option<crate::business_evidence::TunEvidenceIdentity>,
     tun: T,
     peers: Arc<PeerManager>,
     outbound_tx: mpsc::Sender<OutboundPacket>,
@@ -56,12 +65,55 @@ impl<T> DataPlane<T>
 where
     T: VirtualInterface + Send + 'static,
 {
+    /// Install aggregate diagnostics before starting the worker. The owner
+    /// does not authorize delivery and is absent from default instances.
+    #[allow(dead_code)]
+    pub(crate) fn with_resource_capture(
+        mut self,
+        capture: Arc<crate::dataplane_resources::ResourceCapture>,
+    ) -> std::result::Result<Self, crate::dataplane_resources::EnableError> {
+        if self.resource_capture.is_some() {
+            return Err(crate::dataplane_resources::EnableError::AlreadyEnabled);
+        }
+        if capture.is_finished() {
+            return Err(crate::dataplane_resources::EnableError::CaptureFinished);
+        }
+        self.resource_capture = Some(capture);
+        Ok(self)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resource_capture(
+        &self,
+    ) -> Option<&Arc<crate::dataplane_resources::ResourceCapture>> {
+        self.resource_capture.as_ref()
+    }
+
+    /// Opt in with an explicit backend before starting the packet worker.
+    /// Historical receipts never decide packet acceptance.
+    #[allow(dead_code)]
+    pub(crate) fn with_rx_business_capture(
+        mut self,
+        capture: Arc<crate::business_evidence::CaptureOwner>,
+        target: crate::business_evidence::TunEvidenceIdentity,
+    ) -> std::result::Result<Self, crate::business_evidence::EnableError> {
+        if self.rx_business_capture.is_some() {
+            return Err(crate::business_evidence::EnableError::AlreadyEnabled);
+        }
+        self.rx_business_capture = Some(capture);
+        self.tun_evidence_identity = Some(target);
+        Ok(self)
+    }
+
     /// Create a data plane and a receiver for routed outbound packets.
     pub fn new(tun: T, peers: Arc<PeerManager>) -> (Self, mpsc::Receiver<OutboundPacket>) {
         let (outbound_tx, outbound_rx) = mpsc::channel(1024);
         let local_feedback_rx = peers.subscribe_local_mtu_feedback();
         (
             Self {
+                resource_capture: None,
+                rx_business_capture: None,
+                tun_evidence_identity: None,
                 tun,
                 peers,
                 outbound_tx,
@@ -96,6 +148,9 @@ where
         let local_feedback_rx = peers.subscribe_local_mtu_feedback();
         (
             Self {
+                resource_capture: None,
+                rx_business_capture: None,
+                tun_evidence_identity: None,
                 tun,
                 peers,
                 outbound_tx,
@@ -337,7 +392,17 @@ where
             .read(buf)
             .await
             .map_err(|e| DaemonError::Network(format!("TUN read failed: {e}")))?;
-        Ok((buf[..n].to_vec(), started, std::time::Instant::now()))
+        let packet = buf[..n].to_vec();
+        let completed = std::time::Instant::now();
+        if let Some(capture) = self.resource_capture() {
+            let _ = capture.observe_vec(
+                crate::dataplane_resources::VecSite::TxTunReadCopy,
+                crate::dataplane_resources::VecOperation::SliceCopy,
+                Some(packet.len()),
+                &packet,
+            );
+        }
+        Ok((packet, started, completed))
     }
 
     /// Route a packet that has already been removed from the TUN read queue.
@@ -391,7 +456,16 @@ where
         };
 
         let routed_packet = if src_ip == self.tun.address() {
-            packet[..total_len].to_vec()
+            let routed = packet[..total_len].to_vec();
+            if let Some(capture) = self.resource_capture() {
+                let _ = capture.observe_vec(
+                    crate::dataplane_resources::VecSite::TxRoutedPacketCopy,
+                    crate::dataplane_resources::VecOperation::SliceCopy,
+                    Some(routed.len()),
+                    &routed,
+                );
+            }
+            routed
         } else {
             match self.normalize_outbound_source(&packet[..total_len], &src_ip, &dst_ip, protocol) {
                 Some(normalized) => normalized,
@@ -552,6 +626,8 @@ where
     }
 
     async fn write_inbound(&mut self, packet: InboundPacket) -> Result<()> {
+        use crate::dataplane_resources::{VecOperation, VecSite};
+
         let trace = packet.trace.clone();
         let validation_started = std::time::Instant::now();
         let parsed = match IpPacket::new(&packet.packet) {
@@ -568,6 +644,14 @@ where
         let protocol = parsed.protocol();
         let total_len = parsed.total_len().min(packet.packet.len());
         let mut inbound_packet = packet.packet[..total_len].to_vec();
+        if let Some(capture) = self.resource_capture() {
+            capture.observe_vec(
+                VecSite::RxTunPacketCopy,
+                VecOperation::SliceCopy,
+                Some(inbound_packet.len()),
+                &inbound_packet,
+            );
+        }
         let src_ip = parsed.src_addr_string();
         let dst_ip = parsed.dst_addr_string();
 
@@ -598,7 +682,8 @@ where
             return Ok(());
         }
 
-        if src_ip != peer.virtual_ip {
+        let source_was_normalized = src_ip != peer.virtual_ip;
+        if source_was_normalized {
             match self.normalize_inbound_source(
                 &inbound_packet,
                 &packet.peer_id,
@@ -656,6 +741,20 @@ where
                 tun_write_started.duration_since(validation_started),
             );
         }
+        // Bind the original auth carrier and this actual TUN target before
+        // write awaits. Current session/path/runtime is never substituted.
+        let tun_evidence = self.rx_business_capture.as_ref().map(|capture| {
+            (
+                capture.clone(),
+                packet.authenticated_ingress.clone(),
+                self.tun_evidence_identity,
+                if source_was_normalized {
+                    peer.virtual_ip.parse::<Ipv4Addr>().ok()
+                } else {
+                    None
+                },
+            )
+        });
         let written = self
             .tun
             .write(&inbound_packet)
@@ -670,6 +769,24 @@ where
                 written,
                 inbound_packet.len()
             )));
+        }
+
+        if let Some((capture, authenticated, target, allowed_source)) = tun_evidence {
+            match (authenticated.as_deref(), target) {
+                (Some(authenticated), Some(target)) if written != 0 => {
+                    capture.capture_tun_full(
+                        authenticated,
+                        target,
+                        &inbound_packet,
+                        written,
+                        allowed_source,
+                        tun_write_completed,
+                    );
+                }
+                _ => {
+                    capture.note_gap(crate::business_evidence::EvidenceGap::IdentityMissing);
+                }
+            }
         }
 
         #[cfg(target_os = "android")]
@@ -809,6 +926,14 @@ where
         }
         match normalize_overlay_source(packet, src_ip, local_ip, self.overlay_v4) {
             SourceNormalization::Normalized(normalized) => {
+                if let Some(capture) = self.resource_capture() {
+                    let _ = capture.observe_vec(
+                        crate::dataplane_resources::VecSite::TxNormalizedPacketCopy,
+                        crate::dataplane_resources::VecOperation::SliceCopy,
+                        Some(normalized.len()),
+                        &normalized,
+                    );
+                }
                 debug!(
                     "Normalized outbound {protocol} source IP {src_ip} -> {local_ip} for {dst_ip}"
                 );
@@ -847,6 +972,14 @@ where
     ) -> Option<Vec<u8>> {
         match normalize_overlay_source(packet, src_ip, peer_virtual_ip, self.overlay_v4) {
             SourceNormalization::Normalized(normalized) => {
+                if let Some(capture) = self.resource_capture() {
+                    let _ = capture.observe_vec(
+                        crate::dataplane_resources::VecSite::RxNormalizedPacketCopy,
+                        crate::dataplane_resources::VecOperation::SliceCopy,
+                        Some(normalized.len()),
+                        &normalized,
+                    );
+                }
                 debug!(
                     "Normalized inbound {protocol} source IP {src_ip} -> {peer_virtual_ip} for peer {peer_id} ({dst_ip})"
                 );

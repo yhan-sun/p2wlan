@@ -269,6 +269,14 @@ impl WireGuardTransport {
             }
         };
         let crypto_us = crypto_started.elapsed().as_micros() as u64;
+        if let Some(capture) = self.resource_capture() {
+            let _ = capture.observe_vec(
+                crate::dataplane_resources::VecSite::TxSerializedWire,
+                crate::dataplane_resources::VecOperation::SerializedOutput,
+                None,
+                &wire_bytes,
+            );
+        }
         if let Some(sampled) = sampled {
             profiler.record(
                 sampled,
@@ -442,6 +450,14 @@ impl WireGuardTransport {
         }
         let wire_bytes =
             wire_result.map_err(|e| DaemonError::Peer(format!("WireGuard encrypt failed: {e}")))?;
+        if let Some(capture) = self.resource_capture() {
+            let _ = capture.observe_vec(
+                crate::dataplane_resources::VecSite::TxSerializedWire,
+                crate::dataplane_resources::VecOperation::SerializedOutput,
+                None,
+                &wire_bytes,
+            );
+        }
         debug!(
             event = "wireguard_outbound_counter_allocated",
             peer_id = %packet.peer_id,

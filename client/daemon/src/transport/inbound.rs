@@ -124,6 +124,7 @@ impl WireGuardTransport {
             let direct_socket = packet.direct_socket;
             let udp_transport_owner = packet.udp_transport_owner;
             let packet_network_generation = packet.network_generation;
+            let physical_ingress = packet.physical_ingress;
             debug!(
                 event = "wireguard_inbound_envelope_received",
                 bytes = packet.wire_bytes.len(),
@@ -143,6 +144,32 @@ impl WireGuardTransport {
             match self.decrypt_inbound_classified(&packet.wire_bytes).await {
                 Ok(Some(mut inbound)) => {
                     let decrypt_completed = Instant::now();
+                    if let Some(capture) = self.rx_business_capture.as_ref() {
+                        let wire = match (
+                            wire_receiver_index(&packet.wire_bytes),
+                            wire_counter(&packet.wire_bytes),
+                            u32::try_from(packet.wire_bytes.len()),
+                        ) {
+                            (Some(receiver_index), Some(counter), Ok(wire_len)) => {
+                                Some(crate::business_evidence::WireTuple {
+                                    receiver_index,
+                                    counter,
+                                    wire_len,
+                                })
+                            }
+                            _ => None,
+                        };
+                        inbound.authenticated_ingress = capture.capture_authenticated(
+                            &inbound.packet,
+                            &inbound.peer_id,
+                            physical_ingress.as_deref(),
+                            self.wg_evidence_owner,
+                            inbound.session_instance,
+                            inbound.from_previous_session,
+                            wire,
+                            decrypt_completed,
+                        );
+                    }
                     profiler.record(
                         sampled,
                         "rx_decrypt_us",

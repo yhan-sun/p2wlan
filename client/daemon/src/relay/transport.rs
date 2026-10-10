@@ -527,6 +527,7 @@ impl RelayTransport {
                     );
                     inbound_tx
                         .send(ReceivedEncryptedPacket {
+                            physical_ingress: None,
                             source: None,
                             local_endpoint: None,
                             relay_endpoint: Some(self.relay_endpoint.clone()),

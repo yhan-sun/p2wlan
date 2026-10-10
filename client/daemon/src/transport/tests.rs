@@ -346,6 +346,7 @@ mod tests {
             let wire_bytes = self.remote_session.encrypt_to_bytes(packet).unwrap();
             self.encrypted_tx
                 .send(ReceivedEncryptedPacket {
+                    physical_ingress: None,
                     source: None,
                     local_endpoint: None,
                     relay_endpoint: Some(self.relay_endpoint.clone()),
@@ -1168,6 +1169,7 @@ mod tests {
         // to the new generation after decryption.
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: None,
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
@@ -2107,6 +2109,7 @@ mod tests {
         });
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: None,
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
@@ -2275,6 +2278,7 @@ mod tests {
             )
         };
         let envelope = |wire_bytes| ReceivedEncryptedPacket {
+            physical_ingress: None,
             source: None,
             local_endpoint: None,
             relay_endpoint: Some(relay_endpoint.clone()),
@@ -2832,6 +2836,7 @@ mod tests {
 
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: None,
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
@@ -2934,6 +2939,7 @@ mod tests {
 
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: None,
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
@@ -3067,6 +3073,7 @@ mod tests {
         );
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: Some("198.51.100.10:51820".parse().unwrap()),
                 local_endpoint: Some(local_endpoint),
                 relay_endpoint: None,
@@ -3103,6 +3110,7 @@ mod tests {
         );
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: None,
                 local_endpoint: None,
                 relay_endpoint: Some(relay_endpoint.to_string()),
@@ -3189,6 +3197,7 @@ mod tests {
 
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: None,
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
@@ -3265,6 +3274,7 @@ mod tests {
 
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: None,
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
@@ -3364,6 +3374,7 @@ mod tests {
         // 1. Undecryptable datagram claiming the socket: no affinity pin.
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: Some("198.51.100.7:51820".parse().unwrap()),
                 local_endpoint: udp.local_addr().ok(),
                 relay_endpoint: None,
@@ -3402,6 +3413,7 @@ mod tests {
         let wire_bytes = remote_session.encrypt_to_bytes(&packet).unwrap();
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: Some("198.51.100.7:51820".parse().unwrap()),
                 local_endpoint: udp.local_addr().ok(),
                 relay_endpoint: None,
@@ -3507,6 +3519,7 @@ mod tests {
         );
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: Some("198.51.100.8:51820".parse().unwrap()),
                 local_endpoint: Some(local_endpoint),
                 relay_endpoint: None,
@@ -3607,6 +3620,7 @@ mod tests {
         );
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: Some("198.51.100.9:51820".parse().unwrap()),
                 local_endpoint: Some(replacement_endpoint),
                 relay_endpoint: None,
@@ -3734,6 +3748,7 @@ mod tests {
         );
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: Some(source),
                 local_endpoint: Some(stale_local_endpoint),
                 relay_endpoint: None,
@@ -4311,6 +4326,7 @@ mod tests {
         });
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: Some(observed_endpoint),
                 local_endpoint: udp.local_addr().ok(),
                 relay_endpoint: None,
@@ -4437,6 +4453,7 @@ mod tests {
         });
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: Some(source),
                 local_endpoint: udp.local_addr().ok(),
                 relay_endpoint: None,
@@ -4583,6 +4600,7 @@ mod tests {
         });
         encrypted_tx
             .send(ReceivedEncryptedPacket {
+                physical_ingress: None,
                 source: Some(source),
                 local_endpoint: udp.local_addr().ok(),
                 relay_endpoint: None,
@@ -4857,6 +4875,7 @@ mod tests {
         for bytes in [&first_buf[..first_len], &second_buf[..second_len]] {
             encrypted_tx
                 .send(ReceivedEncryptedPacket {
+                    physical_ingress: None,
                     source: Some(first_source),
                     local_endpoint: Some(receiver_addr),
                     relay_endpoint: None,

@@ -1,5 +1,6 @@
 use super::*;
 use crate::dataplane::{NetworkOutboundResourceSnapshot, PendingQueueResidence};
+use crate::dataplane_resources::{QueueAggregateLease, QueueStage, QueueTotals, ResourceCapture};
 
 mod actor;
 use actor::*;
@@ -71,6 +72,12 @@ impl PendingPacket {
     fn stored_bytes(&self) -> usize {
         match self {
             Self::Plain { packet, .. } => packet.packet.len(),
+        }
+    }
+
+    fn stored_capacity(&self) -> usize {
+        match self {
+            Self::Plain { packet, .. } => packet.packet.capacity(),
         }
     }
 
@@ -148,6 +155,7 @@ pub(crate) struct RelayStartupWait {
 pub(super) struct PeerPendingQueue {
     queue: VecDeque<PendingPacket>,
     bytes: usize,
+    resource_capture: Option<PendingQueueCapture>,
     /// When the peer's FIRST packet started waiting (None = not waiting).
     wait_started: Option<Instant>,
     /// Shared startup deadline for this peer + generation.
@@ -167,11 +175,19 @@ pub(super) struct PeerPendingQueue {
     loss_report_deadline: Option<tokio::time::Instant>,
 }
 
+/// Diagnostics move with the actual FIFO owner. A failed local capacity sum
+/// stays unknown; it never changes enqueue, retry, overflow or drop decisions.
+struct PendingQueueCapture {
+    lease: QueueAggregateLease,
+    vec_capacity: Option<usize>,
+}
+
 impl PeerPendingQueue {
     fn new() -> Self {
         Self {
             queue: VecDeque::new(),
             bytes: 0,
+            resource_capture: None,
             wait_started: None,
             wait_deadline: None,
             wait_generation: None,
@@ -181,6 +197,69 @@ impl PeerPendingQueue {
             deferred_losses: VecDeque::new(),
             loss_report_deadline: None,
         }
+    }
+
+    fn attach_resource_capture(&mut self, capture: Option<&Arc<ResourceCapture>>) {
+        if self.resource_capture.is_some() {
+            return;
+        }
+        let Some(lease) = capture
+            .and_then(|capture| QueueAggregateLease::new(capture.clone(), QueueStage::ActorFifo))
+        else {
+            return;
+        };
+        // Usually the first ingress attaches to an empty new FIFO or timing
+        // shell. An existing bounded FIFO is adopted once, never scanned on
+        // each packet; every later mutation adjusts capacity in constant work.
+        let vec_capacity = self.queue.iter().try_fold(0usize, |capacity, packet| {
+            capacity.checked_add(packet.stored_capacity())
+        });
+        self.resource_capture = Some(PendingQueueCapture {
+            lease,
+            vec_capacity,
+        });
+        self.observe_resource_totals();
+    }
+
+    fn relocate_resources(&mut self, stage: QueueStage) {
+        if let Some(capture) = self.resource_capture.as_mut() {
+            let _ = capture.lease.relocate(stage);
+        }
+    }
+
+    fn change_resource_capacity(&mut self, capacity: usize, increase: bool) {
+        let Some(capture) = self.resource_capture.as_mut() else {
+            return;
+        };
+        capture.vec_capacity = capture.vec_capacity.and_then(|previous| {
+            if increase {
+                previous.checked_add(capacity)
+            } else {
+                previous.checked_sub(capacity)
+            }
+        });
+        self.observe_resource_totals();
+    }
+
+    fn observe_resource_totals(&mut self) {
+        let Some(capture) = self.resource_capture.as_mut() else {
+            return;
+        };
+        let totals = if let Some(vec_capacity) = capture.vec_capacity {
+            QueueTotals {
+                packets: self.queue.len(),
+                plaintext_len: self.bytes,
+                vec_capacity,
+            }
+        } else {
+            // Typed invalid observation, without inventing a saturated sum.
+            QueueTotals {
+                packets: 0,
+                plaintext_len: 1,
+                vec_capacity: 0,
+            }
+        };
+        let _ = capture.lease.set_totals(totals);
     }
 
     /// Park a packet in the bounded queue, dropping the OLDEST entries first
@@ -198,27 +277,31 @@ impl PeerPendingQueue {
             && (self.queue.len() >= MAX_PENDING_PACKETS_PER_PEER
                 || self.bytes.saturating_add(packet_len) > MAX_PENDING_BYTES_PER_PEER)
         {
-            if let Some(old) = self.queue.pop_front() {
+            if let Some(old) = self.pop_front() {
                 let old_len = old.stored_bytes();
-                self.bytes = self.bytes.saturating_sub(old_len);
                 dropped_bytes = dropped_bytes.saturating_add(old_len);
                 dropped_packets.push(old);
             }
         }
+        let packet_capacity = packet.stored_capacity();
         self.bytes = self.bytes.saturating_add(packet_len);
         self.queue.push_back(packet);
+        self.change_resource_capacity(packet_capacity, true);
         (dropped_packets, dropped_bytes)
     }
 
     fn pop_front(&mut self) -> Option<PendingPacket> {
         let packet = self.queue.pop_front()?;
         self.bytes = self.bytes.saturating_sub(packet.stored_bytes());
+        self.change_resource_capacity(packet.stored_capacity(), false);
         Some(packet)
     }
 
     fn push_front(&mut self, packet: PendingPacket) {
+        let packet_capacity = packet.stored_capacity();
         self.bytes = self.bytes.saturating_add(packet.stored_bytes());
         self.queue.push_front(packet);
+        self.change_resource_capacity(packet_capacity, true);
     }
 
     fn delivery_deadline_reason(&self) -> &'static str {
@@ -425,7 +508,9 @@ pub(crate) async fn run_network_outbound(
     }
     // Reuse the same task owner for final discard/reporting. Every report has
     // an overall two-second deadline; incomplete phases stay explicit.
-    for (peer_id, queue) in pending.drain() {
+    for (peer_id, mut queue) in pending.drain() {
+        queue.attach_resource_capture(ctx.transport.resource_capture());
+        queue.relocate_resources(QueueStage::TaskOrUnjoinedFifo);
         flush_tasks.spawn(process_peer_queue(peer_id, queue, ctx.clone()));
     }
     while let Some(result) = flush_tasks.join_next().await {

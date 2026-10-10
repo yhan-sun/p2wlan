@@ -202,6 +202,11 @@ impl WireGuardTransport {
         let (outbound_tx, outbound_rx) = mpsc::channel(1024);
         (
             Self {
+                resource_capture: None,
+                #[cfg(test)]
+                resource_queue_gate: None,
+                rx_business_capture: None,
+                wg_evidence_owner: crate::business_evidence::WgEvidenceOwnerId::allocate(),
                 sessions: Arc::new(Mutex::new(HashMap::new())),
                 next_session_instance: Arc::new(AtomicU64::new(1)),
                 pending_outbound: Arc::new(Mutex::new(HashMap::new())),
@@ -215,6 +220,47 @@ impl WireGuardTransport {
             },
             outbound_rx,
         )
+    }
+
+    /// Install one aggregate observer before spawning the transport workers.
+    #[allow(dead_code)]
+    pub(crate) fn with_resource_capture(
+        mut self,
+        capture: Arc<crate::dataplane_resources::ResourceCapture>,
+    ) -> std::result::Result<Self, crate::dataplane_resources::EnableError> {
+        if self.resource_capture.is_some() {
+            return Err(crate::dataplane_resources::EnableError::AlreadyEnabled);
+        }
+        if capture.is_finished() {
+            return Err(crate::dataplane_resources::EnableError::CaptureFinished);
+        }
+        self.resource_capture = Some(capture);
+        Ok(self)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resource_capture(
+        &self,
+    ) -> Option<&Arc<crate::dataplane_resources::ResourceCapture>> {
+        self.resource_capture.as_ref()
+    }
+
+    /// Opt in before cloning/spawning; historical RX facts never gate packets.
+    #[allow(dead_code)]
+    pub(crate) fn with_rx_business_capture(
+        mut self,
+        capture: Arc<crate::business_evidence::CaptureOwner>,
+    ) -> std::result::Result<Self, crate::business_evidence::EnableError> {
+        if self.rx_business_capture.is_some() {
+            return Err(crate::business_evidence::EnableError::AlreadyEnabled);
+        }
+        self.rx_business_capture = Some(capture);
+        Ok(self)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn wg_evidence_owner(&self) -> crate::business_evidence::WgEvidenceOwnerId {
+        self.wg_evidence_owner
     }
 
     pub(in crate::transport) fn allocate_session_instance(&self) -> u64 {
@@ -1099,6 +1145,26 @@ impl WireGuardTransport {
     /// from waits that still occupy the shared outbound actor.
     pub(crate) async fn hold_session_registry_for_test(&self) -> impl Drop + '_ {
         self.sessions.lock().await
+    }
+
+    pub(crate) fn with_resource_queue_gate_for_test(
+        mut self,
+        gate: Arc<ResourceQueueTestGate>,
+    ) -> Self {
+        self.resource_queue_gate = Some(gate);
+        self
+    }
+
+    pub(crate) async fn pause_resource_queue_for_test(&self) {
+        if let Some(gate) = self.resource_queue_gate.as_ref() {
+            gate.pause_once().await;
+        }
+    }
+
+    pub(crate) fn observe_resource_queue_task_for_test(&self, task: tokio::task::AbortHandle) {
+        if let Some(gate) = self.resource_queue_gate.as_ref() {
+            gate.observe_task(task);
+        }
     }
 
     pub(super) async fn expire_pending_responder_for_test(&self, peer_id: &str, token: &str) {

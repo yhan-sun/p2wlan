@@ -125,3 +125,15 @@ mod fresh_mapping_failures;
 
 #[path = "tests/fresh_mapping_summary.rs"]
 mod fresh_mapping_summary;
+
+#[path = "tests/business_receipts.rs"]
+mod business_receipts;
+
+#[path = "tests/business_receipt_controls.rs"]
+mod business_receipt_controls;
+
+#[path = "tests/resource_capture.rs"]
+mod resource_capture;
+
+#[path = "tests/resource_capture_tx.rs"]
+mod resource_capture_tx;

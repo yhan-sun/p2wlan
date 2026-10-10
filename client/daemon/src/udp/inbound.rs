@@ -263,7 +263,17 @@ impl UdpTransport {
         mut shutdown_rx: Option<&mut watch::Receiver<bool>>,
         mut reader_ready_tx: Option<oneshot::Sender<bool>>,
     ) -> Result<()> {
+        use crate::dataplane_resources::{VecOperation, VecSite};
+
         let mut buf = vec![0u8; 65_535];
+        if let Some(capture) = self.resource_capture() {
+            capture.observe_vec(
+                VecSite::UdpReaderBuffer,
+                VecOperation::FixedReadBuffer,
+                None,
+                &buf,
+            );
+        }
 
         loop {
             // The shutdown signal is selected TOGETHER with the receive: a
@@ -1700,10 +1710,61 @@ impl UdpTransport {
                 .max_capacity()
                 .saturating_sub(inbound_tx.capacity())
                 as u64;
+            // Preserve the original enqueue observations exactly once for
+            // both the authority envelope and the opt-in historical carrier.
+            let local_endpoint = socket.local_addr().ok();
+            let publication_owner = self.inbound_publication_owner();
+            let network_generation = self.peers.current_network_generation_sync();
+            let physical_ingress = self.rx_business_capture.as_ref().and_then(|capture| {
+                if !capture.accepts_observation() {
+                    return None;
+                }
+                let runtime = std::num::NonZeroU64::new(self.transport_instance_id());
+                let index = u32::try_from(socket_index).ok();
+                let socket_owner = match index {
+                    Some(index)
+                        if socket_index < DYNAMIC_SOCKET_INDEX_BASE
+                            && socket_index != IPV6_SOCKET_INDEX =>
+                    {
+                        crate::business_evidence::SocketOwner::FixedPool { index }
+                    }
+                    // No late registry lookup can establish an original
+                    // dynamic attach/phase owner, or classify IPv6 as pool.
+                    _ => crate::business_evidence::SocketOwner::Unknown,
+                };
+                if runtime.is_none() || index.is_none() || local_endpoint.is_none() {
+                    capture.note_gap(crate::business_evidence::EvidenceGap::IdentityMissing);
+                }
+                Some(Arc::new(
+                    crate::business_evidence::PhysicalIngressContext::from_udp_reader(
+                        network_generation,
+                        runtime,
+                        index,
+                        socket_owner,
+                        crate::business_evidence::PublicationObservation::EnqueueObserved {
+                            owner: std::num::NonZeroU64::new(publication_owner),
+                        },
+                        source,
+                        local_endpoint,
+                        udp_received,
+                        transport_queue_send_started,
+                    ),
+                ))
+            });
+            let wire_bytes = data.to_vec();
+            if let Some(capture) = self.resource_capture() {
+                capture.observe_vec(
+                    VecSite::UdpWireCopy,
+                    VecOperation::SliceCopy,
+                    Some(wire_bytes.len()),
+                    &wire_bytes,
+                );
+            }
             inbound_tx
                 .send(ReceivedEncryptedPacket {
+                    physical_ingress,
                     source: Some(source),
-                    local_endpoint: socket.local_addr().ok(),
+                    local_endpoint,
                     relay_endpoint: None,
                     relay_connection_id: None,
                     relay_peer_id: None,
@@ -1715,21 +1776,21 @@ impl UdpTransport {
                     // publication replacement can therefore reject a queued
                     // packet from the retired reader instead of treating it
                     // as evidence for the replacement socket.
-                    udp_transport_owner: Some(self.inbound_publication_owner()),
-                    network_generation: Some(self.peers.current_network_generation_sync()),
+                    udp_transport_owner: Some(publication_owner),
+                    network_generation: Some(network_generation),
                     profile_sampled,
                     udp_received: Some(udp_received),
                     transport_queue_send_started: Some(transport_queue_send_started),
-                    wire_bytes: data.to_vec(),
+                    wire_bytes,
                 })
                 .await
                 .map_err(|_| {
                     DaemonError::Network("received encrypted packet channel closed".to_string())
                 })?;
 
-            // All diagnostic work is sampled and happens after the packet is
-            // in the bounded transport queue. A contended metrics lock can
-            // therefore never add receive-side queueing latency.
+            // Sampled tail metrics below are recorded after enqueue into the
+            // bounded transport queue. Their contended metrics lock does not
+            // delay this packet's enqueue.
             profiler.record(
                 profile_sampled,
                 "rx_udp_prequeue_us",

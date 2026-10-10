@@ -320,6 +320,8 @@ pub struct ReceivedEncryptedPacket {
     pub(crate) transport_queue_send_started: Option<Instant>,
     /// Serialized WireGuard transport message.
     pub wire_bytes: Vec<u8>,
+    /// Opt-in historical reader carrier; None allocates no metadata.
+    pub(crate) physical_ingress: Option<Arc<crate::business_evidence::PhysicalIngressContext>>,
 }
 
 // The socket handle is an in-process lifetime guard, not packet identity.
@@ -336,6 +338,7 @@ impl PartialEq for ReceivedEncryptedPacket {
             && self.socket_index == other.socket_index
             && self.udp_transport_owner == other.udp_transport_owner
             && self.network_generation == other.network_generation
+            && self.physical_ingress == other.physical_ingress
             && self.wire_bytes == other.wire_bytes
     }
 }
@@ -459,6 +462,14 @@ impl InboundUdpTransport {
 /// Encrypts routed TUN packets with peer WireGuard sessions.
 #[derive(Clone)]
 pub struct WireGuardTransport {
+    resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
+    #[cfg(test)]
+    resource_queue_gate: Option<Arc<ResourceQueueTestGate>>,
+    /// Default-disabled evidence owner; never session/path authority.
+    #[allow(dead_code)]
+    rx_business_capture: Option<Arc<crate::business_evidence::CaptureOwner>>,
+    #[allow(dead_code)]
+    wg_evidence_owner: crate::business_evidence::WgEvidenceOwnerId,
     sessions: Arc<Mutex<HashMap<String, PeerTransportSessions>>>,
     /// Monotonic local identity for every installed transport session. This
     /// is not exposed on the wire and is never used as a WireGuard counter.
@@ -546,6 +557,10 @@ mod direct_validation;
 mod dplpmtud;
 mod inbound;
 mod relay_control;
+#[cfg(test)]
+mod resource_queue_test_gate;
 mod sessions;
+#[cfg(test)]
+pub(crate) use resource_queue_test_gate::ResourceQueueTestGate;
 mod wire;
 use sessions::PeerTransportSessions;
