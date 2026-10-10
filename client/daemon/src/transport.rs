@@ -245,13 +245,17 @@ impl SessionUnavailableReason {
 /// Result of an encryption attempt that is bound to one cached session
 /// instance. Returning the plaintext on a stale-session miss avoids a
 /// per-packet clone on the successful LAN fast path while preserving the
-/// existing slow-path FIFO fallback.
+/// existing slow-path FIFO fallback. Successful encryption also retains that
+/// same plaintext until an exact nonblocking syscall has accepted the datagram;
+/// a known not-sent result abandons the counter and re-enters the plaintext FIFO.
 pub(crate) enum SessionBoundEncryption {
     Encrypted {
         packet: EncryptedPeerPacket,
+        plaintext: OutboundPacket,
         session_lock_wait_us: u64,
         crypto_us: u64,
     },
+    Contended(OutboundPacket),
     Unavailable {
         packet: OutboundPacket,
         reason: SessionUnavailableReason,

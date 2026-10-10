@@ -206,9 +206,9 @@ impl WireGuardTransport {
 
     /// Encrypt a business packet only if the cached active session instance
     /// is still installed.  The caller owns the per-peer emit guard and the
-    /// network-epoch gate, so this method takes only the short sessions lock;
-    /// it never performs network I/O while either ordering guard is held.
-    pub(crate) async fn encrypt_outbound_with_emit_guard_for_session(
+    /// network-epoch gate. Contention returns the exact plaintext to the
+    /// bounded per-peer FIFO without waiting in the shared outbound actor.
+    pub(crate) fn try_encrypt_outbound_with_emit_guard_for_session(
         &self,
         packet: OutboundPacket,
         expected_session_instance: u64,
@@ -216,7 +216,9 @@ impl WireGuardTransport {
         let profiler = global_dataplane_profiler();
         let sampled = packet.trace.as_ref().map(|trace| trace.sampled);
         let session_lock_started = Instant::now();
-        let mut sessions = self.sessions.lock().await;
+        let Ok(mut sessions) = self.sessions.try_lock() else {
+            return SessionBoundEncryption::Contended(packet);
+        };
         let session_lock_acquired = Instant::now();
         let session_lock_wait_us = session_lock_acquired
             .duration_since(session_lock_started)
@@ -285,9 +287,9 @@ impl WireGuardTransport {
             "WireGuard counter allocated under the LAN Direct fast-path ordering lock"
         );
         let encrypted = EncryptedPeerPacket {
-            room_authorization: packet.room_authorization,
-            peer_id: packet.peer_id,
-            dst_ip: packet.dst_ip,
+            room_authorization: packet.room_authorization.clone(),
+            peer_id: packet.peer_id.clone(),
+            dst_ip: packet.dst_ip.clone(),
             wire_bytes,
             is_business: true,
         };
@@ -302,6 +304,7 @@ impl WireGuardTransport {
         drop(sessions);
         SessionBoundEncryption::Encrypted {
             packet: encrypted,
+            plaintext: packet,
             session_lock_wait_us,
             crypto_us,
         }

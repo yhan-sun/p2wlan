@@ -1090,6 +1090,20 @@ impl DplpmtudRuntime {
         operation()
     }
 
+    /// Fast-path admission must not wait behind another publication/send.
+    /// Poison recovery matches the authoritative blocking gate above.
+    pub(crate) fn try_with_business_publication_gate<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let _guard = match self.business_publication_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        Some(operation())
+    }
+
     /// Final budget linearization point. If this returns `Some`, the token was
     /// current for the entire synchronous operation (normally one
     /// `UdpSocket::try_send_to` syscall). A revocation that wins the gate makes

@@ -182,6 +182,7 @@ where
             .local_feedback_rx
             .take()
             .expect("DataPlane::run may only be called once");
+        let mut local_feedback_open = true;
 
         if let Some(mut inbound_rx) = self.inbound_rx.take() {
             loop {
@@ -235,7 +236,7 @@ where
                         }
                         self.write_inbound(packet).await?;
                     }
-                    feedback = local_feedback_rx.recv() => {
+                    feedback = local_feedback_rx.recv(), if local_feedback_open => {
                         match feedback {
                             Ok(packet) => self.write_local_feedback(&packet).await?,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -245,7 +246,12 @@ where
                                     "local PMTU feedback receiver dropped a bounded backlog"
                                 );
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                // Feedback closure must neither discard the
+                                // inbound receiver nor leave a ready branch
+                                // spinning in the outbound-only fallback.
+                                local_feedback_open = false;
+                            }
                         }
                     }
                 }
@@ -254,8 +260,20 @@ where
 
         loop {
             tokio::select! {
-                result = self.read_and_route_once(&mut buf) => result?,
-                feedback = local_feedback_rx.recv() => {
+                result = self.read_packet(&mut buf) => {
+                    let (packet, tun_read_started, tun_read_completed) = result?;
+                    if !packet.is_empty() {
+                        // Match the bidirectional loop: once read consumed a
+                        // packet, feedback cannot cancel its routing awaits.
+                        self.route_outbound_packet(
+                            &packet,
+                            tun_read_started,
+                            tun_read_completed,
+                        )
+                        .await?;
+                    }
+                }
+                feedback = local_feedback_rx.recv(), if local_feedback_open => {
                     match feedback {
                         Ok(packet) => self.write_local_feedback(&packet).await?,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -265,7 +283,9 @@ where
                                 "local PMTU feedback receiver dropped a bounded backlog"
                             );
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            local_feedback_open = false;
+                        }
                     }
                 }
             }
@@ -293,6 +313,7 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     async fn read_and_route_once(&mut self, buf: &mut [u8]) -> Result<()> {
         let (packet, tun_read_started, tun_read_completed) = self.read_packet(buf).await?;
         if packet.is_empty() {

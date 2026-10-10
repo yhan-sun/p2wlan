@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "repository": "yhan-sun/p2wlan",
+  "variants": ["baseline", "candidate"],
+  "max_batch_executions": 32,
+  "max_rounds_per_scenario": 1000,
+  "max_campaign_executions_per_variant": 10000,
+  "retries": 0,
+  "confidence_level": 0.95,
+  "direct_deadline_ms": 10000,
+  "startup_clock": "one_coordinator_monotonic_clock",
+  "budgets": "unchanged_between_paired_variants",
+  "denominator": "all_prescheduled_rounds_including_failures_and_timeouts",
+  "unavailable_metrics": "null_with_reason_never_inferred_from_final_path",
+  "direct_proof": ["current_bilateral_path_identity", "request_id", "real_tun_bidirectional_business", "no_relay_for_request"],
+  "required_run_identity": ["client_commit", "client_patch_sha256", "client_binary_sha256", "server_commit", "server_binary_sha256", "config_sha256", "platform", "scenario", "seed", "cold_or_warm", "probe_budget", "maximum_duration"],
+  "planned_metrics": ["ipv4_udp_direct_at_10s", "first_business_available_ms", "tx_local_dataplane_latency_us", "rx_local_dataplane_latency_us", "application_interaction_ms", "business_outage_duration_ms", "probe_cost", "resource_peak"],
+  "synthetic_runner_scope": "synthetic_ipv4_udp_normal_join",
+  "synthetic_runner_limits": ["mock_tun", "not_public_nat_success_rate", "not_minecraft_latency", "not_direct_at_10s", "not_independent_network_samples"]
+}

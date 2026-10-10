@@ -136,6 +136,7 @@ pub(crate) struct DirectBusinessSendGate {
 struct DirectBusinessWouldBlockInjection {
     remaining: usize,
     attempts_tx: watch::Sender<usize>,
+    pending_waker: Option<Arc<futures_util::task::AtomicWaker>>,
 }
 
 #[cfg(test)]
