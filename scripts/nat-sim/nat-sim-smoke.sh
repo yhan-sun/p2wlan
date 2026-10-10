@@ -1216,7 +1216,12 @@ for round in $(seq 1 "$ROUNDS"); do
   ROUND_DEADLINE=$((SECONDS + ROUND_TIMEOUT_S))
   WORK_DEADLINE=$((ROUND_DEADLINE - FINALIZE_BUDGET_S))
   if (( WORK_DEADLINE < SECONDS )); then WORK_DEADLINE=$SECONDS; fi
+  # Capture Unix before shell SECONDS: a crossed second is conservative,
+  # never an extension of the original integer-second round/stage deadline.
+  ROUND_CLOCK_ORIGIN_UNIX_S=$(python3 -c 'import time; print(time.time_ns()//1000000000)')
+  ROUND_CLOCK_ORIGIN_SECONDS=$SECONDS
   ROUND_DIR="$BASE_DIR/round-$round"
+  reset_baseline_pair
   NODE_A_RUNTIME="$ROUND_DIR/node-a-runtime"
   NODE_B_RUNTIME="$ROUND_DIR/node-b-runtime"
   mkdir -p "$ROUND_DIR" "$NODE_A_RUNTIME" "$NODE_B_RUNTIME" "$ROUND_DIR/launches"
@@ -1395,14 +1400,16 @@ for round in $(seq 1 "$ROUNDS"); do
   # in availability/experiment modes it may use Relay so fallback remains a
   # measured outcome rather than a harness failure.
   OVERLAY_FLAGS=(--validate-overlay)
+  BUSINESS_START_GATE_FILE=""
   if [[ "$MODE" != "direct" ]]; then
     # Availability mode: drive the real encrypted overlay loopback through the
     # production dataplane over whatever path is usable (Relay here), and let
     # the outbound selector ride Relay since Direct is blackholed.
     OVERLAY_FLAGS+=(--overlay-any-path)
-  else
-    # The direct-profile generator is armed at startup but cannot inject
-    # business traffic until both daemons have confirmed Relay below.
+  fi
+  if [[ "$MODE" == direct || "$MODE" == hard-hard ]]; then
+    # Both generators stay closed through the authenticated baseline pair
+    # and the original peer confirmation barrier below.
     BUSINESS_START_GATE_FILE="$ROUND_DIR/business-validation.start-gate"
     OVERLAY_FLAGS+=(--overlay-start-gate-file "$BUSINESS_START_GATE_FILE")
   fi
@@ -1428,6 +1435,38 @@ for round in $(seq 1 "$ROUNDS"); do
     # Hard<->Hard worker from the ordinary offer/punch lane. It does not force
     # planner eligibility or bypass the encrypted validation/business gates.
     TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --hard-hard-experiment-only"
+  fi
+
+  if [[ "$MODE" == hard-hard ]]; then
+    if ! grep -q '^DIRECT_GATE=1$' "$ROUND_DIR/nat-sim.out" 2>/dev/null; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=hard_hard_direct_gate_not_active" >&2
+      overall=1
+      stop_round_processes
+      continue
+    fi
+    # Spend the original 20s stage inside the unchanged work/round budget.
+    # Load and arm the observer before either daemon can activate its start.
+    HARD_HARD_GATE_DEADLINE=$(stage_deadline 20)
+    HARD_HARD_GATE_DEADLINE_MS=$(((ROUND_CLOCK_ORIGIN_UNIX_S + HARD_HARD_GATE_DEADLINE - ROUND_CLOCK_ORIGIN_SECONDS) * 1000))
+    HARD_HARD_WATCHER_ARMED="$ROUND_DIR/hard-hard-direct-gate.armed"
+    python3 "$ROOT_DIR/scripts/nat-sim/hard_hard_gate.py" --watch \
+      --node-a-log "$ROUND_DIR/node-a.log" --node-b-log "$ROUND_DIR/node-b.log" \
+      --gate-file "$DIRECT_GATE_FILE" --evidence-file "$ROUND_DIR/hard-hard-direct-gate.json" \
+      --armed-file "$HARD_HARD_WATCHER_ARMED" --deadline-ms "$HARD_HARD_GATE_DEADLINE_MS" \
+      --max-skew-ms "$HARD_HARD_GATE_MAX_SKEW_MS" \
+      >"$ROUND_DIR/hard-hard-direct-gate.out" 2>&1 &
+    HARD_HARD_WATCHER_PID=$!
+    PIDS+=($HARD_HARD_WATCHER_PID)
+    while [[ ! -f "$HARD_HARD_WATCHER_ARMED" ]] && (( SECONDS < HARD_HARD_GATE_DEADLINE )); do
+      kill -0 "$HARD_HARD_WATCHER_PID" 2>/dev/null || break
+      deadline_pause 0.01 "$HARD_HARD_GATE_DEADLINE" || break
+    done
+    if [[ ! -f "$HARD_HARD_WATCHER_ARMED" ]]; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=hard_hard_gate_watcher_not_armed" >&2
+      overall=1
+      stop_round_processes
+      continue
+    fi
   fi
 
   if (( PREPARE_DELAY_A_MS > 0 )); then
@@ -1484,8 +1523,8 @@ for round in $(seq 1 "$ROUNDS"); do
   PIDS+=($NODE_B_PID)
 
   # Both daemons were launched with --validate-overlay, so the business
-  # verification contract is armed from this point onward. In direct mode its
-  # shared file gate still prevents generated payloads until both Relay
+  # verification contract is armed from this point onward. Direct and HH
+  # shared file gates still prevent generated payloads until both Relay
   # confirmations below. Any later data-plane failure cannot be auto-retried.
   : >"$ROUND_DIR/business-validation.started"
 
@@ -1522,67 +1561,44 @@ for round in $(seq 1 "$ROUNDS"); do
 
   if [[ "$MODE" != "direct" ]]; then
     if [[ "$MODE" == "hard-hard" ]]; then
-      if ! grep -q '^DIRECT_GATE=1$' "$ROUND_DIR/nat-sim.out" 2>/dev/null; then
-        echo "[nat-sim] ROUND $round: FAIL reason_code=hard_hard_direct_gate_not_active" >&2
-        overall=1
-        stop_round_processes
-        continue
-      fi
-      HARD_HARD_GATE_DEADLINE=$(stage_deadline 20)
-      HARD_HARD_GATE_RESULT=pending
-      while [[ "$SECONDS" -lt "$HARD_HARD_GATE_DEADLINE" ]]; do
-        if grep -q 'event="hard_hard_start_activated"' "$ROUND_DIR/node-a.log" 2>/dev/null \
-          && grep -q 'event="hard_hard_start_activated"' "$ROUND_DIR/node-b.log" 2>/dev/null; then
-          HARD_HARD_GATE_RESULT=ready
-          break
-        fi
-        # A model/measurement/cancellation failure before rendezvous is a
-        # valid negative experiment result only when both endpoints have
-        # emitted their terminal typed attempt. Keep the Direct packet gate
-        # closed in that case and continue over Relay so the normal business,
-        # health, final-status, and evidence gates still run. Missing terminal
-        # evidence remains a fail-closed harness error.
-        if grep -q 'event="hard_hard_attempt_report"' "$ROUND_DIR/node-a.log" 2>/dev/null \
-          && grep -q 'event="hard_hard_attempt_report"' "$ROUND_DIR/node-b.log" 2>/dev/null; then
-          HARD_HARD_GATE_RESULT=terminal
-          break
-        fi
-        if ! kill -0 "$NODE_A_PID" 2>/dev/null || ! kill -0 "$NODE_B_PID" 2>/dev/null; then
-          break
-        fi
-        deadline_pause 0.05 "$HARD_HARD_GATE_DEADLINE" || break
+      # The already armed round-owned observer ran concurrently with token
+      # and baseline capture. Joining it cannot renew its original deadline.
+      while kill -0 "$HARD_HARD_WATCHER_PID" 2>/dev/null && (( SECONDS < HARD_HARD_GATE_DEADLINE )); do
+        deadline_pause 0.01 "$HARD_HARD_GATE_DEADLINE" || break
       done
-      if [[ "$HARD_HARD_GATE_RESULT" == pending ]]; then
-        echo "[nat-sim] ROUND $round: FAIL reason_code=hard_hard_rendezvous_gate_timeout" >&2
-        # Preserve the exact planner/profile fences at the fail-closed gate.
-        # These are explicitly diagnostic snapshots, not substitutes for the
-        # final evidence files required by a valid matrix round.
+      HARD_HARD_WATCHER_STATUS=0
+      if kill -0 "$HARD_HARD_WATCHER_PID" 2>/dev/null; then
+        stop_pid_group_bounded "$HARD_HARD_WATCHER_PID"
+        HARD_HARD_WATCHER_STATUS=1
+      elif wait "$HARD_HARD_WATCHER_PID"; then
+        :
+      else
+        HARD_HARD_WATCHER_STATUS=$?
+      fi
+      REMAINING_ROUND_PIDS=()
+      for owned_pid in "${PIDS[@]}"; do
+        if [[ "$owned_pid" != "$HARD_HARD_WATCHER_PID" ]]; then
+          REMAINING_ROUND_PIDS+=("$owned_pid")
+        fi
+      done
+      PIDS=("${REMAINING_ROUND_PIDS[@]}")
+      if [[ "$HARD_HARD_WATCHER_STATUS" -ne 0 || ! -f "$ROUND_DIR/hard-hard-direct-gate.json" ]]; then
+        echo "[nat-sim] ROUND $round: FAIL reason_code=hard_hard_rendezvous_gate_invalid" >&2
+        # Retain diagnostic-only snapshots; these cannot stand in for valid
+        # final matrix evidence or turn a gate failure into a NAT negative.
         fetch_required_json \
-          "http://127.0.0.1:$DIAG_A_PORT/status" \
-          "$ROUND_DIR/node-a.gate-timeout.status.json" \
-          status \
-          "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" || true
+          "http://127.0.0.1:$DIAG_A_PORT/status" "$ROUND_DIR/node-a.gate-timeout.status.json" \
+          status "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" || true
         fetch_required_json \
-          "http://127.0.0.1:$DIAG_B_PORT/status" \
-          "$ROUND_DIR/node-b.gate-timeout.status.json" \
-          status \
-          "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" || true
+          "http://127.0.0.1:$DIAG_B_PORT/status" "$ROUND_DIR/node-b.gate-timeout.status.json" \
+          status "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" || true
         overall=1
         stop_round_processes
         continue
       fi
-      if [[ "$HARD_HARD_GATE_RESULT" == ready ]]; then
-        if ! python3 "$ROOT_DIR/scripts/nat-sim/hard_hard_gate.py" \
-          --node-a-log "$ROUND_DIR/node-a.log" \
-          --node-b-log "$ROUND_DIR/node-b.log" \
-          --gate-file "$DIRECT_GATE_FILE" \
-          --evidence-file "$ROUND_DIR/hard-hard-direct-gate.json" \
-          --max-skew-ms "$HARD_HARD_GATE_MAX_SKEW_MS"; then
-          echo "[nat-sim] ROUND $round: FAIL reason_code=hard_hard_rendezvous_gate_invalid" >&2
-          overall=1
-          stop_round_processes
-          continue
-        fi
+      # Success means release or the existing paired pre-rendezvous terminal
+      # observation. The normal matrix's final evidence gates decide validity.
+      if [[ -f "$DIRECT_GATE_FILE" ]]; then
         echo "[nat-sim] round $round: released Hard<->Hard direct gate at the validated rendezvous deadline" >&2
       else
         echo "[nat-sim] round $round: kept Hard<->Hard direct gate closed after terminal pre-rendezvous reports on both endpoints" >&2
@@ -1632,6 +1648,11 @@ for round in $(seq 1 "$ROUNDS"); do
     wait_for_relay_confirmation_barrier "$OVERLAY_DEADLINE"
     if [[ "$BARRIER_RESULT" != ready ]]; then
       echo "[nat-sim] ROUND $round: FAIL reason_code=${BARRIER_REASON:-relay_peer_confirmation_timeout} stage=barrier relay_peer_confirmed_a=$BARRIER_A_CONFIRMED relay_peer_confirmed_b=$BARRIER_B_CONFIRMED http_a=$BARRIER_A_HTTP http_b=$BARRIER_B_HTTP" >&2
+      overall=1
+      stop_round_processes
+      continue
+    fi
+    if [[ "$MODE" == hard-hard ]] && ! release_hard_hard_business_gate "$BUSINESS_START_GATE_FILE"; then
       overall=1
       stop_round_processes
       continue

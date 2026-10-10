@@ -675,6 +675,7 @@ include!("peer/connection/selection.rs");
 include!("peer/connection/health.rs");
 include!("peer/connection/events.rs");
 include!("peer/connection/nat_hint.rs");
+include!("peer/traversal_context.rs");
 include!("peer/manager/state.rs");
 include!("peer/manager/core.rs");
 include!("peer/manager/peers.rs");

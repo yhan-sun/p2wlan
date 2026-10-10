@@ -435,7 +435,7 @@ fn hard_hard_measurement_failure_class(rejection: &FreshMappingRejection) -> &'s
         | FreshMappingRejection::UnobservedAllocation
         | FreshMappingRejection::BatchStale
         | FreshMappingRejection::PublicIpChanged
-        | FreshMappingRejection::NoProbesSent => "measurement_insufficient",
+        | FreshMappingRejection::NoProbesSent(_) => "measurement_insufficient",
         FreshMappingRejection::StableLocalNat
         | FreshMappingRejection::NoStablePeerEndpoint
         | FreshMappingRejection::BindFailed

@@ -131,6 +131,8 @@ impl UdpTransport {
             #[cfg(test)]
             probe_send_failure_hook_enabled: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
+            fresh_mapping_generation_gate: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
             remote_incarnation_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             direct_business_send_gate: Arc::new(std::sync::Mutex::new(None)),
@@ -231,6 +233,43 @@ impl UdpTransport {
             hook: self.probe_send_failure_hook.clone(),
             enabled: self.probe_send_failure_hook_enabled.clone(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_fresh_mapping_gate_for_test(
+        &self,
+        stage: FreshMappingGateStage,
+        peer_id: &str,
+    ) -> (
+        FreshMappingGateGuard,
+        oneshot::Receiver<FreshMappingGateContext>,
+    ) {
+        let (arrived_tx, arrived_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let gate = Arc::new(FreshMappingGenerationGate {
+            stage,
+            peer_id: peer_id.to_owned(),
+            arrived_tx: StdMutex::new(Some(arrived_tx)),
+            release_rx: StdMutex::new(Some(release_rx)),
+        });
+        let mut slot = self
+            .fresh_mapping_generation_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            slot.is_none(),
+            "one lifecycle gate may be armed per transport"
+        );
+        *slot = Some(gate.clone());
+        drop(slot);
+        (
+            FreshMappingGateGuard {
+                slot: self.fresh_mapping_generation_gate.clone(),
+                gate,
+                release_tx: Some(release_tx),
+            },
+            arrived_rx,
+        )
     }
 
     /// Add up to `count - 1` ephemeral sockets for an explicitly enabled

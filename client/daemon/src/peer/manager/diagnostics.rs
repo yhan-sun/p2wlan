@@ -192,6 +192,7 @@ impl PeerManager {
                         None,
                         local_nat_capabilities.as_ref(),
                         relay_available,
+                        self.config.network.birthday_probing_enabled,
                         Some(&traversal_history),
                         Some(&fresh_mapping_history),
                     );
@@ -263,6 +264,7 @@ impl PeerManager {
                         local_endpoint,
                         local_nat_capabilities.as_ref(),
                         relay_available,
+                        self.config.network.birthday_probing_enabled,
                         Some(&traversal_history),
                         Some(&fresh_mapping_history),
                     );
@@ -334,6 +336,7 @@ impl PeerManager {
             local_endpoint,
             local_nat_capabilities.as_ref(),
             relay_available,
+            self.config.network.birthday_probing_enabled,
             Some(&traversal_history),
             Some(&fresh_mapping_history),
         );

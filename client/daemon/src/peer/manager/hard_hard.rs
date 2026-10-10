@@ -101,42 +101,6 @@ impl PeerManager {
             .clone()
             .with_profile_generation(remote_profile_generation);
 
-        let remote_candidates = conn
-            .candidates
-            .iter()
-            .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
-            .collect::<Vec<_>>();
-        let on_link_lan = remote_candidates
-            .iter()
-            .any(|endpoint| conn.is_on_link_host_candidate(*endpoint));
-        let global_ipv6_direct_available = local
-            .stable_public_endpoint
-            .as_deref()
-            .and_then(|endpoint| endpoint.parse::<SocketAddr>().ok())
-            .is_some_and(|endpoint| {
-                endpoint.is_ipv6()
-                    && remote_candidates.iter().any(|candidate| {
-                        candidate.is_ipv6() && is_public_probe_endpoint(*candidate)
-                    })
-            });
-        let peer_reflexive_evidence = conn.candidate_pairs.iter().any(|pair| {
-            matches!(pair.source, CandidatePairSource::PeerReflexive)
-                && matches!(
-                    pair.state,
-                    CandidatePairState::Succeeded | CandidatePairState::Selected
-                )
-        });
-        let learned_endpoint_evidence = conn.candidate_pairs.iter().any(|pair| {
-            matches!(pair.source, CandidatePairSource::Learned)
-                && matches!(
-                    pair.state,
-                    CandidatePairState::Succeeded | CandidatePairState::Selected
-                )
-        });
-        let remote_stable_endpoint_available = remote.is_stable_endpoint()
-            || (!conn.remote_nat_profile.as_ref().is_some_and(|profile| {
-                profile.capabilities.mapping_behavior != MappingBehavior::Unknown
-            }) && conn.endpoint.is_some_and(is_public_probe_endpoint));
         let fresh_mapping_available = self
             .local_fresh_mappings
             .read()
@@ -146,20 +110,19 @@ impl PeerManager {
                 mapping.network_generation == local_generation
                     && mapping.created_at.elapsed() <= FRESH_MAPPING_STATE_MAX_AGE
             });
-        let context = TraversalContext {
-            on_link_lan,
-            global_ipv6_direct_available,
-            peer_reflexive_evidence,
-            learned_endpoint_evidence,
-            local_stable_endpoint_available: local.is_stable_endpoint(),
-            remote_stable_endpoint_available,
-            fresh_mapping_available,
-            remote_profile_fresh: true,
-            relay_available: self.relay_first_required() || !self.config.relay.servers.is_empty(),
-            bounded_birthday_allowed: self.config.network.birthday_probing_enabled
-                && (local.birthday_candidate || remote.birthday_candidate),
-            ..TraversalContext::default()
-        };
+        let context = traversal_context_for_connection(
+            &conn,
+            &local,
+            &remote,
+            TraversalContext {
+                fresh_mapping_available,
+                remote_profile_fresh: true,
+                relay_available: self.relay_first_required()
+                    || !self.config.relay.servers.is_empty(),
+                bounded_birthday_allowed: self.config.network.birthday_probing_enabled,
+                ..TraversalContext::default()
+            },
+        );
         let plan = plan_traversal(&local, &remote, &context);
         (plan.strategy == p2pnet_nat::TraversalStrategy::HardHardSynchronizedCandidate).then_some(
             HardHardPlanSnapshot {
