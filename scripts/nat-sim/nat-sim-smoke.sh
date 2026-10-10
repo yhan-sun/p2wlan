@@ -419,16 +419,17 @@ node_replacement_relay_endpoint() {
     | head -1 || true
 }
 
-# Only inspect business-ingress evidence written after the failover action.
-# The old endpoint's traffic before the kill is not recovery evidence.
+# Require post-action business ingress on the selected replacement endpoint.
+# Other live relays must not satisfy this endpoint's acceptance check.
 node_post_failover_relay_ingress() {
-  local log="$1" start_line="$2" active_endpoint="$3"
+  local log="$1" start_line="$2" replacement_endpoint="$3"
+  [[ -n "$replacement_endpoint" ]] || return 0
   tail -n +"$start_line" "$log" 2>/dev/null \
     | strip_ansi \
     | grep 'overlay_payload_verified' \
     | grep -oE 'ingress=relay:[^ ]+' \
     | cut -d= -f2 \
-    | grep -Fvx "relay:${active_endpoint}" \
+    | grep -Fx "relay:${replacement_endpoint}" \
     | head -1 || true
 }
 
@@ -2492,8 +2493,8 @@ except Exception:
         while (( SECONDS < OVERLAY_DEADLINE )); do
           A_REPLACEMENT=$(node_replacement_relay_endpoint "$ROUND_DIR/node-a.log" "$ACTIVE_ENDPOINT")
           B_REPLACEMENT=$(node_replacement_relay_endpoint "$ROUND_DIR/node-b.log" "$ACTIVE_ENDPOINT")
-          A_POST_INGRESS=$(node_post_failover_relay_ingress "$ROUND_DIR/node-a.log" "$A_FAILOVER_START_LINE" "$ACTIVE_ENDPOINT")
-          B_POST_INGRESS=$(node_post_failover_relay_ingress "$ROUND_DIR/node-b.log" "$B_FAILOVER_START_LINE" "$ACTIVE_ENDPOINT")
+          A_POST_INGRESS=$(node_post_failover_relay_ingress "$ROUND_DIR/node-a.log" "$A_FAILOVER_START_LINE" "$A_REPLACEMENT")
+          B_POST_INGRESS=$(node_post_failover_relay_ingress "$ROUND_DIR/node-b.log" "$B_FAILOVER_START_LINE" "$B_REPLACEMENT")
           if [[ -n "$A_REPLACEMENT" && "$A_REPLACEMENT" == "$B_REPLACEMENT" \
                 && -n "$A_POST_INGRESS" && -n "$B_POST_INGRESS" ]]; then
             re_confirmed=1
