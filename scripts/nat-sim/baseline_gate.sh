@@ -46,6 +46,7 @@ capture_baseline_pair() {
 # Release only this round's existing daemon business gate after the original
 # authenticated baseline callbacks and Relay confirmation barrier succeeded.
 release_hard_hard_business_gate() {
+  BUSINESS_GATE_REASON=""
   local gate=${1:-}
   if [[ "${BASELINE_PAIR_READY:-0}" != 1 || -z "${ROUND_DIR:-}" \
     || "${BASELINE_PAIR_ROUND_DIR:-}" != "$ROUND_DIR" \
@@ -56,10 +57,12 @@ release_hard_hard_business_gate() {
     || "${BARRIER_RESULT:-}" != ready \
     || "${BARRIER_A_CONFIRMED:-}" != true || "${BARRIER_B_CONFIRMED:-}" != true \
     || "${BARRIER_A_HTTP:-}" != 200 || "${BARRIER_B_HTTP:-}" != 200 ]]; then
+    BUSINESS_GATE_REASON=hard_hard_business_gate_not_ready
     echo "[nat-sim] FAIL reason_code=hard_hard_business_gate_not_ready" >&2
     return 1
   fi
   if ! (umask 077; set -o noclobber; : >"$gate"); then
+    BUSINESS_GATE_REASON=hard_hard_business_gate_write_failed
     echo "[nat-sim] FAIL reason_code=hard_hard_business_gate_write_failed" >&2
     return 1
   fi
