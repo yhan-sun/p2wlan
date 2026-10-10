@@ -82,6 +82,17 @@ struct OverlayStats {
 struct SentOverlayNonce {
     peer_id: String,
     generation: u64,
+    seq: u32,
+    sent_at: Instant,
+}
+
+/// One successfully injected burst request. The existing burst container keeps
+/// these exact identities after the smaller periodic nonce registry evicts them.
+#[derive(Clone, Copy)]
+struct InjectedOverlayBurstRequest {
+    nonce: u64,
+    seq: u32,
+    generation: u64,
     sent_at: Instant,
 }
 
@@ -106,8 +117,10 @@ const OVERLAY_PENDING_ECHO_CAP: usize = 256;
 struct OverlayBurst {
     /// Armed once first-usable evidence exists for this peer.
     armed: bool,
-    /// Nonces of the burst packets actually injected.
-    nonces: Vec<u64>,
+    /// Exact successful requests awaiting one matching echo. Bounded by the
+    /// configured burst size; removing a match prevents duplicate credit after
+    /// the smaller ingress seen ring forgets an older echo.
+    nonces: Vec<InjectedOverlayBurstRequest>,
     /// Packets injected.
     sent: u64,
     /// Verified echoes received for this burst.
@@ -173,24 +186,33 @@ async fn fire_pending_bursts(
                 continue;
             };
             let nonce = *next_nonce;
-            // Register the outbound nonce BEFORE the send so a fast echo
-            // cannot race ahead of the registry insert.
-            sent_nonces.insert(
-                nonce,
-                SentOverlayNonce {
-                    peer_id: peer_id.clone(),
-                    generation,
-                    sent_at: Instant::now(),
-                },
-            );
-            nonce_order.push_back(nonce);
-            while nonce_order.len() > OVERLAY_NONCE_CAP {
-                if let Some(oldest) = nonce_order.pop_front() {
-                    sent_nonces.remove(&oldest);
-                }
-            }
+            let seq = *next_seq;
+            let sent_at = Instant::now();
             if controller.inject(packet).await.is_ok() {
-                nonces.push(nonce);
+                // This loop awaits its send cycle before polling ingress again.
+                // Register only an actual successful injection; a fast echo can
+                // queue meanwhile, but cannot be handled before this insertion.
+                sent_nonces.insert(
+                    nonce,
+                    SentOverlayNonce {
+                        peer_id: peer_id.clone(),
+                        generation,
+                        seq,
+                        sent_at,
+                    },
+                );
+                nonce_order.push_back(nonce);
+                while nonce_order.len() > OVERLAY_NONCE_CAP {
+                    if let Some(oldest) = nonce_order.pop_front() {
+                        sent_nonces.remove(&oldest);
+                    }
+                }
+                nonces.push(InjectedOverlayBurstRequest {
+                    nonce,
+                    seq,
+                    generation,
+                    sent_at,
+                });
             }
         }
         if let Some(burst) = bursts.get_mut(&peer_id) {
@@ -436,8 +458,8 @@ pub async fn run_overlay_validate_loop(
     let mut seen = VecDeque::<(u64, u32)>::new();
     let mut next_nonce: u64 = rand::random();
     let mut next_seq = 0u32;
-    // Bounded outbound nonce registry: nonce -> (peer sent to, generation,
-    // sent at).  Echo verification requires an exact match here.
+    // Bounded successful-injection registry: nonce -> (peer, generation, seq,
+    // request creation time). Echo verification requires an exact match here.
     let mut sent_nonces: HashMap<u64, SentOverlayNonce> = HashMap::new();
     let mut nonce_order: VecDeque<u64> = VecDeque::new();
     // Post-first-usable burst verification: one burst of `overlay_burst`
@@ -765,23 +787,25 @@ async fn send_overlay_payloads(
         else {
             continue;
         };
-        // Register the outbound nonce BEFORE the send so a fast echo cannot
-        // race ahead of the registry insert.
-        sent_nonces.insert(
-            *next_nonce,
-            SentOverlayNonce {
-                peer_id: peer_id.clone(),
-                generation,
-                sent_at: Instant::now(),
-            },
-        );
-        nonce_order.push_back(*next_nonce);
-        while nonce_order.len() > OVERLAY_NONCE_CAP {
-            if let Some(oldest) = nonce_order.pop_front() {
-                sent_nonces.remove(&oldest);
-            }
-        }
+        let sent_at = Instant::now();
         if controller.inject(packet).await.is_ok() {
+            // The same task handles ingress only after this awaited send cycle.
+            // Failed injections leave no matchable entry or eviction side effect.
+            sent_nonces.insert(
+                *next_nonce,
+                SentOverlayNonce {
+                    peer_id: peer_id.clone(),
+                    generation,
+                    seq: *next_seq,
+                    sent_at,
+                },
+            );
+            nonce_order.push_back(*next_nonce);
+            while nonce_order.len() > OVERLAY_NONCE_CAP {
+                if let Some(oldest) = nonce_order.pop_front() {
+                    sent_nonces.remove(&oldest);
+                }
+            }
             sent += 1;
             stats.last_seq = u64::from(*next_seq);
             info!(
@@ -950,6 +974,7 @@ async fn handle_overlay_ingress(
                     Some(sent)
                         if sent.peer_id == peer_id
                             && sent.generation == event.connection_generation
+                            && sent.seq == seq
                             && sent.sent_at.elapsed() <= OVERLAY_NONCE_TTL =>
                     {
                         let generation = sent.generation;
@@ -1043,10 +1068,18 @@ async fn handle_overlay_ingress(
                     }
                 }
             }
-            // A verified echo of a burst packet counts toward the burst.
+            // Burst tracking retains exact successful requests independently of
+            // the 256-entry periodic registry, so larger bursts remain verifiable.
             if direction == OVERLAY_DIRECTION_ECHO {
                 if let Some(burst) = bursts.get_mut(&peer_id) {
-                    if burst.fired_at.is_some() && burst.nonces.contains(&nonce) {
+                    if let Some(index) = burst.nonces.iter().position(|sent| {
+                        burst.fired_at.is_some()
+                            && sent.nonce == nonce
+                            && sent.seq == seq
+                            && sent.generation == event.connection_generation
+                            && sent.sent_at.elapsed() <= OVERLAY_NONCE_TTL
+                    }) {
+                        burst.nonces.swap_remove(index);
                         burst.received = burst.received.saturating_add(1);
                         if burst.received >= burst.sent {
                             info!(
@@ -1444,5 +1477,560 @@ mod overlay_validate_tests {
         assert_eq!(parsed.src_addr().to_string(), "10.20.0.1");
         assert_eq!(parsed.dst_addr().to_string(), "10.20.0.2");
         assert_eq!(&parsed.payload()[8..], b"P2WLOV");
+    }
+}
+
+/// B01-ACK-01 local controls. These exercise actual MockTun send results and
+/// the existing payload verifier/ingress handler, not WireGuard or Relay I/O.
+#[cfg(test)]
+mod ack01_exact_injection_tests {
+    use super::*;
+    use p2pnet_tun::VirtualInterface;
+
+    const PEER: &str = "peer-ack01";
+    const LOCAL_VIP: &str = "10.20.0.1";
+    const PEER_VIP: &str = "10.20.0.2";
+    const RELAY: &str = "tcp://relay.test:443";
+
+    struct Fixture {
+        peers: Arc<PeerManager>,
+        tun: Option<p2pnet_tun::mock::MockTunDevice>,
+        controller: MockTunController,
+        timeline: Arc<ConnectionTimeline>,
+        stats: OverlayStats,
+        seen: VecDeque<(u64, u32)>,
+        sent_nonces: HashMap<u64, SentOverlayNonce>,
+        nonce_order: VecDeque<u64>,
+        bursts: HashMap<String, OverlayBurst>,
+        pending: VecDeque<PendingOverlayEcho>,
+        next_nonce: u64,
+        next_seq: u32,
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            let mut config = Config::generate_default("http://ctrl.test", "default")
+                .expect("test config must build");
+            config.relay.path_policy = crate::config::PathPolicy::Auto;
+            let peers = Arc::new(PeerManager::new(config));
+            peers
+                .add_peer(&crate::control::PeerInfo {
+                    node_id: PEER.to_string(),
+                    public_key: "pk".to_string(),
+                    endpoint: "127.0.0.1:45003".to_string(),
+                    nat_type: "Unknown".to_string(),
+                    virtual_ip: PEER_VIP.to_string(),
+                    online: true,
+                    ..crate::control::PeerInfo::default()
+                })
+                .await;
+            let generation = peers.current_network_generation_sync();
+            peers
+                .mark_relay_transport_ready(PEER, RELAY, generation)
+                .await;
+            assert!(peers.confirm_relay_peer(PEER, RELAY, generation).await);
+            let (tun, controller) =
+                p2pnet_tun::mock::MockTunDevice::new_pair("ack01", 1420, LOCAL_VIP);
+            Self {
+                peers,
+                tun: Some(tun),
+                controller,
+                timeline: ConnectionTimeline::new("local-ack01", 1),
+                stats: OverlayStats {
+                    sent: 0,
+                    received_valid: 0,
+                    received_invalid: 0,
+                    verified_round_trips: 0,
+                    last_seq: 0,
+                },
+                seen: VecDeque::new(),
+                sent_nonces: HashMap::new(),
+                nonce_order: VecDeque::new(),
+                bursts: HashMap::new(),
+                pending: VecDeque::new(),
+                next_nonce: 0x1000,
+                next_seq: 10,
+            }
+        }
+
+        fn event_count(&self, name: &str) -> usize {
+            self.timeline
+                .snapshot()
+                .events
+                .iter()
+                .filter(|event| event.event == name)
+                .count()
+        }
+
+        async fn inject_periodic(&mut self) -> u64 {
+            send_overlay_payloads(
+                &self.controller,
+                &self.peers,
+                LOCAL_VIP,
+                true,
+                None,
+                &mut self.next_nonce,
+                &mut self.next_seq,
+                &mut self.stats,
+                &mut self.sent_nonces,
+                &mut self.nonce_order,
+            )
+            .await
+        }
+
+        fn arm_burst(&mut self) {
+            // Existing isolated burst boundary; no first-usable claim is made.
+            self.bursts.insert(
+                PEER.to_string(),
+                OverlayBurst {
+                    armed: true,
+                    nonces: Vec::new(),
+                    sent: 0,
+                    received: 0,
+                    fired_at: None,
+                },
+            );
+        }
+
+        async fn inject_burst_attempts(&mut self, count: usize) {
+            fire_pending_bursts(
+                &self.controller,
+                &self.peers,
+                LOCAL_VIP,
+                true,
+                None,
+                count,
+                &mut self.next_nonce,
+                &mut self.next_seq,
+                &mut self.sent_nonces,
+                &mut self.nonce_order,
+                &mut self.bursts,
+            )
+            .await;
+        }
+
+        async fn read_requests(
+            tun: &mut p2pnet_tun::mock::MockTunDevice,
+            count: usize,
+        ) -> Vec<(u64, u32)> {
+            let mut requests = Vec::new();
+            for _ in 0..count {
+                let mut bytes = [0u8; 512];
+                let size = tun.read(&mut bytes).await.expect("mock TUN stays open");
+                let packet = p2pnet_tun::Ipv4Packet::new(&bytes[..size])
+                    .expect("actual injected request remains IPv4");
+                assert_eq!(packet.src_addr().to_string(), LOCAL_VIP);
+                assert_eq!(packet.dst_addr().to_string(), PEER_VIP);
+                let payload = &packet.payload()[8..];
+                assert_eq!(&payload[..OVERLAY_MAGIC.len()], OVERLAY_MAGIC);
+                assert_eq!(payload[6], OVERLAY_DIRECTION_REQUEST);
+                let nonce = u64::from_be_bytes(payload[7..15].try_into().unwrap());
+                let seq = u32::from_be_bytes(payload[15..19].try_into().unwrap());
+                let checksum = u32::from_be_bytes(
+                    payload[OVERLAY_CHECKSUM_OFFSET..OVERLAY_CHECKSUM_OFFSET + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                assert_eq!(
+                    checksum,
+                    crc32_business_payload(&payload[..OVERLAY_CHECKSUM_SPAN])
+                );
+                requests.push((nonce, seq));
+            }
+            requests
+        }
+
+        async fn take_one_request(&mut self) -> (u64, u32) {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                Self::read_requests(self.tun.as_mut().expect("mock TUN stays open"), 1),
+            )
+            .await
+            .expect("actual successful request must be readable")[0]
+        }
+
+        async fn inject_and_read_burst(&mut self, count: usize) -> Vec<(u64, u32)> {
+            self.arm_burst();
+            let mut tun = self.tun.take().expect("mock TUN stays open");
+            // The real MockTun has only 256 slots. Drain concurrently for the
+            // 257-packet control rather than pretending the queue is larger.
+            let (_, requests) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(
+                    self.inject_burst_attempts(count),
+                    Self::read_requests(&mut tun, count),
+                )
+            })
+            .await
+            .expect("bounded real burst injection/read must complete");
+            self.tun = Some(tun);
+            assert_eq!(self.bursts[PEER].sent, count as u64);
+            requests
+        }
+
+        async fn echo(&mut self, nonce: u64, seq: u32) {
+            let payload = build_overlay_payload(OVERLAY_DIRECTION_ECHO, nonce, seq);
+            let packet = build_udp_overlay_packet(PEER_VIP, LOCAL_VIP, 39287, 39286, &payload)
+                .expect("valid addresses must build an echo");
+            // This is an explicit post-decrypt unit input. It proves no native
+            // crypto/current-session/current-Relay/fault or system-TUN claim.
+            handle_overlay_ingress(
+                OverlayIngressEvent {
+                    peer_id: PEER.to_string(),
+                    packet,
+                    ingress: OverlayIngress::Relay(RELAY.to_string()),
+                    connection_generation: self.peers.current_network_generation_sync(),
+                },
+                &self.controller,
+                LOCAL_VIP,
+                "local-ack01",
+                true,
+                true,
+                &mut self.seen,
+                &mut self.stats,
+                &self.peers,
+                &self.timeline,
+                &self.sent_nonces,
+                &mut self.bursts,
+                &mut self.pending,
+                None,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_wrong_sequence_cannot_confirm_then_exact_echo_can() {
+        let mut fixture = Fixture::new().await;
+        assert_eq!(fixture.inject_periodic().await, 1);
+        let (nonce, seq) = fixture.take_one_request().await;
+        fixture.echo(nonce, seq.wrapping_add(1)).await;
+        assert_eq!(
+            fixture.stats.received_valid, 1,
+            "valid CRC/payload reached matching"
+        );
+        assert_eq!(
+            fixture.event_count("first_usable_bidirectional_overlay_ms"),
+            0,
+            "B01_ACK_01_PERIODIC_SEQ: wrong seq must not confirm a local request"
+        );
+        fixture.echo(nonce, seq).await;
+        assert_eq!(fixture.stats.received_valid, 2);
+        assert_eq!(
+            fixture.event_count("first_usable_bidirectional_overlay_ms"),
+            1,
+            "the same successful request's exact echo still confirms"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_failed_injection_cannot_confirm_a_valid_echo() {
+        let mut fixture = Fixture::new().await;
+        drop(fixture.tun.take());
+        assert!(
+            fixture.controller.inject(vec![0x45]).await.is_err(),
+            "real closed MockTun receiver proves injection failure"
+        );
+        assert_eq!(fixture.inject_periodic().await, 0);
+        fixture.echo(fixture.next_nonce, fixture.next_seq).await;
+        assert_eq!(
+            fixture.stats.received_valid, 1,
+            "valid CRC/payload reached matching"
+        );
+        assert_eq!(
+            fixture.event_count("first_usable_bidirectional_overlay_ms"),
+            0,
+            "B01_ACK_01_PERIODIC_ERR: attempted but failed injection is not sent"
+        );
+        assert!(fixture.sent_nonces.is_empty());
+        assert!(fixture.nonce_order.is_empty());
+    }
+
+    #[tokio::test]
+    async fn burst_failed_injection_cannot_confirm_a_valid_echo() {
+        let mut fixture = Fixture::new().await;
+        fixture.arm_burst();
+        drop(fixture.tun.take());
+        assert!(fixture.controller.inject(vec![0x45]).await.is_err());
+        fixture.inject_burst_attempts(1).await;
+        assert_eq!(fixture.bursts[PEER].sent, 0);
+        fixture.echo(fixture.next_nonce, fixture.next_seq).await;
+        assert_eq!(
+            fixture.stats.received_valid, 1,
+            "valid CRC/payload reached matching"
+        );
+        assert_eq!(
+            fixture.event_count("first_usable_bidirectional_overlay_ms"),
+            0,
+            "B01_ACK_01_BURST_ERR: failed burst injection is not sent"
+        );
+        assert_eq!(fixture.event_count("overlay_burst_complete"), 0);
+        assert!(fixture.sent_nonces.is_empty());
+        assert!(fixture.nonce_order.is_empty());
+    }
+
+    #[tokio::test]
+    async fn burst_wrong_sequence_cannot_complete_then_exact_echo_can() {
+        let mut fixture = Fixture::new().await;
+        let requests = fixture.inject_and_read_burst(1).await;
+        let (nonce, seq) = requests[0];
+        fixture.echo(nonce, seq.wrapping_add(1)).await;
+        assert_eq!(
+            fixture.stats.received_valid, 1,
+            "valid CRC/payload reached matching"
+        );
+        assert_eq!(
+            fixture.event_count("overlay_burst_complete"),
+            0,
+            "B01_ACK_01_BURST_SEQ: wrong seq cannot complete the successful burst"
+        );
+        fixture.echo(nonce, seq).await;
+        assert_eq!(fixture.event_count("overlay_burst_complete"), 1);
+        assert!(!fixture.bursts.contains_key(PEER));
+    }
+
+    #[tokio::test]
+    async fn burst_repeat_after_seen_eviction_cannot_replace_missing_echo() {
+        let mut fixture = Fixture::new().await;
+        let requests = fixture.inject_and_read_burst(2).await;
+        let first = requests[0];
+        fixture.echo(first.0, first.1).await;
+        assert_eq!(fixture.bursts[PEER].received, 1);
+        for index in 0..OVERLAY_SEEN_CAP {
+            fixture
+                .echo(0x9000 + index as u64, 0x9000 + index as u32)
+                .await;
+        }
+        assert!(
+            !fixture.seen.contains(&first),
+            "real verifier evicted the first pair"
+        );
+        fixture.echo(first.0, first.1).await;
+        assert_eq!(
+            fixture.stats.received_valid,
+            OVERLAY_SEEN_CAP as u64 + 2,
+            "the repeat passed payload verification after actual seen eviction"
+        );
+        assert_eq!(
+            fixture.event_count("overlay_burst_complete"),
+            0,
+            "B01_ACK_01_BURST_ONCE: one successful request cannot earn two credits"
+        );
+        assert_eq!(fixture.bursts[PEER].received, 1);
+        fixture.echo(requests[1].0, requests[1].1).await;
+        assert_eq!(
+            fixture.event_count("overlay_burst_complete"),
+            1,
+            "only the second request's genuine exact echo completes the burst"
+        );
+    }
+
+    #[tokio::test]
+    async fn burst_larger_than_periodic_registry_keeps_exact_successes() {
+        let mut fixture = Fixture::new().await;
+        let requests = fixture.inject_and_read_burst(OVERLAY_NONCE_CAP + 1).await;
+        assert_eq!(fixture.sent_nonces.len(), OVERLAY_NONCE_CAP);
+        assert!(
+            !fixture.sent_nonces.contains_key(&requests[0].0),
+            "actual FIFO eviction occurred before any echo was handled"
+        );
+        for (nonce, seq) in requests {
+            fixture.echo(nonce, seq).await;
+        }
+        assert_eq!(
+            fixture.event_count("overlay_burst_complete"),
+            1,
+            "all 257 actual injected requests can complete despite registry eviction"
+        );
+        assert!(!fixture.bursts.contains_key(PEER));
+    }
+
+    #[tokio::test]
+    async fn successful_request_expired_ttl_cannot_confirm_or_complete_burst() {
+        let mut fixture = Fixture::new().await;
+        let requests = fixture.inject_and_read_burst(1).await;
+        let (nonce, seq) = requests[0];
+        // Only the original request's age is controlled. Injection/read/CRC,
+        // peer identity, generation and the open 20s burst window stay real.
+        let expired = Instant::now()
+            .checked_sub(OVERLAY_NONCE_TTL + Duration::from_secs(1))
+            .expect("test Instant must support a past request timestamp");
+        fixture
+            .sent_nonces
+            .get_mut(&nonce)
+            .expect("actual injection registered")
+            .sent_at = expired;
+        let burst_request = fixture
+            .bursts
+            .get_mut(PEER)
+            .expect("actual burst fired")
+            .nonces
+            .iter_mut()
+            .find(|request| request.nonce == nonce)
+            .expect("actual successful burst request retained");
+        burst_request.sent_at = expired;
+        assert!(expired.elapsed() > OVERLAY_NONCE_TTL);
+        assert!(
+            fixture.bursts[PEER]
+                .fired_at
+                .expect("actual burst fired")
+                .elapsed()
+                < OVERLAY_BURST_TIMEOUT,
+            "20s overall timeout must still be open"
+        );
+
+        fixture.echo(nonce, seq).await;
+        assert_eq!(
+            fixture.stats.received_valid, 1,
+            "exact echo still passes original packet/CRC/VIP verification"
+        );
+        assert_eq!(
+            fixture.event_count("first_usable_bidirectional_overlay_ms"),
+            0,
+            "B01_ACK_01_TTL_FIRST: expired successful request cannot confirm"
+        );
+        assert_eq!(
+            fixture.event_count("overlay_burst_complete"),
+            0,
+            "B01_ACK_01_TTL_BURST: expired successful request cannot complete burst"
+        );
+        assert_eq!(fixture.bursts[PEER].received, 0);
+
+        // An independent real fresh injection/read proves that a broken
+        // fixture/ingress path did not manufacture the negative result.
+        let mut fresh = Fixture::new().await;
+        let fresh_requests = fresh.inject_and_read_burst(1).await;
+        fresh.echo(fresh_requests[0].0, fresh_requests[0].1).await;
+        assert_eq!(
+            fresh.event_count("first_usable_bidirectional_overlay_ms"),
+            1
+        );
+        assert_eq!(fresh.event_count("overlay_burst_complete"), 1);
+    }
+
+    #[tokio::test]
+    async fn advanced_generation_old_burst_cannot_count_current_generation_echo() {
+        let mut fixture = Fixture::new().await;
+        let requests = fixture.inject_and_read_burst(1).await;
+        let (nonce, seq) = requests[0];
+        let old_generation = fixture.peers.current_network_generation_sync();
+        // Use the existing production transition API, not a test mirror or
+        // rewriting the registry/event's stored generation to force a result.
+        let generation = fixture
+            .peers
+            .advance_network_generation("ack01 supplemental old-burst control")
+            .await;
+        assert!(generation > old_generation);
+        assert_eq!(fixture.peers.current_network_generation_sync(), generation);
+
+        // Fixture::echo reads the actual current generation. The event clears
+        // the handler's initial current-generation check and reaches matching.
+        fixture.echo(nonce, seq).await;
+        assert_eq!(
+            fixture.stats.received_valid, 1,
+            "current-generation old nonce/seq passed the payload verifier"
+        );
+        assert_eq!(
+            fixture.event_count("first_usable_bidirectional_overlay_ms"),
+            0,
+            "B01_ACK_01_GEN_FIRST: old request cannot confirm in the new generation"
+        );
+        assert_eq!(
+            fixture.event_count("overlay_burst_complete"),
+            0,
+            "B01_ACK_01_GEN_BURST: old burst cannot count a relabelled current event"
+        );
+        assert_eq!(fixture.bursts[PEER].received, 0);
+
+        // Restore confirmation using the existing production API, then produce
+        // a genuinely new request in that generation as a positive control.
+        fixture
+            .peers
+            .mark_relay_transport_ready(PEER, RELAY, generation)
+            .await;
+        assert!(
+            fixture
+                .peers
+                .confirm_relay_peer(PEER, RELAY, generation)
+                .await
+        );
+        let fresh = fixture.inject_and_read_burst(1).await;
+        assert_ne!(fresh[0], (nonce, seq));
+        fixture.echo(fresh[0].0, fresh[0].1).await;
+        assert_eq!(fixture.stats.received_valid, 2);
+        assert_eq!(
+            fixture.event_count("first_usable_bidirectional_overlay_ms"),
+            1
+        );
+        assert_eq!(fixture.event_count("overlay_burst_complete"), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_periodic_and_burst_injection_preserve_full_successful_fifo() {
+        let mut fixture = Fixture::new().await;
+        let mut tun = fixture.tun.take().expect("mock TUN stays open");
+        // Fill the real 256-entry successful registry, reading every real
+        // injection. No fabricated registry entries or larger MockTun queue.
+        let (_, requests) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                async {
+                    for _ in 0..OVERLAY_NONCE_CAP {
+                        assert_eq!(fixture.inject_periodic().await, 1);
+                    }
+                },
+                Fixture::read_requests(&mut tun, OVERLAY_NONCE_CAP),
+            )
+        })
+        .await
+        .expect("bounded real successful injection/read must complete");
+        fixture.tun = Some(tun);
+        assert_eq!(fixture.sent_nonces.len(), OVERLAY_NONCE_CAP);
+        assert_eq!(fixture.nonce_order.len(), OVERLAY_NONCE_CAP);
+        let fifo_before = fixture.nonce_order.clone();
+        let oldest = requests[0];
+        let original_request_time = fixture.sent_nonces[&oldest.0].sent_at;
+
+        drop(fixture.tun.take());
+        assert!(
+            fixture.controller.inject(vec![0x45]).await.is_err(),
+            "real closed receiver supplies injection Err"
+        );
+        assert_eq!(fixture.inject_periodic().await, 0);
+        let failed_periodic = (fixture.next_nonce, fixture.next_seq);
+        fixture.arm_burst();
+        fixture.inject_burst_attempts(1).await;
+        let failed_burst = (fixture.next_nonce, fixture.next_seq);
+        assert_ne!(failed_periodic, failed_burst);
+        assert_eq!(fixture.bursts[PEER].sent, 0);
+
+        // The decisive oracle is external behavior of the oldest successful
+        // request, which the old pre-Err registration would have evicted.
+        assert!(
+            original_request_time.elapsed() <= OVERLAY_NONCE_TTL,
+            "retained-success control must remain within its original TTL"
+        );
+        fixture.echo(oldest.0, oldest.1).await;
+        assert_eq!(
+            fixture.stats.received_valid, 1,
+            "oldest exact successful echo passes payload verification"
+        );
+        assert_eq!(
+            fixture.event_count("first_usable_bidirectional_overlay_ms"),
+            1,
+            "B01_ACK_01_ERR_RETAIN: actual injection failures cannot evict success"
+        );
+
+        // State checks supplement the behavioral oracle: both failure sites
+        // left the existing full FIFO unchanged and inserted no failed pair.
+        assert_eq!(fixture.nonce_order, fifo_before);
+        assert_eq!(fixture.sent_nonces.len(), OVERLAY_NONCE_CAP);
+        assert!(!fixture.sent_nonces.contains_key(&failed_periodic.0));
+        assert!(!fixture.sent_nonces.contains_key(&failed_burst.0));
+        assert!(requests
+            .iter()
+            .all(|(nonce, _)| fixture.sent_nonces.contains_key(nonce)));
+        fixture.echo(failed_periodic.0, failed_periodic.1).await;
+        fixture.echo(failed_burst.0, failed_burst.1).await;
+        assert_eq!(fixture.stats.received_valid, 3);
+        assert_eq!(fixture.event_count("overlay_burst_complete"), 0);
     }
 }
