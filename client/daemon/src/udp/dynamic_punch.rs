@@ -1229,7 +1229,7 @@ impl UdpTransport {
             return FreshMappingOutcome::Rejected(if cancelled_after_cleanup {
                 FreshMappingRejection::Superseded
             } else {
-                FreshMappingRejection::NoProbesSent(probe_summary)
+                FreshMappingRejection::NoProbesSent(Box::new(probe_summary))
             });
         }
 
