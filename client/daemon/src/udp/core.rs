@@ -78,6 +78,8 @@ impl UdpTransport {
         peers.register_dplpmtud_runtime(dplpmtud.clone()).await;
 
         Ok(Self {
+            resource_capture: None,
+            rx_business_capture: None,
             transport_instance_id: NEXT_UDP_TRANSPORT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             socket: primary_socket,
             sockets: Arc::new(Vec::new()),
@@ -153,6 +155,42 @@ impl UdpTransport {
             dplpmtud_local_virtual_ip: None,
             learning_cache: Arc::new(Mutex::new(LearningCache::new())),
         })
+    }
+
+    /// Aggregate diagnostics are optional and never grant send permission.
+    #[allow(dead_code)]
+    pub(crate) fn with_resource_capture(
+        mut self,
+        capture: Arc<crate::dataplane_resources::ResourceCapture>,
+    ) -> std::result::Result<Self, crate::dataplane_resources::EnableError> {
+        if self.resource_capture.is_some() {
+            return Err(crate::dataplane_resources::EnableError::AlreadyEnabled);
+        }
+        if capture.is_finished() {
+            return Err(crate::dataplane_resources::EnableError::CaptureFinished);
+        }
+        self.resource_capture = Some(capture);
+        Ok(self)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resource_capture(
+        &self,
+    ) -> Option<&Arc<crate::dataplane_resources::ResourceCapture>> {
+        self.resource_capture.as_ref()
+    }
+
+    /// Opt in before cloning/spawning; observations never gate delivery.
+    #[allow(dead_code)]
+    pub(crate) fn with_rx_business_capture(
+        mut self,
+        capture: Arc<crate::business_evidence::CaptureOwner>,
+    ) -> std::result::Result<Self, crate::business_evidence::EnableError> {
+        if self.rx_business_capture.is_some() {
+            return Err(crate::business_evidence::EnableError::AlreadyEnabled);
+        }
+        self.rx_business_capture = Some(capture);
+        Ok(self)
     }
 
     /// Interface currently enforced for public UDP egress, if any.

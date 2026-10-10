@@ -184,11 +184,15 @@ pub const IPV6_SOCKET_INDEX: usize = 2048;
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
 #[derive(Clone)]
 pub struct UdpTransport {
+    resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
     /// Process-local identity of this concrete UDP publication. Clones keep
     /// the identity; a newly bound/replaced transport gets a new one, so a
     /// cached fast-path socket index can never silently carry across a
     /// publication replacement that reused the same index.
     transport_instance_id: u64,
+    /// Explicit opt-in historical reader evidence; never path authority.
+    #[allow(dead_code)]
+    rx_business_capture: Option<Arc<crate::business_evidence::CaptureOwner>>,
     /// The primary socket is used for STUN and remains the single-socket
     /// fallback. Additional sockets, when explicitly enabled, are only used
     /// for bounded symmetric-NAT traversal experiments.

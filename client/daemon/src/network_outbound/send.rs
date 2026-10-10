@@ -45,6 +45,14 @@ pub(super) async fn encrypt_then_send_with_deadline(
     stopping: Option<&AtomicBool>,
 ) -> EncryptSendOutcome {
     let retry_packet = packet.clone();
+    if let Some(capture) = transport.resource_capture() {
+        let _ = capture.observe_vec(
+            crate::dataplane_resources::VecSite::TxRetryCopy,
+            crate::dataplane_resources::VecOperation::DeepClone,
+            Some(retry_packet.packet.len()),
+            &retry_packet.packet,
+        );
+    }
     let profiler = global_dataplane_profiler();
     let sampled_trace = retry_packet.trace.clone();
     let encrypt_started = Instant::now();
@@ -58,6 +66,14 @@ pub(super) async fn encrypt_then_send_with_deadline(
     // across its exact nonblocking UDP syscall, which is the revocation/path
     // replacement linearization point.
     let preparation_retry = retry_packet.clone();
+    if let Some(capture) = transport.resource_capture() {
+        let _ = capture.observe_vec(
+            crate::dataplane_resources::VecSite::TxPreparationCopy,
+            crate::dataplane_resources::VecOperation::DeepClone,
+            Some(preparation_retry.packet.len()),
+            &preparation_retry.packet,
+        );
+    }
     let preparation_bound = admission_deadline.map_or(OUTBOUND_SEND_TIMEOUT, |deadline| {
         deadline
             .saturating_duration_since(Instant::now())
@@ -1039,3 +1055,7 @@ pub(super) async fn select_outbound_path(
 #[cfg(test)]
 #[path = "tests/send.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/resource_capture_send.rs"]
+mod resource_capture_tests;

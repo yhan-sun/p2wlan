@@ -1,4 +1,5 @@
 use super::*;
+use crate::dataplane_resources::{VecOperation, VecSite};
 
 impl WireGuardTransport {
     /// Decrypt one inbound WireGuard transport packet.
@@ -13,6 +14,14 @@ impl WireGuardTransport {
         wire_bytes: &[u8],
     ) -> std::result::Result<Option<InboundPacket>, InboundDecryptError> {
         let msg = MessageTransport::from_bytes(wire_bytes).map_err(InboundDecryptError::Parse)?;
+        if let Some(capture) = self.resource_capture() {
+            capture.observe_vec(
+                VecSite::RxParsedPayloadCopy,
+                VecOperation::SliceCopy,
+                Some(msg.encrypted_payload.len()),
+                &msg.encrypted_payload,
+            );
+        }
         let receiver_index = msg.receiver_index;
 
         let mut sessions = self.sessions.lock().await;
@@ -43,6 +52,14 @@ impl WireGuardTransport {
             }
             match active.session.decrypt(&msg) {
                 Ok(packet) => {
+                    if let Some(capture) = self.resource_capture() {
+                        capture.observe_vec(
+                            VecSite::RxAuthenticatedPlaintext,
+                            VecOperation::CryptoOutput,
+                            None,
+                            &packet,
+                        );
+                    }
                     let token = active
                         .awaiting_confirmation
                         .then(|| active.token.clone())
@@ -69,6 +86,7 @@ impl WireGuardTransport {
                 self.remember_promoted_responder_token(&peer_id, token);
             }
             return Ok(Some(InboundPacket {
+                authenticated_ingress: None,
                 peer_id,
                 packet,
                 session_instance: Some(session_instance),
@@ -88,6 +106,14 @@ impl WireGuardTransport {
                 }
                 match pending.slot.session.decrypt(&msg) {
                     Ok(packet) => {
+                        if let Some(capture) = self.resource_capture() {
+                            capture.observe_vec(
+                                VecSite::RxAuthenticatedPlaintext,
+                                VecOperation::CryptoOutput,
+                                None,
+                                &packet,
+                            );
+                        }
                         promoted = Some((
                             peer_id.clone(),
                             packet,
@@ -161,6 +187,7 @@ impl WireGuardTransport {
                 self.flush_pending_outbound_for_peer(&peer_id).await;
             }
             return Ok(Some(InboundPacket {
+                authenticated_ingress: None,
                 peer_id,
                 packet,
                 session_instance: Some(session_instance),
@@ -178,7 +205,16 @@ impl WireGuardTransport {
             }
             match previous.slot.session.decrypt(&msg) {
                 Ok(packet) => {
+                    if let Some(capture) = self.resource_capture() {
+                        capture.observe_vec(
+                            VecSite::RxAuthenticatedPlaintext,
+                            VecOperation::CryptoOutput,
+                            None,
+                            &packet,
+                        );
+                    }
                     return Ok(Some(InboundPacket {
+                        authenticated_ingress: None,
                         peer_id: peer_id.clone(),
                         packet,
                         session_instance: Some(previous.slot.session_instance),

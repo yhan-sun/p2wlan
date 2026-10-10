@@ -95,6 +95,7 @@ async fn does_not_lose_tun_packets_when_inbound_work_is_ready() {
             );
             inbound_tx
                 .send(InboundPacket {
+                    authenticated_ingress: None,
                     peer_id: "peer-b".to_string(),
                     packet,
                     session_instance: None,
@@ -255,6 +256,7 @@ async fn assert_closed_feedback_keeps_packet_pump_running(bidirectional: bool) {
     if let Some(inbound_tx) = inbound_tx.as_ref() {
         inbound_tx
             .try_send(InboundPacket {
+                authenticated_ingress: None,
                 peer_id: "peer-b".into(),
                 packet: inbound.clone(),
                 session_instance: None,
@@ -338,6 +340,7 @@ async fn writes_inbound_peer_packet_to_tun() {
 
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".to_string(),
             packet: packet.clone(),
             session_instance: None,
@@ -380,6 +383,7 @@ async fn drops_inbound_packet_with_spoofed_peer_virtual_ip() {
 
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".to_string(),
             packet,
             session_instance: None,
@@ -421,6 +425,7 @@ async fn normalizes_inbound_non_overlay_source_pollution() {
 
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".to_string(),
             packet,
             session_instance: None,
@@ -467,6 +472,7 @@ async fn keeps_blocking_inbound_overlay_source_spoofing() {
 
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".to_string(),
             packet,
             session_instance: None,
@@ -582,6 +588,7 @@ async fn live_acl_denies_matching_inbound_packet() {
 
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".to_string(),
             packet,
             session_instance: None,
@@ -643,6 +650,7 @@ async fn room_revocation_blocks_both_directions_even_with_cached_peers() {
     );
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".into(),
             packet: inbound.clone(),
             session_instance: None,
@@ -663,6 +671,7 @@ async fn room_revocation_blocks_both_directions_even_with_cached_peers() {
     ctrl.inject(outbound).await.unwrap();
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".into(),
             packet: inbound,
             session_instance: None,

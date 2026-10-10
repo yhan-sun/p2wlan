@@ -34,6 +34,7 @@ pub(super) fn append_ingress(
         entry.deferred_losses = losses;
         entry.loss_report_deadline = loss_deadline;
     }
+    entry.attach_resource_capture(ctx.transport.resource_capture());
     if entry.wait_generation.is_none() {
         let now = Instant::now();
         entry.wait_generation = Some(generation);
@@ -114,13 +115,21 @@ pub(super) fn schedule_peer_work(
         .map(|(peer, _)| peer.clone())
         .collect();
     for peer_id in ready {
-        let Some(queue) = pending.remove(&peer_id) else {
+        let Some(mut queue) = pending.remove(&peer_id) else {
             continue;
         };
-        pending.insert(peer_id.clone(), queue.timing_shell());
+        queue.attach_resource_capture(ctx.transport.resource_capture());
+        let mut shell = queue.timing_shell();
+        shell.attach_resource_capture(ctx.transport.resource_capture());
+        pending.insert(peer_id.clone(), shell);
+        queue.relocate_resources(QueueStage::TaskOrUnjoinedFifo);
         let ctx = ctx.clone();
         let active_peer = peer_id.clone();
+        #[cfg(test)]
+        let observer = ctx.transport.clone();
         let task = tasks.spawn(process_peer_queue(peer_id, queue, ctx));
+        #[cfg(test)]
+        observer.observe_resource_queue_task_for_test(task.clone());
         active.insert(active_peer, task.id());
     }
 }
@@ -131,6 +140,8 @@ pub(super) fn merge_peer_work(
     mut completed: PeerPendingQueue,
     ctx: &PeerWorkContext,
 ) {
+    completed.attach_resource_capture(ctx.transport.resource_capture());
+    completed.relocate_resources(QueueStage::ActorFifo);
     let generation = ctx.peers.current_network_generation_sync();
     if completed
         .wait_generation
@@ -467,6 +478,8 @@ pub(super) async fn process_peer_queue(
     mut queue: PeerPendingQueue,
     ctx: PeerWorkContext,
 ) -> (String, PeerPendingQueue) {
+    #[cfg(test)]
+    ctx.transport.pause_resource_queue_for_test().await;
     if ctx.stopping.load(Ordering::Acquire) {
         discard_packets(&mut queue, &peer_id, QueueLossReason::WorkerStopped, &ctx);
     } else if !queue.queue.is_empty() {
@@ -558,6 +571,10 @@ pub(super) async fn process_peer_queue(
 #[cfg(test)]
 #[path = "../tests/admission_owner.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/resource_capture_queue.rs"]
+mod resource_capture_tests;
 
 pub(super) fn report_shutdown_unknown(
     queue: &PeerPendingQueue,

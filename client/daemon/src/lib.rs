@@ -31,12 +31,16 @@
 
 pub mod acl;
 pub mod build_info;
+// Private, default-disabled registered RX evidence.
+#[allow(dead_code)]
+pub(crate) mod business_evidence;
 pub(crate) mod business_mtu;
 pub(crate) mod candidate_refresh;
 pub mod config;
 pub mod connection_timeline;
 pub mod control;
 pub mod dataplane;
+pub(crate) mod dataplane_resources;
 pub mod diagnostics;
 pub mod dns;
 pub(crate) mod dplpmtud;
