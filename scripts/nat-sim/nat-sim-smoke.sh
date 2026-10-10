@@ -1291,6 +1291,60 @@ read -r RELAY_SEED RELAY_PUB < <(go run "$ROOT_DIR/scripts/relay_keygen.go")
 
 overall=0
 round_num=0
+# TCP services do not consume simulated UDP mappings. Start their existing
+# owners while STUN initializes in the ordinary single-relay listener mode.
+# Each helper runs in the round's owning shell and registers the real $! PID.
+round_start_relays() {
+  KEYRING_JSON="{\"relay-sim\":\"$RELAY_PUB\"}"
+  RELAY_PIDS=()
+  RELAY_ENDPOINTS=""
+  if [[ "$RELAY_COUNT" -lt 1 ]]; then RELAY_COUNT=1; fi
+  for relay_idx in $(seq 1 "$RELAY_COUNT"); do
+    R_PORT=$((RELAY_PORT + relay_idx - 1))
+    R_METRICS=$((RELAY_METRICS_PORT + relay_idx - 1))
+    R_AUDIENCE="relay-sim"
+    R_REGION="local"
+    if [[ "$relay_idx" -gt 1 ]]; then
+      R_AUDIENCE="relay-sim-$relay_idx"
+    fi
+    RELAY_AUDIENCE="$R_AUDIENCE" RELAY_REGION="$R_REGION" \
+      python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
+      --artifact-set "$ARTIFACT_SET" --component relay --role "relay-$relay_idx" \
+      --record "$ROUND_DIR/launches/relay-$relay_idx.json" \
+      --env-key RELAY_AUDIENCE --env-key RELAY_REGION -- \
+      -bind "127.0.0.1:$R_PORT" \
+      -ticket-keyring "$KEYRING_JSON" -require-auth -allow-insecure-plaintext \
+      -metrics-bind "127.0.0.1:$R_METRICS" \
+      -forward-delay "${RELAY_DELAY_MS}ms" \
+      >"$ROUND_DIR/relay-$relay_idx.log" 2>&1 &
+    RELAY_PIDS+=($!)
+    round_register_process "relay-$relay_idx" "${RELAY_PIDS[$((relay_idx - 1))]}"
+    if [[ -n "$RELAY_ENDPOINTS" ]]; then RELAY_ENDPOINTS="$RELAY_ENDPOINTS,"; fi
+    RELAY_ENDPOINTS="${RELAY_ENDPOINTS}{\"region\":\"$R_REGION\",\"audience\":\"$R_AUDIENCE\",\"endpoint\":\"tcp://127.0.0.1:$R_PORT\"}"
+  done
+  RELAY_PID="${RELAY_PIDS[0]}"
+}
+
+round_start_control() {
+  export PORT DB_PATH="$ROUND_DIR/control.db" JWT_SECRET=smoke \
+    P2WLAN_A0_SIGNAL_TRACE \
+    RELAY_TICKET_SIGNER_JSON="{\"active\":{\"kid\":\"relay-sim\",\"private_key\":\"$RELAY_SEED\"}}" \
+    RELAY_CATALOG_JSON="[$RELAY_ENDPOINTS]"
+  python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
+    --artifact-set "$ARTIFACT_SET" --component control --role control \
+    --record "$ROUND_DIR/launches/control.json" \
+    --env-key PORT --env-key DB_PATH --env-key JWT_SECRET --env-key P2WLAN_A0_SIGNAL_TRACE \
+    --env-key RELAY_TICKET_SIGNER_JSON --env-key RELAY_CATALOG_JSON -- \
+    >"$ROUND_DIR/server.log" 2>&1 &
+  SERVER_PID=$!
+  round_register_process control "$SERVER_PID"
+}
+
+TCP_STARTUP_OVERLAP_ELIGIBLE=0
+if [[ "$MODE" == direct && "$RELAY_COUNT" == 1 && "$EGRESS_CAPTURE" == listeners ]]; then
+  TCP_STARTUP_OVERLAP_ELIGIBLE=1
+fi
+
 for round in $(seq 1 "$ROUNDS"); do
   round_num=$round
   ROUND_DEADLINE=$((SECONDS + ROUND_TIMEOUT_S))
@@ -1371,9 +1425,16 @@ for round in $(seq 1 "$ROUNDS"); do
     >"$ROUND_DIR/nat-sim.out" 2>&1 &
   NAT_PID=$!
   round_register_process nat "$NAT_PID"
-  for _ in {1..40}; do
-    grep -q 'STUN_A=' "$ROUND_DIR/nat-sim.out" 2>/dev/null && break
-    deadline_pause 0.25 || break
+  ROUND_TCP_STARTED_EARLY=0
+  if [[ "$TCP_STARTUP_OVERLAP_ELIGIBLE" == 1 ]]; then
+    round_start_relays
+    round_start_control
+    ROUND_TCP_STARTED_EARLY=1
+  fi
+  for _ in {1..200}; do
+    if grep -q 'STUN_A=' "$ROUND_DIR/nat-sim.out" 2>/dev/null && \
+      grep -q 'STUN_B=' "$ROUND_DIR/nat-sim.out" 2>/dev/null; then break; fi
+    deadline_pause 0.05 || break
   done
   STUN_A=$(sed -n 's/^STUN_A=//p' "$ROUND_DIR/nat-sim.out")
   STUN_B=$(sed -n 's/^STUN_B=//p' "$ROUND_DIR/nat-sim.out")
@@ -1406,34 +1467,9 @@ for round in $(seq 1 "$ROUNDS"); do
   # Relay(s) (safety net; TCP, bypasses the NATs).  Multiple relays offer a
   # catalog with several candidates; the daemon selects one and fails over to
   # another when the active one dies (RELAY_FAILOVER).
-  KEYRING_JSON="{\"relay-sim\":\"$RELAY_PUB\"}"
-  RELAY_PIDS=()
-  RELAY_ENDPOINTS=""
-  if [[ "$RELAY_COUNT" -lt 1 ]]; then RELAY_COUNT=1; fi
-  for relay_idx in $(seq 1 "$RELAY_COUNT"); do
-    R_PORT=$((RELAY_PORT + relay_idx - 1))
-    R_METRICS=$((RELAY_METRICS_PORT + relay_idx - 1))
-    R_AUDIENCE="relay-sim"
-    R_REGION="local"
-    if [[ "$relay_idx" -gt 1 ]]; then
-      R_AUDIENCE="relay-sim-$relay_idx"
-    fi
-    RELAY_AUDIENCE="$R_AUDIENCE" RELAY_REGION="$R_REGION" \
-      python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
-      --artifact-set "$ARTIFACT_SET" --component relay --role "relay-$relay_idx" \
-      --record "$ROUND_DIR/launches/relay-$relay_idx.json" \
-      --env-key RELAY_AUDIENCE --env-key RELAY_REGION -- \
-      -bind "127.0.0.1:$R_PORT" \
-      -ticket-keyring "$KEYRING_JSON" -require-auth -allow-insecure-plaintext \
-      -metrics-bind "127.0.0.1:$R_METRICS" \
-      -forward-delay "${RELAY_DELAY_MS}ms" \
-      >"$ROUND_DIR/relay-$relay_idx.log" 2>&1 &
-    RELAY_PIDS+=($!)
-    round_register_process "relay-$relay_idx" "${RELAY_PIDS[$((relay_idx - 1))]}"
-    if [[ -n "$RELAY_ENDPOINTS" ]]; then RELAY_ENDPOINTS="$RELAY_ENDPOINTS,"; fi
-    RELAY_ENDPOINTS="${RELAY_ENDPOINTS}{\"region\":\"$R_REGION\",\"audience\":\"$R_AUDIENCE\",\"endpoint\":\"tcp://127.0.0.1:$R_PORT\"}"
-  done
-  RELAY_PID="${RELAY_PIDS[0]}"
+  if [[ "$ROUND_TCP_STARTED_EARLY" != 1 ]]; then
+    round_start_relays
+  fi
 
   if [[ "$RELAY_COUNT" -ge 2 && "$RELAY_ENDPOINTS" != *'"region":"local"'* ]]; then
     echo "[nat-sim] relay failover catalog must contain the primary local region" >&2
@@ -1442,18 +1478,9 @@ for round in $(seq 1 "$ROUNDS"); do
 
   # Control server with the relay catalog (no UDP observer in the catalog:
   # every STUN flow must traverse the simulated NATs).
-  export PORT DB_PATH="$ROUND_DIR/control.db" JWT_SECRET=smoke \
-    P2WLAN_A0_SIGNAL_TRACE \
-    RELAY_TICKET_SIGNER_JSON="{\"active\":{\"kid\":\"relay-sim\",\"private_key\":\"$RELAY_SEED\"}}" \
-    RELAY_CATALOG_JSON="[$RELAY_ENDPOINTS]"
-  python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
-    --artifact-set "$ARTIFACT_SET" --component control --role control \
-    --record "$ROUND_DIR/launches/control.json" \
-    --env-key PORT --env-key DB_PATH --env-key JWT_SECRET --env-key P2WLAN_A0_SIGNAL_TRACE \
-    --env-key RELAY_TICKET_SIGNER_JSON --env-key RELAY_CATALOG_JSON -- \
-    >"$ROUND_DIR/server.log" 2>&1 &
-  SERVER_PID=$!
-  round_register_process control "$SERVER_PID"
+  if [[ "$ROUND_TCP_STARTED_EARLY" != 1 ]]; then
+    round_start_control
+  fi
 
   for _ in {1..40}; do
     if curl -fsS --max-time "$(deadline_curl_timeout)" "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then break; fi
@@ -1578,9 +1605,9 @@ for round in $(seq 1 "$ROUNDS"); do
   # prevents one endpoint punching before its peer gathers its NAT profile.
   # Other modes retain sequential startup.
   if [[ "$MODE" != "hard-hard" && "$MODE" != "direct" ]]; then
-    for _ in {1..40}; do
+    for _ in {1..200}; do
       grep -q 'Control plane registration confirmed' "$ROUND_DIR/node-a.log" 2>/dev/null && break
-      deadline_pause 0.25 || break
+      deadline_pause 0.05 || break
     done
   fi
 
@@ -1611,14 +1638,14 @@ for round in $(seq 1 "$ROUNDS"); do
   # confirmations below. Any later data-plane failure cannot be auto-retried.
   : >"$ROUND_DIR/business-validation.started"
 
-  for _ in {1..40}; do
+  for _ in {1..200}; do
     grep -q 'Control plane registration confirmed' "$ROUND_DIR/node-b.log" 2>/dev/null && break
-    deadline_pause 0.25 || break
+    deadline_pause 0.05 || break
   done
   if [[ "$MODE" == "hard-hard" || "$MODE" == "direct" ]]; then
-    for _ in {1..40}; do
+    for _ in {1..200}; do
       grep -q 'Control plane registration confirmed' "$ROUND_DIR/node-a.log" 2>/dev/null && break
-      deadline_pause 0.25 || break
+      deadline_pause 0.05 || break
     done
   fi
 

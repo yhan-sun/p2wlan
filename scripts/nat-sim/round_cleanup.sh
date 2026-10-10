@@ -233,7 +233,11 @@ _round_fixed_windows() {
     (( cap > 0 )) || cap=1
     _ROUND_RESOURCE_END_MS=$((now + cap))
   fi
-  _round_capture_window
+  if _round_clock_origin_present; then
+    _round_capture_window "$now" "$SECONDS"
+  else
+    _round_capture_window
+  fi
 }
 
 _round_owner_lines() {
@@ -473,6 +477,9 @@ finish_round() {
   [[ "$_ROUND_STATE" == open ]] || return 0
   _ROUND_STATE=finalizing
   _round_fixed_windows
+  # Let pending HTTP owners consume the same cleanup fence concurrently
+  # with status capture, before metadata work spends their TERM budget.
+  _round_http_publish_cancel || true
   round_capture_final_statuses || true
   (( STATUS_SCHEMA_OK == 1 )) || round_fail final_status_unavailable 1
   # The source/launch receipt hashes captured declarations and binds roles
