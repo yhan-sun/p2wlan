@@ -414,11 +414,53 @@ impl DirectValidationRegistry {
     /// shared by every caller so improving observability cannot weaken
     /// stale-worker invalidation.
     pub(crate) async fn cancel_peer_with_reason(&self, peer_id: &str, reason_code: &str) {
-        // Keep the session guard while taking the expectation guard. Session
-        // creation and expectation registration use this same order, so a
-        // same-ID rejoin cannot install a replacement expectation between the
-        // old session's removal and its conditional cleanup.
+        self.cancel_peer_scoped_with_reason(peer_id, reason_code, None)
+            .await;
+    }
+
+    /// A candidate handover's deferred cleanup owns only the predecessor
+    /// candidate epoch. Preserve workers and ACK expectations admitted into
+    /// the committed epoch, a later epoch, or another peer/network lifecycle.
+    pub(crate) async fn cancel_peer_before_remote_candidate_epoch(
+        &self,
+        peer_id: &str,
+        committed_epoch: crate::peer::PathEpoch,
+    ) {
+        self.cancel_peer_scoped_with_reason(
+            peer_id,
+            "remote_candidate_generation_changed",
+            Some(committed_epoch),
+        )
+        .await;
+    }
+
+    async fn cancel_peer_scoped_with_reason(
+        &self,
+        peer_id: &str,
+        reason_code: &str,
+        before_epoch: Option<crate::peer::PathEpoch>,
+    ) {
+        let in_scope = |generation, peer_session_generation, remote_candidate_epoch| {
+            before_epoch.is_none_or(|epoch| {
+                generation == epoch.network_generation
+                    && peer_session_generation == epoch.peer_session_generation
+                    && remote_candidate_epoch < epoch.remote_candidate_epoch
+            })
+        };
+        // Acquire both guards before revocation. A replacement cannot appear
+        // between the scope check, watch cancellation, and ACK removal.
         let mut sessions = self.sessions.lock().await;
+        let mut expectations = self.expectations.lock().await;
+        if sessions.get(peer_id).is_some_and(|session| {
+            let target = *session.target_tx.borrow();
+            !in_scope(
+                target.generation,
+                target.peer_session_generation,
+                target.remote_candidate_epoch,
+            )
+        }) {
+            return;
+        }
         let owner_token = if let Some(session) = sessions.remove(peer_id) {
             let current = *session.target_tx.borrow();
             session.target_tx.send_replace(DirectValidationTarget {
@@ -429,14 +471,21 @@ impl DirectValidationRegistry {
         } else {
             None
         };
-        let mut expectations = self.expectations.lock().await;
         let expectation_before = expectations.contains_key(peer_id);
         let mut expectation_cancelled = false;
+        let expectation_in_scope = expectations.get(peer_id).is_some_and(|expectation| {
+            in_scope(
+                expectation.generation,
+                expectation.peer_session_generation,
+                expectation.remote_candidate_epoch,
+            )
+        });
         match owner_token {
             Some(owner_token) => {
-                if expectations
-                    .get(peer_id)
-                    .is_some_and(|expectation| expectation.owner_token == owner_token)
+                if expectation_in_scope
+                    && expectations
+                        .get(peer_id)
+                        .is_some_and(|expectation| expectation.owner_token == owner_token)
                 {
                     expectations.remove(peer_id);
                     expectation_cancelled = true;
@@ -446,15 +495,22 @@ impl DirectValidationRegistry {
             // compatibility test helper can create one); clean it while the
             // session lock still excludes a concurrent replacement.
             None => {
-                expectation_cancelled = expectations.remove(peer_id).is_some();
+                if expectation_in_scope {
+                    expectation_cancelled = expectations.remove(peer_id).is_some();
+                }
             }
         }
-        let cooldown_cancelled = self
-            .slow_relay_cooldowns
-            .lock()
-            .await
-            .remove(peer_id)
-            .is_some();
+        // Slow-relay suppression spans the network generation, not candidate
+        // epochs. An old handover cannot clear a newer cooldown.
+        let cooldown_cancelled = if before_epoch.is_none() {
+            self.slow_relay_cooldowns
+                .lock()
+                .await
+                .remove(peer_id)
+                .is_some()
+        } else {
+            false
+        };
         debug!(target: "p2pnet_daemon::direct_validation",
             event = "direct_validation_registry_peer_cancelled",
             peer_id = %peer_id,
