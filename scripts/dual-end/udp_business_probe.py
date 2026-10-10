@@ -391,7 +391,9 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     if args.command == "new-nonces":
-        print(json.dumps({"run_nonce": secrets.token_hex(16), "round_nonce": secrets.token_hex(16)}))
+        # These nonces are public correlation IDs, not authentication credentials.
+        public_nonces = {"run_nonce": secrets.token_hex(16), "round_nonce": secrets.token_hex(16)}
+        print(json.dumps(public_nonces))
         return 0
     config = Config((args.bind_ip, args.bind_port), (args.target_ip, args.target_port),
                     args.run_nonce, args.round_nonce, args.count, args.interval_ms,
