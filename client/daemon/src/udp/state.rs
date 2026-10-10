@@ -1236,9 +1236,10 @@ pub(crate) enum FreshMappingRejection {
     /// The generation was superseded or the peer went away.
     Superseded,
     /// The peer-facing punch loop sent no probe into the kernel queue
-    /// (attempts=0, all sends failed, or every send was aborted by
-    /// cancellation). The generation must not claim success.
-    NoProbesSent,
+    /// (attempts=0 or all completed calls failed). The returned fixed-size
+    /// summary retains actual classified failures and outer stop causes.
+    /// Explicit cancellation still returns the unit `Superseded` variant.
+    NoProbesSent(FreshMappingProbeSummary),
 }
 
 impl FreshMappingRejection {
@@ -1256,7 +1257,7 @@ impl FreshMappingRejection {
             Self::CapacityRejected => "capacity_rejected",
             Self::MissingProbeKey => "missing_probe_key",
             Self::Superseded => "superseded",
-            Self::NoProbesSent => "no_probes_sent",
+            Self::NoProbesSent(_) => "no_probes_sent",
         }
     }
 }
@@ -1670,6 +1671,27 @@ pub(crate) enum ProbeSendFailureKind {
     ProbeRegistrationFailed,
     ProbeEncodingFailed,
 }
+
+impl ProbeSendFailureKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::PhysicalSend => "physical_send",
+            Self::PreHandoffTimeout => "pre_handoff_timeout",
+            Self::NetworkGenerationChanged => "network_generation_changed",
+            Self::CandidateEpochChanged => "candidate_epoch_changed",
+            Self::LocalProfileGenerationChanged => "local_profile_generation_changed",
+            Self::RemoteProfileGenerationChanged => "remote_profile_generation_changed",
+            Self::PeerSessionChanged => "peer_session_changed",
+            Self::SessionRetired => "session_retired",
+            Self::SocketUnavailable => "socket_unavailable",
+            Self::SocketRevoked => "socket_revoked",
+            Self::ProbeRegistrationFailed => "probe_registration_failed",
+            Self::ProbeEncodingFailed => "probe_encoding_failed",
+        }
+    }
+}
+
+include!("fresh_mapping_summary.rs");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BirthdaySweepFailureKind {

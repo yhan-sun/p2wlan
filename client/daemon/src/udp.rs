@@ -294,6 +294,10 @@ pub struct UdpTransport {
     probe_send_failure_hook: Arc<std::sync::Mutex<Option<ProbeSendFailureHook>>>,
     #[cfg(test)]
     probe_send_failure_hook_enabled: Arc<AtomicBool>,
+    /// Per-transport one-shot ordinary fresh-mapping lifecycle barrier.
+    /// Absent from production; it never supplies send authority or summaries.
+    #[cfg(test)]
+    fresh_mapping_generation_gate: Arc<StdMutex<Option<Arc<FreshMappingGenerationGate>>>>,
     /// One-shot lifecycle linearization seam used only by the remote-restart
     /// race regression.
     #[cfg(test)]
@@ -359,6 +363,11 @@ use learning::model_deltas;
 use learning::fresh_mapping_target_eligible;
 
 pub(crate) use dynamic_punch::monotonic_millis;
+#[cfg(test)]
+use dynamic_punch::{
+    FreshMappingGateContext, FreshMappingGateGuard, FreshMappingGateStage,
+    FreshMappingGenerationGate,
+};
 
 #[cfg(test)]
 use birthday::hard_hard_birthday_candidates;

@@ -170,6 +170,7 @@ impl PeerDiagnostics {
         local_endpoint: Option<SocketAddr>,
         local_nat_capabilities: Option<&NatCapabilities>,
         relay_available: bool,
+        birthday_probing_enabled: bool,
         traversal_history: Option<&TraversalHistory>,
         fresh_mapping_history: Option<&HashMap<String, VecDeque<FreshMappingPredictionResult>>>,
     ) -> Self {
@@ -353,57 +354,22 @@ impl PeerDiagnostics {
             .as_ref()
             .unwrap_or(&default_remote_capabilities);
         let remote_nat_profile_fresh = conn.remote_nat_profile_is_fresh();
-        let remote_profile_mapping_known =
-            conn.remote_nat_profile.as_ref().is_some_and(|profile| {
-                profile.capabilities.mapping_behavior != MappingBehavior::Unknown
-            });
-        let remote_candidate_endpoints = conn
-            .candidates
-            .iter()
-            .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
-            .collect::<Vec<_>>();
-        let on_link_lan = remote_candidate_endpoints
-            .iter()
-            .any(|endpoint| conn.is_on_link_host_candidate(*endpoint));
-        let global_ipv6_direct_available = local_endpoint
-            .is_some_and(|endpoint| endpoint.is_ipv6())
-            && remote_candidate_endpoints
-                .iter()
-                .any(|endpoint| endpoint.is_ipv6() && is_public_probe_endpoint(*endpoint));
-        let peer_reflexive_evidence = conn.candidate_pairs.iter().any(|pair| {
-            matches!(pair.source, CandidatePairSource::PeerReflexive)
-                && matches!(
-                    pair.state,
-                    CandidatePairState::Succeeded | CandidatePairState::Selected
-                )
-        });
-        let learned_endpoint_evidence = conn.candidate_pairs.iter().any(|pair| {
-            matches!(pair.source, CandidatePairSource::Learned)
-                && matches!(
-                    pair.state,
-                    CandidatePairState::Succeeded | CandidatePairState::Selected
-                )
-        });
-        let remote_stable_endpoint_available = remote_capabilities.is_stable_endpoint()
-            || (!remote_profile_mapping_known
-                && conn.endpoint.is_some_and(is_public_probe_endpoint));
         let fresh_mapping_available = fresh_mapping_history
             .and_then(|history| history.get(&conn.node_id))
             .is_some_and(|results| !results.is_empty());
-        let traversal_context = TraversalContext {
-            on_link_lan,
-            global_ipv6_direct_available,
-            peer_reflexive_evidence,
-            learned_endpoint_evidence,
-            local_stable_endpoint_available: local_capabilities.is_stable_endpoint(),
-            remote_stable_endpoint_available,
-            fresh_mapping_available,
-            remote_profile_fresh: remote_nat_profile_fresh,
-            relay_available,
-            bounded_birthday_allowed: local_capabilities.birthday_candidate
-                || remote_capabilities.birthday_candidate,
-            ..TraversalContext::default()
-        };
+        let traversal_context = traversal_context_for_connection(
+            conn,
+            local_capabilities,
+            remote_capabilities,
+            TraversalContext {
+                fresh_mapping_available,
+                remote_profile_fresh: remote_nat_profile_fresh
+                    && conn.remote_nat_profile_matches_candidate_epoch(),
+                relay_available,
+                bounded_birthday_allowed: birthday_probing_enabled,
+                ..TraversalContext::default()
+            },
+        );
         let traversal_plan = Some(plan_traversal(
             local_capabilities,
             remote_capabilities,
@@ -587,6 +553,7 @@ impl From<&PeerConnection> for PeerDiagnostics {
             None,
             None,
             false,
+            TraversalContext::default().bounded_birthday_allowed,
             None,
             None,
         )

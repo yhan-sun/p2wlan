@@ -119,3 +119,9 @@ mod probe_admission_transaction;
 
 #[path = "tests/nat_ingress.rs"]
 mod nat_ingress;
+
+#[path = "tests/fresh_mapping_failures.rs"]
+mod fresh_mapping_failures;
+
+#[path = "tests/fresh_mapping_summary.rs"]
+mod fresh_mapping_summary;

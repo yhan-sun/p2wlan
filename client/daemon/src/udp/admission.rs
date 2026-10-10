@@ -788,6 +788,8 @@ impl UdpTransport {
     /// landed between the snapshot and the registration invalidates the WHOLE
     /// probe (the stale payload is never stamped with the new epoch and never
     /// sent).
+    // Production consumes classified send outcomes; nonce-only callers are tests.
+    #[cfg(test)]
     async fn send_probe_on_socket(
         &self,
         socket_index: usize,

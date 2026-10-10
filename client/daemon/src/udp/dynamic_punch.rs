@@ -4,6 +4,117 @@ use super::*;
 #[path = "tests/dynamic_mapping.rs"]
 mod measurement_tests;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FreshMappingGateStage {
+    AfterModelBeforeProbe,
+    BeforeZeroCleanup,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct FreshMappingGateContext {
+    pub(super) peer_id: String,
+    pub(super) socket_index: usize,
+    pub(super) network_generation: u64,
+    pub(super) punch_generation: u64,
+}
+
+#[cfg(test)]
+pub(super) struct FreshMappingGenerationGate {
+    pub(super) stage: FreshMappingGateStage,
+    pub(super) peer_id: String,
+    pub(super) arrived_tx: StdMutex<Option<oneshot::Sender<FreshMappingGateContext>>>,
+    pub(super) release_rx: StdMutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[cfg(test)]
+pub(super) struct FreshMappingGateGuard {
+    pub(super) slot: Arc<StdMutex<Option<Arc<FreshMappingGenerationGate>>>>,
+    pub(super) gate: Arc<FreshMappingGenerationGate>,
+    pub(super) release_tx: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+impl FreshMappingGateGuard {
+    pub(super) fn release(&mut self) {
+        if let Some(release) = self.release_tx.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FreshMappingGateGuard {
+    fn drop(&mut self) {
+        self.release();
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.gate))
+        {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+impl UdpTransport {
+    async fn wait_for_fresh_mapping_gate_for_test(
+        &self,
+        stage: FreshMappingGateStage,
+        peer_id: &str,
+        socket_index: usize,
+        network_generation: u64,
+        punch_generation: u64,
+    ) {
+        let gate = {
+            let mut slot = self
+                .fresh_mapping_generation_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot
+                .as_ref()
+                .is_some_and(|gate| gate.stage == stage && gate.peer_id == peer_id)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some(gate) = gate else {
+            return;
+        };
+        let arrived = gate
+            .arrived_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("the selected lifecycle gate is consumed once");
+        let release = gate
+            .release_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("the selected lifecycle gate has one release receiver");
+        let _ = arrived.send(FreshMappingGateContext {
+            peer_id: peer_id.to_owned(),
+            socket_index,
+            network_generation,
+            punch_generation,
+        });
+        // No mutex guard or runtime authority is retained across this await.
+        // This non-paused test watchdog does not rebase any model timestamp.
+        timeout(Duration::from_secs(2), release)
+            .await
+            .expect("the test must release its lifecycle gate within 2s")
+            .expect("gate guard Drop must release a parked generation");
+    }
+}
+
 pub(super) const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
 
 pub(crate) fn monotonic_millis() -> u64 {
@@ -989,6 +1100,18 @@ impl UdpTransport {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::BatchStale);
         }
 
+        #[cfg(test)]
+        if !measure_only {
+            self.wait_for_fresh_mapping_gate_for_test(
+                FreshMappingGateStage::AfterModelBeforeProbe,
+                peer_id,
+                socket_index,
+                network_generation,
+                punch_generation,
+            )
+            .await;
+        }
+
         // The peer-facing punch loop: only sends from the dedicated socket
         // may claim success.  The mapping is fixed when the first peer-facing
         // probe enters the kernel send queue.
@@ -1001,15 +1124,18 @@ impl UdpTransport {
             monotonic_millis()
         };
         let mut sent = 0u32;
+        let mut probe_summary = FreshMappingProbeSummary::default();
         if !measure_only {
             for round in 0..attempts {
                 if cancellation.is_some_and(|c| c.is_cancelled()) {
+                    probe_summary.record_outer_stop(FreshMappingProbeStopCause::Cancelled);
                     debug!(
                     "Fresh-mapping punch generation {punch_generation} aborted mid-punch; session superseded"
                 );
                     break;
                 }
                 if self.peers.is_direct(peer_id).await {
+                    probe_summary.record_outer_stop(FreshMappingProbeStopCause::DirectConfirmed);
                     // Direct was confirmed while this generation was measuring or
                     // punching: stop emitting peer-facing probes from the
                     // generation's socket immediately.
@@ -1019,34 +1145,42 @@ impl UdpTransport {
                     break;
                 }
                 if self.peers.current_network_generation_sync() != network_generation {
+                    probe_summary
+                        .record_outer_stop(FreshMappingProbeStopCause::NetworkGenerationChanged);
                     debug!(
                     "Fresh-mapping punch generation {punch_generation} aborted mid-punch; the network generation changed"
                 );
                     break;
                 }
                 for target in &stable_targets {
+                    probe_summary.record_call();
                     match self
-                        .send_probe_on_socket(
+                        .send_probe_on_socket_result_with_hard_hard_token_classified(
                             socket_index,
                             socket.clone(),
                             Some(peer_id),
                             *target,
                             true,
                             PendingProbePurpose::ConnectivityCheck,
+                            None,
+                            false,
+                            None,
                         )
                         .await
                     {
-                        Ok(_) => {
+                        Ok(result) => {
                             sent = sent.saturating_add(1);
+                            probe_summary.record_success(&result);
                             if !OUTBOUND_CONNECTIVITY_PROBE_SPACING.is_zero() {
                                 sleep(OUTBOUND_CONNECTIVITY_PROBE_SPACING).await;
                             }
                         }
-                        Err(error) => {
+                        Err(failure) => {
+                            probe_summary.record_failure(&failure);
                             debug!(
-                            "Fresh-mapping punch from socket {socket_index} to {} failed: {error}",
-                            target
-                        );
+                                "Fresh-mapping punch from socket {socket_index} to {} failed: {}",
+                                target, failure.error
+                            );
                         }
                     }
                     if round + 1 < attempts && !probe_interval.is_zero() {
@@ -1062,24 +1196,40 @@ impl UdpTransport {
         // the previous generation's socket (the peer's working path) stays.
         if !measure_only && sent == 0 {
             let cancelled = cancellation.is_some_and(|c| c.is_cancelled());
+            if cancelled {
+                probe_summary.record_outer_stop(FreshMappingProbeStopCause::Cancelled);
+            }
+            #[cfg(test)]
+            self.wait_for_fresh_mapping_gate_for_test(
+                FreshMappingGateStage::BeforeZeroCleanup,
+                peer_id,
+                socket_index,
+                network_generation,
+                punch_generation,
+            )
+            .await;
             self.peers
                 .record_direct_event(
                     peer_id,
                     "fresh_mapping_skipped",
                     stable_targets.first().copied(),
                     Some(stable_targets.len()),
-                    None,
+                    Some(sent),
                     format!(
-                        "fresh-mapping generation sent no peer-facing probe (attempts={attempts}); keeping the previous generation's socket"
+                        "fresh-mapping generation sent no peer-facing probe (attempts={attempts}); keeping the previous generation's socket {}",
+                        probe_summary.diagnostic_fields(),
                     ),
                 )
                 .await;
             self.detach_dynamic_socket_by_index(socket_index, "no_peer_facing_probe")
                 .await;
-            return FreshMappingOutcome::Rejected(if cancelled {
+            // Cleanup includes real lock/drain awaits. Cancellation arriving
+            // inside any of them must supersede the completed generation.
+            let cancelled_after_cleanup = cancellation.is_some_and(|c| c.is_cancelled());
+            return FreshMappingOutcome::Rejected(if cancelled_after_cleanup {
                 FreshMappingRejection::Superseded
             } else {
-                FreshMappingRejection::NoProbesSent
+                FreshMappingRejection::NoProbesSent(probe_summary)
             });
         }
 

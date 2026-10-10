@@ -2231,7 +2231,7 @@ async fn fresh_mapping_zero_attempts_returns_no_probes_sent_and_keeps_predecesso
     assert!(
         matches!(
             outcome,
-            FreshMappingOutcome::Rejected(FreshMappingRejection::NoProbesSent)
+            FreshMappingOutcome::Rejected(FreshMappingRejection::NoProbesSent(_))
         ),
         "attempts=0 must never claim Accepted, got {outcome:?}"
     );

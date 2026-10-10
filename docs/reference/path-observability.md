@@ -2,6 +2,10 @@
 
 路径观测只读取已提交的 Direct/Relay 状态，不做路径决策、不写 socket、不阻塞数据面。唯一的状态转换入口是 commit_path_transition；每个 peer 最多保留 32 条转换记录，动态标签不包含 peer id、endpoint、IP、session id 或任意错误文本。
 
+`peers[].traversal_plan` 是当前资料下的尝试建议，不表示运行时已取得探测许可或 Direct 已建立。生日扫描建议遵守 `birthday_probing_enabled`，可预测的 Hard↔Hard 计划不受该生日开关影响；IPv6 依据本地 NAT 能力中的端点及远端当前候选，诊断显示的本地 socket 地址仍用于候选对展示。
+
+`peers[].remote_nat_profile_fresh` 表示资料的时间新鲜度；`traversal_plan.remote_profile_fresh` 还要求资料属于当前 remote candidate epoch。时间仍新鲜的旧 epoch 资料不能授权 Hard↔Hard。运行时的 Relay 回退建议来自配置及拓扑要求，带路径选择的诊断使用实时 Relay 可用性；两者都不代表对端已确认。历史 fresh-mapping 校准记录只描述已有观察，不授予当前映射或探测许可。诊断可能返回缓存，实际发送和 Direct 提交仍复核当前生命周期及预算。
+
 本地认证的 GET /status 响应附带进程内递增的 X-P2WLAN-Status-Request-ID 响应头，用于把同主机客户端的连接/首字节耗时与 daemon 快照、序列化和写回阶段对应起来。诊断日志只记录请求编号、进程编号、耗时和快照重试/回退状态，不记录授权头、token 或 peer 身份；JSON schema 不依赖该可选响应头。
 
 状态对象带 schema_version、network_generation、peer_session_generation、remote_candidate_epoch、lifecycle、current_path、previous_path、transition_reason、last_path_change_reason、path_age_ms、first_direct_commit_age_ms、direct_state、relay_state、recovery_state、selected_path_mtu 和 selected_udp_datagram_size。`transition_reason` 是最后一次被接纳事件的原因，可能没有改变活动路径；`last_path_change_reason` 仅在活动路径实际切换时更新。首个 Direct 提交的 age 保留到本网络代际结束，不依赖 32 条转换事件环。
@@ -284,3 +288,13 @@ Control 额外维护有界的 `connection_metric_hourly` 聚合，用于比每�
 `GET /admin/api/v1/connection-trends` 默认返回最近 24 个小时 bucket，支持 `window_hours=1..720` 与可选 `network_id`。响应固定补齐缺失小时为零 bucket，因此调用方不需要把“没有 sample”误读成丢失数据。全局查询按小时汇总所有 network，network-scoped 查询只读取指定 network。
 
 当前 Rust telemetry wire 的 `selected_mtu`、`last_direct_latency_ms`、`last_relay_latency_ms` 会在 Control ingestion 时兼容映射到 authoritative snapshot 的 `selected_path_mtu` / 当前路径 validation RTT 字段；该映射只修正字段命名差异，不改变 daemon 的路径决策。
+
+## Ordinary fresh-mapping 零成功摘要
+
+daemon 内部 `FreshMappingRejection::NoProbesSent(summary)` 保留固定大小的 typed 摘要，原 fallback label 仍为 `no_probes_sent`。`logical_calls_attempted` 统计已进入 ordinary classified send 的调用；`successful_primary_sends` 保持原 `sent` 的语义，每次返回 Ok 的 primary 计一次，兼容副本失败不会抹掉 primary 成功。`first_failure` 与十二类固定计数只来自返回 Err 的 `ProbeSendFailureKind`，取消、Direct 确认和本机 network generation 改变等外层停止另存为 `outer_stop`，不能当成 physical send error。零 attempts 的 first failure 为 None，调用和成本均为零。
+
+`physical_send_errors` / `physical_send_error_bytes` 只累加现有 classified failure 或成功结果中的实际成本字段，不由失败类型、包长或 logical call 数推算。它们描述该次已完成发送 transaction，不包含后续 retransmit task 的全部成本，不是预算扣款、对端收包或 TUN 交付证明。计数使用饱和加法；`counters_saturated=true` 时饱和值只作下界，不能称为精确总数。
+
+零成功分支的 UDP owner 在原 `fresh_mapping_skipped` 事件追加一次 first failure、调用数、primary 成功数、physical 成本、outer stop 和 saturation 展示，并明确 `sent_probes=0`。ordinary caller 保留原 label/fallback，不重复展示或累加该成本。诊断事件环、时间线和日志均为 best effort；事件可能因竞争、替换或输出丢失而不可见，不能用事件条数反推累计成本。
+
+该 producer 事件在 cleanup 前记录。完整 detach 的最后 await 返回后再次检查显式 cancellation，并保持 unit `Superseded` 终态优先；cleanup 期间才到达的 cancellation 不会回填先前事件的 outer stop，也不会返回 NoProbesSent payload。Superseded 的事件不是 durable 成本账本。future 被 drop/abort/panic 而未返回时，这份局部摘要的最终覆盖未知，不能补成零成本或已成功。此改动不新增发送 owner/预算/队列，不收紧 ordinary retained-Arc 或 HH2 授权规则，诊断字段不参与路径选择。
