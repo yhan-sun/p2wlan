@@ -895,9 +895,215 @@ async fn hard_hard_hh2_readiness_timeout_is_not_owner_revocation() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(error.kind, ProbeSendFailureKind::PreHandoffTimeout);
+    assert_eq!(error.physical_send_errors, 0);
     drop(epoch);
     tokio::time::resume();
+    let mut bytes = [0; 128];
+    assert_eq!(
+        fixture.remote.try_recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(fixture
+        .peers
+        .hard_hard_pair_scope("peer-b", TOKEN)
+        .await
+        .is_some());
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn hard_hard_hh2_classified_readiness_timeout_is_not_physical_send_error() {
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let fixture = WinnerFixture::with_protocol(true, true).await;
+    let selected = pair(&fixture, 0, fixture.remote.local_addr().unwrap());
+    assert!(observe(&fixture, &selected, HardHardPairEvidence::ConnectivityAck).await);
+    fixture.sockets[0].writable().await.unwrap();
+    let live = Arc::new(StdMutex::new(LiveBirthdayProgress::default()));
+    let scope = fixture
+        .peers
+        .hard_hard_pair_scope("peer-b", TOKEN)
+        .await
+        .unwrap();
+    let confirmation_before = scope.measurement.evidence.confirmation_snapshot();
+    let failure = {
+        // Stop registration at its pending-map lock, then queue an epoch
+        // waiter. The FIFO epoch gate hands that waiter ownership when the
+        // registration finishes, before the physical helper can reacquire it.
+        let pending = fixture.udp.pending_probes.lock().await;
+        let send = fixture
+            .udp
+            .send_probe_on_socket_result_with_hard_hard_token_classified(
+                selected.socket_index,
+                fixture.sockets[0].clone(),
+                Some("peer-b"),
+                selected.remote_endpoint,
+                true,
+                PendingProbePurpose::HardHardNomination,
+                Some(TOKEN),
+                true,
+                Some(BirthdayLiveRecorder::new(live.clone())),
+            );
+        tokio::pin!(send);
+        assert!(futures_util::poll!(send.as_mut()).is_pending());
+        let epoch_waiter = fixture.udp.network_epoch_gate.lock();
+        tokio::pin!(epoch_waiter);
+        assert!(futures_util::poll!(epoch_waiter.as_mut()).is_pending());
+        drop(pending);
+        assert!(futures_util::poll!(send.as_mut()).is_pending());
+        let epoch = epoch_waiter.await;
+        assert_eq!(fixture.udp.pending_probes.lock().await.len(), 1);
+        tokio::time::pause();
+        let failure = send.await.unwrap_err();
+        drop(epoch);
+        tokio::time::resume();
+        failure
+    };
+    let mut bytes = [0; 256];
+    assert_eq!(
+        fixture.remote.try_recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let current = fixture
+        .peers
+        .hard_hard_pair_scope("peer-b", TOKEN)
+        .await
+        .expect("readiness contention must retain the valid owner");
+    assert!(!current.cancellation.is_cancelled());
+    assert_eq!(
+        current.measurement.evidence.confirmation_snapshot(),
+        confirmation_before
+    );
+    assert!(fixture.udp.pending_probes.lock().await.is_empty());
+    assert!(fixture.udp.hard_hard_probe_bindings.lock().await.is_empty());
+    assert_eq!(failure.physical_send_errors, 0);
+    assert_eq!(failure.physical_send_error_bytes, 0);
+    assert_eq!(failure.kind, ProbeSendFailureKind::PreHandoffTimeout);
+    assert!(failure.retryable_not_sent());
+    {
+        let live = live.lock().unwrap();
+        assert_eq!(live.counters.physical_datagrams_sent, 0);
+        assert_eq!(live.counters.physical_send_errors, 0);
+        assert_eq!(live.counters.physical_send_error_bytes, 0);
+        assert!(live.first_send_at_ms.is_none());
+    }
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn hard_hard_hh2_classified_syscall_failure_keeps_physical_error() {
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let fixture = WinnerFixture::with_protocol(true, true).await;
+    let selected = pair(&fixture, 0, fixture.remote.local_addr().unwrap());
+    assert!(observe(&fixture, &selected, HardHardPairEvidence::ConnectivityAck).await);
+    let _send_failures = fixture.udp.set_probe_send_failures_for_test([1]);
+    let live = Arc::new(StdMutex::new(LiveBirthdayProgress::default()));
+    let failure = fixture
+        .udp
+        .send_probe_on_socket_result_with_hard_hard_token_classified(
+            selected.socket_index,
+            fixture.sockets[0].clone(),
+            Some("peer-b"),
+            selected.remote_endpoint,
+            true,
+            PendingProbePurpose::HardHardNomination,
+            Some(TOKEN),
+            true,
+            Some(BirthdayLiveRecorder::new(live.clone())),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.kind, ProbeSendFailureKind::PhysicalSend);
+    assert!(failure.retryable_not_sent());
+    assert_eq!(failure.physical_send_errors, 1);
+    assert!(failure.physical_send_error_bytes > 0);
+    {
+        let live = live.lock().unwrap();
+        assert_eq!(live.counters.physical_datagrams_sent, 0);
+        assert_eq!(live.counters.physical_send_errors, 1);
+        assert_eq!(
+            live.counters.physical_send_error_bytes,
+            failure.physical_send_error_bytes
+        );
+        assert!(live.first_send_at_ms.is_none());
+    }
+    let mut bytes = [0; 256];
+    assert_eq!(
+        fixture.remote.try_recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(fixture
+        .peers
+        .hard_hard_pair_scope("peer-b", TOKEN)
+        .await
+        .is_some());
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn hard_hard_hh2_typed_owner_rejection_does_not_claim_physical_send() {
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let fixture = WinnerFixture::with_protocol(true, true).await;
+    let selected = pair(&fixture, 0, fixture.remote.local_addr().unwrap());
+    assert!(observe(&fixture, &selected, HardHardPairEvidence::ConnectivityAck).await);
+    let failure = fixture
+        .udp
+        .send_hh2_probe_datagram(
+            selected.socket_index,
+            &fixture.sockets[0],
+            b"not-sent",
+            "peer-b",
+            selected.remote_endpoint,
+            "superseded-token",
+            PendingProbePurpose::HardHardNomination,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.kind, ProbeSendFailureKind::SocketRevoked);
+    assert!(!failure.retryable_not_sent());
+    assert_eq!(failure.physical_send_errors, 0);
+    assert_eq!(failure.physical_send_error_bytes, 0);
+    let mut bytes = [0; 128];
+    assert_eq!(
+        fixture.remote.try_recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(fixture
+        .peers
+        .hard_hard_pair_scope("peer-b", TOKEN)
+        .await
+        .is_some());
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn hard_hard_hh2_real_syscall_error_is_typed_as_physical_send() {
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let fixture = WinnerFixture::with_protocol(true, true).await;
+    let selected = pair(&fixture, 0, fixture.remote.local_addr().unwrap());
+    assert!(observe(&fixture, &selected, HardHardPairEvidence::ConnectivityAck).await);
+    // This exceeds the IPv4 UDP payload maximum and reaches a real loopback
+    // send syscall, with no failure hook or outbound interface changes.
+    let oversized = vec![0; 65_536];
+    let failure = fixture
+        .udp
+        .send_hh2_probe_datagram(
+            selected.socket_index,
+            &fixture.sockets[0],
+            &oversized,
+            "peer-b",
+            selected.remote_endpoint,
+            TOKEN,
+            PendingProbePurpose::HardHardNomination,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.kind, ProbeSendFailureKind::PhysicalSend);
+    assert!(failure.retryable_not_sent());
+    assert_eq!(failure.physical_send_errors, 1);
+    assert_eq!(failure.physical_send_error_bytes, oversized.len() as u64);
     let mut bytes = [0; 128];
     assert_eq!(
         fixture.remote.try_recv_from(&mut bytes).unwrap_err().kind(),

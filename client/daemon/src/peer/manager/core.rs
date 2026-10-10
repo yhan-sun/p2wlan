@@ -998,7 +998,16 @@ impl PeerManager {
                 Ok(connections) => return (epoch_guard, connections),
                 Err(_) => {
                     drop(epoch_guard);
-                    drop(self.connections.write().await);
+                    let connections = self.connections.write().await;
+                    // The fair RwLock has granted this writer its permit.
+                    // Dropping it before try_write would let another queued
+                    // writer reserve that permit and make both owners yield
+                    // forever. Retain it only across a nonblocking epoch
+                    // attempt: no reverse-order await may hold connections.
+                    if let Ok(epoch_guard) = self.network_epoch_gate.try_lock() {
+                        return (epoch_guard, connections);
+                    }
+                    drop(connections);
                 }
             }
         }
@@ -1018,7 +1027,15 @@ impl PeerManager {
                 Ok(connections) => return (epoch_guard, connections),
                 Err(_) => {
                     drop(epoch_guard);
-                    drop(self.connections.read().await);
+                    let connections = self.connections.read().await;
+                    // A queued writer can similarly block try_read after
+                    // a granted reader is discarded. Try the epoch while
+                    // retaining that grant, but release connections at once
+                    // if the epoch is busy; never await in reverse order.
+                    if let Ok(epoch_guard) = self.network_epoch_gate.try_lock() {
+                        return (epoch_guard, connections);
+                    }
+                    drop(connections);
                 }
             }
         }

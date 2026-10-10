@@ -7,6 +7,8 @@
 include!("tests/part01a.rs");
 include!("tests/part01c.rs");
 include!("tests/part01b.rs");
+#[path = "tests/ordinary_recovery.rs"]
+mod ordinary_recovery;
 include!("tests/part02a.rs");
 include!("tests/part02b.rs");
 #[path = "tests/daemon_e2e/mod.rs"]

@@ -14,11 +14,16 @@ from unittest.mock import patch
 import subprocess
 
 import benchmark_campaign as campaign
+from test_launch_identity import SOURCE, write_valid_launch_evidence
 
 
 class BenchmarkCampaignTests(unittest.TestCase):
     def setUp(self):
         self.plan = campaign.build_plan(["strict-normal"], 3, 100, 2)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.fixtures = Path(temporary.name)
+        self.fixture_index = 0
 
     def record(self, batch, variant="baseline", success=True):
         changes, options = campaign.MATRIX.SCENARIOS[batch["scenario"]]
@@ -28,6 +33,9 @@ class BenchmarkCampaignTests(unittest.TestCase):
                  "errors": [] if success else ["smoke_exit:1"],
                  "environment_overrides": changes, "network_profile": {"schema_version": 1, **options}}
                 for index, seed in enumerate(batch["seed_bases"])]
+        for row in rows:
+            self.fixture_index += 1
+            row["launch_identity"] = write_valid_launch_evidence(self.fixtures / str(self.fixture_index))
         return {"variant": variant, "batch_id": batch["id"], "exit_code": 0,
                 "manifest": {"schema_version": 1, "valid": success, "scope": self.plan["scope"], "retries": 0,
                              "source": {"commit": "a" * 40, "patch_sha256": "b" * 64},
@@ -76,6 +84,40 @@ class BenchmarkCampaignTests(unittest.TestCase):
         record = self.record(self.plan["batches"][0])
         with self.assertRaisesRegex(ValueError, "duplicate"):
             campaign.summarize(self.plan, [record, copy.deepcopy(record)])
+
+    def test_success_cannot_be_claimed_without_launch_identity(self):
+        record = self.record(self.plan["batches"][0])
+        for row in record["manifest"]["runs"]:
+            row.pop("launch_identity")
+        with self.assertRaisesRegex(ValueError, "launch"):
+            campaign.summarize(self.plan, [record])
+
+    def test_malformed_launch_identity_cannot_count_as_success(self):
+        malformed = [None, {"schema_version": True, "valid": True, "errors": [], "records": []},
+                     {"schema_version": 1, "valid": 1, "errors": [], "records": []},
+                     {"schema_version": 1, "valid": True, "errors": [], "records": []}]
+        for identity in malformed:
+            record = self.record(self.plan["batches"][0])
+            for row in record["manifest"]["runs"]:
+                row["launch_identity"] = identity
+            with self.subTest(identity=identity), self.assertRaisesRegex(ValueError, "launch"):
+                campaign.summarize(self.plan, [record])
+
+    def test_missing_launch_failures_remain_in_requested_denominator(self):
+        record = self.record(self.plan["batches"][0], success=False)
+        for row in record["manifest"]["runs"]:
+            absent = campaign.read_launch_evidence(self.fixtures / "not-launched", SOURCE)
+            row.update(exit_code=0, errors=["launch_identity:missing_required_role:node-a"],
+                       launch_identity=absent)
+        result = campaign.summarize(self.plan, [record])["variants"]["baseline"]
+        self.assertEqual(result["requested"], 3)
+        self.assertEqual(result["accounted"], 2)
+        self.assertEqual(result["successful_valid_smoke_rounds"], 0)
+        self.assertEqual(result["failed_or_incomplete"], 2)
+        self.assertEqual(result["missing"], 1)
+        self.assertEqual(result["success_fraction_of_requested"], 0)
+        self.assertIn("configuration_input_sha256_at_launch", result["unavailable_run_identity"])
+        self.assertIsNone(result["resolved_runtime_configuration_sha256"])
 
     def test_source_changed_between_batches_is_rejected(self):
         records = [self.record(batch) for batch in self.plan["batches"]]
@@ -147,6 +189,9 @@ class BenchmarkCampaignTests(unittest.TestCase):
                         profile = batch_output / f"{row['scenario']}-{index + 1}.profile.json"
                         campaign.save(profile, row["network_profile"])
                         row.update(profile=str(profile), profile_sha256=campaign.digest(profile.read_bytes()))
+                        evidence_dir = batch_output / f"{row['scenario']}-{index + 1}"
+                        row.update(evidence_dir=str(evidence_dir),
+                                   launch_identity=write_valid_launch_evidence(evidence_dir, source))
                     campaign.save(batch_output / "manifest.json", manifest)
                     self.assertEqual(kwargs["cwd"], campaign.ROOT)
                     self.assertTrue(kwargs["start_new_session"])
@@ -177,8 +222,25 @@ class BenchmarkCampaignTests(unittest.TestCase):
                 campaign.collect_campaign(output / "campaign.json", self.plan, campaign.digest(plan_path.read_bytes()))
             raw_manifest.write_text(original)
             profile = Path(records[0]["manifest"]["runs"][0]["profile"])
+            profile_original = profile.read_text()
             profile.write_text(profile.read_text() + " ")
             with self.assertRaisesRegex(ValueError, "raw network profile"):
+                campaign.collect_campaign(output / "campaign.json", self.plan, campaign.digest(plan_path.read_bytes()))
+            profile.write_text(profile_original)
+            evidence_dir = Path(records[0]["manifest"]["runs"][0]["evidence_dir"])
+            raw_record = evidence_dir / "round-1" / "launches" / "node-a.json"
+            original_record = raw_record.read_bytes()
+            for mutate in (lambda: raw_record.write_bytes(original_record + b" "),
+                           lambda: raw_record.write_text(json.dumps({**json.loads(original_record), "pid": True}))):
+                mutate()
+                with self.assertRaisesRegex(ValueError, "launch identity"):
+                    campaign.collect_campaign(output / "campaign.json", self.plan, campaign.digest(plan_path.read_bytes()))
+                raw_record.write_bytes(original_record)
+            snapshot = evidence_dir / "artifacts" / "daemon"
+            snapshot.chmod(0o700)
+            snapshot.write_text("#!/bin/sh\nexit 9\n")
+            snapshot.chmod(0o500)
+            with self.assertRaisesRegex(ValueError, "launch identity"):
                 campaign.collect_campaign(output / "campaign.json", self.plan, campaign.digest(plan_path.read_bytes()))
 
     def test_different_checkout_harness_is_rejected_before_creating_output(self):
@@ -220,6 +282,11 @@ class BenchmarkCampaignTests(unittest.TestCase):
         self.assertEqual(baseline["successful_valid_smoke_rounds"], 3)
         self.assertEqual(baseline["failed_batches"], 1)
         self.assertFalse(baseline["execution_succeeded"])
+        self.assertEqual(baseline["launch_identity_available_runs"], 3)
+        self.assertEqual(baseline["configuration_identity_scope"], "argv_and_allowlisted_environment")
+        self.assertIsNone(baseline["resolved_runtime_configuration_sha256"])
+        self.assertEqual(baseline["unavailable_run_identity"], ["resolved_runtime_configuration_sha256"])
+        self.assertIn("stdin authorization", baseline["resolved_runtime_configuration_unavailable_reason"])
 
     def test_maximum_campaign_index_does_not_duplicate_raw_manifests(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -231,9 +231,11 @@ fn empty_queue_rejects_a_single_oversized_packet() {
     assert_eq!(queue.bytes, 0);
 }
 
-fn merge_context() -> (PeerManager, Arc<ConnectionTimeline>) {
+fn merge_context() -> (Arc<PeerManager>, Arc<ConnectionTimeline>) {
     (
-        PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap()),
+        Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        )),
         ConnectionTimeline::new("queue-merge", 0),
     )
 }

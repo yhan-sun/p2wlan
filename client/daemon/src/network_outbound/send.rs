@@ -1,7 +1,8 @@
 use super::*;
 
-/// Encrypt a RAW packet (holding the peer's emit lock) and send it while the
-/// guard is still held.
+/// Compatibility entry for unit tests of one isolated send. The worker
+/// supplies the FIFO's original deadline through the bounded entry below.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn encrypt_then_send(
     packet: OutboundPacket,
@@ -12,6 +13,36 @@ pub(super) async fn encrypt_then_send(
     udp_transport: &RwLock<Option<UdpTransport>>,
     relay_transport: &RwLock<Option<RelayTransport>>,
     relay_expected: bool,
+) -> EncryptSendOutcome {
+    encrypt_then_send_with_deadline(
+        packet,
+        transport,
+        peers,
+        expected_generation,
+        prefer_direct,
+        udp_transport,
+        relay_transport,
+        relay_expected,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Encrypt a RAW packet (holding the peer's emit lock) and send it while the
+/// guard is still held.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn encrypt_then_send_with_deadline(
+    packet: OutboundPacket,
+    transport: &WireGuardTransport,
+    peers: &PeerManager,
+    expected_generation: u64,
+    prefer_direct: bool,
+    udp_transport: &RwLock<Option<UdpTransport>>,
+    relay_transport: &RwLock<Option<RelayTransport>>,
+    relay_expected: bool,
+    admission_deadline: Option<Instant>,
+    stopping: Option<&AtomicBool>,
 ) -> EncryptSendOutcome {
     let retry_packet = packet.clone();
     let profiler = global_dataplane_profiler();
@@ -26,232 +57,273 @@ pub(super) async fn encrypt_then_send(
     // gate is released. Managed Direct later takes a fresh epoch guard only
     // across its exact nonblocking UDP syscall, which is the revocation/path
     // replacement linearization point.
-    let emit_lock_started = Instant::now();
-    let emit_guard = Arc::new(transport.acquire_outbound_emit_guard(&packet.peer_id).await);
-    let emit_guard_acquired = Instant::now();
-    let emit_lock_wait_ms = emit_lock_started.elapsed().as_millis() as u64;
-    if let Some(trace) = sampled_trace.as_ref() {
-        profiler.record(
-            trace.sampled,
-            "tx_emit_guard_wait_us",
-            emit_guard_acquired.duration_since(emit_lock_started),
-        );
+    let preparation_retry = retry_packet.clone();
+    let preparation_bound = admission_deadline.map_or(OUTBOUND_SEND_TIMEOUT, |deadline| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(OUTBOUND_SEND_TIMEOUT)
+    });
+    if preparation_bound.is_zero() {
+        return EncryptSendOutcome::Terminal {
+            packet: retry_packet,
+            reason_code: REASON_OUTBOUND_DELIVERY_DEADLINE,
+            reason: "original FIFO deadline expired before encryption/handoff".into(),
+        };
     }
-    debug!(
-        event = "outbound_business_emit_lock_acquired",
-        peer_id = %packet.peer_id,
-        generation = expected_generation,
-        lock_wait_ms = emit_lock_wait_ms,
-        "business packet acquired its per-peer WireGuard counter-ordering lock"
-    );
-    let (encrypted, direct_business_plan, force_relay) = {
-        let epoch_gate = peers.network_epoch_gate();
-        let epoch_gate_wait_started = Instant::now();
-        let _epoch_guard = epoch_gate.lock().await;
-        let epoch_gate_acquired = Instant::now();
+    // This future contains no UDP syscall or Relay writer admission. A
+    // cancellation may abandon an allocated counter, but its ciphertext has
+    // never been handed off, so only the original plaintext can be retried.
+    let prepare = async {
+        let emit_lock_started = Instant::now();
+        let emit_guard = Arc::new(transport.acquire_outbound_emit_guard(&packet.peer_id).await);
+        let emit_guard_acquired = Instant::now();
+        let emit_lock_wait_ms = emit_lock_started.elapsed().as_millis() as u64;
         if let Some(trace) = sampled_trace.as_ref() {
             profiler.record(
                 trace.sampled,
-                "tx_epoch_gate_wait_us",
-                epoch_gate_acquired.duration_since(epoch_gate_wait_started),
+                "tx_emit_guard_wait_us",
+                emit_guard_acquired.duration_since(emit_lock_started),
             );
         }
-        let current_generation = peers.current_network_generation_sync();
-        if current_generation != expected_generation {
-            debug!(
-                event = "outbound_counter_allocation_rejected",
-                peer_id = %retry_packet.peer_id,
-                expected_generation,
-                current_generation,
-                reason_code = REASON_OUTBOUND_GENERATION_CHANGED,
-                "business packet was not encrypted because its network generation is stale"
-            );
-            return EncryptSendOutcome::Retryable {
-                packet: retry_packet,
+        debug!(
+            event = "outbound_business_emit_lock_acquired",
+            peer_id = %packet.peer_id,
+            generation = expected_generation,
+            lock_wait_ms = emit_lock_wait_ms,
+            "business packet acquired its per-peer WireGuard counter-ordering lock"
+        );
+        let (encrypted, direct_business_plan, force_relay) = {
+            let epoch_gate = peers.network_epoch_gate();
+            let epoch_gate_wait_started = Instant::now();
+            let _epoch_guard = epoch_gate.lock().await;
+            let epoch_gate_acquired = Instant::now();
+            if let Some(trace) = sampled_trace.as_ref() {
+                profiler.record(
+                    trace.sampled,
+                    "tx_epoch_gate_wait_us",
+                    epoch_gate_acquired.duration_since(epoch_gate_wait_started),
+                );
+            }
+            let current_generation = peers.current_network_generation_sync();
+            if current_generation != expected_generation {
+                debug!(
+                    event = "outbound_counter_allocation_rejected",
+                    peer_id = %preparation_retry.peer_id,
+                    expected_generation,
+                    current_generation,
+                    reason_code = REASON_OUTBOUND_GENERATION_CHANGED,
+                    "business packet was not encrypted because its network generation is stale"
+                );
+                return Err(EncryptSendOutcome::Retryable {
+                packet: preparation_retry,
                 reason_code: REASON_OUTBOUND_GENERATION_CHANGED,
                 reason: format!(
                     "network generation advanced before counter allocation: expected={expected_generation} current={current_generation}"
                 ),
-            };
-        }
-        let relay_available = relay_transport.read().await.is_some();
-        let udp = udp_transport.read().await.clone();
-        let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
-        let selection = peers
-            .select_path_for_data_with_local_endpoint_in_epoch(
-                &retry_packet.peer_id,
-                prefer_direct,
-                relay_available || relay_expected,
-                udp_local_endpoint,
-                current_generation,
-                false,
-            )
-            .await;
-        let mut force_relay = false;
-        let direct_business_plan = if selection.path == Some(NetworkPath::Direct)
-            && selection.direct_confirmed
-        {
-            match (udp, selection.direct_endpoint) {
-                (Some(udp), Some(endpoint)) => {
-                    match udp
-                        .prepare_direct_business_send(&retry_packet.peer_id, endpoint)
-                        .await
-                    {
-                        DirectBusinessBudgetGate::Unmanaged => None,
-                        DirectBusinessBudgetGate::ManagedPending { reason } => {
-                            // Make-before-break: the encrypted Direct commit
-                            // exists, but its authoritative business proof
-                            // (confirmed budget) does not. A confirmed Relay
-                            // must keep carrying business instead of parking
-                            // the queue behind a budget only the Direct
-                            // commit can publish.
-                            if !relay_make_before_break_fallback(
-                                &_epoch_guard,
-                                peers,
-                                &retry_packet.peer_id,
-                                current_generation,
-                                relay_available,
-                                reason,
-                            )
+            });
+            }
+            let relay_available = relay_transport.read().await.is_some();
+            let udp = udp_transport.read().await.clone();
+            let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
+            let selection = peers
+                .select_path_for_data_with_local_endpoint_in_epoch(
+                    &preparation_retry.peer_id,
+                    prefer_direct,
+                    relay_available || relay_expected,
+                    udp_local_endpoint,
+                    current_generation,
+                    false,
+                )
+                .await;
+            let mut force_relay = false;
+            let direct_business_plan = if selection.path == Some(NetworkPath::Direct)
+                && selection.direct_confirmed
+            {
+                match (udp, selection.direct_endpoint) {
+                    (Some(udp), Some(endpoint)) => {
+                        match udp
+                            .prepare_direct_business_send(&preparation_retry.peer_id, endpoint)
                             .await
-                            {
-                                return EncryptSendOutcome::BudgetPending {
-                                    packet: retry_packet,
-                                    reason: format!(
+                        {
+                            DirectBusinessBudgetGate::Unmanaged => None,
+                            DirectBusinessBudgetGate::ManagedPending { reason } => {
+                                // Make-before-break: the encrypted Direct commit
+                                // exists, but its authoritative business proof
+                                // (confirmed budget) does not. A confirmed Relay
+                                // must keep carrying business instead of parking
+                                // the queue behind a budget only the Direct
+                                // commit can publish.
+                                if !relay_make_before_break_fallback(
+                                    &_epoch_guard,
+                                    peers,
+                                    &preparation_retry.peer_id,
+                                    current_generation,
+                                    relay_available,
+                                    reason,
+                                )
+                                .await
+                                {
+                                    return Err(EncryptSendOutcome::BudgetPending {
+                                        packet: preparation_retry,
+                                        reason: format!(
                                         "Direct DPLPMTUD budget pending before encryption: {reason}"
                                     ),
-                                };
+                                    });
+                                }
+                                force_relay = true;
+                                None
                             }
-                            force_relay = true;
-                            None
-                        }
-                        DirectBusinessBudgetGate::Ready(prepared) => {
-                            let Some(inner_len) =
-                                complete_inner_ip_packet_len(&retry_packet.packet)
-                            else {
-                                return EncryptSendOutcome::Terminal {
-                                    packet: retry_packet,
-                                    reason_code: REASON_DIRECT_BUSINESS_MALFORMED,
-                                    reason: "managed Direct packet is not one complete IP packet"
-                                        .to_string(),
+                            DirectBusinessBudgetGate::Ready(prepared) => {
+                                let Some(inner_len) =
+                                    complete_inner_ip_packet_len(&preparation_retry.packet)
+                                else {
+                                    return Err(EncryptSendOutcome::Terminal {
+                                        packet: preparation_retry,
+                                        reason_code: REASON_DIRECT_BUSINESS_MALFORMED,
+                                        reason:
+                                            "managed Direct packet is not one complete IP packet"
+                                                .to_string(),
+                                    });
                                 };
-                            };
-                            let overlay_budget = prepared.token.max_overlay_payload_size.0 as usize;
-                            if retry_packet.packet[0] >> 4 == 6
-                                && overlay_budget < crate::business_mtu::IPV6_MINIMUM_MTU as usize
-                            {
-                                return EncryptSendOutcome::Terminal {
-                                    packet: retry_packet,
+                                let overlay_budget =
+                                    prepared.token.max_overlay_payload_size.0 as usize;
+                                if preparation_retry.packet[0] >> 4 == 6
+                                    && overlay_budget
+                                        < crate::business_mtu::IPV6_MINIMUM_MTU as usize
+                                {
+                                    return Err(EncryptSendOutcome::Terminal {
+                                    packet: preparation_retry,
                                     reason_code: REASON_IPV6_BUDGET_BELOW_MINIMUM_MTU,
                                     reason: format!(
                                         "inner IPv6 business traffic requires an advertised MTU of at least {}; confirmed inner budget is {overlay_budget}; no UDP handoff or invalid Packet Too Big was produced",
                                         crate::business_mtu::IPV6_MINIMUM_MTU,
                                     ),
-                                };
-                            }
-                            if inner_len > overlay_budget {
-                                let feedback = peers.emit_local_mtu_feedback(
-                                    &retry_packet.peer_id,
-                                    &retry_packet.packet,
-                                    crate::business_mtu::LocalMtuFeedbackKind::PacketTooBig {
-                                        inner_ip_mtu: prepared.token.max_overlay_payload_size.0,
-                                    },
-                                );
-                                return EncryptSendOutcome::Terminal {
-                                    packet: retry_packet,
+                                });
+                                }
+                                if inner_len > overlay_budget {
+                                    let feedback = peers.emit_local_mtu_feedback(
+                                        &preparation_retry.peer_id,
+                                        &preparation_retry.packet,
+                                        crate::business_mtu::LocalMtuFeedbackKind::PacketTooBig {
+                                            inner_ip_mtu: prepared.token.max_overlay_payload_size.0,
+                                        },
+                                    );
+                                    return Err(EncryptSendOutcome::Terminal {
+                                    packet: preparation_retry,
                                     reason_code: REASON_DIRECT_BUDGET_OVERSIZE,
                                     reason: format!(
                                         "inner IP packet {inner_len} exceeds confirmed overlay budget {overlay_budget}; feedback={feedback:?}"
                                     ),
-                                };
+                                });
+                                }
+                                Some(DirectBusinessSendPlan {
+                                    udp,
+                                    prepared: *prepared,
+                                })
                             }
-                            Some(DirectBusinessSendPlan {
-                                udp,
-                                prepared: *prepared,
-                            })
                         }
                     }
-                }
-                _ => {
-                    if !relay_make_before_break_fallback(
-                        &_epoch_guard,
-                        peers,
-                        &retry_packet.peer_id,
-                        current_generation,
-                        relay_available,
-                        "Direct selected without a published UDP endpoint/socket",
-                    )
-                    .await
-                    {
-                        return EncryptSendOutcome::BudgetPending {
-                            packet: retry_packet,
-                            reason: "Direct selected without a published UDP endpoint/socket"
-                                .to_string(),
-                        };
+                    _ => {
+                        if !relay_make_before_break_fallback(
+                            &_epoch_guard,
+                            peers,
+                            &preparation_retry.peer_id,
+                            current_generation,
+                            relay_available,
+                            "Direct selected without a published UDP endpoint/socket",
+                        )
+                        .await
+                        {
+                            return Err(EncryptSendOutcome::BudgetPending {
+                                packet: preparation_retry,
+                                reason: "Direct selected without a published UDP endpoint/socket"
+                                    .to_string(),
+                            });
+                        }
+                        force_relay = true;
+                        None
                     }
-                    force_relay = true;
-                    None
+                }
+            } else {
+                None
+            };
+            let result = match transport.encrypt_outbound_with_emit_guard(packet).await {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    debug!(
+                        event = "outbound_session_unavailable",
+                        peer_id = %preparation_retry.peer_id,
+                        generation = expected_generation,
+                        bytes = preparation_retry.packet.len(),
+                        reason_code = REASON_OUTBOUND_SESSION_NOT_READY,
+                        "business packet remained plaintext because no usable WireGuard session exists"
+                    );
+                    return Err(EncryptSendOutcome::Retryable {
+                        packet: preparation_retry,
+                        reason_code: REASON_OUTBOUND_SESSION_NOT_READY,
+                        reason: "WireGuard session is not ready".to_string(),
+                    });
+                }
+                Err(err) => {
+                    warn!(
+                        event = "outbound_encrypt_failed",
+                        peer_id = %preparation_retry.peer_id,
+                        generation = expected_generation,
+                        bytes = preparation_retry.packet.len(),
+                        reason_code = REASON_OUTBOUND_ENCRYPT_FAILED,
+                        error = %err,
+                        "business packet encryption failed before a transport handoff"
+                    );
+                    return Err(EncryptSendOutcome::Terminal {
+                        packet: preparation_retry,
+                        reason_code: REASON_OUTBOUND_ENCRYPT_FAILED,
+                        reason: err.to_string(),
+                    });
+                }
+            };
+            if let Some(trace) = sampled_trace.as_ref() {
+                profiler.record(
+                    trace.sampled,
+                    "tx_epoch_gate_hold_us",
+                    epoch_gate_acquired.elapsed(),
+                );
+            }
+            if selection.path == Some(NetworkPath::Direct)
+                && selection.direct_confirmed
+                && !force_relay
+            {
+                if let Some(endpoint) = selection.direct_endpoint {
+                    peers
+                        .satisfy_direct_first_in_epoch(
+                            &_epoch_guard,
+                            &preparation_retry.peer_id,
+                            current_generation,
+                            endpoint,
+                        )
+                        .await;
                 }
             }
-        } else {
-            None
+            (result, direct_business_plan, force_relay)
         };
-        let result = match transport.encrypt_outbound_with_emit_guard(packet).await {
-            Ok(Some(value)) => value,
-            Ok(None) => {
-                debug!(
-                    event = "outbound_session_unavailable",
-                    peer_id = %retry_packet.peer_id,
-                    generation = expected_generation,
-                    bytes = retry_packet.packet.len(),
-                    reason_code = REASON_OUTBOUND_SESSION_NOT_READY,
-                    "business packet remained plaintext because no usable WireGuard session exists"
-                );
-                return EncryptSendOutcome::Retryable {
-                    packet: retry_packet,
-                    reason_code: REASON_OUTBOUND_SESSION_NOT_READY,
-                    reason: "WireGuard session is not ready".to_string(),
-                };
-            }
-            Err(err) => {
-                warn!(
-                    event = "outbound_encrypt_failed",
-                    peer_id = %retry_packet.peer_id,
-                    generation = expected_generation,
-                    bytes = retry_packet.packet.len(),
-                    reason_code = REASON_OUTBOUND_ENCRYPT_FAILED,
-                    error = %err,
-                    "business packet encryption failed before a transport handoff"
-                );
-                return EncryptSendOutcome::Terminal {
-                    packet: retry_packet,
-                    reason_code: REASON_OUTBOUND_ENCRYPT_FAILED,
-                    reason: err.to_string(),
-                };
-            }
-        };
-        if let Some(trace) = sampled_trace.as_ref() {
-            profiler.record(
-                trace.sampled,
-                "tx_epoch_gate_hold_us",
-                epoch_gate_acquired.elapsed(),
-            );
-        }
-        if selection.path == Some(NetworkPath::Direct) && selection.direct_confirmed && !force_relay
-        {
-            if let Some(endpoint) = selection.direct_endpoint {
-                peers
-                    .satisfy_direct_first_in_epoch(
-                        &_epoch_guard,
-                        &retry_packet.peer_id,
-                        current_generation,
-                        endpoint,
-                    )
-                    .await;
-            }
-        }
-        (result, direct_business_plan, force_relay)
+        Ok((
+            emit_guard,
+            encrypted,
+            direct_business_plan,
+            force_relay,
+            emit_lock_started,
+            emit_guard_acquired,
+        ))
     };
+    let (emit_guard, encrypted, direct_business_plan, force_relay, emit_lock_started, emit_guard_acquired) =
+        match timeout(preparation_bound, prepare).await {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(outcome)) => return outcome,
+            Err(_) => return EncryptSendOutcome::Retryable {
+                packet: retry_packet,
+                reason_code: REASON_OUTBOUND_ADMISSION_TIMEOUT,
+                reason: "bounded pre-handoff emit/epoch/slot/session admission timed out; no transport owned ciphertext".into(),
+            },
+        };
     let encrypt_completed = Instant::now();
     if let Some(plan) = direct_business_plan.as_ref() {
         if encrypted.wire_bytes.len() > plan.prepared.token.max_udp_datagram_size.0 as usize {
@@ -305,6 +377,18 @@ pub(super) async fn encrypt_then_send(
             encrypt_completed.duration_since(encrypt_started),
         );
     }
+    let window = SendAdmissionWindow {
+        deadline: admission_deadline,
+        stopping,
+        expected_generation,
+    };
+    if let Some(reason_code) = window.rejection_reason() {
+        return EncryptSendOutcome::Terminal {
+            packet: retry_packet,
+            reason_code,
+            reason: "FIFO lifecycle ended after preparation and before transport handoff".into(),
+        };
+    }
     let transport_handoff_started = Instant::now();
     let outcome = send_encrypted_packet_bounded(
         &encrypted,
@@ -317,6 +401,7 @@ pub(super) async fn encrypt_then_send(
         direct_business_plan.as_ref(),
         complete_inner_ip_packet_len(&retry_packet.packet).unwrap_or(retry_packet.packet.len()),
         force_relay,
+        window,
     )
     .await;
     let transport_handoff_completed = Instant::now();
@@ -445,11 +530,42 @@ pub(super) async fn encrypt_then_send(
     }
 }
 
+#[derive(Clone, Copy)]
+struct SendAdmissionWindow<'a> {
+    deadline: Option<Instant>,
+    stopping: Option<&'a AtomicBool>,
+    expected_generation: u64,
+}
+
+impl SendAdmissionWindow<'_> {
+    fn rejection_reason(self) -> Option<&'static str> {
+        if self
+            .stopping
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            Some(REASON_OUTBOUND_WORKER_STOPPED)
+        } else if self.deadline.is_some_and(|at| at <= Instant::now()) {
+            Some(REASON_OUTBOUND_DELIVERY_DEADLINE)
+        } else {
+            None
+        }
+    }
+
+    fn rejected(self) -> Option<SendOutcome> {
+        self.rejection_reason().map(|reason_code| {
+            SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
+                reason_code,
+                reason: "original FIFO lifecycle ended before physical handoff".into(),
+            })
+        })
+    }
+}
+
 /// Send one encrypted packet with a hard time bound so a stalled relay cannot
 /// block the shared outbound worker. The caller owns the per-peer emit guard
 /// and releases it immediately after this classification returns.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn send_encrypted_packet_bounded(
+async fn send_encrypted_packet_bounded(
     packet: &EncryptedPeerPacket,
     peers: &PeerManager,
     prefer_direct: bool,
@@ -460,6 +576,7 @@ pub(super) async fn send_encrypted_packet_bounded(
     direct_business_plan: Option<&DirectBusinessSendPlan>,
     inner_ip_packet_len: usize,
     force_relay: bool,
+    window: SendAdmissionWindow<'_>,
 ) -> SendOutcome {
     // Capture the exact shared connection before entering the bounded send.
     // The same snapshot is passed into the send operation, so a supervisor
@@ -467,12 +584,35 @@ pub(super) async fn send_encrypted_packet_bounded(
     // actually blocked on another. The replacement remains available for the
     // next plaintext retry.
     let profiler = global_dataplane_profiler();
+    let bounded_send_started = Instant::now();
     let relay_read_started = Instant::now();
-    let relay_guard = relay_transport.read().await;
+    // No transport owns this ciphertext while only the slot snapshot waits.
+    // Bound this phase separately from the terminal-aware physical send;
+    // both phases share the original two-second transport-operation budget.
+    if let Some(rejected) = window.rejected() {
+        return rejected;
+    }
+    let slot_bound = window.deadline.map_or(OUTBOUND_SEND_TIMEOUT, |deadline| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(OUTBOUND_SEND_TIMEOUT)
+    });
+    let relay_guard = match timeout(slot_bound, relay_transport.read()).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            return SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
+                reason_code: REASON_OUTBOUND_ADMISSION_TIMEOUT,
+                reason: "Relay slot snapshot timed out before any physical handoff".into(),
+            })
+        }
+    };
     let relay_read_acquired = Instant::now();
     let relay_for_send = relay_guard.clone();
     let relay_read_hold = relay_read_acquired.elapsed();
     drop(relay_guard);
+    if let Some(rejected) = window.rejected() {
+        return rejected;
+    }
     if let Some(sampled) = sampled {
         profiler.record(
             sampled,
@@ -487,8 +627,15 @@ pub(super) async fn send_encrypted_packet_bounded(
     }
     let relay_at_start = relay_for_send.clone();
     let relay_send_started = AtomicBool::new(false);
+    let remaining = OUTBOUND_SEND_TIMEOUT.saturating_sub(bounded_send_started.elapsed());
+    if remaining.is_zero() {
+        return SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
+            reason_code: REASON_OUTBOUND_ADMISSION_TIMEOUT,
+            reason: "send budget expired before entering the transport".into(),
+        });
+    }
     match timeout(
-        OUTBOUND_SEND_TIMEOUT,
+        remaining,
         send_encrypted_packet_once(
             packet,
             peers,
@@ -501,6 +648,7 @@ pub(super) async fn send_encrypted_packet_bounded(
             direct_business_plan,
             inner_ip_packet_len,
             force_relay,
+            window,
         ),
     )
     .await
@@ -549,7 +697,7 @@ pub(super) fn outbound_send_timeout_failure_for_path(reason: &'static str) -> Se
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn send_encrypted_packet_once(
+async fn send_encrypted_packet_once(
     packet: &EncryptedPeerPacket,
     peers: &PeerManager,
     prefer_direct: bool,
@@ -561,6 +709,7 @@ pub(super) async fn send_encrypted_packet_once(
     direct_business_plan: Option<&DirectBusinessSendPlan>,
     inner_ip_packet_len: usize,
     force_relay: bool,
+    window: SendAdmissionWindow<'_>,
 ) -> SendOutcome {
     let profiler = global_dataplane_profiler();
     // Take one path/generation snapshot atomically. Managed Direct keeps this
@@ -579,6 +728,13 @@ pub(super) async fn send_encrypted_packet_once(
             );
         }
         let generation = peers.current_network_generation_sync();
+        if generation != window.expected_generation && direct_business_plan.is_none() {
+            return SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
+                reason_code: REASON_OUTBOUND_GENERATION_CHANGED,
+                reason: "network generation changed after counter allocation, before handoff"
+                    .into(),
+            });
+        }
         let relay_peer_confirmed = peers
             .is_relay_business_admitted_in_epoch(&_epoch_guard, &packet.peer_id, generation)
             .await;
@@ -608,6 +764,12 @@ pub(super) async fn send_encrypted_packet_once(
             force_relay,
         )
         .await;
+        // These authority/slot awaits still precede every syscall or writer
+        // admission. After the check below, the physical operation owns its
+        // existing terminal-aware timeout and is never externally replayed.
+        if let Some(rejected) = window.rejected() {
+            return rejected;
+        }
         debug!(
             event = "outbound_transport_handoff_started",
             peer_id = %packet.peer_id,

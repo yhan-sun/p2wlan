@@ -287,7 +287,7 @@ mod hard_hard_tests {
             ..BirthdaySweepProgress::default()
         }));
 
-        let report = birthday_terminal_report(&Some(progress), "worker_failed")
+        let report = hard_hard_terminal_report(&Some(progress), "worker_failed", true)
             .await
             .expect("birthday progress must yield a terminal partial report");
         let birthday = report
@@ -338,7 +338,7 @@ mod hard_hard_tests {
             progress.last_send_at_ms = Some(110);
         }
 
-        let report = birthday_terminal_report(&Some(progress), "deadline")
+        let report = hard_hard_terminal_report(&Some(progress), "deadline", true)
             .await
             .expect("live birthday progress must produce a terminal report");
         let birthday = report.birthday.as_ref().unwrap();
@@ -365,6 +365,40 @@ mod hard_hard_tests {
     }
 
     #[tokio::test]
+    async fn predictable_terminal_report_without_handoff_preserves_errors_and_budget() {
+        let progress = Arc::new(tokio::sync::Mutex::new(BirthdaySweepProgress::default()));
+        let live = progress.lock().await.live.clone();
+        {
+            let mut live = live.lock().unwrap();
+            live.counters.targets_assigned = 2;
+            live.counters.targets_attempted = 1;
+            live.counters.logical_probes_attempted = 1;
+            live.counters.logical_probe_send_failures = 1;
+            live.counters.physical_send_errors = 1;
+            live.counters.physical_send_error_bytes = 96;
+            live.counters.budget_skipped = 1;
+        }
+        let report = hard_hard_terminal_report(&Some(progress), "deadline", false)
+            .await
+            .unwrap();
+        assert!(report.birthday.is_none());
+        assert_eq!(report.physical_datagrams_sent, 0);
+        assert_eq!(report.physical_bytes_sent, 0);
+        assert_eq!(report.logical_probes_sent, 0);
+        assert_eq!(report.logical_probes_attempted, 1);
+        assert_eq!(report.physical_send_errors, 1);
+        assert_eq!(report.physical_send_error_bytes, 96);
+        assert_eq!(report.logical_probe_send_failures, 1);
+        assert_eq!(report.budget_skipped, 1);
+        assert_eq!(report.targets_cancelled, 1);
+        assert!(!report.target_processing_completed);
+        assert!(report.first_send_at_ms.is_none());
+        assert!(report.last_send_at_ms.is_none());
+        assert!(report.per_socket_sent.is_empty());
+        assert!(report.sent_target_endpoints.is_empty());
+    }
+
+    #[tokio::test]
     async fn birthday_terminal_report_preserves_scheduler_failure_reason() {
         let progress = Arc::new(tokio::sync::Mutex::new(BirthdaySweepProgress {
             birthday: BirthdaySweepReport {
@@ -379,7 +413,7 @@ mod hard_hard_tests {
             ..BirthdaySweepProgress::default()
         }));
 
-        let report = birthday_terminal_report(&Some(progress), "send_error")
+        let report = hard_hard_terminal_report(&Some(progress), "send_error", true)
             .await
             .expect("scheduler failure must remain observable");
         assert_eq!(
@@ -1984,6 +2018,139 @@ mod hard_hard_tests {
             .await;
     }
 
+    async fn assert_predictable_post_send_terminal(cancel: bool) {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+        set_hard_hard_test_now_ms(None);
+        let (peers, udp, identity, _remote, peer_session_generation) =
+            exact_birthday_runtime_fixture().await;
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // The sender is held after its syscall, so receiving needs no runtime
+        // progress. Wait for native loopback delivery with a wall-clock bound;
+        // a successful handoff does not imply immediate nonblocking readability.
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let remote = receiver.local_addr().unwrap();
+        let session = PunchAttemptDeduplicator::default()
+            .claim(&identity.peer_id)
+            .await
+            .expect("test must own the production predictable punch session");
+        let cancellation = session.cancellation_handle();
+        let (gate, _gate_guard) = crate::udp::install_probe_post_send_gate_for_test();
+        let record = peers
+            .hard_hard_begin_sweep(
+                &identity.peer_id,
+                &identity.session_token,
+                vec![remote],
+                90,
+                0,
+            )
+            .await
+            .expect("fixture must claim the exact attempt and observation owner");
+        let archive = HardHardTerminalArchiveCapture::default();
+        let subscriber = tracing_subscriber::registry().with(archive.clone());
+        let task = tokio::spawn({
+            let udp = udp.clone();
+            let peers = peers.clone();
+            let identity = identity.clone();
+            let measurement = record.measurement.clone();
+            let attempt = record.attempt_count;
+            async move {
+                hard_hard_wait_and_sweep(
+                    udp,
+                    peers,
+                    session,
+                    identity.peer_id.clone(),
+                    peer_session_generation,
+                    identity,
+                    None,
+                    "birthday-runtime-token".to_string(),
+                    vec![remote],
+                    0,
+                    1,
+                    1,
+                    hard_hard_now_ms(),
+                    0,
+                    (1, 7),
+                    Some("probe-session-exact".to_string()),
+                    "test-predictable-post-send",
+                    attempt,
+                    measurement,
+                )
+                .await
+            }
+            .with_subscriber(subscriber)
+        });
+        tokio::time::timeout(Duration::from_secs(1), gate.reached.notified())
+            .await
+            .expect("production predictable send did not reach the post-send gate");
+        // The production gate is after the primary kernel send and before the
+        // compatibility copy or any later await can complete the sender report.
+        let mut bytes = [0; 2_048];
+        let (received_bytes, source) = receiver.recv_from(&mut bytes).unwrap();
+        assert!(received_bytes > 0);
+        assert_eq!(source, identity.socket_local_endpoint);
+        if cancel {
+            cancellation.cancel_for_hard_hard_cleanup();
+        } else {
+            tokio::time::advance(HARD_HARD_SWEEP_DEADLINE).await;
+        }
+        tokio::task::yield_now().await;
+        assert!(!task.await.unwrap());
+
+        let report = birthday_terminal_attempt(&peers, &record, &archive).await;
+        let stop_reason = if cancel {
+            "session_cancelled"
+        } else {
+            "deadline"
+        };
+        assert_eq!(report.terminal_reason, stop_reason);
+        assert_eq!(report.mode, "predictable");
+        assert!(report.birthday_sweep.is_none());
+        assert_eq!(report.socket_index, Some(identity.socket_index));
+        assert_eq!(report.counts.send_success_datagrams, 1);
+        assert_eq!(report.counts.send_success_bytes, received_bytes as u64);
+        assert_eq!(report.counts.logical_probes_attempted, 1);
+        assert_eq!(report.counts.logical_probes_sent, 1);
+        assert_eq!(report.counts.attempted_targets, 1);
+        assert_eq!(report.counts.send_errors, 0);
+        assert!(report.timeline.actual_first_send_at_ms.is_some());
+        assert_ne!(report.failure_class, "missed_schedule");
+        assert!(!peers.is_direct_sync(&identity.peer_id));
+        assert!(report
+            .timeline
+            .encrypted_validation_completed_at_ms
+            .is_none());
+        assert!(report.business_attribution_identity.is_none());
+        assert!(report.counts.logical_probes_sent < report.counts.planned_logical_probes);
+        // Even with every other completion condition granted, this partial
+        // physical ledger cannot qualify as negative strategy evidence.
+        assert!(!hard_hard_complete_unanswered_exploration(
+            &PunchSendReport {
+                packets_sent: report.counts.logical_probes_sent,
+                logical_probes_sent: report.counts.logical_probes_sent,
+                physical_datagrams_sent: report.counts.send_success_datagrams,
+                target_processing_completed: true,
+                ..Default::default()
+            },
+            report.counts.planned_logical_probes as usize,
+            Default::default(),
+        ));
+        gate.release.notify_waiters();
+        udp.detach_all_dynamic_punch_sockets("test_predictable_post_send_terminal")
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_hard_predictable_post_send_deadline_preserves_live_progress() {
+        assert_predictable_post_send_terminal(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_hard_predictable_post_send_cancellation_preserves_live_progress() {
+        assert_predictable_post_send_terminal(true).await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn hard_hard_birthday_primary_send_error_is_recorded_before_cleanup_cancel() {
         let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
@@ -2167,7 +2334,7 @@ mod hard_hard_tests {
     fn hard_hard_attempt_failure_classes_preserve_terminal_evidence() {
         let classify =
             |report: PunchSendReport, probe_rx: UdpProbeRxSnapshot, direct: bool, reason: &str| {
-                hard_hard_attempt_failure_class(&report, probe_rx, direct, reason)
+                hard_hard_attempt_failure_class(&report, 2, probe_rx, direct, reason)
             };
         assert_eq!(
             classify(
@@ -2238,11 +2405,7 @@ mod hard_hard_tests {
         );
         assert_eq!(
             classify(
-                PunchSendReport {
-                    logical_probes_attempted: 1,
-                    physical_datagrams_sent: 1,
-                    ..PunchSendReport::default()
-                },
+                failure_class_complete_ledger(),
                 UdpProbeRxSnapshot::default(),
                 false,
                 "no_authenticated_direct_confirmation"
@@ -3412,4 +3575,6 @@ mod hard_hard_tests {
         );
         assert!(second_cancel.is_cancelled());
     }
+
+    include!("failure_class_tests.rs");
 }

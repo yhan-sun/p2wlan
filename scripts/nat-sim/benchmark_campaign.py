@@ -19,6 +19,8 @@ import signal
 import subprocess
 import sys
 
+from launch_identity import read_launch_evidence, validate_launch_summary
+
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = ROOT / "contracts/network_core_benchmark.json"
@@ -42,9 +44,11 @@ def digest(value: bytes) -> str:
 
 def harness_identity(root: Path) -> dict:
     """Bind both checkouts to the same executable simulation, excluding this coordinator."""
-    names = subprocess.check_output(
+    names = set(subprocess.check_output(
         ["git", "ls-files", "scripts/nat-sim", "scripts/diagnostics-auth.sh", "scripts/relay_keygen.go"],
-        cwd=root, text=True).splitlines()
+        cwd=root, text=True).splitlines())
+    # Include the executable owner even before a new helper is committed.
+    names.add("scripts/nat-sim/launch_identity.py")
     excluded = {"scripts/nat-sim/benchmark_campaign.py", "scripts/nat-sim/test_benchmark_campaign.py"}
     return {name: digest((root / name).read_bytes()) for name in names
             if name not in excluded and Path(name).suffix in {".py", ".sh", ".c", ".go", ".json"}}
@@ -153,6 +157,7 @@ def summarize(plan: dict, records: list[dict]) -> dict:
     seen, sources = set(), {}
     failed_batches = {variant: 0 for variant in plan["variants"]}
     outcomes = {variant: [] for variant in plan["variants"]}
+    launch_available = {variant: 0 for variant in plan["variants"]}
     for record in records:
         variant, batch_id = record["variant"], record["batch_id"]
         if variant not in outcomes or batch_id not in expected or (variant, batch_id) in seen:
@@ -202,6 +207,9 @@ def summarize(plan: dict, records: list[dict]) -> dict:
             if (row.get("environment_overrides") != changes
                     or row.get("network_profile") != {"schema_version": 1, **options}):
                 raise ValueError("run environment or network profile differs from the frozen scenario")
+            launch = row.get("launch_identity")
+            validate_launch_summary(launch, source, successful=row["valid"])
+            launch_available[variant] += int(isinstance(launch, dict) and launch.get("valid") is True)
             outcomes[variant].append(row["valid"] and row["exit_code"] == 0
                                      and not manifest.get("source_changed", False))
         expected_valid = len(runs) == batch["rounds"] and all(row["valid"] for row in runs)
@@ -222,8 +230,15 @@ def summarize(plan: dict, records: list[dict]) -> dict:
             "execution_succeeded": observed == requested and successes == requested and not failed_batches[variant],
             "direct_at_10s": None, "first_business_ms": None, "application_p99_ms": None,
             "unavailable_reason": "normal matrix has no exact connection-start/real-TUN/application proof",
-            "unavailable_run_identity": ["client_binary_sha256_at_launch", "server_binary_sha256_at_launch",
-                                         "config_sha256_at_launch"],
+            "launch_identity_available_runs": launch_available[variant],
+            "configuration_identity_scope": "argv_and_allowlisted_environment",
+            "resolved_runtime_configuration_sha256": None,
+            "resolved_runtime_configuration_unavailable_reason":
+                "launch input identity excludes generated runtime configuration and stdin authorization",
+            "unavailable_run_identity": ["resolved_runtime_configuration_sha256"] +
+                ([] if launch_available[variant] == requested else
+                 ["client_binary_sha256_at_launch", "server_binary_sha256_at_launch",
+                  "configuration_input_sha256_at_launch"]),
         }
     return {"schema_version": 1, "scope": plan["scope"], "retries": 0, "variants": result,
             "complete": all(value["missing"] == 0 for value in result.values()),
@@ -322,6 +337,18 @@ def collect_campaign(path: Path, plan: dict, plan_sha256: str) -> list[dict]:
                         or row.get("profile_sha256") != digest(profile.read_bytes())
                         or row.get("network_profile") != load_json(profile)):
                     raise ValueError("raw network profile differs from the manifest")
+                evidence_dir = manifest_path.parent / f"{row['scenario']}-{index + 1}"
+                if row.get("evidence_dir") != str(evidence_dir):
+                    raise ValueError("launch evidence path differs from its scheduled run directory")
+                frozen_launch = row.get("launch_identity")
+                validate_launch_summary(frozen_launch, campaign["source"], successful=row["valid"])
+                reread_launch = read_launch_evidence(evidence_dir, campaign["source"])
+                if frozen_launch is None:
+                    if ((evidence_dir / "artifact-set.json").exists()
+                            or (evidence_dir / "round-1" / "launches").exists()):
+                        raise ValueError("absent launch identity changed after collection")
+                elif reread_launch != frozen_launch:
+                    raise ValueError("launch identity digest, content, artifact or source changed after collection")
     return campaign["records"]
 
 

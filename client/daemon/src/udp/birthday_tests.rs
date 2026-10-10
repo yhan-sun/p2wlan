@@ -70,6 +70,10 @@ fn probe_failure_kinds_keep_precise_terminal_stop_reasons() {
     let cases = [
         (ProbeSendFailureKind::PhysicalSend, "send_error"),
         (
+            ProbeSendFailureKind::PreHandoffTimeout,
+            "probe_pre_handoff_timeout",
+        ),
+        (
             ProbeSendFailureKind::NetworkGenerationChanged,
             "network_generation_changed",
         ),

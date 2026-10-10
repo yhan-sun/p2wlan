@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from network_conditions import load_profiles
+from test_launch_identity import write_valid_launch_evidence
 
 
 spec = importlib.util.spec_from_file_location("network_matrix", Path(__file__).with_name("run-network-matrix.py"))
@@ -34,6 +35,7 @@ class NetworkMatrixTests(unittest.TestCase):
             root = Path(directory)
             round_dir = root / "round-1"
             round_dir.mkdir()
+            write_valid_launch_evidence(root)
             observed = {side: {"first_usable": {"path": "relay"}, "overlay_verified": 2} for side in ("a", "b")}
             data = {"nat-evidence": {"result": "pass", "observed": observed, "decision": {}},
                     "mapping-evidence": {"valid": True}, "continuity-evidence": {"valid": True},
@@ -78,6 +80,25 @@ class NetworkMatrixTests(unittest.TestCase):
                 MATRIX.main(["--rounds", "33", "--output", str(output)])
             self.assertEqual(raised.exception.code, 2)
             self.assertFalse(output.exists())
+
+    def test_success_requires_launch_identity_even_when_business_and_cleanup_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            round_dir = root / "round-1"
+            round_dir.mkdir()
+            observed = {side: {"first_usable": {"path": "relay"}, "overlay_verified": 2}
+                        for side in ("a", "b")}
+            evidence = {"nat-evidence": {"result": "pass", "observed": observed, "decision": {}},
+                        "mapping-evidence": {"valid": True}, "continuity-evidence": {"valid": True},
+                        "cleanup": {"all_reaped": True, "forced_termination": False}}
+            for name, value in evidence.items():
+                (round_dir / f"{name}.json").write_text(json.dumps(value))
+            for side in ("a", "b"):
+                (round_dir / f"node-{side}.status.json").write_text(json.dumps(
+                    {"peers": [{"state": "relay", "active_path": "relay", "online": True}]}))
+            result = MATRIX.read_case(root, 0)
+            self.assertFalse(result["valid"], "passing business evidence cannot invent launch identity")
+            self.assertTrue(any("launch_identity" in error for error in result["errors"]), result)
 
 
 if __name__ == "__main__":

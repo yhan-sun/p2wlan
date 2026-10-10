@@ -1,6 +1,49 @@
 use super::*;
 use crate::dataplane::{NetworkOutboundResourceSnapshot, PendingQueueResidence};
 
+mod actor;
+use actor::*;
+
+/// Loss metadata travels with the existing FIFO owner, never with retained
+/// ciphertext or a second report task. At saturation, reason totals remain
+/// exact while generation detail is explicitly omitted.
+const MAX_DEFERRED_LOSS_RECORDS: usize = 16;
+
+struct DeferredLoss {
+    generation: Option<u64>,
+    reason: QueueLossReason,
+    packets: usize,
+    bytes: usize,
+    counter_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueueLossReason {
+    QueueFull,
+    GenerationChanged,
+    WorkerStopped,
+    DirectOnly,
+    StartupExpired,
+    Offline,
+    DeliveryExpired,
+    BackpressureExpired,
+}
+
+impl QueueLossReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::QueueFull => REASON_OUTBOUND_QUEUE_FULL,
+            Self::GenerationChanged => REASON_OUTBOUND_GENERATION_CHANGED,
+            Self::WorkerStopped => REASON_OUTBOUND_WORKER_STOPPED,
+            Self::DirectOnly => REASON_DIRECT_ONLY_NO_RELAY,
+            Self::StartupExpired => REASON_RELAY_STARTUP_WAIT_EXPIRED,
+            Self::Offline => REASON_OUTBOUND_PEER_OFFLINE,
+            Self::DeliveryExpired => REASON_OUTBOUND_DELIVERY_DEADLINE,
+            Self::BackpressureExpired => REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE,
+        }
+    }
+}
+
 /// One queued per-peer packet. The queue intentionally contains plaintext
 /// only. An encrypted packet and its emit guard exist only in one lexical send
 /// operation; a retry releases the guard and allocates a fresh counter.
@@ -28,12 +71,6 @@ impl PendingPacket {
     fn stored_bytes(&self) -> usize {
         match self {
             Self::Plain { packet, .. } => packet.packet.len(),
-        }
-    }
-
-    fn peer_id(&self) -> &str {
-        match self {
-            Self::Plain { packet, .. } => &packet.peer_id,
         }
     }
 
@@ -126,6 +163,8 @@ pub(super) struct PeerPendingQueue {
     /// Prevent the maintenance tick from flooding diagnostics while the same
     /// queue remains behind one missing Direct business budget.
     budget_pending_reported: bool,
+    deferred_losses: VecDeque<DeferredLoss>,
+    loss_report_deadline: Option<tokio::time::Instant>,
 }
 
 impl PeerPendingQueue {
@@ -139,6 +178,8 @@ impl PeerPendingQueue {
             retry_after: None,
             delivery_deadline: None,
             budget_pending_reported: false,
+            deferred_losses: VecDeque::new(),
+            loss_report_deadline: None,
         }
     }
 
@@ -191,6 +232,23 @@ impl PeerPendingQueue {
             REASON_OUTBOUND_DELIVERY_DEADLINE
         }
     }
+
+    fn has_work(&self) -> bool {
+        !self.queue.is_empty() || !self.deferred_losses.is_empty()
+    }
+
+    /// The actor keeps only this workflow timing shell while the old packet
+    /// batch is task-owned. New arrivals share its original deadlines.
+    fn timing_shell(&self) -> Self {
+        let mut shell = Self::new();
+        shell.wait_started = self.wait_started;
+        shell.wait_deadline = self.wait_deadline;
+        shell.wait_generation = self.wait_generation;
+        shell.delivery_deadline = self.delivery_deadline;
+        shell.budget_pending_reported = self.budget_pending_reported;
+        shell.loss_report_deadline = self.loss_report_deadline;
+        shell
+    }
 }
 
 /// Bump the relay probe kick so the forced-relay probe loop fires immediately
@@ -216,640 +274,312 @@ pub(crate) async fn run_network_outbound(
     let mut pending: HashMap<String, PeerPendingQueue> = HashMap::new();
     let direct_notify = peers.direct_commit_notify();
     let relay_notify = peers.relay_confirm_notify();
-    let mut committed_path_change_rx = peers.subscribe_committed_business_path_changes();
-    let mut direct_budget_change_rx = peers.subscribe_direct_business_budget_changes();
+    let mut path_changes = peers.subscribe_committed_business_path_changes();
+    let mut budget_changes = peers.subscribe_direct_business_budget_changes();
     let mut relay_available_rx = relay_available_rx;
     let mut ticker = interval(OUTBOUND_MAINTENANCE_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    #[cfg(test)]
+    if let Some(initial_pending) = admission_test_hooks::take_initial_pending() {
+        ticker.tick().await;
+        pending = initial_pending;
+        admission_test_hooks::worker_ready();
+    }
+    let ctx = PeerWorkContext {
+        transport,
+        peers,
+        prefer_direct,
+        udp_transport,
+        relay_transport,
+        startup_wait: relay_startup_wait,
+        timeline,
+        stopping: Arc::new(AtomicBool::new(false)),
+    };
     let mut probe_kick = 0u64;
-    // Each peer owns one independent flush task.  The actor remains free to
-    // receive and route other peers while a relay writer is slow or being
-    // replaced; `flushing_peers` prevents a newer live packet from starting a
-    // second FIFO for the same peer.
-    let mut flush_tasks = JoinSet::new();
-    let mut flushing_peers = HashSet::new();
-    // The cache is owned by this actor so a fast send can never run beside an
-    // older per-peer flush. Negative eligibility tokens keep Public Direct,
-    // Relay-only and otherwise ineligible peers on the existing path without
-    // repeating a connection-map read for every packet.
-    let mut fast_paths: HashMap<String, DirectFastPathEntry> = HashMap::new();
-    let mut fast_path_ineligible: HashMap<String, FastPathEligibilityToken> = HashMap::new();
-    // `relay_available` is a live transport snapshot, while this flag says
-    // that the configured topology requires a relay-first admission window.
-    // Keeping them separate closes the startup race where Direct was admitted
-    // in the few milliseconds before the relay supervisor published its slot.
-    let relay_expected = relay_startup_wait.relay_expected;
     let _ = relay_probe_kick_tx.send(probe_kick);
-
+    let mut flush_tasks = JoinSet::new();
+    let mut flushing_peers = HashMap::new();
+    let mut fast_paths = HashMap::new();
+    let mut fast_path_ineligible = HashMap::new();
     loop {
         tokio::select! {
             packet = outbound_rx.recv() => {
                 let Some(mut packet) = packet else { break; };
-                let profiler = global_dataplane_profiler();
-                let network_dequeued = Instant::now();
+                let now = Instant::now();
                 if let Some(trace) = packet.trace.as_mut() {
-                    trace.network_queue_dequeued = Some(network_dequeued);
+                    trace.network_queue_dequeued = Some(now);
                     if trace.sampled {
-                        profiler.record_network_outbound_resources(
-                            true,
-                            resource_snapshot(outbound_rx.len(), &pending, flush_tasks.len()),
-                        );
+                        global_dataplane_profiler().record_network_outbound_resources(true,
+                            resource_snapshot(outbound_rx.len(), &pending, flush_tasks.len()));
                     }
                     if let Some(enqueued) = trace.transport_queue_send_started {
-                        profiler.record(
-                            trace.sampled,
-                            "tx_network_outbound_queue_wait_us",
-                            network_dequeued.duration_since(enqueued),
-                        );
+                        global_dataplane_profiler().record(trace.sampled,
+                            "tx_network_outbound_queue_wait_us", now.duration_since(enqueued));
                     }
                 }
                 let peer_id = packet.peer_id.clone();
-                let can_try_fast_path = prefer_direct
-                    && peers.is_direct_sync(&peer_id)
-                    && !pending.contains_key(&peer_id)
-                    && !flushing_peers.contains(&peer_id);
-                if can_try_fast_path {
-                    match try_lan_direct_fast_path(
-                        packet,
-                        &transport,
-                        &peers,
-                        prefer_direct,
-                        &udp_transport,
-                        &mut fast_paths,
-                        &mut fast_path_ineligible,
-                    ) {
+                let can_try_fast = ctx.prefer_direct && ctx.peers.is_direct_sync(&peer_id)
+                    && !pending.contains_key(&peer_id) && !flushing_peers.contains_key(&peer_id);
+                let packet = if can_try_fast {
+                    match try_lan_direct_fast_path(packet, &ctx.transport, &ctx.peers,
+                        ctx.prefer_direct, &ctx.udp_transport, &mut fast_paths, &mut fast_path_ineligible) {
                         FastPathAttempt::Sent => continue,
-                        FastPathAttempt::Fallback(packet) => {
-                            handle_ingress(
-                                packet,
-                                &transport,
-                                &peers,
-                                &mut pending,
-                                prefer_direct,
-                                &udp_transport,
-                                &relay_transport,
-                                relay_startup_wait,
-                                relay_expected,
-                                &mut probe_kick,
-                                &relay_probe_kick_tx,
-                                &timeline,
-                                &mut flush_tasks,
-                                &mut flushing_peers,
-                            ).await;
-                        }
+                        FastPathAttempt::Fallback(packet) => packet,
                         FastPathAttempt::Terminal { packet, generation, reason_code, reason } => {
-                            flushing_peers.insert(peer_id.clone());
-                            let transport = transport.clone();
-                            let peers = peers.clone();
-                            let timeline = timeline.clone();
-                            flush_tasks.spawn(async move {
-                                report_fast_path_terminal(
-                                    &transport, &peers, &peer_id, generation,
-                                    packet.packet.len(), reason_code, reason, &timeline, None,
-                                ).await;
+                            let active_peer = peer_id.clone();
+                            let ctx = ctx.clone();
+                            let task = flush_tasks.spawn(async move {
+                                report_fast_path_terminal(&ctx.transport, &ctx.peers, &peer_id,
+                                    generation, packet.packet.len(), reason_code, reason, &ctx.timeline, None).await;
                                 (peer_id, PeerPendingQueue::new())
                             });
+                            flushing_peers.insert(active_peer, task.id());
+                            continue;
                         }
                         FastPathAttempt::TerminalBytes { peer_id, path, local_endpoint, bytes, reason_code, reason } => {
-                            // Terminal physical outcomes never return plaintext.
-                            // Report health/loss in the existing per-peer task
-                            // boundary, so asynchronous cleanup cannot stall
-                            // unrelated ingress or overtake this peer's FIFO.
-                            flushing_peers.insert(peer_id.clone());
-                            let transport = transport.clone();
-                            let peers = peers.clone();
-                            let timeline = timeline.clone();
-                            flush_tasks.spawn(async move {
-                                report_fast_path_terminal(
-                                    &transport, &peers, &peer_id, path.generation,
-                                    bytes, reason_code, reason, &timeline, Some((path, local_endpoint)),
-                                ).await;
+                            let active_peer = peer_id.clone();
+                            let ctx = ctx.clone();
+                            let task = flush_tasks.spawn(async move {
+                                report_fast_path_terminal(&ctx.transport, &ctx.peers, &peer_id,
+                                    path.generation, bytes, reason_code, reason, &ctx.timeline,
+                                    Some((path, local_endpoint))).await;
                                 (peer_id, PeerPendingQueue::new())
                             });
+                            flushing_peers.insert(active_peer, task.id());
+                            continue;
                         }
                     }
-                } else {
-                    handle_ingress(
-                        packet,
-                        &transport,
-                        &peers,
-                        &mut pending,
-                        prefer_direct,
-                        &udp_transport,
-                        &relay_transport,
-                        relay_startup_wait,
-                        relay_expected,
-                        &mut probe_kick,
-                        &relay_probe_kick_tx,
-                        &timeline,
-                        &mut flush_tasks,
-                        &mut flushing_peers,
-                    ).await;
-                }
+                } else { packet };
+                append_ingress(packet, &mut pending, &ctx, &mut probe_kick, &relay_probe_kick_tx);
+                schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
             }
             _ = direct_notify.notified() => {
-                start_ready_peer_flushes(
-                    &transport,
-                    &peers,
-                    &mut pending,
-                    prefer_direct,
-                    &udp_transport,
-                    &relay_transport,
-                    relay_expected,
-                    &timeline,
-                    &mut flush_tasks,
-                    &mut flushing_peers,
-                ).await;
+                #[cfg(test)]
+                admission_test_hooks::before_scan(admission_test_hooks::Scan::DirectNotify).await;
+                schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
             }
             _ = relay_notify.notified() => {
-                start_ready_peer_flushes(
-                    &transport,
-                    &peers,
-                    &mut pending,
-                    prefer_direct,
-                    &udp_transport,
-                    &relay_transport,
-                    relay_expected,
-                    &timeline,
-                    &mut flush_tasks,
-                    &mut flushing_peers,
-                ).await;
+                schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
             }
-            changed = committed_path_change_rx.changed() => {
+            changed = path_changes.changed() => {
                 if changed.is_err() { break; }
-                maintenance(
-                    &transport,
-                    &peers,
-                    &mut pending,
-                    prefer_direct,
-                    &udp_transport,
-                    &relay_transport,
-                    relay_expected,
-                    &timeline,
-                    &mut flush_tasks,
-                    &mut flushing_peers,
-                ).await;
+                schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
             }
-            changed = direct_budget_change_rx.changed() => {
+            changed = budget_changes.changed() => {
                 if changed.is_err() { break; }
-                start_ready_peer_flushes(
-                    &transport,
-                    &peers,
-                    &mut pending,
-                    prefer_direct,
-                    &udp_transport,
-                    &relay_transport,
-                    relay_expected,
-                    &timeline,
-                    &mut flush_tasks,
-                    &mut flushing_peers,
-                ).await;
+                schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
             }
             changed = relay_available_rx.changed() => {
                 if changed.is_err() { break; }
-                // A relay came up (or cleared): kick the probe loop so a
-                // waiting peer's confirmation is not delayed by the probe
-                // cadence, then flush whatever became usable.
                 bump_probe_kick(&mut probe_kick, &relay_probe_kick_tx);
-                start_ready_peer_flushes(
-                    &transport,
-                    &peers,
-                    &mut pending,
-                    prefer_direct,
-                    &udp_transport,
-                    &relay_transport,
-                    relay_expected,
-                    &timeline,
-                    &mut flush_tasks,
-                    &mut flushing_peers,
-                ).await;
+                schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
             }
             _ = ticker.tick() => {
-                maintenance(
-                    &transport,
-                    &peers,
-                    &mut pending,
-                    prefer_direct,
-                    &udp_transport,
-                    &relay_transport,
-                    relay_expected,
-                    &timeline,
-                    &mut flush_tasks,
-                    &mut flushing_peers,
-                ).await;
+                #[cfg(test)]
+                admission_test_hooks::before_scan(admission_test_hooks::Scan::Ticker).await;
+                schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
             }
-            flush_result = flush_tasks.join_next(), if !flush_tasks.is_empty() => {
-                match flush_result {
+            result = flush_tasks.join_next(), if !flush_tasks.is_empty() => {
+                match result {
                     Some(Ok((peer_id, queue))) => {
                         flushing_peers.remove(&peer_id);
-                        merge_completed_flush(&mut pending, peer_id, queue, &peers, &timeline).await;
-                        start_ready_peer_flushes(
-                            &transport,
-                            &peers,
-                            &mut pending,
-                            prefer_direct,
-                            &udp_transport,
-                            &relay_transport,
-                            relay_expected,
-                            &timeline,
-                            &mut flush_tasks,
-                            &mut flushing_peers,
-                        ).await;
+                        merge_peer_work(&mut pending, peer_id, queue, &ctx);
+                        #[cfg(test)]
+                        admission_test_hooks::peer_completed(&pending, flushing_peers.len());
+                        schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
                     }
                     Some(Err(err)) => {
-                        // A flush task contains only bounded transport work;
-                        // a panic is still a lifecycle loss and must be
-                        // visible instead of silently deleting its queue.
-                        warn!("outbound per-peer flush task failed: {err}");
+                        let failed_peer = flushing_peers.iter()
+                            .find(|(_, task)| **task == err.id()).map(|(peer, _)| peer.clone());
+                        if let Some(peer) = failed_peer.as_ref() { flushing_peers.remove(peer); }
+                        ctx.timeline.emit("outbound_peer_task_failed", None, None,
+                            Some(format!("peer={failed_peer:?} accounting_complete=false old_task_fifo_unknown=true owner_released=true")));
+                        warn!(event="outbound_peer_task_failed", peer_id=?failed_peer, error=%err,
+                            "failed owner released; old task FIFO accounting remains unconfirmed");
+                        schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
                     }
                     None => {}
                 }
             }
         }
     }
-
-    // Finish already-started per-peer tasks before accounting their returned
-    // queues.  This is a bounded shutdown path: each transport handoff has a
-    // hard timeout and no task owns an encrypted retry packet.
+    // Closing first also bounds the final channel drain under live producers.
+    // Do not cancel already-started physical work with a replayable timeout.
+    outbound_rx.close();
+    ctx.stopping.store(true, Ordering::Release);
+    while let Ok(packet) = outbound_rx.try_recv() {
+        append_ingress(
+            packet,
+            &mut pending,
+            &ctx,
+            &mut probe_kick,
+            &relay_probe_kick_tx,
+        );
+    }
     while let Some(result) = flush_tasks.join_next().await {
         match result {
-            Ok((peer_id, queue)) => {
-                merge_completed_flush(&mut pending, peer_id, queue, &peers, &timeline).await;
-            }
-            Err(err) => warn!("outbound per-peer flush task failed during shutdown: {err}"),
+            Ok((peer_id, queue)) => merge_peer_work(&mut pending, peer_id, queue, &ctx),
+            Err(err) => warn!(event="outbound_peer_task_failed", error=%err,
+                "task failed during shutdown; accounting remains unconfirmed"),
         }
     }
-
-    // The worker owns the only mutable copy of these per-peer queues.  When
-    // either ingress or relay watch closes, account every still-parked packet
-    // before returning; otherwise a graceful task shutdown would be a silent
-    // loss path that never reaches /status.stats or the timeline.
-    let queued_peers = pending.len();
-    let queued_packets: usize = pending.values().map(|entry| entry.queue.len()).sum();
-    drop_all_pending_queues(
-        &peers,
-        &mut pending,
-        REASON_OUTBOUND_WORKER_STOPPED,
-        &timeline,
-    )
-    .await;
-    timeline.emit(
+    // Reuse the same task owner for final discard/reporting. Every report has
+    // an overall two-second deadline; incomplete phases stay explicit.
+    for (peer_id, queue) in pending.drain() {
+        flush_tasks.spawn(process_peer_queue(peer_id, queue, ctx.clone()));
+    }
+    while let Some(result) = flush_tasks.join_next().await {
+        if let Ok((peer_id, queue)) = result {
+            report_shutdown_unknown(&queue, &peer_id, &ctx);
+        }
+    }
+    ctx.timeline.emit(
         "outbound_worker_stopped",
         None,
         Some(REASON_OUTBOUND_WORKER_STOPPED),
-        Some(format!("peers={queued_peers} packets={queued_packets}")),
+        Some("all packet owners stopped; incomplete accounting is reported explicitly".to_string()),
     );
 }
 
-/// Route one RAW packet: encrypt + send immediately when its peer already has
-/// a usable path AND a WireGuard session; otherwise park it (PLAINTEXT — no
-/// counter, no emit lock) in the peer's bounded queue and start the peer's
-/// SHARED startup deadline (first packet of a peer + generation only).
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_ingress(
-    packet: OutboundPacket,
-    transport: &WireGuardTransport,
-    peers: &Arc<PeerManager>,
-    pending: &mut HashMap<String, PeerPendingQueue>,
-    prefer_direct: bool,
-    udp_transport: &Arc<RwLock<Option<UdpTransport>>>,
-    relay_transport: &Arc<RwLock<Option<RelayTransport>>>,
-    relay_startup_wait: RelayStartupWait,
-    relay_expected: bool,
-    probe_kick: &mut u64,
-    relay_probe_kick_tx: &watch::Sender<u64>,
-    timeline: &Arc<ConnectionTimeline>,
-    flush_tasks: &mut JoinSet<(String, PeerPendingQueue)>,
-    flushing_peers: &mut HashSet<String>,
-) {
-    let peer_id = packet.peer_id.clone();
-    let generation = peers.current_network_generation().await;
-    if let Some((nonce, sequence, direction)) = overlay_packet_identity(&packet.packet) {
-        debug!(
-            event = "outbound_overlay_queued",
-            peer_id = %peer_id,
-            nonce = format_args!("{nonce:#x}"),
-            sequence,
-            direction,
-            generation,
-            "raw overlay packet entered the per-peer FIFO"
-        );
-    }
-    // A waiting queue whose generation advanced mid-wait is dropped first
-    // (old NAT mappings are invalid); the packet below starts a fresh wait.
-    if pending.get(&peer_id).is_some_and(|entry| {
-        entry.wait_generation.is_some() && entry.wait_generation != Some(generation)
-    }) {
-        drop_pending_queue(
-            peers,
-            pending.remove(&peer_id),
-            REASON_OUTBOUND_GENERATION_CHANGED,
-            timeline,
-        )
-        .await;
+/// Deterministic actor scheduling only for the admission contention tests.
+/// The seed is transferred once into the existing actor-owned FIFO; it is
+/// never a second live queue and is absent from production builds.
+#[cfg(test)]
+pub(super) mod admission_test_hooks {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+    use tokio::sync::Semaphore;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::network_outbound) enum Scan {
+        Ticker,
+        DirectNotify,
     }
 
-    let relay_available = relay_transport.read().await.is_some();
-    let usable = peers
-        .is_data_path_admitted_for_generation(
-            &peer_id,
-            generation,
-            relay_available || relay_expected,
-        )
-        .await;
-    // Every business packet, including a packet arriving after confirmation,
-    // enters the same per-peer FIFO. This is the critical distinction from the
-    // old relay-first implementation, which could send a new live packet
-    // around an older retry/session flush.
-    let entry = pending
-        .entry(peer_id.clone())
-        .or_insert_with(PeerPendingQueue::new);
-    let (mut dropped_entries, dropped_bytes) = entry.enqueue(PendingPacket::plain(packet));
-    let dropped_packets = dropped_entries.len();
-    debug!(
-        event = "outbound_fifo_state",
-        peer_id = %peer_id,
-        generation,
-        queue_depth = entry.queue.len(),
-        queue_bytes = entry.bytes,
-        wait_started = entry.wait_started.is_some(),
-        wait_generation = ?entry.wait_generation,
-        dropped_packets,
-        dropped_bytes,
-        "raw business packet appended to the per-peer FIFO"
-    );
-    if dropped_packets > 0 {
-        for dropped in &mut dropped_entries {
-            let _ = peers.emit_local_mtu_feedback(
-                &peer_id,
-                dropped.raw_packet(),
-                crate::business_mtu::LocalMtuFeedbackKind::Unreachable,
-            );
-            record_pending_residence(
-                dropped.take_pending_residence(),
-                "tx_pending_residence_dropped_us",
-            );
-        }
-        record_overflow_drop(
-            peers,
-            &peer_id,
-            dropped_packets,
-            dropped_bytes,
-            entry,
-            timeline,
-        )
-        .await;
+    pub(in crate::network_outbound) struct WorkerHook {
+        initial_pending: Mutex<Option<HashMap<String, PeerPendingQueue>>>,
+        events: mpsc::UnboundedSender<Option<Scan>>,
+        pause_scan: Option<Scan>,
+        armed: AtomicBool,
+        release: Semaphore,
+        completions: mpsc::UnboundedSender<Completion>,
+        completion_receiver: Mutex<Option<mpsc::UnboundedReceiver<Completion>>>,
     }
 
-    if entry.queue.is_empty() {
-        pending.remove(&peer_id);
-        return;
+    #[derive(Debug)]
+    pub(in crate::network_outbound) struct Completion {
+        pub(in crate::network_outbound) actor_packets: usize,
+        pub(in crate::network_outbound) loss_records: usize,
+        pub(in crate::network_outbound) active_tasks: usize,
     }
 
-    let should_start_wait = entry.wait_started.is_none() && !usable;
-    if should_start_wait {
-        match relay_startup_wait.timeout {
-            None => {
-                // Direct-only configuration: never wait for a relay that is
-                // not configured/expected.  Drop every parked packet with a
-                // stable reason code.
-                drop_pending_queue(
-                    peers,
-                    pending.remove(&peer_id),
-                    REASON_DIRECT_ONLY_NO_RELAY,
-                    timeline,
-                )
-                .await;
-                debug!(
-                    "Outbound packet for peer {} dropped: direct-only config has no relay and direct is not confirmed",
-                    peer_id
-                );
-            }
-            Some(timeout) => {
-                entry.wait_started = Some(Instant::now());
-                entry.wait_deadline = Some(Instant::now() + timeout);
-                entry.wait_generation = Some(generation);
-                // Kick the forced-relay probe loop: the peer's first business
-                // packet is waiting and the relay path is not confirmed yet.
-                bump_probe_kick(probe_kick, relay_probe_kick_tx);
-                let queue_head = entry
-                    .queue
-                    .front()
-                    .map(|packet| raw_packet_summary(packet.raw_packet()))
-                    .unwrap_or_else(|| "empty".to_string());
-                timeline.emit(
-                    "outbound_first_packet_wait_started",
-                    None,
-                    None,
-                    Some(format!(
-                        "peer={peer_id} generation={generation} wait_timeout_ms={} queued={} queue_head={queue_head}",
-                        timeout.as_millis(),
-                        entry.queue.len()
-                    )),
-                );
-            }
-        }
+    tokio::task_local! {
+        pub(in crate::network_outbound) static WORKER: Arc<WorkerHook>;
     }
 
-    if usable {
-        if let Some(entry) = pending.get_mut(&peer_id) {
-            // Even a queue created after a confirmed path belongs to this
-            // generation.  Recording it here lets generation advance cancel
-            // a retry that was parked after a path/transport change instead
-            // of leaving it behind an apparently healthy peer.
-            entry.wait_generation = Some(generation);
-            entry
-                .delivery_deadline
-                .get_or_insert_with(|| Instant::now() + OUTBOUND_DELIVERY_DEADLINE);
-        }
-        start_ready_peer_flushes(
-            transport,
-            peers,
-            pending,
-            prefer_direct,
-            udp_transport,
-            relay_transport,
-            relay_expected,
-            timeline,
-            flush_tasks,
-            flushing_peers,
-        )
-        .await;
-    }
-}
-
-/// Count a queue-overflow loss structurally and emit the timeline event.
-pub(super) async fn record_overflow_drop(
-    peers: &PeerManager,
-    peer_id: &str,
-    dropped_packets: usize,
-    dropped_bytes: usize,
-    entry: &PeerPendingQueue,
-    timeline: &ConnectionTimeline,
-) {
-    peers
-        .record_outbound_drop(REASON_OUTBOUND_QUEUE_FULL, dropped_packets, dropped_bytes)
-        .await;
-    record_loss_event(
-        peers,
-        "drop",
-        peer_id,
-        entry
-            .wait_generation
-            .unwrap_or_else(|| peers.current_network_generation_sync()),
-        REASON_OUTBOUND_QUEUE_FULL,
-        dropped_packets,
-        dropped_bytes,
-        timeline,
-    )
-    .await;
-    timeline.emit(
-        "outbound_packet_dropped",
-        None,
-        Some(REASON_OUTBOUND_QUEUE_FULL),
-        Some(format!(
-            "peer={peer_id} dropped={dropped_packets} bytes={dropped_bytes} reason={REASON_OUTBOUND_QUEUE_FULL} queued={} queued_bytes={} queue_head={}",
-            entry.queue.len(),
-            entry.bytes,
-            entry
-                .queue
-                .front()
-                .map(|packet| raw_packet_summary(packet.raw_packet()))
-                .unwrap_or_else(|| "empty".to_string())
-        )),
-    );
-}
-
-/// Start one independent flush task for every peer that became usable
-/// (DirectConfirmed or RelayPeerConfirmed). Only plaintext is retained
-/// between attempts; encrypted packets never live in the retry queue.
-///
-/// The previous implementation awaited all peer flushes in this actor. That
-/// made the actor stop receiving new TUN packets while one relay writer was
-/// stalled. The task set below preserves one FIFO owner per peer while the
-/// actor remains fair to other peers.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn start_ready_peer_flushes(
-    transport: &WireGuardTransport,
-    peers: &Arc<PeerManager>,
-    pending: &mut HashMap<String, PeerPendingQueue>,
-    prefer_direct: bool,
-    udp_transport: &Arc<RwLock<Option<UdpTransport>>>,
-    relay_transport: &Arc<RwLock<Option<RelayTransport>>>,
-    relay_expected: bool,
-    timeline: &Arc<ConnectionTimeline>,
-    flush_tasks: &mut JoinSet<(String, PeerPendingQueue)>,
-    flushing_peers: &mut HashSet<String>,
-) {
-    let now = Instant::now();
-    let delivery_expired: Vec<(String, &'static str)> = pending
-        .iter()
-        .filter(|(_, entry)| {
-            !entry.queue.is_empty()
-                && entry
-                    .delivery_deadline
-                    .is_some_and(|deadline| now >= deadline)
-        })
-        .map(|(peer_id, entry)| (peer_id.clone(), entry.delivery_deadline_reason()))
-        .collect();
-    for (peer_id, reason_code) in delivery_expired {
-        drop_pending_queue(peers, pending.remove(&peer_id), reason_code, timeline).await;
-    }
-
-    let (ready_ids, budget_pending_ids): (Vec<String>, Vec<String>) = {
-        let mut ready = Vec::new();
-        let mut budget_pending = Vec::new();
-        for (peer_id, entry) in pending.iter() {
-            if entry.queue.is_empty() {
-                continue;
-            }
-            if flushing_peers.contains(peer_id) {
-                continue;
-            }
-            if entry.retry_after.is_some_and(|at| at > Instant::now()) {
-                continue;
-            }
-            let generation = peers.current_network_generation().await;
-            let relay_available = relay_transport.read().await.is_some();
-            if peers
-                .is_data_path_admitted_for_generation(
-                    peer_id,
-                    generation,
-                    relay_available || relay_expected,
-                )
-                .await
-            {
-                if direct_business_budget_ready_for_active_path(
-                    peers,
-                    peer_id,
-                    udp_transport,
-                    generation,
-                    relay_available,
-                )
-                .await
-                {
-                    ready.push(peer_id.clone());
-                } else {
-                    budget_pending.push(peer_id.clone());
-                }
-            }
-        }
-        (ready, budget_pending)
-    };
-    // A queue can be created while relay confirmation is still pending, so
-    // `handle_ingress` cannot start its delivery deadline at that time.  Once
-    // the same-generation path becomes usable, bind one deadline to the whole
-    // queued batch before handing ownership to a flush task.  Without this
-    // boundary a slow writer can make a 256-packet backlog drain for tens of
-    // seconds even though the startup wait itself was bounded.
-    let delivery_deadline = now + OUTBOUND_DELIVERY_DEADLINE;
-    for peer_id in ready_ids.iter().chain(budget_pending_ids.iter()) {
-        if let Some(entry) = pending.get_mut(peer_id) {
-            entry.delivery_deadline.get_or_insert(delivery_deadline);
-            if !entry.budget_pending_reported && budget_pending_ids.contains(peer_id) {
-                timeline.emit(
-                    "direct_business_budget_pending",
-                    Some("direct"),
-                    Some(REASON_DIRECT_BUDGET_PENDING),
-                    Some(format!(
-                        "peer={peer_id} queued={} queued_bytes={} ttl_ms={}",
-                        entry.queue.len(),
-                        entry.bytes,
-                        OUTBOUND_DELIVERY_DEADLINE.as_millis(),
-                    )),
-                );
-                entry.budget_pending_reported = true;
-            }
-        }
-    }
-    // Remove each ready queue before starting its task. Each queue remains
-    // single-owner, preserving FIFO and retry-at-front invariants, while a
-    // stalled relay writer for one peer cannot hold up another peer's ingress.
-    let ready_queues: Vec<(String, PeerPendingQueue)> = ready_ids
-        .into_iter()
-        .filter_map(|peer_id| pending.remove(&peer_id).map(|queue| (peer_id, queue)))
-        .collect();
-    for (peer_id, queue) in ready_queues {
-        flushing_peers.insert(peer_id.clone());
-        let task_transport = transport.clone();
-        let task_peers = peers.clone();
-        let task_udp_transport = udp_transport.clone();
-        let task_relay_transport = relay_transport.clone();
-        let task_timeline = timeline.clone();
-        flush_tasks.spawn(async move {
-            flush_one_peer(
-                peer_id,
-                queue,
-                task_transport,
-                task_peers,
-                prefer_direct,
-                task_udp_transport,
-                task_relay_transport,
-                relay_expected,
-                task_timeline,
+    impl WorkerHook {
+        pub(in crate::network_outbound) fn new(
+            initial_pending: HashMap<String, PeerPendingQueue>,
+            pause_scan: Option<Scan>,
+        ) -> (Arc<Self>, mpsc::UnboundedReceiver<Option<Scan>>) {
+            let (events, receiver) = mpsc::unbounded_channel();
+            let (completions, completion_receiver) = mpsc::unbounded_channel();
+            (
+                Arc::new(Self {
+                    initial_pending: Mutex::new(Some(initial_pending)),
+                    events,
+                    pause_scan,
+                    armed: AtomicBool::new(true),
+                    release: Semaphore::new(0),
+                    completions,
+                    completion_receiver: Mutex::new(Some(completion_receiver)),
+                }),
+                receiver,
             )
-            .await
+        }
+
+        pub(in crate::network_outbound) fn release_scan(&self) {
+            self.release.add_permits(1);
+        }
+
+        pub(in crate::network_outbound) fn completion_receiver(
+            &self,
+        ) -> mpsc::UnboundedReceiver<Completion> {
+            self.completion_receiver.lock().unwrap().take().unwrap()
+        }
+    }
+
+    pub(in crate::network_outbound) fn confirmed_direct_queue(
+        generation: u64,
+        packet: OutboundPacket,
+    ) -> HashMap<String, PeerPendingQueue> {
+        let peer_id = packet.peer_id.clone();
+        let mut queue = PeerPendingQueue::new();
+        queue.wait_generation = Some(generation);
+        queue.delivery_deadline = Some(Instant::now() + OUTBOUND_DELIVERY_DEADLINE);
+        assert!(queue.enqueue(PendingPacket::plain(packet)).0.is_empty());
+        HashMap::from([(peer_id, queue)])
+    }
+
+    pub(in crate::network_outbound) fn set_delivery_deadline(
+        queue: &mut PeerPendingQueue,
+        deadline: Instant,
+    ) {
+        queue.delivery_deadline = Some(deadline);
+    }
+
+    pub(in crate::network_outbound) fn queue_view(
+        queue: &PeerPendingQueue,
+    ) -> (Option<Instant>, Vec<Vec<u8>>) {
+        (
+            queue.delivery_deadline,
+            queue
+                .queue
+                .iter()
+                .map(|packet| packet.raw_packet().to_vec())
+                .collect(),
+        )
+    }
+
+    pub(super) fn take_initial_pending() -> Option<HashMap<String, PeerPendingQueue>> {
+        WORKER
+            .try_with(|hook| hook.initial_pending.lock().unwrap().take())
+            .ok()
+            .flatten()
+    }
+
+    pub(super) fn worker_ready() {
+        let _ = WORKER.try_with(|hook| {
+            let _ = hook.events.send(None);
         });
+    }
+
+    pub(super) fn peer_completed(pending: &HashMap<String, PeerPendingQueue>, active_tasks: usize) {
+        let _ = WORKER.try_with(|hook| {
+            let _ = hook.completions.send(Completion {
+                actor_packets: pending.values().map(|queue| queue.queue.len()).sum(),
+                loss_records: pending
+                    .values()
+                    .map(|queue| queue.deferred_losses.len())
+                    .sum(),
+                active_tasks,
+            });
+        });
+    }
+
+    pub(super) async fn before_scan(scan: Scan) {
+        let hook = WORKER
+            .try_with(|hook| {
+                (hook.pause_scan == Some(scan) && hook.armed.swap(false, Ordering::SeqCst))
+                    .then(|| hook.clone())
+            })
+            .ok()
+            .flatten();
+        if let Some(hook) = hook {
+            let _ = hook.events.send(Some(scan));
+            hook.release.acquire().await.unwrap().forget();
+        }
     }
 }
 
@@ -875,12 +605,55 @@ fn record_outbound_flush_batch(
     debug!(peer_id, flushed, remaining, "Flushed a queued packet batch");
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn flush_one_peer(
+    peer_id: String,
+    queue: PeerPendingQueue,
+    transport: WireGuardTransport,
+    peers: Arc<PeerManager>,
+    prefer_direct: bool,
+    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    relay_expected: bool,
+    timeline: Arc<ConnectionTimeline>,
+) -> (String, PeerPendingQueue) {
+    let ctx = PeerWorkContext {
+        transport: transport.clone(),
+        peers: peers.clone(),
+        prefer_direct,
+        udp_transport: udp_transport.clone(),
+        relay_transport: relay_transport.clone(),
+        startup_wait: RelayStartupWait {
+            relay_expected,
+            timeout: None,
+        },
+        timeline: timeline.clone(),
+        stopping: Arc::new(AtomicBool::new(false)),
+    };
+    let (peer_id, mut remaining) = flush_one_peer_until_stopped(
+        peer_id,
+        queue,
+        transport,
+        peers,
+        prefer_direct,
+        udp_transport,
+        relay_transport,
+        relay_expected,
+        timeline,
+        ctx.stopping.clone(),
+    )
+    .await;
+    report_deferred_losses(&mut remaining, &peer_id, &ctx).await;
+    (peer_id, remaining)
+}
+
 /// Flush one peer's queue. This is the sole owner of that peer's queue while
 /// it is in flight. A terminal/uncertain handoff stops the batch immediately:
 /// that counter is consumed, while later plaintext packets remain available
 /// for a replacement path and receive fresh counters.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn flush_one_peer(
+pub(super) async fn flush_one_peer_until_stopped(
     peer_id: String,
     mut queue: PeerPendingQueue,
     transport: WireGuardTransport,
@@ -890,59 +663,70 @@ pub(super) async fn flush_one_peer(
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     relay_expected: bool,
     timeline: Arc<ConnectionTimeline>,
+    stopping: Arc<AtomicBool>,
 ) -> (String, PeerPendingQueue) {
+    let ctx = PeerWorkContext {
+        transport: transport.clone(),
+        peers: peers.clone(),
+        prefer_direct,
+        udp_transport: udp_transport.clone(),
+        relay_transport: relay_transport.clone(),
+        startup_wait: RelayStartupWait {
+            relay_expected,
+            timeout: None,
+        },
+        timeline: timeline.clone(),
+        stopping,
+    };
     let mut flushed = 0usize;
-    while flushed < MAX_FLUSH_PER_PEER_PER_TICK {
-        if !queue.queue.is_empty()
-            && queue
-                .delivery_deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            let reason_code = queue.delivery_deadline_reason();
-            if flushed > 0 {
-                record_outbound_flush_batch(
-                    &timeline,
-                    &peers,
+    while flushed < MAX_FLUSH_PER_PEER_PER_TICK && !queue.queue.is_empty() {
+        let generation = peers.current_network_generation_sync();
+        let expired = queue
+            .delivery_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        let reason = if ctx.stopping.load(Ordering::Acquire) {
+            Some(QueueLossReason::WorkerStopped)
+        } else if queue.wait_generation.is_some_and(|old| old != generation) {
+            Some(QueueLossReason::GenerationChanged)
+        } else if expired {
+            Some(
+                if queue.delivery_deadline_reason() == REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE {
+                    QueueLossReason::BackpressureExpired
+                } else {
+                    QueueLossReason::DeliveryExpired
+                },
+            )
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            discard_packets(&mut queue, &peer_id, reason, &ctx);
+            break;
+        }
+        // Only untouched plaintext remains in the FIFO during this bounded
+        // authority wait. No ciphertext or send future is cancelled here.
+        let admitted = timeout(admission_bound(&queue), async {
+            let relay_available = relay_transport.read().await.is_some();
+            peers
+                .is_data_path_admitted_for_generation(
                     &peer_id,
-                    flushed,
-                    queue.queue.len(),
-                );
-            }
-            drop_pending_queue(&peers, Some(queue), reason_code, &timeline).await;
-            return (peer_id, PeerPendingQueue::new());
+                    generation,
+                    relay_available || relay_expected,
+                )
+                .await
+        })
+        .await;
+        if !matches!(admitted, Ok(true)) {
+            queue.retry_after = Some(Instant::now() + OUTBOUND_RETRY_DELAY);
+            break;
+        }
+        if ctx.stopping.load(Ordering::Acquire) {
+            discard_packets(&mut queue, &peer_id, QueueLossReason::WorkerStopped, &ctx);
+            break;
         }
         let Some(front) = queue.pop_front() else {
             break;
         };
-
-        let generation = peers.current_network_generation().await;
-        if queue
-            .wait_generation
-            .is_some_and(|queued_generation| queued_generation != generation)
-        {
-            queue.push_front(front);
-            drop_pending_queue(
-                &peers,
-                Some(queue),
-                REASON_OUTBOUND_GENERATION_CHANGED,
-                &timeline,
-            )
-            .await;
-            return (peer_id, PeerPendingQueue::new());
-        }
-
-        let relay_available = relay_transport.read().await.is_some();
-        let usable = peers
-            .is_data_path_admitted_for_generation(
-                &peer_id,
-                generation,
-                relay_available || relay_expected,
-            )
-            .await;
-        if !usable {
-            queue.push_front(front);
-            break;
-        }
 
         let PendingPacket::Plain {
             packet,
@@ -956,7 +740,7 @@ pub(super) async fn flush_one_peer(
         if let Some(residence) = pending_residence.as_mut() {
             residence.pause();
         }
-        match encrypt_then_send(
+        match encrypt_then_send_with_deadline(
             packet,
             &transport,
             &peers,
@@ -965,6 +749,8 @@ pub(super) async fn flush_one_peer(
             &udp_transport,
             &relay_transport,
             relay_expected,
+            queue.delivery_deadline,
+            Some(&ctx.stopping),
         )
         .await
         {
@@ -1115,97 +901,20 @@ pub(super) async fn flush_one_peer(
     (peer_id, queue)
 }
 
-/// Merge only the current generation through the same admission policy used
-/// by live ingress. Surviving packets stay FIFO; losses retain their reason.
+#[cfg(test)]
 pub(super) async fn merge_completed_flush(
     pending: &mut HashMap<String, PeerPendingQueue>,
     peer_id: String,
-    mut completed: PeerPendingQueue,
-    peers: &PeerManager,
-    timeline: &ConnectionTimeline,
+    completed: PeerPendingQueue,
+    peers: &Arc<PeerManager>,
+    timeline: &Arc<ConnectionTimeline>,
 ) {
-    let generation = peers.current_network_generation_sync();
-    if pending.get(&peer_id).is_some_and(|entry| {
-        entry.wait_generation.is_some() && entry.wait_generation != Some(generation)
-    }) {
-        drop_pending_queue(
-            peers,
-            pending.remove(&peer_id),
-            REASON_OUTBOUND_GENERATION_CHANGED,
-            timeline,
-        )
-        .await;
+    let ctx = queue_test_context(peers.clone(), timeline.clone(), true);
+    merge_peer_work(pending, peer_id.clone(), completed, &ctx);
+    if let Some(queue) = pending.get_mut(&peer_id) {
+        report_deferred_losses(queue, &peer_id, &ctx).await;
     }
-    if completed.wait_generation.is_some()
-        && completed.wait_generation != Some(peers.current_network_generation_sync())
-    {
-        drop_pending_queue(
-            peers,
-            Some(completed),
-            REASON_OUTBOUND_GENERATION_CHANGED,
-            timeline,
-        )
-        .await;
-        return;
-    }
-
-    let Some(mut newer) = pending.remove(&peer_id) else {
-        if !completed.queue.is_empty() {
-            pending.insert(peer_id, completed);
-        }
-        return;
-    };
-
-    if completed.queue.is_empty() {
-        pending.insert(peer_id, newer);
-        return;
-    }
-
-    let mut dropped_packets = 0usize;
-    let mut dropped_bytes = 0usize;
-    while let Some(packet) = newer.pop_front() {
-        let (dropped, bytes) = completed.enqueue(packet);
-        dropped_packets = dropped_packets.saturating_add(dropped.len());
-        dropped_bytes = dropped_bytes.saturating_add(bytes);
-        for mut packet in dropped {
-            let _ = peers.emit_local_mtu_feedback(
-                &peer_id,
-                packet.raw_packet(),
-                crate::business_mtu::LocalMtuFeedbackKind::Unreachable,
-            );
-            record_pending_residence(
-                packet.take_pending_residence(),
-                "tx_pending_residence_dropped_us",
-            );
-        }
-    }
-    if completed.wait_started.is_none() {
-        completed.wait_started = newer.wait_started;
-    }
-    if completed.wait_deadline.is_none() {
-        completed.wait_deadline = newer.wait_deadline;
-    }
-    if completed.wait_generation.is_none() {
-        completed.wait_generation = newer.wait_generation;
-    }
-    if completed.retry_after.is_none() {
-        completed.retry_after = newer.retry_after;
-    }
-    if completed.delivery_deadline.is_none() {
-        completed.delivery_deadline = newer.delivery_deadline;
-    }
-    if dropped_packets > 0 {
-        record_overflow_drop(
-            peers,
-            &peer_id,
-            dropped_packets,
-            dropped_bytes,
-            &completed,
-            timeline,
-        )
-        .await;
-    }
-    pending.insert(peer_id, completed);
+    pending.retain(|_, queue| queue.has_work());
 }
 
 /// Record a pre-handoff failure and re-park plaintext at the FRONT of the
@@ -1225,23 +934,10 @@ pub(super) async fn record_retry_and_repark(
     reason: String,
     timeline: &ConnectionTimeline,
 ) {
-    transport
-        .record_outbound_send_failure(reason_code, 1, packet.packet.len())
-        .await;
+    let bytes = packet.packet.len();
     let generation = entry
         .wait_generation
         .unwrap_or_else(|| peers.current_network_generation_sync());
-    record_loss_event(
-        peers,
-        "send_failure",
-        peer_id,
-        generation,
-        reason_code,
-        1,
-        packet.packet.len(),
-        timeline,
-    )
-    .await;
     if let Some(residence) = pending_residence.as_mut() {
         residence.resume();
     }
@@ -1255,6 +951,37 @@ pub(super) async fn record_retry_and_repark(
     entry
         .delivery_deadline
         .get_or_insert_with(|| Instant::now() + OUTBOUND_DELIVERY_DEADLINE);
+    let mut counter_complete = false;
+    let report = async {
+        transport
+            .record_outbound_send_failure(reason_code, 1, bytes)
+            .await;
+        counter_complete = true;
+        record_loss_event(
+            peers,
+            "send_failure",
+            peer_id,
+            generation,
+            reason_code,
+            1,
+            bytes,
+            timeline,
+        )
+        .await;
+    };
+    if timeout(OUTBOUND_SEND_TIMEOUT, report).await.is_err() {
+        timeline.emit("outbound_retry_report_timeout", None, Some(reason_code),
+            Some(format!("peer={peer_id} generation={generation} bytes={bytes} counter_complete={counter_complete} accounting_complete=false plaintext_retained=true")));
+        warn!(
+            event = "outbound_retry_report_timeout",
+            peer_id,
+            generation,
+            bytes,
+            reason_code,
+            counter_complete,
+            "retry accounting incomplete; original plaintext remains in FIFO"
+        );
+    }
     debug!(
         event = "outbound_plaintext_reparked",
         peer_id = %peer_id,
@@ -1290,16 +1017,16 @@ pub(super) async fn record_terminal_drop(
     reason: String,
     timeline: &ConnectionTimeline,
 ) {
-    let bytes = packet.packet.len();
-    record_terminal_drop_bytes(
+    report_fast_path_terminal(
         transport,
         peers,
         peer_id,
         packet_generation,
-        bytes,
+        packet.packet.len(),
         reason_code,
         reason,
         timeline,
+        None,
     )
     .await;
 }
@@ -1410,8 +1137,29 @@ pub(super) async fn record_terminal_drop_bytes(
     );
 }
 
-/// Periodic maintenance: expire startup deadlines, cancel waits on peer
-/// offline / generation change, and flush what became usable.
+#[cfg(test)]
+fn queue_test_context(
+    peers: Arc<PeerManager>,
+    timeline: Arc<ConnectionTimeline>,
+    relay_expected: bool,
+) -> PeerWorkContext {
+    let (transport, _) = WireGuardTransport::new();
+    PeerWorkContext {
+        transport,
+        peers,
+        prefer_direct: true,
+        udp_transport: Arc::new(RwLock::new(None)),
+        relay_transport: Arc::new(RwLock::new(None)),
+        startup_wait: RelayStartupWait {
+            relay_expected,
+            timeout: None,
+        },
+        timeline,
+        stopping: Arc::new(AtomicBool::new(false)),
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn maintenance(
     transport: &WireGuardTransport,
@@ -1422,179 +1170,28 @@ pub(super) async fn maintenance(
     relay_transport: &Arc<RwLock<Option<RelayTransport>>>,
     relay_expected: bool,
     timeline: &Arc<ConnectionTimeline>,
-    flush_tasks: &mut JoinSet<(String, PeerPendingQueue)>,
-    flushing_peers: &mut HashSet<String>,
+    _flush_tasks: &mut JoinSet<(String, PeerPendingQueue)>,
+    _flushing_peers: &mut HashSet<String>,
 ) {
-    let now = Instant::now();
-    let generation = peers.current_network_generation().await;
-
-    // 1. Startup-deadline expiry: every queued packet of a peer whose shared
-    //    deadline passed is dropped with the stable reason code.  A peer that
-    //    JUST became usable (RelayPeerConfirmed or DirectConfirmed) in the same
-    //    tick is NOT dropped here: the confirmation races the deadline, and
-    //    flush_ready_peers below must deliver its queued packets instead of the
-    //    expiry dropping them as if the path never came up.
-    let expired: Vec<String> = {
-        let mut expired = Vec::new();
-        for (peer_id, entry) in pending.iter() {
-            if entry.wait_deadline.is_none_or(|deadline| now < deadline) {
-                continue;
-            }
-            let relay_available = relay_transport.read().await.is_some();
-            let usable = peers
-                .is_data_path_admitted_for_generation(
-                    peer_id,
-                    generation,
-                    relay_available || relay_expected,
-                )
-                .await;
-            if !usable {
-                expired.push(peer_id.clone());
-            }
-        }
-        expired
-    };
-    for peer_id in expired {
-        drop_pending_queue(
-            peers,
-            pending.remove(&peer_id),
-            REASON_RELAY_STARTUP_WAIT_EXPIRED,
-            timeline,
-        )
-        .await;
-    }
-
-    // 2. Cancellation: peer offline or generation change invalidates the wait.
-    let cancellations: Vec<(String, &'static str)> = pending
-        .iter()
-        .filter(|(_, entry)| !entry.queue.is_empty())
-        .filter_map(|(peer_id, entry)| {
-            if entry.wait_generation != Some(generation) {
-                return Some((peer_id.clone(), REASON_OUTBOUND_GENERATION_CHANGED));
-            }
-            None
-        })
-        .collect();
-    for (peer_id, reason) in cancellations {
-        drop_pending_queue(peers, pending.remove(&peer_id), reason, timeline).await;
-    }
-    let offline: Vec<String> = {
-        let mut offline = Vec::new();
-        for (peer_id, entry) in pending.iter() {
-            if !entry.queue.is_empty() && !peers.peer_online(peer_id).await {
-                offline.push(peer_id.clone());
-            }
-        }
-        offline
-    };
-    for peer_id in offline {
-        drop_pending_queue(
-            peers,
-            pending.remove(&peer_id),
-            REASON_OUTBOUND_PEER_OFFLINE,
-            timeline,
-        )
-        .await;
-    }
-
-    // 3. Flush what became usable (paced by each peer's retry_after).
-    start_ready_peer_flushes(
-        transport,
-        peers,
-        pending,
+    let ctx = PeerWorkContext {
+        transport: transport.clone(),
+        peers: peers.clone(),
         prefer_direct,
-        udp_transport,
-        relay_transport,
-        relay_expected,
-        timeline,
-        flush_tasks,
-        flushing_peers,
-    )
-    .await;
-}
-
-/// Drop a pending queue, emitting a stable reason event with the peer detail
-/// and recording the loss in the peer manager's structural drop counters.
-pub(super) async fn drop_pending_queue(
-    peers: &PeerManager,
-    queue: Option<PeerPendingQueue>,
-    reason_code: &'static str,
-    timeline: &ConnectionTimeline,
-) {
-    let Some(mut queue) = queue else { return };
-    let dropped = queue.queue.len();
-    if dropped == 0 {
-        return;
-    }
-    let peer_id = queue
-        .queue
-        .front()
-        .map(|packet| packet.peer_id().to_string())
-        .unwrap_or_default();
-    let generation = queue.wait_generation.unwrap_or(0);
-    for packet in &mut queue.queue {
-        record_pending_residence(
-            packet.take_pending_residence(),
-            "tx_pending_residence_dropped_us",
-        );
-    }
-    if matches!(
-        reason_code,
-        REASON_OUTBOUND_DELIVERY_DEADLINE
-            | REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE
-            | REASON_RELAY_STARTUP_WAIT_EXPIRED
-            | REASON_DIRECT_ONLY_NO_RELAY
-    ) {
-        for packet in &queue.queue {
-            let _ = peers.emit_local_mtu_feedback(
-                &peer_id,
-                packet.raw_packet(),
-                crate::business_mtu::LocalMtuFeedbackKind::Unreachable,
-            );
+        udp_transport: udp_transport.clone(),
+        relay_transport: relay_transport.clone(),
+        startup_wait: RelayStartupWait {
+            relay_expected,
+            timeout: None,
+        },
+        timeline: timeline.clone(),
+        stopping: Arc::new(AtomicBool::new(false)),
+    };
+    let ready: Vec<_> = pending.drain().collect();
+    for (peer_id, queue) in ready {
+        let (peer_id, remaining) = process_peer_queue(peer_id, queue, ctx.clone()).await;
+        if remaining.has_work() {
+            pending.insert(peer_id, remaining);
         }
-    }
-    timeline.emit(
-        "relay_unavailable_or_first_packet_expired",
-        None,
-        Some(reason_code),
-        Some(format!(
-            "peer={peer_id} generation={generation} dropped={dropped} bytes={} waited_ms={}",
-            queue.bytes,
-            queue
-                .wait_started
-                .map(|started| started.elapsed().as_millis())
-                .unwrap_or(0)
-        )),
-    );
-    peers
-        .record_outbound_drop(reason_code, dropped, queue.bytes)
-        .await;
-    record_loss_event(
-        peers,
-        "drop",
-        &peer_id,
-        generation,
-        reason_code,
-        dropped,
-        queue.bytes,
-        timeline,
-    )
-    .await;
-    debug!(
-        "Dropped {dropped} queued packets for peer {peer_id}: {reason_code} (bytes={})",
-        queue.bytes
-    );
-}
-
-pub(super) async fn drop_all_pending_queues(
-    peers: &PeerManager,
-    pending: &mut HashMap<String, PeerPendingQueue>,
-    reason_code: &'static str,
-    timeline: &ConnectionTimeline,
-) {
-    let peer_ids: Vec<String> = pending.keys().cloned().collect();
-    for peer_id in peer_ids {
-        drop_pending_queue(peers, pending.remove(&peer_id), reason_code, timeline).await;
     }
 }
 

@@ -1094,6 +1094,13 @@ impl WireGuardTransport {
 }
 #[cfg(test)]
 impl WireGuardTransport {
+    /// Hold the actual registry without exposing its private session entries.
+    /// Admission tests use this guard to distinguish per-peer session waits
+    /// from waits that still occupy the shared outbound actor.
+    pub(crate) async fn hold_session_registry_for_test(&self) -> impl Drop + '_ {
+        self.sessions.lock().await
+    }
+
     pub(super) async fn expire_pending_responder_for_test(&self, peer_id: &str, token: &str) {
         let mut sessions = self.sessions.lock().await;
         sessions

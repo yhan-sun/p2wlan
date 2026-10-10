@@ -1,3 +1,4 @@
+use super::super::queue::{admission_test_hooks as admission_hooks, PeerPendingQueue};
 use super::super::test_support::*;
 use super::*;
 use crate::config::Config;
@@ -193,6 +194,7 @@ struct LanWorkerFixture {
     peers: Arc<PeerManager>,
     transport: WireGuardTransport,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     receiver_a: tokio::net::UdpSocket,
     receiver_b: tokio::net::UdpSocket,
     remote_a: p2pnet_wireguard::TransportSession,
@@ -267,6 +269,7 @@ impl LanWorkerFixture {
             peers,
             transport,
             udp_transport: Arc::new(RwLock::new(Some(udp))),
+            relay_transport: Arc::new(RwLock::new(None)),
             receiver_a,
             receiver_b,
             remote_a,
@@ -285,7 +288,7 @@ impl LanWorkerFixture {
             self.peers.clone(),
             true,
             self.udp_transport.clone(),
-            Arc::new(RwLock::new(None)),
+            self.relay_transport.clone(),
             self.relay_available_rx.clone(),
             RelayStartupWait {
                 relay_expected: false,
@@ -840,4 +843,457 @@ async fn delayed_terminal_report_cannot_degrade_a_replacement_direct_commit() {
             .await
     );
     assert!(!fixture.peers.is_direct_sync("peer-a"));
+}
+
+struct AdmissionWorker {
+    tx: mpsc::Sender<OutboundPacket>,
+    task: tokio::task::JoinHandle<()>,
+    hook: Arc<admission_hooks::WorkerHook>,
+    events: mpsc::UnboundedReceiver<Option<admission_hooks::Scan>>,
+    timeline: Arc<ConnectionTimeline>,
+}
+
+#[derive(Clone, Copy)]
+struct AdmissionIdentity {
+    path_a: ActivePathSnapshot,
+    path_b: ActivePathSnapshot,
+    session_a: u64,
+    session_b: u64,
+}
+
+impl LanWorkerFixture {
+    async fn admission_identity(&self) -> AdmissionIdentity {
+        let generation = self.peers.current_network_generation_sync();
+        AdmissionIdentity {
+            path_a: self
+                .peers
+                .active_direct_path_snapshot("peer-a", generation, true)
+                .await
+                .unwrap(),
+            path_b: self
+                .peers
+                .active_direct_path_snapshot("peer-b", generation, true)
+                .await
+                .unwrap(),
+            session_a: self
+                .transport
+                .try_session_status("peer-a")
+                .unwrap()
+                .active_session_instance
+                .unwrap(),
+            session_b: self
+                .transport
+                .try_session_status("peer-b")
+                .unwrap()
+                .active_session_instance
+                .unwrap(),
+        }
+    }
+
+    async fn spawn_admission_worker(
+        &self,
+        initial_pending: HashMap<String, PeerPendingQueue>,
+        pause_scan: Option<admission_hooks::Scan>,
+    ) -> AdmissionWorker {
+        let (tx, rx) = mpsc::channel(2);
+        let (probe_kick_tx, _probe_kick_rx) = watch::channel(0u64);
+        let (hook, mut events) = admission_hooks::WorkerHook::new(initial_pending, pause_scan);
+        let timeline = ConnectionTimeline::new("admission-isolation", 0);
+        let task = tokio::spawn(admission_hooks::WORKER.scope(
+            hook.clone(),
+            run_network_outbound(
+                rx,
+                self.transport.clone(),
+                self.peers.clone(),
+                true,
+                self.udp_transport.clone(),
+                self.relay_transport.clone(),
+                self.relay_available_rx.clone(),
+                RelayStartupWait {
+                    relay_expected: false,
+                    timeout: None,
+                },
+                probe_kick_tx,
+                timeline.clone(),
+            ),
+        ));
+        assert_eq!(
+            timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("instrumented worker must reach its idle select")
+                .expect("worker readiness event"),
+            None,
+        );
+        AdmissionWorker {
+            tx,
+            task,
+            hook,
+            events,
+            timeline,
+        }
+    }
+}
+
+/// Capacity, rather than a dequeue notification alone, proves both original
+/// entries left the bounded ingress channel. The wire assertions below then
+/// rule out implementations which drain by losing or misidentifying entries.
+async fn admission_channel_drained(worker: &mut AdmissionWorker) -> bool {
+    let drained = matches!(
+        timeout(Duration::from_secs(1), worker.tx.reserve_many(2)).await,
+        Ok(Ok(_)),
+    );
+    if !drained {
+        worker.task.abort();
+        let _ = (&mut worker.task).await;
+    }
+    drained
+}
+
+fn enqueue_admission_head(worker: &AdmissionWorker) {
+    worker.tx.try_send(isolated_packet("peer-a", 1)).unwrap();
+    worker.tx.try_send(isolated_packet("peer-b", 9)).unwrap();
+    assert_eq!(worker.tx.capacity(), 0, "the input must start full");
+}
+
+async fn verify_admission_fifo_and_identity(
+    fixture: &mut LanWorkerFixture,
+    worker: AdmissionWorker,
+    identity: AdmissionIdentity,
+) {
+    let first = match receive_wire(&fixture.receiver_a).await {
+        Ok(first) => first,
+        Err(err) => {
+            let losses = timeout(
+                Duration::from_millis(100),
+                fixture.peers.outbound_loss_stats(),
+            )
+            .await;
+            panic!(
+                "original A1 must survive contention and reach the wire: {err:?}; worker_finished={} epoch_available={} path_a={:?} session_a={:?} losses={losses:?} timeline={:?}",
+                worker.task.is_finished(),
+                fixture.peers.network_epoch_gate().try_lock().is_ok(),
+                fixture.peers.committed_business_path_snapshot_sync("peer-a"),
+                fixture.transport.try_session_status("peer-a"),
+                worker.timeline.snapshot().events,
+            );
+        }
+    };
+    let second = receive_wire(&fixture.receiver_a)
+        .await
+        .expect("newer A2 must share A1's FIFO after contention");
+    let other = receive_wire(&fixture.receiver_b)
+        .await
+        .expect("B must survive admission contention and reach its own wire");
+    assert_eq!(
+        fixture.remote_a.decrypt_from_bytes(&first).unwrap(),
+        isolated_packet("peer-a", 1).packet,
+    );
+    assert_eq!(
+        fixture.remote_a.decrypt_from_bytes(&second).unwrap(),
+        isolated_packet("peer-a", 2).packet,
+    );
+    assert_eq!(
+        fixture.remote_b.decrypt_from_bytes(&other).unwrap(),
+        isolated_packet("peer-b", 9).packet,
+    );
+    assert!(
+        crate::transport::wire_counter(&first).unwrap()
+            < crate::transport::wire_counter(&second).unwrap(),
+        "A's FIFO must preserve ascending authenticated counters",
+    );
+    assert!(fixture
+        .peers
+        .active_direct_path_snapshot_is_current_sync("peer-a", identity.path_a));
+    assert!(fixture
+        .peers
+        .active_direct_path_snapshot_is_current_sync("peer-b", identity.path_b));
+    assert_eq!(
+        fixture
+            .transport
+            .try_session_status("peer-a")
+            .unwrap()
+            .active_session_instance,
+        Some(identity.session_a),
+    );
+    assert_eq!(
+        fixture
+            .transport
+            .try_session_status("peer-b")
+            .unwrap()
+            .active_session_instance,
+        Some(identity.session_b),
+    );
+    drop(worker.tx);
+    timeout(Duration::from_secs(1), worker.task)
+        .await
+        .expect("worker shutdown must finish after authority locks release")
+        .unwrap();
+    assert!(fixture.peers.outbound_loss_stats().await.drops.is_empty());
+    assert!(fixture.receiver_a.try_recv(&mut [0u8; 2048]).is_err());
+    assert!(fixture.receiver_b.try_recv(&mut [0u8; 2048]).is_err());
+}
+
+#[tokio::test]
+async fn direct_fallback_drains_ingress_while_network_epoch_is_held() {
+    let mut fixture = LanWorkerFixture::new().await;
+    let _loss = install_loss_sink(&fixture);
+    let identity = fixture.admission_identity().await;
+    let mut worker = fixture.spawn_admission_worker(HashMap::new(), None).await;
+    let epoch = fixture.peers.network_epoch_gate();
+    let held = epoch.lock().await;
+    enqueue_admission_head(&worker);
+    let drained = admission_channel_drained(&mut worker).await;
+    if drained {
+        worker.tx.try_send(isolated_packet("peer-a", 2)).unwrap();
+    }
+    assert!(fixture.receiver_a.try_recv(&mut [0u8; 2048]).is_err());
+    assert!(fixture.receiver_b.try_recv(&mut [0u8; 2048]).is_err());
+    drop(held);
+    assert!(drained, "epoch contention must not occupy shared ingress");
+    verify_admission_fifo_and_identity(&mut fixture, worker, identity).await;
+}
+
+#[tokio::test]
+async fn direct_fallback_drains_ingress_while_connection_writer_is_held() {
+    let mut fixture = LanWorkerFixture::new().await;
+    let _loss = install_loss_sink(&fixture);
+    let identity = fixture.admission_identity().await;
+    let mut worker = fixture.spawn_admission_worker(HashMap::new(), None).await;
+    // The worker has no cached fast entry. Its read-only snapshot attempt
+    // therefore falls back while this actual authority writer is held.
+    let held = fixture.peers.hold_connections_writer_for_test().await;
+    enqueue_admission_head(&worker);
+    let drained = admission_channel_drained(&mut worker).await;
+    if drained {
+        worker.tx.try_send(isolated_packet("peer-a", 2)).unwrap();
+    }
+    assert!(fixture.receiver_a.try_recv(&mut [0u8; 2048]).is_err());
+    assert!(fixture.receiver_b.try_recv(&mut [0u8; 2048]).is_err());
+    drop(held);
+    assert!(
+        drained,
+        "connection-map writer contention must not occupy shared ingress",
+    );
+    verify_admission_fifo_and_identity(&mut fixture, worker, identity).await;
+}
+
+#[tokio::test]
+async fn direct_fallback_drains_ingress_while_udp_slot_writer_is_held() {
+    let mut fixture = LanWorkerFixture::new().await;
+    let _loss = install_loss_sink(&fixture);
+    let identity = fixture.admission_identity().await;
+    let mut worker = fixture.spawn_admission_worker(HashMap::new(), None).await;
+    let held = fixture.udp_transport.write().await;
+    enqueue_admission_head(&worker);
+    let drained = admission_channel_drained(&mut worker).await;
+    if drained {
+        worker.tx.try_send(isolated_packet("peer-a", 2)).unwrap();
+    }
+    assert!(fixture.receiver_a.try_recv(&mut [0u8; 2048]).is_err());
+    assert!(fixture.receiver_b.try_recv(&mut [0u8; 2048]).is_err());
+    drop(held);
+    assert!(
+        drained,
+        "UDP slot replacement must not occupy shared ingress"
+    );
+    verify_admission_fifo_and_identity(&mut fixture, worker, identity).await;
+}
+
+#[tokio::test]
+async fn direct_fallback_drains_ingress_while_relay_slot_writer_is_held() {
+    let mut fixture = LanWorkerFixture::new().await;
+    let _loss = install_loss_sink(&fixture);
+    let identity = fixture.admission_identity().await;
+    let mut worker = fixture.spawn_admission_worker(HashMap::new(), None).await;
+    // Existing emit contention already has a nonblocking fast fallback.
+    // Holding both guards forces both LAN peers through that fallback, so
+    // this test reaches the otherwise unnecessary shared Relay slot read.
+    let emit_a = fixture
+        .transport
+        .acquire_outbound_emit_guard("peer-a")
+        .await;
+    let emit_b = fixture
+        .transport
+        .acquire_outbound_emit_guard("peer-b")
+        .await;
+    let held = fixture.relay_transport.write().await;
+    enqueue_admission_head(&worker);
+    let drained = admission_channel_drained(&mut worker).await;
+    if drained {
+        worker.tx.try_send(isolated_packet("peer-a", 2)).unwrap();
+    }
+    assert!(fixture.receiver_a.try_recv(&mut [0u8; 2048]).is_err());
+    assert!(fixture.receiver_b.try_recv(&mut [0u8; 2048]).is_err());
+    drop(held);
+    drop(emit_a);
+    drop(emit_b);
+    assert!(
+        drained,
+        "Relay slot replacement must not occupy Direct fallback ingress",
+    );
+    verify_admission_fifo_and_identity(&mut fixture, worker, identity).await;
+}
+
+#[tokio::test]
+async fn session_registry_contention_remains_per_peer_after_direct_fallback() {
+    let mut fixture = LanWorkerFixture::new().await;
+    let _loss = install_loss_sink(&fixture);
+    let identity = fixture.admission_identity().await;
+    let mut worker = fixture.spawn_admission_worker(HashMap::new(), None).await;
+    let held = fixture.transport.hold_session_registry_for_test().await;
+    enqueue_admission_head(&worker);
+    let drained = admission_channel_drained(&mut worker).await;
+    if drained {
+        worker.tx.try_send(isolated_packet("peer-a", 2)).unwrap();
+    }
+    assert!(fixture.receiver_a.try_recv(&mut [0u8; 2048]).is_err());
+    assert!(fixture.receiver_b.try_recv(&mut [0u8; 2048]).is_err());
+    drop(held);
+    assert!(
+        drained,
+        "session registry waits must remain in per-peer tasks"
+    );
+    verify_admission_fifo_and_identity(&mut fixture, worker, identity).await;
+}
+
+async fn shared_scan_must_drain_ingress(scan: admission_hooks::Scan) {
+    let mut fixture = LanWorkerFixture::new().await;
+    let _loss = install_loss_sink(&fixture);
+    let identity = fixture.admission_identity().await;
+    let pending = admission_hooks::confirmed_direct_queue(
+        identity.path_a.generation,
+        isolated_packet("peer-a", 1),
+    );
+    let mut worker = fixture.spawn_admission_worker(pending, Some(scan)).await;
+    if scan == admission_hooks::Scan::DirectNotify {
+        // A stored permit is a real advisory wakeup; no path truth is changed.
+        fixture.peers.direct_commit_notify().notify_one();
+    }
+    assert_eq!(
+        timeout(Duration::from_secs(1), worker.events.recv())
+            .await
+            .expect("target scan must be selected before taking authority lock")
+            .expect("scan barrier event"),
+        Some(scan),
+    );
+    // The scan already owns the actor, before input becomes ready. Releasing
+    // its barrier under this lock rules out select scheduling as a false pass.
+    let epoch = fixture.peers.network_epoch_gate();
+    let held = epoch.lock().await;
+    worker.tx.try_send(isolated_packet("peer-a", 2)).unwrap();
+    worker.tx.try_send(isolated_packet("peer-b", 9)).unwrap();
+    assert_eq!(worker.tx.capacity(), 0);
+    worker.hook.release_scan();
+    let drained = admission_channel_drained(&mut worker).await;
+    assert!(fixture.receiver_a.try_recv(&mut [0u8; 2048]).is_err());
+    assert!(fixture.receiver_b.try_recv(&mut [0u8; 2048]).is_err());
+    drop(held);
+    assert!(
+        drained,
+        "selected {scan:?} shared scan must not wait on epoch before draining ingress",
+    );
+    verify_admission_fifo_and_identity(&mut fixture, worker, identity).await;
+}
+
+#[tokio::test]
+async fn maintenance_scan_does_not_stop_ingress_drain() {
+    shared_scan_must_drain_ingress(admission_hooks::Scan::Ticker).await;
+}
+
+#[tokio::test]
+async fn direct_notification_scan_does_not_stop_ingress_drain() {
+    shared_scan_must_drain_ingress(admission_hooks::Scan::DirectNotify).await;
+}
+
+#[tokio::test]
+async fn shutdown_during_emit_admission_never_starts_a_physical_handoff() {
+    let fixture = LanWorkerFixture::new().await;
+    let _loss = install_loss_sink(&fixture);
+    let generation = fixture.peers.current_network_generation_sync();
+    let queue = admission_hooks::confirmed_direct_queue(generation, isolated_packet("peer-a", 1))
+        .remove("peer-a")
+        .unwrap();
+    let held = fixture
+        .transport
+        .acquire_outbound_emit_guard("peer-a")
+        .await;
+    let stopping = Arc::new(AtomicBool::new(false));
+    let mut work = Box::pin(super::super::queue::flush_one_peer_until_stopped(
+        "peer-a".into(),
+        queue,
+        fixture.transport.clone(),
+        fixture.peers.clone(),
+        true,
+        fixture.udp_transport.clone(),
+        fixture.relay_transport.clone(),
+        false,
+        ConnectionTimeline::new("stop-during-admission", 0),
+        stopping.clone(),
+    ));
+    // All authority reads are uncontended. A single poll reaches the actual
+    // held emit guard in the bounded preparation future, without a sleep.
+    assert!(work.as_mut().now_or_never().is_none());
+    stopping.store(true, Ordering::Release);
+    drop(held);
+    let (_, remaining) = timeout(Duration::from_secs(1), work).await.unwrap();
+    assert!(admission_hooks::queue_view(&remaining).1.is_empty());
+    assert!(fixture.receiver_a.try_recv(&mut [0u8; 2048]).is_err());
+    let stats = fixture.peers.outbound_loss_stats().await;
+    assert_eq!(stats.drops[REASON_OUTBOUND_WORKER_STOPPED].packets, 1);
+}
+
+#[tokio::test]
+async fn original_delivery_deadline_bounds_emit_admission_and_never_renews_plaintext() {
+    let fixture = LanWorkerFixture::new().await;
+    let _loss = install_loss_sink(&fixture);
+    let generation = fixture.peers.current_network_generation_sync();
+    let mut queue =
+        admission_hooks::confirmed_direct_queue(generation, isolated_packet("peer-a", 1))
+            .remove("peer-a")
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_millis(30);
+    admission_hooks::set_delivery_deadline(&mut queue, deadline);
+    let held = fixture
+        .transport
+        .acquire_outbound_emit_guard("peer-a")
+        .await;
+    let mut work = Box::pin(super::super::queue::flush_one_peer_until_stopped(
+        "peer-a".into(),
+        queue,
+        fixture.transport.clone(),
+        fixture.peers.clone(),
+        true,
+        fixture.udp_transport.clone(),
+        fixture.relay_transport.clone(),
+        false,
+        ConnectionTimeline::new("deadline-during-admission", 0),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    assert!(work.as_mut().now_or_never().is_none());
+    // The real preparation deadline drives completion while the guard stays
+    // held; no artificial scheduling sleep or socket saturation is involved.
+    let (_, remaining) = timeout(Duration::from_secs(1), work).await.unwrap();
+    let (retained_deadline, packets) = admission_hooks::queue_view(&remaining);
+    assert_eq!(retained_deadline, Some(deadline));
+    assert_eq!(packets, vec![isolated_packet("peer-a", 1).packet]);
+    assert!(fixture.receiver_a.try_recv(&mut [0u8; 2048]).is_err());
+    drop(held);
+    let (_, expired) = super::super::queue::flush_one_peer(
+        "peer-a".into(),
+        remaining,
+        fixture.transport.clone(),
+        fixture.peers.clone(),
+        true,
+        fixture.udp_transport.clone(),
+        fixture.relay_transport.clone(),
+        false,
+        ConnectionTimeline::new("expired-original-deadline", 0),
+    )
+    .await;
+    assert!(admission_hooks::queue_view(&expired).1.is_empty());
+    assert!(fixture.receiver_a.try_recv(&mut [0u8; 2048]).is_err());
+    assert_eq!(
+        fixture.peers.outbound_loss_stats().await.drops[REASON_OUTBOUND_DELIVERY_DEADLINE].packets,
+        1
+    );
 }
