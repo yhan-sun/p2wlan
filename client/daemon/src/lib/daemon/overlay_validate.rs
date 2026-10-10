@@ -844,7 +844,7 @@ async fn handle_overlay_ingress(
     event: OverlayIngressEvent,
     controller: &MockTunController,
     local_vip: &str,
-    local_node_id: &str,
+    _local_node_id: &str,
     overlay_any_path: bool,
     start_gate_released: bool,
     seen: &mut VecDeque<(u64, u32)>,
@@ -881,7 +881,7 @@ async fn handle_overlay_ingress(
     match verify_overlay_packet(
         &event.packet,
         local_vip,
-        local_node_id,
+        &event.peer_id,
         seen,
         stats,
         peers,
@@ -1115,11 +1115,11 @@ async fn handle_overlay_ingress(
 
 /// Verify a decrypted inbound overlay payload that the production dataplane
 /// delivered.  Returns the sender peer and the payload identity when the
-/// magic, checksum and nonce/seq are all valid.
+/// magic, checksum, nonce/seq and source VIP/ingress peer binding are valid.
 async fn verify_overlay_packet(
     packet: &[u8],
     local_vip: &str,
-    _local_node_id: &str,
+    ingress_peer_id: &str,
     seen: &mut VecDeque<(u64, u32)>,
     stats: &mut OverlayStats,
     peers: &Arc<PeerManager>,
@@ -1184,11 +1184,6 @@ async fn verify_overlay_packet(
             reason: format!("duplicate nonce/seq ({nonce:#x}/{seq})"),
         };
     }
-    seen.push_back((nonce, seq));
-    while seen.len() > OVERLAY_SEEN_CAP {
-        seen.pop_front();
-    }
-
     let src_ip = parsed.src_addr().to_string();
     let dst_ip = parsed.dst_addr().to_string();
     let Some(peer_id) = peers.resolve_virtual_ip(&src_ip).await else {
@@ -1202,6 +1197,20 @@ async fn verify_overlay_packet(
         return OverlayVerdict::Invalid {
             reason: format!("unexpected destination {dst_ip} (local {local_vip})"),
         };
+    }
+    if peer_id != ingress_peer_id {
+        stats.received_invalid += 1;
+        return OverlayVerdict::Invalid {
+            reason: format!(
+                "source virtual IP {src_ip} resolves to peer {peer_id} but ingress peer is {ingress_peer_id}"
+            ),
+        };
+    }
+    // Only accepted attribution may occupy the bounded duplicate history.
+    // A bad VIP/peer binding cannot poison the matching legitimate packet.
+    seen.push_back((nonce, seq));
+    while seen.len() > OVERLAY_SEEN_CAP {
+        seen.pop_front();
     }
     stats.received_valid += 1;
     stats.verified_round_trips += 1;
@@ -2032,5 +2041,282 @@ mod ack01_exact_injection_tests {
         fixture.echo(failed_burst.0, failed_burst.1).await;
         assert_eq!(fixture.stats.received_valid, 3);
         assert_eq!(fixture.event_count("overlay_burst_complete"), 0);
+    }
+
+    /// B01-ACK-02 peer/VIP attribution controls only. Inputs start after
+    /// decryption; no native WireGuard/Relay/current-owner claim is made.
+    mod ack02_peer_binding_tests {
+        use super::*;
+
+        const OTHER_PEER: &str = "peer-ack02-other";
+        const OTHER_VIP: &str = "10.20.0.3";
+
+        async fn add_other_peer(fixture: &Fixture) {
+            fixture
+                .peers
+                .add_peer(&crate::control::PeerInfo {
+                    node_id: OTHER_PEER.to_string(),
+                    public_key: "pk-ack02-other".to_string(),
+                    endpoint: "127.0.0.1:45004".to_string(),
+                    nat_type: "Unknown".to_string(),
+                    virtual_ip: OTHER_VIP.to_string(),
+                    online: true,
+                    ..crate::control::PeerInfo::default()
+                })
+                .await;
+            assert_eq!(
+                fixture.peers.resolve_virtual_ip(OTHER_VIP).await.as_deref(),
+                Some(OTHER_PEER),
+                "the differing ingress peer is an actual registered peer"
+            );
+            assert_eq!(
+                fixture.peers.resolve_virtual_ip(PEER_VIP).await.as_deref(),
+                Some(PEER),
+                "the payload source VIP retains its original peer"
+            );
+        }
+
+        async fn deliver_packet(
+            fixture: &mut Fixture,
+            ingress_peer: &str,
+            packet: Vec<u8>,
+            start_gate_released: bool,
+        ) {
+            // Explicit post-decrypt input, not a current-owner receipt or
+            // native decryption proof. No matching branch is copied here.
+            handle_overlay_ingress(
+                OverlayIngressEvent {
+                    peer_id: ingress_peer.to_string(),
+                    packet,
+                    ingress: OverlayIngress::Relay(RELAY.to_string()),
+                    connection_generation: fixture.peers.current_network_generation_sync(),
+                },
+                &fixture.controller,
+                LOCAL_VIP,
+                "local-ack02",
+                true,
+                start_gate_released,
+                &mut fixture.seen,
+                &mut fixture.stats,
+                &fixture.peers,
+                &fixture.timeline,
+                &fixture.sent_nonces,
+                &mut fixture.bursts,
+                &mut fixture.pending,
+                None,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn wrong_peer_exact_echo_cannot_credit_then_same_packet_right_peer_can() {
+            let mut fixture = Fixture::new().await;
+            add_other_peer(&fixture).await;
+            // Actual bounded MockTun injection/read and CRC decoding supply
+            // the successful tuple; no success registry is pre-populated.
+            let (nonce, seq) = fixture.inject_and_read_burst(1).await[0];
+            let fifo_before = fixture.nonce_order.clone();
+            assert!(fixture.sent_nonces[&nonce].sent_at.elapsed() <= OVERLAY_NONCE_TTL);
+            let payload = build_overlay_payload(OVERLAY_DIRECTION_ECHO, nonce, seq);
+            let packet = build_udp_overlay_packet(PEER_VIP, LOCAL_VIP, 39287, 39286, &payload)
+                .expect("the original successful request supplies an exact echo");
+
+            deliver_packet(&mut fixture, OTHER_PEER, packet.clone(), true).await;
+            assert_eq!(
+                (
+                    fixture.event_count("first_usable_bidirectional_overlay_ms"),
+                    fixture.event_count("overlay_burst_complete"),
+                ),
+                (0, 0),
+                "B01_ACK_02_PEER_BINDING_ECHO: another ingress peer cannot credit this exact successful request"
+            );
+            assert_eq!(fixture.stats.received_valid, 0);
+            assert_eq!(fixture.stats.verified_round_trips, 0);
+            assert_eq!(fixture.stats.received_invalid, 1);
+            assert!(fixture.sent_nonces.contains_key(&nonce));
+            assert_eq!(fixture.nonce_order, fifo_before);
+            assert_eq!(fixture.bursts[PEER].sent, 1);
+            assert_eq!(fixture.bursts[PEER].received, 0);
+            assert!(!fixture.seen.contains(&(nonce, seq)));
+
+            // Identical packet bytes and tuple; only attribution changes.
+            // A bad peer must not poison seen or delete success/burst state.
+            deliver_packet(&mut fixture, PEER, packet.clone(), true).await;
+            assert_eq!(fixture.stats.received_valid, 1);
+            assert_eq!(fixture.stats.verified_round_trips, 1);
+            assert_eq!(fixture.stats.received_invalid, 1);
+            assert_eq!(
+                fixture.event_count("first_usable_bidirectional_overlay_ms"),
+                1
+            );
+            assert_eq!(fixture.event_count("overlay_burst_complete"), 1);
+            assert!(fixture.sent_nonces.contains_key(&nonce));
+            assert_eq!(fixture.nonce_order, fifo_before);
+
+            deliver_packet(&mut fixture, PEER, packet, true).await;
+            assert_eq!(fixture.stats.received_valid, 1);
+            assert_eq!(fixture.stats.received_invalid, 2);
+            assert_eq!(
+                fixture.event_count("first_usable_bidirectional_overlay_ms"),
+                1
+            );
+            assert_eq!(fixture.event_count("overlay_burst_complete"), 1);
+        }
+
+        #[tokio::test]
+        async fn wrong_peer_request_cannot_queue_echo_then_same_packet_right_peer_is_echoed() {
+            let mut fixture = Fixture::new().await;
+            add_other_peer(&fixture).await;
+            let nonce = 0x2000;
+            let seq = 30;
+            let payload = build_overlay_payload(OVERLAY_DIRECTION_REQUEST, nonce, seq);
+            let packet = build_udp_overlay_packet(PEER_VIP, LOCAL_VIP, 39286, 39287, &payload)
+                .expect("valid source/destination addresses build a request");
+
+            // A closed existing start gate makes the forbidden action an
+            // observable queued echo without timeout-based absence checks.
+            deliver_packet(&mut fixture, OTHER_PEER, packet.clone(), false).await;
+            assert!(
+                fixture.pending.is_empty(),
+                "B01_ACK_02_PEER_BINDING_REQUEST: another ingress peer cannot enqueue an echo for this VIP"
+            );
+            assert_eq!(fixture.stats.received_valid, 0);
+            assert_eq!(fixture.stats.verified_round_trips, 0);
+            assert_eq!(fixture.stats.received_invalid, 1);
+            assert!(!fixture.seen.contains(&(nonce, seq)));
+            assert!(fixture.sent_nonces.is_empty());
+
+            // Correct attribution and open gate must produce a real MockTun
+            // ECHO for the same bytes and the exact original nonce/seq.
+            deliver_packet(&mut fixture, PEER, packet, true).await;
+            let mut bytes = [0u8; 512];
+            let size = tokio::time::timeout(
+                Duration::from_secs(1),
+                fixture
+                    .tun
+                    .as_mut()
+                    .expect("mock TUN stays open")
+                    .read(&mut bytes),
+            )
+            .await
+            .expect("the existing one-second fixture read bound must suffice")
+            .expect("correct attribution must inject an echo into the actual mock TUN");
+            let echo = p2pnet_tun::Ipv4Packet::new(&bytes[..size])
+                .expect("the actual injected echo remains IPv4");
+            assert_eq!(echo.src_addr().to_string(), LOCAL_VIP);
+            assert_eq!(echo.dst_addr().to_string(), PEER_VIP);
+            let echoed_payload = &echo.payload()[8..];
+            // Each response has fresh random filler. Check the original
+            // request identity and actual CRC instead of comparing filler.
+            assert_eq!(
+                echoed_payload.len(),
+                OVERLAY_CHECKSUM_OFFSET + 4 + OVERLAY_FILLER_BYTES
+            );
+            assert_eq!(&echoed_payload[..OVERLAY_MAGIC.len()], OVERLAY_MAGIC);
+            assert_eq!(echoed_payload[OVERLAY_MAGIC.len()], OVERLAY_DIRECTION_ECHO);
+            assert_eq!(
+                u64::from_be_bytes(echoed_payload[7..15].try_into().expect("eight nonce bytes")),
+                nonce
+            );
+            assert_eq!(
+                u32::from_be_bytes(
+                    echoed_payload[15..19]
+                        .try_into()
+                        .expect("four sequence bytes")
+                ),
+                seq
+            );
+            assert_eq!(
+                u32::from_be_bytes(
+                    echoed_payload[OVERLAY_CHECKSUM_OFFSET..OVERLAY_CHECKSUM_OFFSET + 4]
+                        .try_into()
+                        .expect("four checksum bytes")
+                ),
+                crc32_business_payload(&echoed_payload[..OVERLAY_CHECKSUM_SPAN])
+            );
+            assert!(fixture.pending.is_empty());
+            assert_eq!(fixture.stats.received_valid, 1);
+            assert_eq!(fixture.stats.verified_round_trips, 1);
+            assert_eq!(fixture.stats.received_invalid, 1);
+            assert!(fixture.sent_nonces.is_empty());
+            assert_eq!(
+                fixture.event_count("first_usable_bidirectional_overlay_ms"),
+                0
+            );
+            assert_eq!(fixture.event_count("overlay_burst_complete"), 0);
+        }
+
+        #[tokio::test]
+        async fn unknown_vip_destination_and_duplicate_keep_existing_invalid_diagnostics() {
+            let mut fixture = Fixture::new().await;
+            // Fresh distinct pairs preserve the old invalid reason order.
+            for (src, dst, nonce, seq, expected_reason) in [
+                (
+                    "10.20.0.99",
+                    "10.20.0.98",
+                    0x2200,
+                    40,
+                    "unknown sender virtual IP",
+                ),
+                (PEER_VIP, "10.20.0.98", 0x2201, 41, "unexpected destination"),
+            ] {
+                let payload = build_overlay_payload(OVERLAY_DIRECTION_REQUEST, nonce, seq);
+                let packet = build_udp_overlay_packet(src, dst, 39286, 39287, &payload)
+                    .expect("valid IPv4 literals build the diagnostic control");
+                let verdict = verify_overlay_packet(
+                    &packet,
+                    LOCAL_VIP,
+                    PEER,
+                    &mut fixture.seen,
+                    &mut fixture.stats,
+                    &fixture.peers,
+                    "relay:tcp://relay.test:443",
+                )
+                .await;
+                assert!(matches!(
+                    verdict,
+                    OverlayVerdict::Invalid { ref reason }
+                        if reason.starts_with(expected_reason)
+                ));
+            }
+            let payload = build_overlay_payload(OVERLAY_DIRECTION_REQUEST, 0x2202, 42);
+            let packet = build_udp_overlay_packet(PEER_VIP, LOCAL_VIP, 39286, 39287, &payload)
+                .expect("valid addresses build the accepted/duplicate control");
+            let accepted = verify_overlay_packet(
+                &packet,
+                LOCAL_VIP,
+                PEER,
+                &mut fixture.seen,
+                &mut fixture.stats,
+                &fixture.peers,
+                "relay:tcp://relay.test:443",
+            )
+            .await;
+            assert!(matches!(accepted, OverlayVerdict::Valid { .. }));
+            let duplicate = verify_overlay_packet(
+                &packet,
+                LOCAL_VIP,
+                PEER,
+                &mut fixture.seen,
+                &mut fixture.stats,
+                &fixture.peers,
+                "relay:tcp://relay.test:443",
+            )
+            .await;
+            assert!(matches!(
+                duplicate,
+                OverlayVerdict::Invalid { ref reason }
+                    if reason.starts_with("duplicate nonce/seq")
+            ));
+            assert_eq!(fixture.stats.received_valid, 1);
+            assert_eq!(fixture.stats.verified_round_trips, 1);
+            assert_eq!(fixture.stats.received_invalid, 3);
+            assert!(fixture.sent_nonces.is_empty());
+            assert_eq!(
+                fixture.event_count("first_usable_bidirectional_overlay_ms"),
+                0
+            );
+            assert_eq!(fixture.event_count("overlay_burst_complete"), 0);
+        }
     }
 }
