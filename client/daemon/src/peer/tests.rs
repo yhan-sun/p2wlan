@@ -36,3 +36,6 @@ mod capabilities;
 
 #[path = "tests/traversal_context.rs"]
 mod traversal_context;
+
+#[path = "tests/candidate_validation_handover.rs"]
+mod candidate_validation_handover;
