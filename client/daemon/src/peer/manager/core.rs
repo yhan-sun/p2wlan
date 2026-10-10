@@ -855,13 +855,17 @@ impl PeerManager {
     }
 
     /// Cancel a peer's Direct-validation ownership after an accepted remote
-    /// candidate-set handover. Candidate publication releases the epoch gate
-    /// before awaiting this cancellation, keeping the publication transaction
-    /// bounded.
-    pub(crate) async fn cancel_direct_validation_for_remote_candidate_change(&self, peer_id: &str) {
+    /// candidate-set handover. The captured commit epoch limits deferred
+    /// cleanup to older candidate owners in the same peer/network lifecycle;
+    /// a worker admitted after publication must survive this cleanup.
+    pub(crate) async fn cancel_direct_validation_for_remote_candidate_change(
+        &self,
+        peer_id: &str,
+        committed_epoch: PathEpoch,
+    ) {
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
             registry
-                .cancel_peer_with_reason(peer_id, "remote_candidate_generation_changed")
+                .cancel_peer_before_remote_candidate_epoch(peer_id, committed_epoch)
                 .await;
         }
     }

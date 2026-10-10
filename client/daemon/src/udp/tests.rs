@@ -11,6 +11,9 @@ include!("tests/part08.rs");
 include!("tests/part09.rs");
 include!("tests/socket_handoff.rs");
 
+#[path = "tests/candidate_cleanup_scope.rs"]
+mod candidate_cleanup_scope;
+
 #[tokio::test]
 async fn audit_cancel_inbound_must_release_primary_socket_with_ipv6() {
     for enable_ipv6 in [false, true] {

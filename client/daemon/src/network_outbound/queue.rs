@@ -1,4 +1,5 @@
 use super::*;
+use crate::dataplane::{NetworkOutboundResourceSnapshot, PendingQueueResidence};
 
 /// One queued per-peer packet. The queue intentionally contains plaintext
 /// only. An encrypted packet and its emit guard exist only in one lexical send
@@ -8,15 +9,19 @@ pub(super) enum PendingPacket {
         packet: OutboundPacket,
         direct_budget_reroutes: u8,
         local_backpressure_retries: u32,
+        pending_residence: Option<PendingQueueResidence>,
     },
 }
 
 impl PendingPacket {
     fn plain(packet: OutboundPacket) -> Self {
+        let pending_residence =
+            PendingQueueResidence::start(packet.trace.as_ref().is_some_and(|trace| trace.sampled));
         Self::Plain {
             packet,
             direct_budget_reroutes: 0,
             local_backpressure_retries: 0,
+            pending_residence,
         }
     }
 
@@ -45,6 +50,45 @@ impl PendingPacket {
                 ..
             } => *local_backpressure_retries > 0,
         }
+    }
+
+    fn take_pending_residence(&mut self) -> Option<PendingQueueResidence> {
+        match self {
+            Self::Plain {
+                pending_residence, ..
+            } => pending_residence.take(),
+        }
+    }
+}
+
+fn record_pending_residence(residence: Option<PendingQueueResidence>, stage: &'static str) {
+    if let Some(residence) = residence {
+        global_dataplane_profiler().record(true, stage, residence.finish());
+    }
+}
+
+fn resource_snapshot(
+    channel_packets: usize,
+    pending: &HashMap<String, PeerPendingQueue>,
+    active_flush_tasks: usize,
+) -> NetworkOutboundResourceSnapshot {
+    // This actor cannot inspect task-owned queues or an mpsc channel's byte
+    // contents. Do not reinterpret a peer/task count as packets or fabricate
+    // a whole-pipeline byte total from this partial ownership boundary.
+    let (actor_pending_packets, actor_pending_bytes) =
+        pending
+            .values()
+            .fold((0usize, 0usize), |(packets, bytes), queue| {
+                (
+                    packets.saturating_add(queue.queue.len()),
+                    bytes.saturating_add(queue.bytes),
+                )
+            });
+    NetworkOutboundResourceSnapshot {
+        channel_packets,
+        actor_pending_packets,
+        actor_pending_bytes,
+        active_flush_tasks,
     }
 }
 
@@ -205,11 +249,12 @@ pub(crate) async fn run_network_outbound(
                 let network_dequeued = Instant::now();
                 if let Some(trace) = packet.trace.as_mut() {
                     trace.network_queue_dequeued = Some(network_dequeued);
-                    profiler.record_value(
-                        trace.sampled,
-                        "tx_network_outbound_queue_depth",
-                        outbound_rx.len() as u64,
-                    );
+                    if trace.sampled {
+                        profiler.record_network_outbound_resources(
+                            true,
+                            resource_snapshot(outbound_rx.len(), &pending, flush_tasks.len()),
+                        );
+                    }
                     if let Some(enqueued) = trace.transport_queue_send_started {
                         profiler.record(
                             trace.sampled,
@@ -232,7 +277,7 @@ pub(crate) async fn run_network_outbound(
                         &udp_transport,
                         &mut fast_paths,
                         &mut fast_path_ineligible,
-                    ).await {
+                    ) {
                         FastPathAttempt::Sent => continue,
                         FastPathAttempt::Fallback(packet) => {
                             handle_ingress(
@@ -253,28 +298,34 @@ pub(crate) async fn run_network_outbound(
                             ).await;
                         }
                         FastPathAttempt::Terminal { packet, generation, reason_code, reason } => {
-                            record_terminal_drop(
-                                &transport,
-                                &peers,
-                                &peer_id,
-                                generation,
-                                packet,
-                                reason_code,
-                                reason,
-                                &timeline,
-                            ).await;
+                            flushing_peers.insert(peer_id.clone());
+                            let transport = transport.clone();
+                            let peers = peers.clone();
+                            let timeline = timeline.clone();
+                            flush_tasks.spawn(async move {
+                                report_fast_path_terminal(
+                                    &transport, &peers, &peer_id, generation,
+                                    packet.packet.len(), reason_code, reason, &timeline, None,
+                                ).await;
+                                (peer_id, PeerPendingQueue::new())
+                            });
                         }
-                        FastPathAttempt::TerminalBytes { peer_id, generation, bytes, reason_code, reason } => {
-                            record_terminal_drop_bytes(
-                                &transport,
-                                &peers,
-                                &peer_id,
-                                generation,
-                                bytes,
-                                reason_code,
-                                reason,
-                                &timeline,
-                            ).await;
+                        FastPathAttempt::TerminalBytes { peer_id, path, local_endpoint, bytes, reason_code, reason } => {
+                            // Terminal physical outcomes never return plaintext.
+                            // Report health/loss in the existing per-peer task
+                            // boundary, so asynchronous cleanup cannot stall
+                            // unrelated ingress or overtake this peer's FIFO.
+                            flushing_peers.insert(peer_id.clone());
+                            let transport = transport.clone();
+                            let peers = peers.clone();
+                            let timeline = timeline.clone();
+                            flush_tasks.spawn(async move {
+                                report_fast_path_terminal(
+                                    &transport, &peers, &peer_id, path.generation,
+                                    bytes, reason_code, reason, &timeline, Some((path, local_endpoint)),
+                                ).await;
+                                (peer_id, PeerPendingQueue::new())
+                            });
                         }
                     }
                 } else {
@@ -513,7 +564,7 @@ pub(super) async fn handle_ingress(
     let entry = pending
         .entry(peer_id.clone())
         .or_insert_with(PeerPendingQueue::new);
-    let (dropped_entries, dropped_bytes) = entry.enqueue(PendingPacket::plain(packet));
+    let (mut dropped_entries, dropped_bytes) = entry.enqueue(PendingPacket::plain(packet));
     let dropped_packets = dropped_entries.len();
     debug!(
         event = "outbound_fifo_state",
@@ -528,11 +579,15 @@ pub(super) async fn handle_ingress(
         "raw business packet appended to the per-peer FIFO"
     );
     if dropped_packets > 0 {
-        for dropped in &dropped_entries {
+        for dropped in &mut dropped_entries {
             let _ = peers.emit_local_mtu_feedback(
                 &peer_id,
                 dropped.raw_packet(),
                 crate::business_mtu::LocalMtuFeedbackKind::Unreachable,
+            );
+            record_pending_residence(
+                dropped.take_pending_residence(),
+                "tx_pending_residence_dropped_us",
             );
         }
         record_overflow_drop(
@@ -893,7 +948,14 @@ pub(super) async fn flush_one_peer(
             packet,
             direct_budget_reroutes,
             local_backpressure_retries,
+            mut pending_residence,
         } = front;
+        // Removing a queue from the actor, merging queues, or checking a
+        // temporarily unusable path is still pending residence. Pause only
+        // immediately before an actual encryption/send attempt.
+        if let Some(residence) = pending_residence.as_mut() {
+            residence.pause();
+        }
         match encrypt_then_send(
             packet,
             &transport,
@@ -906,12 +968,19 @@ pub(super) async fn flush_one_peer(
         )
         .await
         {
-            EncryptSendOutcome::Sent => flushed = flushed.saturating_add(1),
+            EncryptSendOutcome::Sent => {
+                record_pending_residence(pending_residence, "tx_pending_residence_sent_us");
+                flushed = flushed.saturating_add(1);
+            }
             EncryptSendOutcome::BudgetPending { packet, reason } => {
+                if let Some(residence) = pending_residence.as_mut() {
+                    residence.resume();
+                }
                 queue.push_front(PendingPacket::Plain {
                     packet,
                     direct_budget_reroutes,
                     local_backpressure_retries,
+                    pending_residence,
                 });
                 queue
                     .delivery_deadline
@@ -934,6 +1003,7 @@ pub(super) async fn flush_one_peer(
                 reason,
             } => {
                 if reason_code == REASON_DIRECT_BUDGET_STALE && direct_budget_reroutes >= 1 {
+                    record_pending_residence(pending_residence, "tx_pending_residence_dropped_us");
                     record_terminal_drop(
                         &transport,
                         &peers,
@@ -964,6 +1034,7 @@ pub(super) async fn flush_one_peer(
                         direct_budget_reroutes
                     },
                     local_backpressure_retries,
+                    pending_residence,
                     reason_code,
                     reason,
                     &timeline,
@@ -981,6 +1052,7 @@ pub(super) async fn flush_one_peer(
                     packet,
                     direct_budget_reroutes,
                     next_backpressure_retries,
+                    pending_residence,
                     REASON_DIRECT_LOCAL_BACKPRESSURE,
                     reason,
                     &timeline,
@@ -1002,6 +1074,7 @@ pub(super) async fn flush_one_peer(
                 reason_code,
                 reason,
             } => {
+                record_pending_residence(pending_residence, "tx_pending_residence_dropped_us");
                 record_terminal_drop(
                     &transport,
                     &peers,
@@ -1094,11 +1167,15 @@ pub(super) async fn merge_completed_flush(
         let (dropped, bytes) = completed.enqueue(packet);
         dropped_packets = dropped_packets.saturating_add(dropped.len());
         dropped_bytes = dropped_bytes.saturating_add(bytes);
-        for packet in dropped {
+        for mut packet in dropped {
             let _ = peers.emit_local_mtu_feedback(
                 &peer_id,
                 packet.raw_packet(),
                 crate::business_mtu::LocalMtuFeedbackKind::Unreachable,
+            );
+            record_pending_residence(
+                packet.take_pending_residence(),
+                "tx_pending_residence_dropped_us",
             );
         }
     }
@@ -1143,6 +1220,7 @@ pub(super) async fn record_retry_and_repark(
     packet: OutboundPacket,
     direct_budget_reroutes: u8,
     local_backpressure_retries: u32,
+    mut pending_residence: Option<PendingQueueResidence>,
     reason_code: &'static str,
     reason: String,
     timeline: &ConnectionTimeline,
@@ -1164,10 +1242,14 @@ pub(super) async fn record_retry_and_repark(
         timeline,
     )
     .await;
+    if let Some(residence) = pending_residence.as_mut() {
+        residence.resume();
+    }
     entry.push_front(PendingPacket::Plain {
         packet,
         direct_budget_reroutes,
         local_backpressure_retries,
+        pending_residence,
     });
     entry.retry_after = Some(Instant::now() + OUTBOUND_RETRY_DELAY);
     entry
@@ -1220,6 +1302,69 @@ pub(super) async fn record_terminal_drop(
         timeline,
     )
     .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn report_fast_path_terminal(
+    transport: &WireGuardTransport,
+    peers: &PeerManager,
+    peer_id: &str,
+    generation: u64,
+    bytes: usize,
+    reason_code: &'static str,
+    reason: String,
+    timeline: &ConnectionTimeline,
+    health_failure: Option<(ActivePathSnapshot, Option<SocketAddr>)>,
+) {
+    let mut accounting_complete = false;
+    let report = async {
+        // Loss belongs to the original packet even if its path was replaced.
+        // Complete accounting before attempting optional path-health cleanup.
+        record_terminal_drop_bytes(
+            transport,
+            peers,
+            peer_id,
+            generation,
+            bytes,
+            reason_code,
+            reason.clone(),
+            timeline,
+        )
+        .await;
+        accounting_complete = true;
+        if let Some((path, local_endpoint)) = health_failure {
+            peers
+                .record_direct_failure_for_active_path_snapshot(
+                    peer_id,
+                    path,
+                    REASON_DIRECT_SEND_FAILED,
+                    reason,
+                    local_endpoint,
+                )
+                .await;
+        }
+    };
+    if timeout(OUTBOUND_SEND_TIMEOUT, report).await.is_err() {
+        let phase = if accounting_complete {
+            "path_health"
+        } else {
+            "loss_accounting"
+        };
+        timeline.emit(
+            "outbound_terminal_report_timeout", Some("direct"), Some(reason_code),
+            Some(format!("peer={peer_id} generation={generation} bytes={bytes} accounting_complete={accounting_complete} phase={phase}; incomplete accounting may be partial")),
+        );
+        warn!(
+            event = "outbound_terminal_report_timeout",
+            peer_id,
+            generation,
+            bytes,
+            reason_code,
+            accounting_complete,
+            phase,
+            "bounded terminal report stopped; only completed accounting is confirmed"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1376,7 +1521,7 @@ pub(super) async fn drop_pending_queue(
     reason_code: &'static str,
     timeline: &ConnectionTimeline,
 ) {
-    let Some(queue) = queue else { return };
+    let Some(mut queue) = queue else { return };
     let dropped = queue.queue.len();
     if dropped == 0 {
         return;
@@ -1387,6 +1532,12 @@ pub(super) async fn drop_pending_queue(
         .map(|packet| packet.peer_id().to_string())
         .unwrap_or_default();
     let generation = queue.wait_generation.unwrap_or(0);
+    for packet in &mut queue.queue {
+        record_pending_residence(
+            packet.take_pending_residence(),
+            "tx_pending_residence_dropped_us",
+        );
+    }
     if matches!(
         reason_code,
         REASON_OUTBOUND_DELIVERY_DEADLINE
@@ -1450,3 +1601,7 @@ pub(super) async fn drop_all_pending_queues(
 #[cfg(test)]
 #[path = "tests/queue.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/profiling.rs"]
+mod profiling_tests;

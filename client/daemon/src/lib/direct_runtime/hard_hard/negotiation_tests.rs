@@ -210,6 +210,26 @@ async fn hard_hard_fresh_retries_spend_one_shared_epoch_budget() {
         .recovery_epoch_work_budget_report(&info.node_id)
         .await
         .unwrap();
+    assert!(
+        !peers
+            .recovery_hard_hard_available(&info.node_id, epoch)
+            .await
+    );
+    assert!(
+        peers
+            .advance_recovery_stage_after_no_ack_for_peer_session(
+                &info.node_id,
+                peers.current_network_generation_sync(),
+                peers.peer_session_generation_sync(&info.node_id).unwrap(),
+                "fixture ordinary attempt completed without ACK",
+            )
+            .await
+    );
+    assert!(
+        peers
+            .recovery_hard_hard_available(&info.node_id, epoch)
+            .await
+    );
     let mut identity = None;
     for _ in 0..before.hard_hard_generations_remaining {
         let reservation = peers
@@ -752,4 +772,202 @@ async fn both_roles_reject_activation_that_would_truncate_confirmation_without_r
             original_start - Duration::from_millis(700)
         );
     }
+}
+
+#[tokio::test]
+async fn production_hard_hard_retry_requires_current_recovery_feedback() {
+    let peers = PeerManager::new(
+        Config::generate_default("https://ctrl.test", "hh-first-opportunity").unwrap(),
+    );
+    let mut info = crate::control::PeerInfo {
+        node_id: "peer-first-opportunity".into(),
+        capabilities: crate::control::PeerCapabilities::current(),
+        registration_seq: 202,
+        public_key: "pk".into(),
+        endpoint: "203.0.113.20:40001".into(),
+        virtual_ip: "10.20.0.2".into(),
+        online: true,
+        ..Default::default()
+    };
+    peers.add_peer(&info).await;
+    let generation = peers.current_network_generation_sync();
+    let session = peers.peer_session_generation_sync(&info.node_id).unwrap();
+    let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&info.node_id).await
+    else {
+        panic!("initial recovery must be admitted");
+    };
+    let before = peers
+        .recovery_epoch_work_budget_report(&info.node_id)
+        .await
+        .unwrap();
+    assert_eq!(before.stage, crate::peer::RecoveryStage::Initial);
+    assert!(
+        !peers
+            .recovery_hard_hard_available(&info.node_id, epoch)
+            .await
+    );
+    assert!(
+        !peers
+            .recovery_hard_hard_available(&info.node_id, epoch.wrapping_add(1))
+            .await
+    );
+    assert!(
+        !peers
+            .advance_recovery_stage_after_no_ack_for_peer_session(
+                &info.node_id,
+                generation.wrapping_add(1),
+                session,
+                "stale network cannot unlock HH",
+            )
+            .await
+    );
+    assert_eq!(
+        peers
+            .recovery_epoch_work_budget_report(&info.node_id)
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(
+        peers
+            .advance_recovery_stage_after_no_ack_for_peer_session(
+                &info.node_id,
+                generation,
+                session,
+                "ordinary attempt completed with no ACK",
+            )
+            .await
+    );
+    let mut expected = before.clone();
+    expected.stage = crate::peer::RecoveryStage::Predicted;
+    assert_eq!(
+        peers
+            .recovery_epoch_work_budget_report(&info.node_id)
+            .await
+            .unwrap(),
+        expected,
+        "feedback must change only the stage, without spending or refilling any budget"
+    );
+    assert!(
+        peers
+            .recovery_hard_hard_available(&info.node_id, epoch)
+            .await
+    );
+    assert!(
+        !peers
+            .recovery_hard_hard_available(&info.node_id, epoch.wrapping_add(1))
+            .await
+    );
+    assert_eq!(
+        peers
+            .recovery_epoch_work_budget_report(&info.node_id)
+            .await
+            .unwrap(),
+        expected
+    );
+
+    info.registration_seq += 1;
+    peers.add_peer(&info).await;
+    let replacement = peers.peer_session_generation_sync(&info.node_id).unwrap();
+    assert_ne!(replacement, session);
+    assert!(
+        !peers
+            .recovery_hard_hard_available(&info.node_id, epoch)
+            .await
+    );
+    assert!(
+        !peers
+            .advance_recovery_stage_after_no_ack_for_peer_session(
+                &info.node_id,
+                generation,
+                session,
+                "retired peer session feedback",
+            )
+            .await
+    );
+    let RecoveryAdmission::Accepted {
+        epoch: replacement_epoch,
+    } = peers.recovery_epoch_admit(&info.node_id).await
+    else {
+        panic!("replacement registration must be admitted");
+    };
+    assert_ne!(replacement_epoch, epoch);
+    let replacement_before = peers
+        .recovery_epoch_work_budget_report(&info.node_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        replacement_before.stage,
+        crate::peer::RecoveryStage::Initial
+    );
+    assert!(
+        !peers
+            .recovery_hard_hard_available(&info.node_id, replacement_epoch)
+            .await
+    );
+    assert!(
+        !peers
+            .recovery_hard_hard_available(&info.node_id, epoch)
+            .await
+    );
+    assert!(
+        !peers
+            .advance_recovery_stage_after_no_ack_for_peer_session(
+                &info.node_id,
+                generation,
+                session,
+                "old feedback cannot unlock replacement recovery",
+            )
+            .await
+    );
+    assert_eq!(
+        peers
+            .recovery_epoch_work_budget_report(&info.node_id)
+            .await
+            .unwrap(),
+        replacement_before
+    );
+    assert!(
+        peers
+            .advance_recovery_stage_after_no_ack_for_peer_session(
+                &info.node_id,
+                generation,
+                replacement,
+                "replacement ordinary attempt completed with no ACK",
+            )
+            .await
+    );
+    let mut replacement_expected = replacement_before;
+    replacement_expected.stage = crate::peer::RecoveryStage::Predicted;
+    assert!(
+        peers
+            .recovery_hard_hard_available(&info.node_id, replacement_epoch)
+            .await
+    );
+    assert_eq!(
+        peers
+            .recovery_epoch_work_budget_report(&info.node_id)
+            .await
+            .unwrap(),
+        replacement_expected
+    );
+    let new_generation = peers
+        .advance_network_generation("retire HH feedback network")
+        .await;
+    assert_ne!(new_generation, generation);
+    assert!(
+        !peers
+            .recovery_hard_hard_available(&info.node_id, replacement_epoch)
+            .await
+    );
+    assert!(
+        !peers
+            .advance_recovery_stage_after_no_ack_for_peer_session(
+                &info.node_id,
+                generation,
+                replacement,
+                "retired network feedback",
+            )
+            .await
+    );
 }

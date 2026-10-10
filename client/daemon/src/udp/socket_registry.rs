@@ -106,6 +106,38 @@ impl UdpTransport {
         self.socket_for_peer(peer_id).await
     }
 
+    /// Read the existing socket registry without waiting or partly running a
+    /// stale-socket detach. Lifecycle cleanup belongs to the ordinary resolver.
+    pub(crate) fn try_socket_for_peer_endpoint(
+        &self,
+        peer_id: &str,
+        endpoint: SocketAddr,
+    ) -> Option<(usize, Arc<UdpSocket>)> {
+        if endpoint.is_ipv6() {
+            return self
+                .ipv6_socket
+                .clone()
+                .map(|socket| (IPV6_SOCKET_INDEX, socket));
+        }
+        let state = self.socket_state.try_lock().ok()?;
+        let index = state
+            .affinity
+            .get(peer_id)
+            .map_or(0, |pin| pin.socket_index);
+        if index >= DYNAMIC_SOCKET_INDEX_BASE {
+            let entry = state.dynamic.get(&index)?;
+            return (entry.peer_id == peer_id
+                && entry.phase.is_usable()
+                && entry.network_generation == self.peers.current_network_generation_sync()
+                && entry.permits_ordinary_traffic())
+            .then(|| (index, entry.socket.clone()));
+        }
+        self.active_sockets()
+            .get(index)
+            .cloned()
+            .map(|socket| (index, socket))
+    }
+
     /// Exact encrypted sends must not consume an unproven rendezvous mapping.
     /// Isolation is established while provisional and never re-enabled after
     /// authentication, so a successful check cannot race a later reservation.

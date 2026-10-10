@@ -38,6 +38,41 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 `connection_timeline.hot_path_observations` 保留进程生命周期内的精确分类计数，包括会话证据锁竞争、身份过期、业务 ingress 暂缓、出站队列冲刷批次，以及匹配 ACK 被验证调度器接纳、合并、限流或因健康 Direct 而忽略的次数。高频会话事件只在每类计数达到 1、2、4、8 等 2 的幂时写入时间线和状态事件流；计数本身不会按包推动状态 revision。`session_evidence_contended` 表示当前身份围栏暂时竞争，`stale_session_evidence` 表示身份已过期，不应仅凭采样事件数反推总包数。
 
+## 本地数据面采样
+
+`dataplane_profile` 与 `dataplane_profile_summary` 使用 `profile_schema_version=2`。发送与接收按固定 1/64 包频率选择诊断样本，各阶段按名称和单位分别保存最近最多 512 个样本，不按 30 秒清空。快慢路径和不同阶段的样本量可能不同，不能由一个阶段的计数推算另一个阶段。
+
+| 字段 | 口径 |
+| --- | --- |
+| `unit` | `microseconds`、`count` 或 `bytes`；通用 `p50`、`p95`、`p99`、`max` 使用该单位 |
+| `sample_count` | 该阶段和单位自 profiler 创建以来接纳的累计样本数，包含已被窗口淘汰的样本 |
+| `window_sample_count` | 本次分位数实际使用的样本数，范围 1–512 |
+| `window_kind` / `window_capacity` | 固定为 `latest_samples` / `512`，表示最近样本窗口，不是固定时长窗口 |
+| `window_start_elapsed_us` / `window_end_elapsed_us` | 窗口内样本记录时刻的最小值和最大值，相对本进程 profiler 起点的单调时间 |
+| `window_span_us` | 上述记录时间范围的非负跨度；单样本为 0 |
+| `reported_at_elapsed_us` / `window_last_sample_age_us` | 本次报告时刻，以及最近窗口样本距报告的非负时间差 |
+
+兼容字段 `p50_us`、`p95_us`、`p99_us`、`max_us` 仅随 `unit=microseconds` 输出；队列包数和字节数不带这些字段。读取 schema 2 时应先检查 `unit`，使用通用分位数字段。P99 的样本量来自 `window_sample_count`，不能使用可能很大的累计 `sample_count`，也不能把窗口最大值当作完整运行期间的峰值。
+
+阶段 debug 报告每累计 8 个样本产生一次；info 汇总由新采样触发，最短间隔 30 秒，闲置时没有独立定时报告。`dataplane_tail_event` 以 2 ms 为候选阈值、5 ms 为 severe 阈值，进程内限频间隔为 100 ms。`tail_events` 累计达到阈值的候选，`tail_events_emitted` 统计限频器接纳的事件，`tail_events_suppressed` 统计限频器省略的候选；emitted 不保证日志订阅器或落盘系统已经保存该事件。它们不表示所有业务包的尾延迟分布。
+
+这些数据仅描述端点本地 userspace 阶段，不是对端应用延迟、公网 RTT 或端到端业务成功证据；采样、日志和直方图均不参与路径选择。
+
+`tx_pending_residence_sent_us` 与 `tx_pending_residence_dropped_us` 分别记录采样包经显式发送成功或丢弃终态完成的 pending 驻留时间。初次进入 network-outbound FIFO 开始计时，actor 到 flush 任务的转移及队列合并不重置；真正进入加密/发送尝试时暂停，重试或预算暂缓后重新排队时继续累计。它是同一包所有排队区间之和，包含重试后的排队，排除加密/发送执行时间。成功与丢弃分开，不能只用成功样本判断积压情况，也不能从这些采样数推算完整丢包数。
+
+这两个阶段只覆盖执行了上述显式终态记录的样本。任务 abort、panic 或关闭期间的取消若发生在记录之前，该样本的最终驻留时间未知，不能按零驻留或发送成功处理。
+
+出站 actor 在采样包从 channel 取出后读取以下资源量；当前已取出的包不再属于 channel。这些仍是采样窗口内的读数，不是连续监测的全程峰值：
+
+| `stage` | `unit` | `resource_scope` 与范围 |
+| --- | --- | --- |
+| `tx_network_outbound_queue_depth` | `count` | `channel_queued_packets`：该 channel 中尚未取出的包数 |
+| `tx_network_outbound_actor_pending_packets` | `count` | `actor_owned_pending_only`：当前 actor 持有的 FIFO 包数之和 |
+| `tx_network_outbound_actor_pending_bytes` | `bytes` | `actor_owned_pending_only`：上述 FIFO 中原始 IP 包长度之和 |
+| `tx_network_outbound_active_flush_tasks` | `count` | `spawned_flush_tasks_including_unjoined`：JoinSet 中的任务数，包含已结束但尚未 join 的任务 |
+
+已移交 flush 任务的 FIFO 及任务正在处理的包不在 actor pending 读数内；任务数不能换算成包数。channel 字节深度、session 层 pending、上游队列、生产者等待提交的包及加密/重试副本不由这些字段覆盖。资源报告携带 `total_logical_bytes_measured=false`，表示整条逻辑流水线的总字节尚未计量；上述原始包长度也不是实际分配内存或 RSS。
+
 ## Hard↔Hard attempt report
 
 控制客户端的阶段追踪同时识别 `hh1` 与 `hh2`，服务端在 `P2WLAN_A0_SIGNAL_TRACE=1` 时记录对应信令接纳阶段。关联字段使用短摘要标签，不输出原始 session token；信令持久化仅表示服务端接纳，不能证明对端已执行探测或建立 Direct。
@@ -155,6 +190,39 @@ manifest 分开报告 requested 场景/轮次、smoke 执行结果、证据有�
 重建和超时会关闭旧映射、取消其发送工作，延迟投递在执行前重新验证源/目标映射身份。该行为模拟 NAT 状态丢失及端口变化，不模拟手机操作系统的换网通知或真实小区切换。`short-idle-stress` 的 1.5–2 秒超时用于加速触发边界；[RFC 4787](https://www.rfc-editor.org/info/rfc4787/) 对一般 UDP 映射要求至少 2 分钟，不能把这个压力参数当作合规 NAT 的默认值。
 
 正常模式还生成 `business-samples.jsonl` 与 `continuity-evidence.json`。它们使用同一主机单调时钟，要求结束前的观测窗口仍有双向业务增长；发生中断或映射重建时，还要求最后一个故障边界之后持续观察至少 2 秒，并看到新的双向业务。仅有故障前的累计成功不能通过。`established-direct-outage` 和 `established-direct-rebind` 还要求首次故障前双方各有至少两个验证通过的 Direct 业务包；采样读取完成时间必须早于故障，只有连接提升日志或故障后才建立 Direct 都不能满足该前置条件。单轮可用 `NORMAL_REQUIRE_DIRECT_BEFORE_FAULT=1` 启用这一检查。故障后允许正常选择 Direct 或 Relay，最终快照还必须保有活动路径。故障事件、抖动值、重建后的新映射与超时必须在 trace 中实际出现；未触发配置故障会报告 `fault_not_exercised`。背景流的成功和超时分别记录，配置会影响 STUN 时允许实际超时，但所有已请求流仍须结束且至少有成功回复。测试进程与任务健康、原始发送捕获、损坏报文、业务首包时限和完整回收的检查继续保留。
+
+## 成对批次实验
+
+`benchmark_campaign.py` 在正常矩阵之上冻结场景、种子和批次，分别执行 baseline 与 candidate。每场景允许 1–1000 轮，每 variant 总计最多 10000 轮，单批最多 32 轮。两个 variant 使用相同的场景与种子；失败不重跑，产品自身的正常有界重试仍生效。命令在包含该脚本的 checkout 根目录运行，计划和证据输出必须是仓库外尚不存在的绝对路径：
+
+```sh
+python3 scripts/nat-sim/benchmark_campaign.py plan \
+  --scenario strict-normal --scenario udp-queue-pressure \
+  --rounds 100 --seed 931200 --batch-size 32 \
+  --output /absolute/path/outside/repository/campaign-plan.json
+
+python3 scripts/nat-sim/benchmark_campaign.py run \
+  --plan /absolute/path/outside/repository/campaign-plan.json \
+  --variant baseline --repository /absolute/path/to/baseline-checkout \
+  --output /absolute/path/outside/repository/baseline-evidence
+
+python3 scripts/nat-sim/benchmark_campaign.py run \
+  --plan /absolute/path/outside/repository/campaign-plan.json \
+  --variant candidate --repository /absolute/path/to/candidate-checkout \
+  --output /absolute/path/outside/repository/candidate-evidence
+
+python3 scripts/nat-sim/benchmark_campaign.py summarize \
+  --plan /absolute/path/outside/repository/campaign-plan.json \
+  --campaign /absolute/path/outside/repository/baseline-evidence/campaign.json \
+  --campaign /absolute/path/outside/repository/candidate-evidence/campaign.json \
+  --output /absolute/path/outside/repository/campaign-summary.json
+```
+
+`--repository` 选择实际构建和运行的 checkout，省略时使用脚本所在仓库。两份 checkout 的已冻结模拟 harness 必须相同；每个 variant 的源码 commit 和补丁摘要在批次间保持一致。计划另绑定契约与场景摘要；收集时复核批次 manifest 的路径、摘要、内容、variant 和源码身份。原始输出应与 manifest 一起保存，不能只复制汇总数字。
+
+汇总的成功率分母为全部预定轮次，包括失败、超时、缺失 manifest 和尚未收集的批次；Wilson 95% 区间沿用同一预定分母。`complete` 只表示两个 variant 的全部预定结果已被计入，失败或缺失 manifest 也可以完成计数，不表示实验通过或 candidate 改善。
+
+当前范围为 `synthetic_ipv4_udp_normal_join`：mock TUN、同主机进程和人工网络条件。成功可经 Direct 或 Relay；`direct_at_10s`、`first_business_ms`、`application_p99_ms` 保持 `null` 并给出未知原因。启动二进制及配置摘要尚未构成完整运行身份，不能从该汇总声称发布产物性能、真实运营商成功率或 Minecraft 交互延迟。不同种子也不构成独立真实网络样本。
 
 ## 活动路径遥测契约（path_telemetry_v1）
 

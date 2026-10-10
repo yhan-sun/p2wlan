@@ -143,6 +143,32 @@ impl PeerManager {
             reason,
             local_endpoint,
             false,
+            None,
+        )
+        .await
+            != DirectFailureCommitOutcome::Rejected
+    }
+
+    /// A delayed business-send failure belongs to one exact committed path.
+    /// Verify its snapshot in the same epoch/connection transaction as the
+    /// existing reducer, so a replacement Direct path cannot inherit it.
+    pub(crate) async fn record_direct_failure_for_active_path_snapshot(
+        &self,
+        node_id: &str,
+        snapshot: ActivePathSnapshot,
+        code: impl Into<String>,
+        reason: impl Into<String>,
+        local_endpoint: Option<SocketAddr>,
+    ) -> bool {
+        self.record_direct_failure_commit_for_peer_session(
+            node_id,
+            snapshot.generation,
+            snapshot.peer_session_generation,
+            code,
+            reason,
+            local_endpoint,
+            false,
+            Some(snapshot),
         )
         .await
             != DirectFailureCommitOutcome::Rejected
@@ -162,6 +188,7 @@ impl PeerManager {
         reason: impl Into<String>,
         local_endpoint: Option<SocketAddr>,
         ignore_confirmed_direct: bool,
+        expected_path: Option<ActivePathSnapshot>,
     ) -> DirectFailureCommitOutcome {
         let reason = reason.into();
         let code = code.into();
@@ -183,6 +210,18 @@ impl PeerManager {
                 return DirectFailureCommitOutcome::Rejected;
             };
             if !conn.online || conn.state == ConnectionState::Closed {
+                return DirectFailureCommitOutcome::Rejected;
+            }
+            if expected_path.is_some_and(|snapshot| {
+                snapshot.path != NetworkPath::Direct
+                    || snapshot.generation != generation
+                    || snapshot.peer_session_generation != peer_session_generation
+                    || conn.state != ConnectionState::Direct
+                    || conn.direct_generation != generation
+                    || conn.direct_commit_seq != snapshot.direct_commit_seq
+                    || conn.selected_direct_endpoint_for_consent(generation)
+                        != Some(snapshot.endpoint)
+            }) {
                 return DirectFailureCommitOutcome::Rejected;
             }
             if ignore_confirmed_direct
@@ -302,6 +341,7 @@ impl PeerManager {
                 reason.clone(),
                 None,
                 true,
+                None,
             )
             .await;
         match outcome {

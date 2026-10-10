@@ -1740,6 +1740,113 @@ impl UdpTransport {
             .await
     }
 
+    /// One nonblocking handoff for the legacy LAN business specialization.
+    /// The caller retains the epoch, slot-read and per-peer emit fences through
+    /// this syscall. Only WouldBlock/StaleToken are safe plaintext fallbacks;
+    /// all other outcomes remain terminal to avoid uncertain delivery replay.
+    pub(crate) fn try_send_lan_business_packet_on_socket(
+        &self,
+        socket: &Arc<UdpSocket>,
+        socket_index: usize,
+        packet: &EncryptedPeerPacket,
+        endpoint: SocketAddr,
+        publication_owner: u64,
+    ) -> std::result::Result<usize, DirectBusinessUdpSendError> {
+        if self.inbound_publication_owner() != publication_owner
+            || self.peer_requires_direct_business_budget(&packet.peer_id)
+        {
+            return Err(DirectBusinessUdpSendError::StaleToken);
+        }
+        // Business traffic requires a LIVE registry owner. Control ACKs may
+        // use a retained detached Arc, but that permission cannot authorize a
+        // business handoff. Retain the same registry guard through the syscall
+        // so detach/replacement linearizes before or after this one datagram.
+        let registry_guard =
+            if socket_index >= DYNAMIC_SOCKET_INDEX_BASE && socket_index != IPV6_SOCKET_INDEX {
+                let state = self
+                    .socket_state
+                    .try_lock()
+                    .map_err(|_| DirectBusinessUdpSendError::WouldBlock)?;
+                let Some(entry) = state.dynamic.get(&socket_index) else {
+                    return Err(DirectBusinessUdpSendError::StaleToken);
+                };
+                if entry.peer_id != packet.peer_id
+                    || !entry.phase.is_usable()
+                    || entry.network_generation != self.peers.current_network_generation_sync()
+                    || !entry.permits_ordinary_traffic()
+                    || !Arc::ptr_eq(&entry.socket, socket)
+                {
+                    return Err(DirectBusinessUdpSendError::StaleToken);
+                }
+                Some(state)
+            } else {
+                let current = if socket_index == IPV6_SOCKET_INDEX {
+                    self.ipv6_socket.as_ref()
+                } else {
+                    self.active_sockets().get(socket_index)
+                };
+                if current.is_none_or(|current| !Arc::ptr_eq(current, socket)) {
+                    return Err(DirectBusinessUdpSendError::StaleToken);
+                }
+                None
+            };
+        if packet
+            .room_authorization
+            .as_ref()
+            .is_some_and(|permit| !permit.is_valid())
+        {
+            return Err(DirectBusinessUdpSendError::Io(
+                "room send authorization expired or revoked".into(),
+            ));
+        }
+        #[cfg(test)]
+        if self
+            .direct_business_emsgsize_once
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(DirectBusinessUdpSendError::LocalPacketTooLarge);
+        }
+        #[cfg(test)]
+        if self.injected_direct_business_would_block_for_test(&packet.peer_id) {
+            return Err(DirectBusinessUdpSendError::WouldBlock);
+        }
+        let sent = self
+            .dplpmtud
+            .try_with_business_publication_gate(|| {
+                // Owner withdrawal uses this same short synchronous gate. It
+                // must win either before or after the exact physical handoff.
+                if self.inbound_publication_owner() != publication_owner
+                    || self.peer_requires_direct_business_budget(&packet.peer_id)
+                {
+                    return Err(DirectBusinessUdpSendError::StaleToken);
+                }
+                socket
+                    .try_send_to(&packet.wire_bytes, endpoint)
+                    .map_err(|error| {
+                        if is_local_packet_too_large(&error) {
+                            DirectBusinessUdpSendError::LocalPacketTooLarge
+                        } else if error.kind() == std::io::ErrorKind::WouldBlock {
+                            DirectBusinessUdpSendError::WouldBlock
+                        } else {
+                            DirectBusinessUdpSendError::Io(error.to_string())
+                        }
+                    })
+            })
+            .ok_or(DirectBusinessUdpSendError::WouldBlock)??;
+        if sent != packet.wire_bytes.len() {
+            return Err(DirectBusinessUdpSendError::Short {
+                sent,
+                expected: packet.wire_bytes.len(),
+            });
+        }
+        drop(registry_guard);
+        // A completed kernel handoff is final even if diagnostics are busy.
+        self.update_socket_diagnostics_try(socket_index, |metrics| {
+            metrics.encrypted_packets_sent += 1
+        });
+        Ok(sent)
+    }
+
     /// Exact-socket control sends may carry an immutable attempt deadline.
     pub(super) async fn send_encrypted_packet_on_socket_until(
         &self,
@@ -1774,6 +1881,10 @@ impl UdpTransport {
                     std::io::ErrorKind::PermissionDenied,
                     "room send authorization expired or revoked",
                 )));
+            }
+            #[cfg(test)]
+            if self.poll_udp_send_pending_for_test(&packet.peer_id, cx) {
+                return std::task::Poll::Pending;
             }
             socket.poll_send_to(cx, &packet.wire_bytes, endpoint)
         })
