@@ -29,3 +29,9 @@
 随后为 `udp_business_probe.py probe` 或 `tcp_business_probe.py probe` 添加 `--request-plan /absolute/new-plan.json`。需同时分发 `probe_request_plan.py`、`udp_business_probe.py` 和对应 TCP 工具；计划核对工具指纹、完整请求 nonce、流、数量及时间配置，不匹配时在打开 socket 前失败。未提供计划时仍使用随机请求 nonce，旧的双文件分发方式保持可用。
 
 默认仍是 8 个请求、100ms 间隔、1000ms 单请求超时、10000ms 总期限及 128 字节负载。计划加载发生在原测量时钟之前，不延长期限或重发请求；TCP 保持一次连接。报告中的 `prepared_probe_input_only` 仅表明使用了计划输入，`daemon_registration_verified` 保持 false，不能据此确认真实 TUN、Direct 或当前连接归属。
+
+两个 probe 的可选 `--write-facts-fd N` 将原 socket 写入观察送入调用方提供的 POSIX 管道，必须同时使用精确请求计划。调用方先创建管道、把写端设为非阻塞并显式传入子进程；工具验证写端后复制私有描述符，仅关闭自己的副本，不设置调用方的文件标志。需额外分发 `probe_write_facts.py` 和 `probe_process_identity.py`。Windows 不支持这个选项；不传选项时保持原有运行方式。
+
+管道中的 JSONL 按序记录计划/工具指纹、当前生产进程、原始单调时钟起点、socket 身份，以及每次原 `sendto` 或 `send` 的时间、帧摘要、偏移、请求字节数、实际返回字节数或数字 errno。TCP 每次分段写入沿用同一原请求截止时间。每条记录最多 512 字节，只尝试一次原子非阻塞写入，总计最多 8192 条、4 MiB；没有采证队列、重试或后台线程。采证耗时计入原预算。管道满、关闭或容量耗尽时停止发出记录，报告保留 `emission_gap_reason`，业务请求仍使用原数量、次数及期限。
+
+这些记录仅属 `original_os_socket_write_observations_only`。Linux 可记录本进程出生时间、boot 和命名空间；其他 POSIX 平台明确标记 Linux 出生/同 boot 时钟不可用。接收方仍须核对自己创建的生产进程和管道、原计划与源码、完整序号及结束记录，再接真实 TUN、物理发送、房间许可与当前连接所有者。`daemon_registration_verified` 和 `kernel_tun_verified` 均为 false，管道接受记录不能证明这些条件。

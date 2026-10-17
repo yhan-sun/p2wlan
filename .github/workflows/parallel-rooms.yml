@@ -38,6 +38,14 @@ jobs:
           else
             python3 scripts/dual-end/test_probe_request_plan.py -v
           fi
+      - name: Original OS socket write observation controls
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python scripts/dual-end/test_probe_write_facts.py -v
+          else
+            python3 scripts/dual-end/test_probe_write_facts.py -v
+          fi
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
         with:
           channel: stable

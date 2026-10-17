@@ -13,6 +13,7 @@ on:
       - "client/android-native/**"
       - "client/tun/**"
       - "scripts/build_android_native.sh"
+      - "scripts/release/**"
       # The daemon owns the authoritative status/route/event contract the
       # Flutter client consumes; changes must re-run client tests + contract
       # test (ADR 0004, P2-04).
@@ -43,6 +44,7 @@ on:
       - "client/android-native/**"
       - "client/tun/**"
       - "scripts/build_android_native.sh"
+      - "scripts/release/**"
       - "client/daemon/src/diagnostics/**"
       - "client/daemon/src/route/**"
       - "client/daemon/src/connection_timeline.rs"
@@ -125,6 +127,18 @@ jobs:
           channel: stable
           flutter-version-file: .fvmrc
           cache: true
+
+      - name: Prepare isolated Android plugin repositories
+        working-directory: .
+        shell: bash
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/p2wlan-android-gradle
+        run: |
+          set -euo pipefail
+          python3 -B scripts/release/test_android_gradle_repositories.py -v
+          python3 -B scripts/release/prepare_android_gradle_repositories.py \
+            --gradle-user-home "$GRADLE_USER_HOME" --flutter-sdk "$FLUTTER_ROOT"
+          printf 'GRADLE_USER_HOME=%s\n' "$GRADLE_USER_HOME" >> "$GITHUB_ENV"
 
       - name: Set up Rust Android targets
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c

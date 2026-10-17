@@ -113,6 +113,12 @@ Path State Machine 的 Linux workspace 步骤使用包装器的默认 target 范
 
 原 Cargo 退出后，两条输出流合计最多等待 5 秒收尾，避免后代继承管道导致 EOF 永不抵达；这不改变测试运行期限。到期记录 `stream_not_closed_after_cargo_exit`，日志标为不完整，不宣称最终摘要或已绑定的失败程序。泵线程停止接受新数据，残留阻塞读取随包装器进程退出关闭；不等待不归包装器直接所有的后代，也不向它们发送信号。原 Cargo 非零退出码仍保留；原退出为零而采证失败时包装器失败。
 
+## Android CI 插件仓库
+
+Android APK 的两个 CI 构建任务使用 runner 临时目录中的独立 `GRADLE_USER_HOME`。`scripts/release/prepare_android_gradle_repositories.py` 只接受 Git checkout 外尚未存在的绝对路径，验证 Flutter SDK 后，将仓库内的 init 脚本按原字节安装到私有 `init.d`；已有目录或符号链接会使准备失败。
+
+init 脚本通过 `FLUTTER_ROOT` 精确限定 Flutter SDK 的 Gradle included build，将 `org.jetbrains.kotlin` 组的插件依赖交给 Maven Central，其他插件仍使用 Plugin Portal。Gradle 的根项目插件仓库不会自动继承到 included build。此配置不改写 SDK、插件版本或 wrapper 校验值；构建失败仍按原任务规则处理。
+
 ## 依赖审计输出
 
 Rust 依赖摘要由 `scripts/security/dependency_reports.py` 的 `rust` 子命令生成。工作流分别保留 cargo-deny 的 stdout 与 stderr，并通过 `--root-deny-stderr`、`--fuzz-deny-stderr` 一起提交诊断；有效的 stdout-only JSON 输出也可使用。摘要分别记录两条输出流的记录数量及 advisories、bans、licenses、sources 完成计数，不推断跨流时间顺序。

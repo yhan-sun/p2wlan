@@ -149,6 +149,18 @@ def prepare_request_plan(config: Config, path: Path | None, transport: str, tool
     return load_plan(path, config, transport, tool_sha256, shared)
 
 
+def prepare_write_facts(descriptor, prepared, config, transport, tool_sha256):
+    if descriptor is None:
+        return None
+    if prepared is None:
+        raise ValueError("write facts require an explicit exact request plan")
+    try:
+        from probe_write_facts import WriteFacts
+    except ImportError as error:
+        raise ValueError("explicit write facts require both observer helper modules") from error
+    return WriteFacts(descriptor, prepared, config, transport, tool_sha256)
+
+
 def open_socket(config: Config, supplied: socket.socket | None) -> socket.socket:
     if supplied is None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -206,7 +218,7 @@ def observe_reply(config: Config, records: list[dict], data: bytes, source: tupl
 
 
 def run_probe(config: Config, supplied_socket: socket.socket | None = None,
-              request_plan: Path | None = None) -> dict:
+              request_plan: Path | None = None, write_facts_fd: int | None = None) -> dict:
     config.validate()
     report = base_report(config, "probe")
     prepared = prepare_request_plan(config, request_plan, "udp", report["tool_sha256"])
@@ -220,6 +232,7 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None,
         "status": "not_sent", "reason": "scheduled",
     } for sequence in range(config.count)]
     report["requests"] = records
+    facts = prepare_write_facts(write_facts_fd, prepared, config, "udp", report["tool_sha256"])
     sock = None
     started = time.monotonic_ns()
     termination = "completed"
@@ -229,6 +242,9 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None,
         # RTT and schedule start at this OS socket measurement, not a daemon
         # join/connection-start event. No cross-host timestamps are subtracted.
         started = time.monotonic_ns()
+        if facts is not None:
+            facts.start(started, config.duration_ms)
+            facts.socket(sock, config.target)
         end_ns = config.duration_ms * NS_PER_MS
         while True:
             elapsed = time.monotonic_ns() - started
@@ -251,7 +267,13 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None,
                 record["sent_offset_ns"] = elapsed
                 try:
                     wire = encode(config, next_sequence, record["request_nonce"], REQUEST)
-                    written = sock.sendto(wire, config.target)
+                    if facts is None:
+                        written = sock.sendto(wire, config.target)
+                    else:
+                        sent = started + record["sent_offset_ns"]
+                        deadline = min(started + end_ns, sent + config.timeout_ms * NS_PER_MS)
+                        written = facts.send(sock, wire, sequence=next_sequence, sent=sent,
+                                             deadline=deadline, frame=wire, target=config.target)
                     if written != len(wire):
                         raise OSError("short UDP send")
                     record.update(status="pending", reason="awaiting_echo")
@@ -298,6 +320,8 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None,
                               reason=termination, completed_offset_ns=elapsed)
         if sock is not None and supplied_socket is None:
             sock.close()
+        if facts is not None:
+            report["write_facts"] = facts.finish(termination)
     report.update(elapsed_ns=elapsed, termination_reason=termination)
     return report
 
@@ -412,6 +436,8 @@ def main(argv: list[str] | None = None) -> int:
         if command == "probe":
             sub.add_argument("--request-plan", type=Path,
                              help="use an exact prepared input plan before the original measurement clock")
+            sub.add_argument("--write-facts-fd", type=int,
+                             help="already nonblocking writable POSIX pipe; requires request plan")
     args = parser.parse_args(argv)
     if args.command == "new-nonces":
         # These nonces are public correlation IDs, not authentication credentials.
@@ -424,7 +450,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config.validate()
         validate_output_path(args.output)
-        report = run_probe(config, request_plan=args.request_plan) if args.command == "probe" else run_echo(
+        report = run_probe(config, request_plan=args.request_plan,
+                           write_facts_fd=args.write_facts_fd) if args.command == "probe" else run_echo(
             config, on_ready=lambda: print(json.dumps({"scope": SCOPE, "event": "echo_ready"}), flush=True))
         write_report(args.output, report)
     except (OSError, ValueError) as error:

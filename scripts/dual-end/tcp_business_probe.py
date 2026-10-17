@@ -17,7 +17,7 @@ import struct
 import time
 from typing import Callable
 
-from udp_business_probe import Config, NS_PER_MS, UNVERIFIED, prepare_request_plan, validate_output_path, write_report
+from udp_business_probe import Config, NS_PER_MS, UNVERIFIED, prepare_request_plan, prepare_write_facts, validate_output_path, write_report
 
 SCOPE = "os_tcp_echo"
 MAGIC = b"P2WTCE1\x00"
@@ -81,12 +81,17 @@ def read_frame(sock: socket.socket, deadline: int) -> bytes:
     return read_exact(sock, size, deadline)
 
 
-def write_frame(sock: socket.socket, data: bytes, deadline: int) -> int:
+def write_frame(sock: socket.socket, data: bytes, deadline: int, *, facts=None,
+                sequence: int = 0, sent: int = 0) -> int:
     wire = struct.pack("!I", len(data)) + data
     written = 0
     while written < len(wire):
         sock.settimeout(remaining(deadline))
-        count = sock.send(wire[written:])
+        if facts is None:
+            count = sock.send(wire[written:])
+        else:
+            count = facts.send(sock, wire[written:], sequence=sequence, sent=sent,
+                               deadline=deadline, frame=wire, offset=written)
         if count <= 0:
             raise OSError("zero TCP write")
         written += count
@@ -114,7 +119,7 @@ def wait_scheduled(planned: int, end: int) -> None:
 
 
 def run_probe(config: Config, supplied_socket: socket.socket | None = None,
-              request_plan: Path | None = None) -> dict:
+              request_plan: Path | None = None, write_facts_fd: int | None = None) -> dict:
     config.validate()
     report = base_report(config, "probe")
     prepared = prepare_request_plan(config, request_plan, "tcp", report["tool_sha256"])
@@ -126,17 +131,22 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None,
                 "sent_offset_ns": None, "completed_offset_ns": None, "rtt_ns": None,
                 "status": "not_sent", "reason": "scheduled"} for i in range(config.count)]
     report["requests"] = records
+    facts = prepare_write_facts(write_facts_fd, prepared, config, "tcp", report["tool_sha256"])
     started = time.monotonic_ns()
     end = started + config.duration_ms * NS_PER_MS
     sock = None
     termination = "completed"
     try:
+        if facts is not None:
+            facts.start(started, config.duration_ms)
         sock = bound_socket(config, supplied_socket)
         sock.settimeout(remaining(min(end, started + config.timeout_ms * NS_PER_MS)))
         report["connection_attempts"] += 1
         sock.connect(config.target)
         if sock.getpeername() != config.target:
             raise OSError("connected TCP peer differs from explicit target")
+        if facts is not None:
+            facts.socket(sock, config.target)
         for record in records:
             planned = started + record["planned_offset_ns"]
             wait_scheduled(planned, end)
@@ -147,7 +157,12 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None,
             deadline = min(end, sent + config.timeout_ms * NS_PER_MS)
             record.update(status="pending", sent_offset_ns=sent - started, reason="awaiting_echo")
             try:
-                write_frame(sock, encode(config, record["sequence"], record["request_nonce"], REQUEST), deadline)
+                data = encode(config, record["sequence"], record["request_nonce"], REQUEST)
+                if facts is None:
+                    write_frame(sock, data, deadline)
+                else:
+                    write_frame(sock, data, deadline, facts=facts,
+                                sequence=record["sequence"], sent=sent)
             except TimeoutError as error:
                 record.update(status="timeout", reason="response_deadline", errno=error.errno)
                 termination = "stream_deadline"
@@ -200,6 +215,8 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None,
                 record["completed_offset_ns"] = elapsed
         if sock is not None and supplied_socket is None:
             sock.close()
+        if facts is not None:
+            report["write_facts"] = facts.finish(termination)
     report.update(elapsed_ns=elapsed, termination_reason=termination)
     return report
 
@@ -323,6 +340,8 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--request-plan", type=Path,
                         help="probe only: exact prepared input plan before the original measurement clock")
+    parser.add_argument("--write-facts-fd", type=int,
+                        help="probe only: already nonblocking writable POSIX pipe; requires request plan")
     args = parser.parse_args()
     config = Config((args.bind_ip, args.bind_port), (args.target_ip, args.target_port),
                     args.run_nonce, args.round_nonce, args.count, args.interval_ms,
@@ -332,8 +351,10 @@ def main() -> int:
         validate_output_path(args.output)
         if args.role == "echo" and args.request_plan is not None:
             raise ValueError("request plans apply only to the probe role")
+        if args.role == "echo" and args.write_facts_fd is not None:
+            raise ValueError("write facts apply only to the probe role")
         if args.role == "probe":
-            report = run_probe(config, request_plan=args.request_plan)
+            report = run_probe(config, request_plan=args.request_plan, write_facts_fd=args.write_facts_fd)
             validate_probe(report)
         else:
             report = run_echo(config, on_ready=lambda: print('{"event":"echo_ready","scope":"os_tcp_echo"}', flush=True))

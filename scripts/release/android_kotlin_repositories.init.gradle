@@ -1,0 +1,18 @@
+// The Flutter SDK is an included build: root plugin repositories do not apply to it.
+def flutterRoot = System.getenv('FLUTTER_ROOT')
+if (flutterRoot) {
+    def flutterGradle = new File(flutterRoot, 'packages/flutter_tools/gradle').canonicalFile
+    gradle.beforeSettings { settings ->
+        if (settings.settingsDir.canonicalFile == flutterGradle) {
+            def repositories = settings.pluginManagement.repositories
+            repositories.maven {
+                name = 'P2wlanKotlinPluginCentral'
+                url = uri('https://repo.maven.apache.org/maven2')
+                content { includeGroup('org.jetbrains.kotlin') }
+            }
+            repositories.gradlePluginPortal {
+                content { excludeGroup('org.jetbrains.kotlin') }
+            }
+        }
+    }
+}
