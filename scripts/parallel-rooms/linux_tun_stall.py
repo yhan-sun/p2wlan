@@ -197,17 +197,23 @@ def measure(harness, lab, groups, report: dict, out: Path, snapshots: dict, slot
 
     kernel_records = {}
 
-    def start_probe(entry):
+    def prepare_probe(entry, *, defer_pipe=False):
         bind = (plan["source_ip"], entry["source_port"])
         target = (plan["target_ip"], entry["target_port"])
         path = out / (entry["phase"] + "-probe.json")
         capture = harness.prepare_write_capture(groups, entry, "udp", bind, target,
-                                                "udp-" + entry["phase"], lab.ns("a"))
+                                                "udp-" + entry["phase"], lab.ns("a"), defer_pipe=defer_pipe)
         kernel = (harness.prepare_kernel_capture(lab, groups, entry, capture, "a1", "b1", snapshots,
                                                 deadline=echo_end / 1_000_000_000)
                   if getattr(groups, "kernel_captures", None) is not None else None)
         if kernel is not None:
             kernel_records[id(entry)] = kernel
+        return path, bind, target, capture
+
+    def start_probe(entry, prepared, *, deferred_pipe=False):
+        path, bind, target, capture = prepared
+        if deferred_pipe and capture is not None:
+            groups.write_captures.activate(capture)
         argv = harness.tool_argv(harness.DUAL / "udp_business_probe.py", "probe", bind, target, entry, path)
         if capture is not None:
             argv.extend(capture.arguments())
@@ -232,13 +238,18 @@ def measure(harness, lab, groups, report: dict, out: Path, snapshots: dict, slot
         if kernel is not None:
             groups.kernel_captures.finish(kernel, deadline=echo_end / 1_000_000_000)
 
+    # Registration is readiness, before STOP and before any original request.
+    # The fresh immutable plan has no pipe until the paused pipe is closed;
+    # its actual child and request clocks still start after confirmed CONT.
+    paused_prepared = prepare_probe(entries[0])
+    fresh_prepared = prepare_probe(entries[1], defer_pipe=True)
     paused_samples = details["paused_samples"] = []
     try:
         owner.stop(min(echo_end, time.monotonic_ns() + 500_000_000))
         hold_end = owner.evidence["stopped_monotonic_ns"] + contract.HOLD_NS
         if hold_end + 2_000_000_000 >= echo_end:
             raise TimeoutError("stall_original_echo_budget_cannot_fit_both_phases")
-        probe, path, bind, target, capture = start_probe(entries[0])
+        probe, path, bind, target, capture = start_probe(entries[0], paused_prepared)
         # Fixed capacity and bounded complete samples, with the original hold
         # end and CONT reserve. Admitted failures remain in the evidence.
         collect_paused_samples(lab, owner, entries[0], probe, paused_samples, hold_end, capture=capture)
@@ -255,7 +266,7 @@ def measure(harness, lab, groups, report: dict, out: Path, snapshots: dict, slot
         owner.resume(echo_end)
     details["paused_request_window"] = contract.paused_request_window(entries[0], owner.evidence)
     collect_probe(entries[0], probe, path, bind, target, capture)
-    probe, path, bind, target, capture = start_probe(entries[1])
+    probe, path, bind, target, capture = start_probe(entries[1], fresh_prepared, deferred_pipe=True)
     collect_probe(entries[1], probe, path, bind, target, capture)
     details["echo_exit"] = harness.wait_child(echo, echo_end / 1_000_000_000)
     details["echo"] = read_object(server_report)

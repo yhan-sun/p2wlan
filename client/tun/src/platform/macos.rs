@@ -157,7 +157,10 @@ impl UtunDevice {
         // Bring the interface up
         set_interface_up(&actual_name)?;
 
-        let fd = AsyncFd::new(owned_fd)?;
+        // SAFETY: the descriptor is owned exclusively by `owned_fd` and is
+        // moved into AsyncFd. It is neither closed nor replaced before
+        // AsyncFd deregisters it; borrowed syscall access never takes ownership.
+        let fd = unsafe { AsyncFd::register(owned_fd) }.map_err(io::Error::from)?;
 
         Ok(Self {
             fd,

@@ -12,6 +12,7 @@ const LOCAL: &str = "10.21.1.2";
 const TARGET: &str = "10.21.1.3";
 
 mod epoch_trace;
+mod scoped_retention;
 mod scoped_view;
 
 fn info() -> PeerInfo {

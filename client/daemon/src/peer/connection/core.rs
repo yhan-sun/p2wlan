@@ -186,7 +186,7 @@ pub struct PeerConnection {
     /// Whether the control plane currently reports this peer online.
     pub online: bool,
     /// Last seen timestamp reported by the control plane.
-    pub last_seen: u64,
+    pub last_seen: LastSeen,
     /// Peer-reported RTT to its selected relay server, in milliseconds.
     pub remote_relay_rtt_ms: Option<u64>,
     /// Current connection state.
@@ -629,7 +629,7 @@ impl PeerConnection {
             remote_nat_profile: None,
             remote_nat_profile_candidate_epoch: None,
             online: true,
-            last_seen: 0,
+            last_seen: LastSeen::new(0),
             remote_relay_rtt_ms: None,
             state: ConnectionState::Idle,
             path_state_machine: PathStateMachine::new(ConnectionState::Idle),

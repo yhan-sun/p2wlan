@@ -58,7 +58,9 @@ pub(crate) use owners::OriginalKernelCurrentOwners;
 mod ingress;
 #[cfg(unix)]
 mod read_loss;
+mod read_packet;
 mod read_peer;
+mod read_retention_input;
 mod read_room;
 #[cfg(any(target_os = "linux", all(unix, test)))]
 pub(super) mod write_window;
@@ -453,180 +455,181 @@ impl CaptureSession {
         original: KernelRead,
         packet: &[u8],
     ) -> Result<Option<Arc<KernelReadBinding>>, CaptureFailure> {
-        let udp = parse_os_udp(packet).ok();
-        let tcp = parse_tcp_segment(packet).ok();
-        let packet_sha256: [u8; 32] = Sha256::digest(packet).into();
-        #[cfg(unix)]
-        let state = self.state.try_original_read_lock(original.ordinal());
-        #[cfg(not(unix))]
-        let state = self.state.try_lock();
-        let mut state = state.map_err(|_| CaptureFailure::Contended)?;
-        if state
-            .system_device
-            .as_ref()
-            .is_none_or(|device| !original.belongs_to(device))
-        {
-            return Err(CaptureFailure::ForeignDevice);
-        }
-        let Some(index) = state
-            .flows
-            .iter()
-            .position(|flow| match flow.plan.protocol {
-                Protocol::Udp => udp
-                    .as_ref()
-                    .is_some_and(|parsed| parsed.flow == flow.plan.flow),
-                Protocol::Tcp => tcp
-                    .as_ref()
-                    .is_some_and(|parsed| parsed.flow() == flow.plan.flow),
-            })
-        else {
-            return Ok(None);
-        };
-        if state
-            .original_device
-            .as_ref()
-            .is_some_and(|first| !first.same_device(&original))
-        {
-            return Err(CaptureFailure::ForeignDevice);
-        }
-        let original = Arc::new(original);
-        if state.original_device.is_none() {
-            state.original_device = Some(original.clone());
-        }
-        let room = state.original_room_owner.clone();
-        let flow = &mut state.flows[index];
-        let plan = flow.plan.clone();
-        if flow.invalid.load(Ordering::Acquire) {
-            return Err(CaptureFailure::FrameConflict);
-        }
-        let mut slots = Vec::with_capacity(MAX_BINDINGS_PER_PACKET);
-        let mut spans = Vec::with_capacity(MAX_BINDINGS_PER_PACKET);
-        if let Some(parsed) = udp {
-            if plan.protocol != Protocol::Udp || parsed.payload_bytes != plan.payload_bytes {
+        read_packet::capture(packet, |udp, tcp| {
+            let packet_sha256: [u8; 32] = Sha256::digest(packet).into();
+            #[cfg(unix)]
+            let state = self.state.try_original_read_lock(original.ordinal());
+            #[cfg(not(unix))]
+            let state = self.state.try_lock();
+            let mut state = state.map_err(|_| CaptureFailure::Contended)?;
+            if state
+                .system_device
+                .as_ref()
+                .is_none_or(|device| !original.belongs_to(device))
+            {
+                return Err(CaptureFailure::ForeignDevice);
+            }
+            let Some(index) = state
+                .flows
+                .iter()
+                .position(|flow| match flow.plan.protocol {
+                    Protocol::Udp => udp
+                        .as_ref()
+                        .is_some_and(|parsed| parsed.flow == flow.plan.flow),
+                    Protocol::Tcp => tcp
+                        .as_ref()
+                        .is_some_and(|parsed| parsed.flow() == flow.plan.flow),
+                })
+            else {
                 return Ok(None);
+            };
+            if state
+                .original_device
+                .as_ref()
+                .is_some_and(|first| !first.same_device(&original))
+            {
+                return Err(CaptureFailure::ForeignDevice);
             }
-            if let Some(slot) = plan.requests.iter().position(|key| *key == parsed.key) {
-                slots.push(slot);
-                spans.push(full::ReadFrameSpan::new(slot, 0, 1));
-                flow.requests[slot].udp_complete = true;
+            let original = Arc::new(original);
+            if state.original_device.is_none() {
+                state.original_device = Some(original.clone());
             }
-        } else if let Some(segment) = tcp {
-            if plan.protocol != Protocol::Tcp {
-                return Ok(None);
+            let room = state.original_room_owner.clone();
+            let flow = &mut state.flows[index];
+            let plan = flow.plan.clone();
+            if flow.invalid.load(Ordering::Acquire) {
+                return Err(CaptureFailure::FrameConflict);
             }
-            if segment.is_syn() {
-                let opened = segment.sequence().wrapping_add(1);
-                if flow.tcp_open.is_some_and(|previous| previous != opened) {
-                    flow.invalid.store(true, Ordering::Release);
-                    return Err(CaptureFailure::FrameConflict);
+            let mut slots = Vec::with_capacity(MAX_BINDINGS_PER_PACKET);
+            let mut spans = Vec::with_capacity(MAX_BINDINGS_PER_PACKET);
+            if let Some(parsed) = udp {
+                if plan.protocol != Protocol::Udp || parsed.payload_bytes != plan.payload_bytes {
+                    return Ok(None);
                 }
-                flow.tcp_open = Some(opened);
-                // SYN/SYN-ACK are only sequence anchors, never application data.
-                return Ok(None);
-            }
-            if segment.is_control_only() {
-                return Ok(None);
-            }
-            let base = flow.tcp_open.ok_or(CaptureFailure::MissingTcpOpen)?;
-            let wire_len = 4 + 63 + u32::from(plan.payload_bytes);
-            // First find all overlaps. The batch bound is checked before any
-            // coverage mutation, so overflow cannot leave partial acceptance.
-            for slot in 0..plan.requests.len() {
-                let start = base.wrapping_add((slot as u32).wrapping_mul(wire_len));
-                if segment.overlaps_frame(start, wire_len as usize) {
-                    if slots.len() == MAX_BINDINGS_PER_PACKET {
-                        flow.invalid.store(true, Ordering::Release);
-                        return Err(CaptureFailure::Capacity);
-                    }
+                if let Some(slot) = plan.requests.iter().position(|key| *key == parsed.key) {
                     slots.push(slot);
+                    spans.push(full::ReadFrameSpan::new(slot, 0, 1));
+                    flow.requests[slot].udp_complete = true;
+                }
+            } else if let Some(segment) = tcp {
+                if plan.protocol != Protocol::Tcp {
+                    return Ok(None);
+                }
+                if segment.is_syn() {
+                    let opened = segment.sequence().wrapping_add(1);
+                    if flow.tcp_open.is_some_and(|previous| previous != opened) {
+                        flow.invalid.store(true, Ordering::Release);
+                        return Err(CaptureFailure::FrameConflict);
+                    }
+                    flow.tcp_open = Some(opened);
+                    // SYN/SYN-ACK are only sequence anchors, never application data.
+                    return Ok(None);
+                }
+                if segment.is_control_only() {
+                    return Ok(None);
+                }
+                let base = flow.tcp_open.ok_or(CaptureFailure::MissingTcpOpen)?;
+                let wire_len = 4 + 63 + u32::from(plan.payload_bytes);
+                // First find all overlaps. The batch bound is checked before any
+                // coverage mutation, so overflow cannot leave partial acceptance.
+                for slot in 0..plan.requests.len() {
+                    let start = base.wrapping_add((slot as u32).wrapping_mul(wire_len));
+                    if segment.overlaps_frame(start, wire_len as usize) {
+                        if slots.len() == MAX_BINDINGS_PER_PACKET {
+                            flow.invalid.store(true, Ordering::Release);
+                            return Err(CaptureFailure::Capacity);
+                        }
+                        slots.push(slot);
+                    }
+                }
+                for slot in &slots {
+                    let key = plan.requests[*slot];
+                    let read = &mut flow.requests[*slot];
+                    if read.tcp.is_none() {
+                        let frame = TcpFramePlan::new(
+                            plan.flow,
+                            TcpFrameKey {
+                                run: key.run,
+                                round: key.round,
+                                sequence: key.sequence,
+                                request_nonce: key.request_nonce,
+                                kind: key.kind,
+                            },
+                            plan.payload_bytes,
+                        )
+                        .ok_or(CaptureFailure::InvalidPlan)?;
+                        read.tcp = TcpFrameCoverage::new(
+                            frame,
+                            base.wrapping_add((*slot as u32).wrapping_mul(wire_len)),
+                            original.at(),
+                            self.expires,
+                        );
+                    }
+                    let coverage = read.tcp.as_mut().ok_or(CaptureFailure::InvalidPlan)?;
+                    if matches!(
+                        coverage.observe(&segment, original.at()),
+                        TcpCoverageResult::Conflict | TcpCoverageResult::Invalidated
+                    ) {
+                        flow.invalid.store(true, Ordering::Release);
+                        return Err(CaptureFailure::FrameConflict);
+                    }
+                    let (start, end) = coverage
+                        .matching_span(&segment)
+                        .ok_or(CaptureFailure::FrameConflict)?;
+                    spans.push(full::ReadFrameSpan::new(*slot, start, end));
                 }
             }
+            if slots.is_empty() {
+                return Ok(None);
+            }
+            let original_peers = self.first_read_peers(
+                flow,
+                &slots,
+                #[cfg(any(target_os = "linux", all(unix, test)))]
+                Some(&original),
+            );
+            let original_request_rooms = self.first_read_request_rooms(flow, &slots, room.as_ref());
             for slot in &slots {
-                let key = plan.requests[*slot];
                 let read = &mut flow.requests[*slot];
-                if read.tcp.is_none() {
-                    let frame = TcpFramePlan::new(
-                        plan.flow,
-                        TcpFrameKey {
-                            run: key.run,
-                            round: key.round,
-                            sequence: key.sequence,
-                            request_nonce: key.request_nonce,
-                            kind: key.kind,
-                        },
-                        plan.payload_bytes,
-                    )
-                    .ok_or(CaptureFailure::InvalidPlan)?;
-                    read.tcp = TcpFrameCoverage::new(
-                        frame,
-                        base.wrapping_add((*slot as u32).wrapping_mul(wire_len)),
-                        original.at(),
-                        self.expires,
-                    );
+                read.read_events = read
+                    .read_events
+                    .checked_add(1)
+                    .ok_or(CaptureFailure::CounterExhausted)?;
+                if read.first_read.is_none() {
+                    read.first_read = Some(original.clone());
                 }
-                let coverage = read.tcp.as_mut().ok_or(CaptureFailure::InvalidPlan)?;
-                if matches!(
-                    coverage.observe(&segment, original.at()),
-                    TcpCoverageResult::Conflict | TcpCoverageResult::Invalidated
-                ) {
-                    flow.invalid.store(true, Ordering::Release);
-                    return Err(CaptureFailure::FrameConflict);
-                }
-                let (start, end) = coverage
-                    .matching_span(&segment)
-                    .ok_or(CaptureFailure::FrameConflict)?;
-                spans.push(full::ReadFrameSpan::new(*slot, start, end));
+                read.last_read = Some(original.clone());
             }
-        }
-        if slots.is_empty() {
-            return Ok(None);
-        }
-        let original_peers = self.first_read_peers(
-            flow,
-            &slots,
-            #[cfg(any(target_os = "linux", all(unix, test)))]
-            Some(&original),
-        );
-        let original_request_rooms = self.first_read_request_rooms(flow, &slots, room.as_ref());
-        for slot in &slots {
-            let read = &mut flow.requests[*slot];
-            read.read_events = read
-                .read_events
-                .checked_add(1)
-                .ok_or(CaptureFailure::CounterExhausted)?;
-            if read.first_read.is_none() {
-                read.first_read = Some(original.clone());
+            let original_responses =
+                self.first_response_inputs(&mut state, index, &slots, &original);
+            if state.read_history.len() >= full::MAX_FULL_PACKETS {
+                return Err(CaptureFailure::Capacity);
             }
-            read.last_read = Some(original.clone());
-        }
-        let original_responses = self.first_response_inputs(&mut state, index, &slots, &original);
-        if state.read_history.len() >= full::MAX_FULL_PACKETS {
-            return Err(CaptureFailure::Capacity);
-        }
-        state
-            .read_history
-            .try_reserve(1)
-            .map_err(|_| CaptureFailure::Capacity)?;
-        let binding = Arc::new(KernelReadBinding {
-            scope: Arc::downgrade(self),
-            read: original,
-            flow: index,
-            slots,
-            packet_len: packet.len(),
-            packet_sha256,
-            plan,
-            spans,
-            physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),
-            full_retained_ns: AtomicU64::new(0),
-            #[cfg(any(target_os = "linux", all(unix, test)))]
-            full_completion_pending: AtomicBool::new(false),
-            original_publication_ns: OnceLock::new(),
-            original_peers,
-            original_responses,
-            original_request_rooms,
-        });
-        state.read_history.push(binding.clone())?;
-        Ok(Some(binding))
+            state
+                .read_history
+                .try_reserve(1)
+                .map_err(|_| CaptureFailure::Capacity)?;
+            let binding = Arc::new(KernelReadBinding {
+                scope: Arc::downgrade(self),
+                read: original,
+                flow: index,
+                slots,
+                packet_len: packet.len(),
+                packet_sha256,
+                plan,
+                spans,
+                physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),
+                full_retained_ns: AtomicU64::new(0),
+                #[cfg(any(target_os = "linux", all(unix, test)))]
+                full_completion_pending: AtomicBool::new(false),
+                original_publication_ns: OnceLock::new(),
+                original_peers,
+                original_responses,
+                original_request_rooms,
+            });
+            state.read_history.push(binding.clone())?;
+            Ok(Some(binding))
+        })
     }
 
     #[cfg(unix)]

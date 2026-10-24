@@ -12,7 +12,6 @@
 - [升级与恢复](guides/upgrade-and-recovery.md)：备份、恢复、回滚和失败边界。
 - [运维指南](guides/operations.md)：服务管理、证书、日志、健康检查和数据保护。
 - [排障指南](guides/troubleshooting.md)：按 Control、Relay、Direct、路由和业务数据面定位问题。
-- [Minecraft 交互采证](guides/minecraft-evidence.md)：固定版本适配器、POSIX 监督器、证据归约与 codec fixture 边界。
 
 ## 准确规则
 

@@ -92,7 +92,8 @@ fn fixture() -> (UtunDevice, UnixDatagram) {
     // Transfer ownership through Into<OwnedFd>; never duplicate a borrowed fd.
     let fd: OwnedFd = sender.into();
     let device = UtunDevice {
-        fd: AsyncFd::new(fd).unwrap(),
+        // SAFETY: this owned socket stays unchanged and open inside AsyncFd.
+        fd: unsafe { AsyncFd::register(fd) }.unwrap(),
         name: "fd-contract-fixture".to_string(),
         mtu: 1420,
         address: "192.0.2.1".to_string(),

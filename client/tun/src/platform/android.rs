@@ -334,7 +334,11 @@ impl AndroidTun {
                         return Err(Error::Io(io::Error::last_os_error()));
                     }
                 }
-                AndroidTunIo::Async(AsyncFd::new(owned_fd)?)
+                // SAFETY: the descriptor is owned exclusively by `owned_fd` and is
+                // moved into AsyncFd. It is neither closed nor replaced before
+                // AsyncFd deregisters it; borrowed syscall access never takes ownership.
+                let fd = unsafe { AsyncFd::register(owned_fd) }.map_err(io::Error::from)?;
+                AndroidTunIo::Async(fd)
             }
             AndroidTunMode::DedicatedBlocking => {
                 let raw_fd = owned_fd.as_raw_fd();

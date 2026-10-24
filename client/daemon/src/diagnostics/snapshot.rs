@@ -465,7 +465,7 @@ fn peer_snapshot_core_matches(
                 .hash(&mut hasher);
             peer.nat_type.hash(&mut hasher);
             peer.online.hash(&mut hasher);
-            peer.last_seen.hash(&mut hasher);
+            peer.last_seen.get().hash(&mut hasher);
             peer.remote_relay_rtt_ms.hash(&mut hasher);
             format!("{:?}", peer.state).hash(&mut hasher);
             peer.probe_session_id.hash(&mut hasher);

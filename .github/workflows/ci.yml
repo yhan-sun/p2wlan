@@ -22,7 +22,7 @@ concurrency:
 jobs:
   rust:
     name: Rust Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install Rust
@@ -30,9 +30,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Install Linux Desktop Dependencies
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          # Use the official archive instead of the runner's slow Azure mirror.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
@@ -259,31 +262,6 @@ jobs:
           python3 scripts/dual-end/test-production-availability-parser.py
           bash -n scripts/dual-end/mini-air-smoke.sh
           bash -n scripts/nat-sim/nat-sim-smoke.sh
-      - name: Verify offline Minecraft evidence contracts
-        run: |
-          python3 scripts/dual-end/test_minecraft_interaction.py
-          python3 scripts/dual-end/test_minecraft_interaction_summary.py
-          python3 scripts/dual-end/test_minecraft_interaction_runner.py
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22.16.0"
-          cache: npm
-          cache-dependency-path: scripts/dual-end/minecraft-adapters/package-lock.json
-      - name: Verify Java Minecraft adapter protocol fixtures
-        run: |
-          npm ci --ignore-scripts --prefix scripts/dual-end/minecraft-adapters
-          npm audit --audit-level=moderate --prefix scripts/dual-end/minecraft-adapters
-          npm test --prefix scripts/dual-end/minecraft-adapters
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "26.0.0"
-          cache: npm
-          cache-dependency-path: scripts/dual-end/minecraft-adapters/bedrock/package-lock.json
-      - name: Verify Bedrock Minecraft adapter protocol fixtures
-        run: |
-          npm ci --ignore-scripts --prefix scripts/dual-end/minecraft-adapters/bedrock
-          npm audit --audit-level=moderate --prefix scripts/dual-end/minecraft-adapters/bedrock
-          npm test --prefix scripts/dual-end/minecraft-adapters/bedrock
       - name: Assert admin UI dependency boundary
         run: |
           test ! -e package.json

@@ -54,7 +54,7 @@ concurrency:
 jobs:
   macos-arm64:
     name: macOS arm64 test DMG
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

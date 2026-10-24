@@ -215,24 +215,28 @@ class LoopbackTests(unittest.TestCase):
         with loopback_socket() as client, loopback_socket() as server:
             config = config_for(client, server, count=3, interval_ms=50)
 
-            def noise():
-                server.settimeout(1)
-                _data, source = server.recvfrom(probe.MAX_DATAGRAM_BYTES)
-                server.sendto(b"bad", source)
-                server.sendto(b"bad", source)
-
-            thread = threading.Thread(target=noise)
-            thread.start()
+            # This control measures the receive cap. Queue both actual noise
+            # datagrams before its clock starts so a producer thread's response
+            # delay cannot turn this fixture into a request-timeout experiment.
+            self.assertEqual(server.sendto(b"bad", client.getsockname()), 3)
+            self.assertEqual(server.sendto(b"bad", client.getsockname()), 3)
+            # Send completion does not guarantee immediate read readiness.
+            # One bounded real wait belongs to setup, before probe clocks.
+            ready = probe.select.select([client], [], [], 1.0)[0]
+            self.assertEqual(
+                ready,
+                [client],
+                msg="receiver not readable after one bounded premeasurement wait for the two actual sends",
+            )
             with patch.object(probe, "MAX_RX_DATAGRAMS", 2):
                 report = probe.run_probe(config, client)
-            thread.join(2)
-            self.assertFalse(thread.is_alive())
         result = summary.summarize([report])
-        self.assertEqual(report["termination_reason"], "receive_budget_exhausted")
-        self.assertEqual(report["received_datagrams"], 2)
-        self.assertEqual(result["prescheduled_requests"], 3)
-        self.assertEqual(result["success_requests"], 0)
-        self.assertEqual(result["status_counts"]["cancelled"] + result["status_counts"]["not_sent"], 3)
+        diagnostic = json.dumps({"report": report, "summary": result}, sort_keys=True)
+        self.assertEqual(report["termination_reason"], "receive_budget_exhausted", msg=diagnostic)
+        self.assertEqual(report["received_datagrams"], 2, msg=diagnostic)
+        self.assertEqual(result["prescheduled_requests"], 3, msg=diagnostic)
+        self.assertEqual(result["success_requests"], 0, msg=diagnostic)
+        self.assertEqual(result["status_counts"]["cancelled"] + result["status_counts"]["not_sent"], 3, msg=diagnostic)
 
     def test_echo_receive_error_preserves_prior_counts_and_cli_returns_failure(self):
         with loopback_socket() as client, loopback_socket() as server:

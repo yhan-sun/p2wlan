@@ -6,6 +6,9 @@
 //! - Falls back to relay when direct connection fails
 //! - Routes packets between TUN device and peer tunnels
 
+mod last_seen;
+pub use last_seen::LastSeen;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;

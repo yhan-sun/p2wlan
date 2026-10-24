@@ -424,7 +424,7 @@ impl PeerDiagnostics {
             remote_nat_profile_fresh,
             traversal_plan,
             online: conn.online,
-            last_seen: conn.last_seen,
+            last_seen: conn.last_seen.get(),
             remote_relay_latency_ms: conn.remote_relay_rtt_ms,
             state: conn.state,
             active_path,

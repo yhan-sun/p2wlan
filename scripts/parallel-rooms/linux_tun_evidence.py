@@ -181,9 +181,10 @@ def wait_child(child: subprocess.Popen, deadline: float, *, capture=None) -> int
     raise TimeoutError("original application child deadline")
 
 
-def prepare_write_capture(groups, entry, protocol, bind, target, stem, namespace):
+def prepare_write_capture(groups, entry, protocol, bind, target, stem, namespace, *, defer_pipe=False):
     captures = getattr(groups, "write_captures", None)
-    return captures.prepare(groups, entry, protocol, bind, target, stem, namespace) if captures else None
+    return captures.prepare(groups, entry, protocol, bind, target, stem, namespace,
+                            defer_pipe=defer_pipe) if captures else None
 
 
 def prepare_kernel_capture(lab, groups, entry, capture, source, target, snapshots, *, deadline=None):

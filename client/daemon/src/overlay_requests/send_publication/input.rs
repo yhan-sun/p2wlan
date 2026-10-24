@@ -38,7 +38,7 @@ impl OriginalPhysicalInput {
             });
             return None;
         }
-        if let Some(reason) = kernel.original_input_rejection(encrypted_at) {
+        if let Some(reason) = kernel.read_retention_input_rejection(encrypted_at) {
             *rejected = reason;
             return None;
         }

@@ -265,7 +265,7 @@ python3 scripts/nat-sim/benchmark_campaign.py summarize \
 
 配置身份范围为 `argv_and_allowlisted_environment`：对实际参数、明确列出的环境变量以及启动时存在的指定配置文件计算摘要，不保存原始参数或环境值，不读取授权 stdin。配置文件尚不存在时记录 `absent_at_launch`，后续自动生成的文件不能替代启动时事实。`configuration_identity_scope` 明示这份输入范围，`resolved_runtime_configuration_sha256` 保持未知；生成后的运行配置、未列出的宿主环境和 stdin 授权不由该摘要覆盖。
 
-当前范围为 `synthetic_ipv4_udp_normal_join`：mock TUN、同主机进程和人工网络条件。成功可经 Direct 或 Relay；`direct_at_10s`、`first_business_ms`、`application_p99_ms` 保持 `null` 并给出未知原因。启动身份不能据此证明发布产物性能、真实运营商成功率或 Minecraft 交互延迟。不同种子也不构成独立真实网络样本。
+当前范围为 `synthetic_ipv4_udp_normal_join`：mock TUN、同主机进程和人工网络条件。成功可经 Direct 或 Relay；`direct_at_10s`、`first_business_ms`、`application_p99_ms` 保持 `null` 并给出未知原因。启动身份不能据此证明发布产物性能、真实运营商成功率或真实应用交互延迟。不同种子也不构成独立真实网络样本。
 
 ## 活动路径遥测契约（path_telemetry_v1）
 

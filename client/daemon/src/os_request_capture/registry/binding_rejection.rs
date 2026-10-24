@@ -10,7 +10,7 @@ impl KernelReadBinding {
         observed_at: Instant,
     ) -> Option<FullRetentionLossReason> {
         use FullRetentionLossReason as Reason;
-        if let Some(reason) = self.original_input_rejection(observed_at) {
+        if let Some(reason) = self.read_retention_input_rejection(observed_at) {
             return Some(reason);
         }
         let Some(scope) = self.scope.upgrade() else {

@@ -9,6 +9,13 @@ pub(crate) struct OriginalKernelReadPeer {
     observed_at: Instant,
 }
 
+// This marker satisfies only the peer expectation for retaining actual read
+// bytes. It is never accepted by a native/current-owner/once transaction.
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) struct ReadRetentionIdentity {
+    _private: (),
+}
+
 impl OriginalKernelReadPeer {
     #[cfg(unix)]
     pub(crate) fn generation(&self) -> u64 {
@@ -84,6 +91,36 @@ impl OriginalKernelReadPeer {
             return self.try_identity_at(peers, at);
         }
         self.try_identity_at_inner(peers, at, context)
+    }
+
+    /// Retention keeps the same one real identity try. A view observed before
+    /// that try may cover only its metadata expectation while the same actual
+    /// epoch guard is immutably borrowed for encryption. Final native identity
+    /// and once admission continue to use the strict entry points above.
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(crate) fn try_read_retention_identity_at_observed(
+        &self,
+        peers: &PeerManager,
+        at: Instant,
+        context: Option<crate::peer::EpochTryContext>,
+    ) -> std::result::Result<ReadRetentionIdentity, OverlayCreditOutcome> {
+        let preobserved = peers.kernel_read_views.observe(&self.peer, self.target);
+        match self.try_identity_at_observed(peers, at, context) {
+            Ok(()) => Ok(ReadRetentionIdentity { _private: () }),
+            Err(error @ OverlayCreditOutcome::Contended(CreditLock::Epoch)) => {
+                let compatible = preobserved.is_some_and(|(view, generation, lifecycle)| {
+                    generation == self.generation
+                        && lifecycle == self.lifecycle
+                        && view.is_live(Instant::now())
+                });
+                if compatible {
+                    Ok(ReadRetentionIdentity { _private: () })
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn try_identity_at_inner(
