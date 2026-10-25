@@ -232,7 +232,13 @@ impl PeerManager {
             .network_epoch_gate
             .try_lock()
             .map_err(|_| Contended(CreditLock::Epoch))?;
-        self.try_kernel_read_peer_values_in_epoch(&_epoch, peer, target)
+        self.try_kernel_read_peer_values_in_epoch(
+            &_epoch,
+            peer,
+            target,
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            context,
+        )
     }
 
     fn try_kernel_read_peer_values_in_epoch(
@@ -240,12 +246,16 @@ impl PeerManager {
         _epoch: &tokio::sync::MutexGuard<'_, ()>,
         peer: &str,
         target: std::net::Ipv4Addr,
+        #[cfg(any(target_os = "linux", all(unix, test)))] context: Option<
+            crate::peer::EpochTryContext,
+        >,
     ) -> std::result::Result<(u64, PeerSessionGeneration), OverlayCreditOutcome> {
         use OverlayCreditOutcome::{Contended, Stale};
-        let connections = self
-            .connections
-            .try_read()
-            .map_err(|_| Contended(CreditLock::Connections))?;
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        let connections = self.connections.try_read_original(context);
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
+        let connections = self.connections.try_read();
+        let connections = connections.map_err(|_| Contended(CreditLock::Connections))?;
         let membership = self
             .peer_membership
             .try_lock()

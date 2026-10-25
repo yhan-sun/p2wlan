@@ -60,7 +60,7 @@ async fn pause_after_peer_membership_publish_for_test(peer_id: &str) {
 
 struct PeerUpdateResources<'a> {
     epoch_guard: crate::peer::NetworkEpochGuard<'a>,
-    conns: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
+    conns: ConnectionsWriteGuard<'a>,
     ip_map: tokio::sync::RwLockWriteGuard<'a, HashMap<String, String>>,
     generation: u64,
 }

@@ -212,6 +212,8 @@ impl CaptureSession {
                 #[cfg(any(target_os = "linux", all(unix, test)))]
                 original_read_peer_epoch_refusal: self.epoch_trace.read_peer_snapshot(),
                 #[cfg(any(target_os = "linux", all(unix, test)))]
+                original_read_peer_connections_refusal: self.connections_trace.snapshot(),
+                #[cfg(any(target_os = "linux", all(unix, test)))]
                 original_kernel_emit_refusal: self.emit_trace.snapshot(),
             },
         })

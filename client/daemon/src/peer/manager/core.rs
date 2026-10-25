@@ -35,7 +35,7 @@ impl PeerManager {
         let (local_mtu_feedback_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             local_node_id_for_traversal: std::sync::RwLock::new(config.node.node_id.clone()),
-            connections: Arc::new(RwLock::new(HashMap::new())),
+            connections: Arc::new(ConnectionsTable::new(HashMap::new())),
             peer_membership: Arc::new(std::sync::Mutex::new(PeerMembershipState::default())),
             kernel_read_views: kernel_read_view::ReadViewRegistry::default(),
             #[cfg(test)]
@@ -968,18 +968,19 @@ impl PeerManager {
     ) -> impl std::future::Future<
         Output = (
             crate::peer::NetworkEpochGuard<'a>,
-            tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
+            ConnectionsWriteGuard<'a>,
         ),
     > + 'a {
         let caller = crate::peer::epoch_gate::EpochLockCaller::capture();
+        let connections_caller = crate::peer::connections::ConnectionsLockCaller::caller();
         async move {
             loop {
                 let epoch_guard = self.network_epoch_gate.lock_for(caller).await;
-                match self.connections.try_write() {
+                match self.connections.try_write_for(connections_caller) {
                     Ok(connections) => return (epoch_guard, connections),
                     Err(_) => {
                         drop(epoch_guard);
-                        let connections = self.connections.write().await;
+                        let connections = self.connections.write_for(connections_caller).await;
                         // The fair RwLock has granted this writer its permit.
                         // Dropping it before try_write would let another queued
                         // writer reserve that permit and make both owners yield
@@ -1034,9 +1035,7 @@ impl PeerManager {
     /// makes it possible to prove timing-sensitive paths do not await this
     /// lock.
     #[cfg(test)]
-    pub(crate) async fn hold_connections_writer_for_test(
-        &self,
-    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, PeerConnection>> {
+    pub(crate) async fn hold_connections_writer_for_test(&self) -> ConnectionsWriteGuard<'_> {
         self.connections.write().await
     }
 
@@ -1189,7 +1188,7 @@ impl PeerManager {
 
     #[cfg(test)]
     pub(crate) fn connection_map_for_test(&self) -> Arc<RwLock<HashMap<String, PeerConnection>>> {
-        self.connections.clone()
+        self.connections.raw_for_test()
     }
 
     #[cfg(test)]

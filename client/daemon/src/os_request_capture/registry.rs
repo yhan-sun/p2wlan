@@ -90,6 +90,8 @@ pub(crate) struct CaptureSession {
     #[cfg(any(target_os = "linux", all(unix, test)))]
     epoch_trace: crate::peer::EpochTraceLease,
     #[cfg(any(target_os = "linux", all(unix, test)))]
+    connections_trace: crate::peer::ConnectionsTraceLease,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
     emit_trace: Arc<crate::transport::EmitTrace>,
     expires: Instant,
     peers: Weak<PeerManager>,
@@ -227,6 +229,9 @@ pub(super) struct ReadSnapshot {
     original_read_peer_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     #[serde(skip_serializing_if = "Option::is_none")]
+    original_read_peer_connections_refusal: Option<crate::peer::ConnectionsRefusalSnapshot>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     original_kernel_emit_refusal: Option<crate::transport::EmitRefusalSnapshot>,
 }
 #[cfg(unix)]
@@ -342,6 +347,11 @@ impl CaptureSession {
                 plan.capture_id,
                 expires,
             ),
+            connections_trace: peers.capture_connections_diagnostics(
+                owner,
+                plan.capture_id,
+                expires,
+            ),
             emit_trace: crate::transport::EmitTrace::new(owner, plan.capture_id, expires),
             expires,
             peers: Arc::downgrade(peers),
@@ -423,6 +433,8 @@ impl CaptureSession {
         self.active.store(false, Ordering::Release);
         #[cfg(any(target_os = "linux", all(unix, test)))]
         self.epoch_trace.deactivate();
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        self.connections_trace.deactivate();
         #[cfg(any(target_os = "linux", all(unix, test)))]
         self.emit_trace.deactivate();
     }

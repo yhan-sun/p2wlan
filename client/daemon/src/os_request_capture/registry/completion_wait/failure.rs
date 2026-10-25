@@ -59,6 +59,8 @@ pub(in crate::os_request_capture::registry) struct FailureMetadata {
     original_system_write_registry_refusal: Option<control_lock::SystemWriteRefusalSnapshot>,
     original_kernel_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
     original_read_peer_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_read_peer_connections_refusal: Option<crate::peer::ConnectionsRefusalSnapshot>,
     original_kernel_emit_refusal: Option<crate::transport::EmitRefusalSnapshot>,
     observations_are_sequential_not_atomic: bool,
     requests: Vec<Row>,
@@ -137,6 +139,7 @@ impl CaptureSession {
                 .system_write_refusal_snapshot(),
             original_kernel_epoch_refusal: self.epoch_trace.snapshot(),
             original_read_peer_epoch_refusal: self.epoch_trace.read_peer_snapshot(),
+            original_read_peer_connections_refusal: self.connections_trace.snapshot(),
             original_kernel_emit_refusal: self.emit_trace.snapshot(),
             observations_are_sequential_not_atomic: true,
             requests: Vec::new(),

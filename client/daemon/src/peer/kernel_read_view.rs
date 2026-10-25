@@ -135,7 +135,13 @@ impl PeerManager {
             return None;
         }
         let values = self
-            .try_kernel_read_peer_values_in_epoch(epoch, &prepared.peer, prepared.target)
+            .try_kernel_read_peer_values_in_epoch(
+                epoch,
+                &prepared.peer,
+                prepared.target,
+                #[cfg(any(target_os = "linux", all(unix, test)))]
+                None,
+            )
             .ok()?;
         let mut state = self.kernel_read_views.state.try_write().ok()?;
         prepared.values.set(values).ok()?;
