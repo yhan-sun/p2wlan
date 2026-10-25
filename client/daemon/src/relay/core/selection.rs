@@ -208,7 +208,7 @@ pub(crate) async fn select_relay_with_cooldowns_for_read<I: RelayReadItem>(
     //     better-ranked candidate that is already mid-connect, then publishes
     //     the best success so far and ABORTS every still-running task.
     // A black-hole candidate can therefore never stretch the total selection
-    // past (first success + the 25ms preference window).
+    // past (first success + the 250ms preference window).
     let mut connected = Vec::new();
     let mut first_success_at: Option<Instant> = None;
     let mut preference_deadline: Option<Instant> = None;
@@ -373,19 +373,11 @@ async fn relay_ticket_for_candidate(
     if let (Some(cache), Some((audience, region))) =
         (ticket_cache, relay_ticket_lookup_key(candidate))
     {
-        let expiry = cache.ticket_expiry_for(audience, region).await;
         let ticket = cache
-            .ticket_for(audience, region)
+            .ticket_with_expiry_for(audience, region)
             .await
             .map_err(RelayAttemptError::Daemon)?;
-        // ticket_for may have refreshed the cache: read the authoritative
-        // expiry after the fetch.
-        let expiry = cache
-            .ticket_expiry_for(audience, region)
-            .await
-            .or(expiry)
-            .unwrap_or(0);
-        return Ok(Some((ticket, expiry)));
+        return Ok(Some(ticket));
     }
 
     Ok(static_relay_ticket.map(|ticket| (ticket, 0)))
