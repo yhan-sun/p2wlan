@@ -19,6 +19,13 @@ fn interval(start: Option<Instant>, end: Option<Instant>) -> QueueInterval {
             reason: "boundary_missing",
         };
     };
+    // Windows may tolerate a reversed Instant within the QPC error margin.
+    // Observations require strict boundary order rather than a zero duration.
+    if end < start {
+        return QueueInterval::Unavailable {
+            reason: "clock_order_invalid",
+        };
+    }
     let Some(elapsed) = end.checked_duration_since(start) else {
         return QueueInterval::Unavailable {
             reason: "clock_order_invalid",
