@@ -93,6 +93,7 @@ impl CaptureSession {
         tokio::select! {
             _ = self.state.completion_released() => {},
             _ = self.window_commands.completion_released() => {},
+            _ = self.system_write_state.completion_released() => {},
         }
     }
 

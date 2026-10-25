@@ -105,6 +105,9 @@ pub(crate) struct CaptureSession {
     // Packet read/retention never locks this disjoint partition.
     #[cfg(any(target_os = "linux", all(unix, test)))]
     window_commands: control_lock::ControlState<()>,
+    // The sole Full-write history appender does not exclude the original
+    // authenticated-input owner. Readers share its immutable published cells.
+    system_write_state: RegistryMutex<ingress::SystemWriteState>,
     state: RegistryMutex<RegistryState>,
     gaps: AtomicU64,
 }
@@ -292,6 +295,10 @@ impl CaptureSession {
         let system_device = First::new();
         let read_history = Published::new(full::MAX_FULL_PACKETS)?;
         let inbound_history = ingress::InboundHistory::new()?;
+        let system_write_history = ingress::SystemWriteState {
+            system_device: system_device.clone(),
+            writes: inbound_history.writes.clone(),
+        };
         let native_flows = Published::new(MAX_REQUESTS)?;
         let sources = native::source_index::SourceIndex::new(
             native_flows.clone(),
@@ -316,6 +323,7 @@ impl CaptureSession {
             producers: registration::producer_membership()?,
         });
         let window_commands = state.sibling(());
+        let system_write_state = state.sibling(system_write_history);
         let session = Arc::new(Self {
             owner,
             active: Arc::new(AtomicBool::new(true)),
@@ -343,6 +351,7 @@ impl CaptureSession {
             sources,
             state,
             window_commands,
+            system_write_state,
             gaps: AtomicU64::new(0),
         });
         if !plan.flows.is_empty() {
@@ -402,10 +411,11 @@ impl CaptureSession {
     }
 
     #[cfg(any(target_os = "linux", all(unix, test)))]
-    fn try_source_metadata_versions(&self) -> Result<(u64, u64), std::sync::TryLockError<()>> {
+    fn try_source_metadata_versions(&self) -> Result<(u64, u64, u64), std::sync::TryLockError<()>> {
         Ok((
             self.state.try_metadata_version()?,
             self.window_commands.try_metadata_version()?,
+            self.system_write_state.try_metadata_version()?,
         ))
     }
 

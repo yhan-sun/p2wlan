@@ -132,7 +132,9 @@ impl CaptureSession {
             original_authenticated_input_registry_refusal: self
                 .state
                 .authenticated_refusal_snapshot(),
-            original_system_write_registry_refusal: self.state.system_write_refusal_snapshot(),
+            original_system_write_registry_refusal: self
+                .system_write_state
+                .system_write_refusal_snapshot(),
             original_kernel_epoch_refusal: self.epoch_trace.snapshot(),
             original_read_peer_epoch_refusal: self.epoch_trace.read_peer_snapshot(),
             original_kernel_emit_refusal: self.emit_trace.snapshot(),

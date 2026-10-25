@@ -42,7 +42,7 @@ async fn source_completion_versions_fence_each_partition_without_an_even_parity_
         assert!(setup.session.try_source_metadata_versions().is_err());
     }
     let after = setup.session.try_source_metadata_versions().unwrap();
-    assert_eq!(after, (before.0 + 2, before.1 + 2));
+    assert_eq!(after, (before.0 + 2, before.1 + 2, before.2));
     digest_no_credit(&setup.session);
 }
 

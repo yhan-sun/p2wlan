@@ -150,7 +150,7 @@ struct PreparedCompletion {
 pub(in crate::os_request_capture::registry) struct NativeCompletionBatch {
     flows: Vec<(usize, Arc<FrozenFlowSources>)>,
     requests: Vec<PreparedCompletion>,
-    version: Option<(u64, u64)>,
+    version: Option<(u64, u64, u64)>,
     unstable: bool,
 }
 
