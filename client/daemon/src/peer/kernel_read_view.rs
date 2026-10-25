@@ -1,6 +1,6 @@
 //! A bounded immutable first-read expectation, live only while its actual
 //! epoch guard is borrowed for encryption. It never authorizes native credit.
-use super::{NetworkEpochGuard, PeerManager, PeerSessionGeneration};
+use super::{ConnectionsWriteGuard, NetworkEpochGuard, PeerManager, PeerSessionGeneration};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
@@ -41,6 +41,7 @@ pub(crate) struct PreparedReadView {
     target: Ipv4Addr,
     values: OnceLock<(u64, PeerSessionGeneration)>,
     active: Arc<AtomicBool>,
+    published: AtomicBool,
 }
 
 impl PreparedReadView {
@@ -116,17 +117,53 @@ impl PeerManager {
             target: target.parse().ok()?,
             values: OnceLock::new(),
             active: Arc::new(AtomicBool::new(false)),
+            published: AtomicBool::new(false),
         }))
     }
 
+    /// Freeze only the peer expectation from the actual grant already used
+    /// for path selection. It is inactive until encryption, and belongs to
+    /// this exact still-held epoch guard. No connection lock is extended.
+    /// The original producer does not mutate these identity fields between
+    /// path selection and encryption; other owners remain epoch-excluded.
+    pub(crate) fn capture_original_kernel_read_view_values(
+        &self,
+        epoch: &mut NetworkEpochGuard<'_>,
+        connections: &ConnectionsWriteGuard<'_>,
+        prepared: &Arc<PreparedReadView>,
+    ) -> bool {
+        if !epoch.protects(&self.network_epoch_gate)
+            || !connections.protects(&self.connections)
+            || !prepared
+                .registry
+                .ptr_eq(&Arc::downgrade(&self.kernel_read_views.identity))
+            || !prepared.observer.live(Instant::now())
+            || prepared.values.get().is_some()
+        {
+            return false;
+        }
+        let Ok(values) = self.try_kernel_read_peer_values_from_connections(
+            connections,
+            &prepared.peer,
+            prepared.target,
+        ) else {
+            return false;
+        };
+        if !epoch.bind_read_view(&prepared.active) {
+            return false;
+        }
+        prepared.values.set(values).is_ok()
+    }
+
     /// The mutable borrow excludes other epoch-fenced caller mutations while
-    /// this expectation is live. Guard Drop also invalidates before unlocking.
+    /// the expectation is active. Guard Drop invalidates before unlocking.
     pub(crate) fn publish_original_kernel_read_view<'a, 'g>(
         &self,
         epoch: &'a mut NetworkEpochGuard<'g>,
         prepared: &Arc<PreparedReadView>,
     ) -> Option<ReadViewPhase<'a, 'g>> {
-        if !epoch.protects(&self.network_epoch_gate)
+        if prepared.published.load(Ordering::Acquire)
+            || !epoch.protects(&self.network_epoch_gate)
             || !prepared
                 .registry
                 .ptr_eq(&Arc::downgrade(&self.kernel_read_views.identity))
@@ -134,20 +171,35 @@ impl PeerManager {
         {
             return None;
         }
-        let values = self
-            .try_kernel_read_peer_values_in_epoch(
-                epoch,
-                &prepared.peer,
-                prepared.target,
-                #[cfg(any(target_os = "linux", all(unix, test)))]
-                None,
+        let fresh_values = if prepared.values.get().is_some() {
+            // A different or later guard cannot activate an earlier copy.
+            if !epoch.read_view_is_bound(&prepared.active) {
+                return None;
+            }
+            None
+        } else {
+            Some(
+                self.try_kernel_read_peer_values_in_epoch(
+                    epoch,
+                    &prepared.peer,
+                    prepared.target,
+                    #[cfg(any(target_os = "linux", all(unix, test)))]
+                    None,
+                )
+                .ok()?,
             )
-            .ok()?;
+        };
         let mut state = self.kernel_read_views.state.try_write().ok()?;
-        prepared.values.set(values).ok()?;
+        if let Some(values) = fresh_values {
+            prepared.values.set(values).ok()?;
+        }
         if !epoch.bind_read_view(&prepared.active) {
             return None;
         }
+        prepared
+            .published
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
         prepared.active.store(true, Ordering::Release);
         state.view = Arc::downgrade(prepared);
         Some(ReadViewPhase {

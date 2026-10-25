@@ -281,3 +281,6 @@ async fn actual_view_metadata_writer_contention_still_fails_closed_without_repla
     drop(phase);
     drop(epoch);
 }
+
+#[path = "kernel_read_view/captured_values.rs"]
+mod captured_values;

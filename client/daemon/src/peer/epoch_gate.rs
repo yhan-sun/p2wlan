@@ -276,6 +276,12 @@ impl NetworkEpochGuard<'_> {
         true
     }
 
+    pub(super) fn read_view_is_bound(&self, active: &Arc<AtomicBool>) -> bool {
+        self.read_view_active
+            .as_ref()
+            .is_some_and(|bound| bound.ptr_eq(&Arc::downgrade(active)))
+    }
+
     pub(crate) fn note_outbound_phase(&self, phase: OutboundEpochPhase) {
         #[cfg(any(target_os = "linux", all(unix, test)))]
         if let (Some(token), Some(trace)) = (self.token, self.owner.trace.get()) {

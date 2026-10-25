@@ -266,6 +266,16 @@ async fn encrypt_then_send_bounded(
                 false,
                 Some(&mut path_log),
             );
+            // Copy only from the original canonical grant. The same epoch
+            // keeps these fields stable through the read-only checks below;
+            // activation still waits for its immutably borrowed crypto phase.
+            if let Some(prepared) = prepared_read_view.as_ref() {
+                peers.capture_original_kernel_read_view_values(
+                    &mut _epoch_guard,
+                    &path_connections,
+                    prepared,
+                );
+            }
             drop(path_connections);
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::DirectBudget);
             let mut force_relay = false;

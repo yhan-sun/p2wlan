@@ -23,6 +23,7 @@ pub(crate) struct ConnectionsTable {
     capture_claimed: AtomicBool,
 }
 pub(crate) struct ConnectionsWriteGuard<'a> {
+    owner: &'a ConnectionsTable,
     inner: Option<RwLockWriteGuard<'a, Table>>,
     observation: Option<WriteObservation>,
 }
@@ -61,6 +62,7 @@ impl ConnectionsTable {
             value.acquired();
         }
         ConnectionsWriteGuard {
+            owner: self,
             inner: Some(inner),
             observation,
         }
@@ -79,6 +81,7 @@ impl ConnectionsTable {
             value.acquired();
         }
         Ok(ConnectionsWriteGuard {
+            owner: self,
             inner: Some(inner),
             observation,
         })
@@ -120,6 +123,11 @@ impl ConnectionsTable {
             return ConnectionsTraceLease::disabled();
         }
         ConnectionsTraceLease::new(&trace, owner)
+    }
+}
+impl ConnectionsWriteGuard<'_> {
+    pub(super) fn protects(&self, table: &ConnectionsTable) -> bool {
+        std::ptr::eq(self.owner, table)
     }
 }
 impl Deref for ConnectionsWriteGuard<'_> {

@@ -250,12 +250,24 @@ impl PeerManager {
             crate::peer::EpochTryContext,
         >,
     ) -> std::result::Result<(u64, PeerSessionGeneration), OverlayCreditOutcome> {
-        use OverlayCreditOutcome::{Contended, Stale};
+        use OverlayCreditOutcome::Contended;
         #[cfg(any(target_os = "linux", all(unix, test)))]
         let connections = self.connections.try_read_original(context);
         #[cfg(not(any(target_os = "linux", all(unix, test))))]
         let connections = self.connections.try_read();
         let connections = connections.map_err(|_| Contended(CreditLock::Connections))?;
+        self.try_kernel_read_peer_values_from_connections(&connections, peer, target)
+    }
+
+    // Both callers retain the actual original connection grant throughout
+    // this copy. Only its epoch-fenced generation/lifecycle/route are frozen.
+    fn try_kernel_read_peer_values_from_connections(
+        &self,
+        connections: &HashMap<String, PeerConnection>,
+        peer: &str,
+        target: std::net::Ipv4Addr,
+    ) -> std::result::Result<(u64, PeerSessionGeneration), OverlayCreditOutcome> {
+        use OverlayCreditOutcome::{Contended, Stale};
         let membership = self
             .peer_membership
             .try_lock()
