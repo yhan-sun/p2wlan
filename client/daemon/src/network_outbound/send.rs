@@ -236,8 +236,7 @@ async fn encrypt_then_send_bounded(
             serialized_buffer_lease,
         ) = {
             let epoch_gate_wait_started = Instant::now();
-            let (mut _epoch_guard, mut path_connections) =
-                peers.lock_epoch_and_connections_write().await;
+            let (_epoch_guard, path_connections) = peers.lock_epoch_and_connections_write().await;
             let epoch_gate_acquired = Instant::now();
             if sampled_trace.is_some() {
                 epoch_profile.waited(epoch_gate_acquired.duration_since(epoch_gate_wait_started));
@@ -255,28 +254,26 @@ async fn encrypt_then_send_bounded(
                 ),
             });
             }
-            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Path);
-            let selection = peers.select_path_for_data_with_local_endpoint_in_epoch_with_conns(
-                &mut path_connections,
-                &preparation_retry.peer_id,
-                prefer_direct,
-                relay_available || relay_expected,
-                udp_local_endpoint,
-                current_generation,
-                false,
-                Some(&mut path_log),
-            );
-            // Copy only from the original canonical grant. The same epoch
-            // keeps these fields stable through the read-only checks below;
-            // activation still waits for its immutably borrowed crypto phase.
-            if let Some(prepared) = prepared_read_view.as_ref() {
-                peers.capture_original_kernel_read_view_values(
-                    &mut _epoch_guard,
-                    &path_connections,
-                    prepared,
-                );
-            }
-            drop(path_connections);
+            let Some((mut _epoch_guard, selection)) = peers
+                .select_path_with_original_identity_epoch(
+                    _epoch_guard,
+                    path_connections,
+                    prepared_read_view,
+                    &preparation_retry.peer_id,
+                    prefer_direct,
+                    relay_available || relay_expected,
+                    udp_local_endpoint,
+                    current_generation,
+                    false,
+                    Some(&mut path_log),
+                )
+            else {
+                return Err(EncryptSendOutcome::Terminal {
+                    packet: preparation_retry,
+                    reason_code: "outbound_preparation_owner_changed",
+                    reason: "original preparation grants have a different owner".into(),
+                });
+            };
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::DirectBudget);
             let mut force_relay = false;
             // A sealed Relay REQUEST echo must use its original Relay writer.
@@ -440,9 +437,7 @@ async fn encrypt_then_send_bounded(
                 }
             }
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Encryption);
-            let read_view_phase = prepared_read_view.as_ref().and_then(|prepared| {
-                peers.publish_original_kernel_read_view(&mut _epoch_guard, prepared)
-            });
+            _epoch_guard.begin_encryption();
             let mut result = match transport
                 .encrypt_request_with_prepared_buffer_diagnostics(
                     packet,
@@ -472,7 +467,7 @@ async fn encrypt_then_send_bounded(
                     });
                 }
             };
-            drop(read_view_phase);
+            let _epoch_guard = _epoch_guard.finish();
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::PhysicalMetadata);
             // The original plaintext has been consumed by the crypto call.
             // Bind the returned wire owner before any further awaited work.

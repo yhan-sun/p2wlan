@@ -284,3 +284,6 @@ async fn actual_view_metadata_writer_contention_still_fails_closed_without_repla
 
 #[path = "kernel_read_view/captured_values.rs"]
 mod captured_values;
+
+#[path = "kernel_read_view/preparation_phase.rs"]
+mod preparation_phase;

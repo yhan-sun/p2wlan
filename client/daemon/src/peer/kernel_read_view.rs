@@ -1,6 +1,7 @@
-//! A bounded immutable first-read expectation, live only while its actual
-//! epoch guard is borrowed for encryption. It never authorizes native credit.
+//! A bounded immutable first-read expectation within identity-preserving
+//! preparation owned by its actual epoch guard. Never native authority.
 use super::{ConnectionsWriteGuard, NetworkEpochGuard, PeerManager, PeerSessionGeneration};
+mod preparation;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
@@ -69,11 +70,13 @@ impl ReadViewRegistry {
     }
 }
 
+#[cfg(all(unix, test))]
 pub(crate) struct ReadViewPhase<'a, 'g> {
     _epoch: &'a mut NetworkEpochGuard<'g>,
     view: Arc<PreparedReadView>,
 }
 
+#[cfg(all(unix, test))]
 impl Drop for ReadViewPhase<'_, '_> {
     fn drop(&mut self) {
         self.view.active.store(false, Ordering::Release);
@@ -122,7 +125,7 @@ impl PeerManager {
     }
 
     /// Freeze only the peer expectation from the actual grant already used
-    /// for path selection. It is inactive until encryption, and belongs to
+    /// for path selection. Activation belongs to
     /// this exact still-held epoch guard. No connection lock is extended.
     /// The original producer does not mutate these identity fields between
     /// path selection and encryption; other owners remain epoch-excluded.
@@ -155,13 +158,25 @@ impl PeerManager {
         prepared.values.set(values).is_ok()
     }
 
-    /// The mutable borrow excludes other epoch-fenced caller mutations while
-    /// the expectation is active. Guard Drop invalidates before unlocking.
+    #[cfg(all(unix, test))]
     pub(crate) fn publish_original_kernel_read_view<'a, 'g>(
         &self,
         epoch: &'a mut NetworkEpochGuard<'g>,
         prepared: &Arc<PreparedReadView>,
     ) -> Option<ReadViewPhase<'a, 'g>> {
+        self.publish_original_kernel_read_value(epoch, prepared)?;
+        Some(ReadViewPhase {
+            _epoch: epoch,
+            view: prepared.clone(),
+        })
+    }
+
+    // Only the scoped owners below may hold this published metadata lease.
+    fn publish_original_kernel_read_value(
+        &self,
+        epoch: &mut NetworkEpochGuard<'_>,
+        prepared: &Arc<PreparedReadView>,
+    ) -> Option<()> {
         if prepared.published.load(Ordering::Acquire)
             || !epoch.protects(&self.network_epoch_gate)
             || !prepared
@@ -202,10 +217,7 @@ impl PeerManager {
             .ok()?;
         prepared.active.store(true, Ordering::Release);
         state.view = Arc::downgrade(prepared);
-        Some(ReadViewPhase {
-            _epoch: epoch,
-            view: prepared.clone(),
-        })
+        Some(())
     }
 }
 

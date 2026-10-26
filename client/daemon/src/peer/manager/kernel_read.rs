@@ -95,7 +95,7 @@ impl OriginalKernelReadPeer {
 
     /// Retention keeps the same one real identity try. A view observed before
     /// that try may cover only its metadata expectation while the same actual
-    /// epoch guard is immutably borrowed for encryption. Final native identity
+    /// epoch guard owns identity-preserving preparation. Final native identity
     /// and once admission continue to use the strict entry points above.
     #[cfg(any(target_os = "linux", all(unix, test)))]
     pub(crate) fn try_read_retention_identity_at_observed(
