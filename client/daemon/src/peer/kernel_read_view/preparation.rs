@@ -51,6 +51,7 @@ impl PeerManager {
     /// Consume the same actual grants and run only the canonical selector.
     /// Its identity-preserving mutations are covered by the epoch owned by
     /// the returned scope; release the connection writer at its old boundary.
+    #[cfg(all(unix, test))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn select_path_with_original_identity_epoch<'g>(
         &'g self,
@@ -104,3 +105,5 @@ impl PeerManager {
         ))
     }
 }
+
+mod grant;

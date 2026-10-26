@@ -287,3 +287,6 @@ mod captured_values;
 
 #[path = "kernel_read_view/preparation_phase.rs"]
 mod preparation_phase;
+
+#[path = "kernel_read_view/preparation_grant.rs"]
+mod preparation_grant;

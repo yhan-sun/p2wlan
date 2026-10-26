@@ -971,13 +971,26 @@ impl PeerManager {
             ConnectionsWriteGuard<'a>,
         ),
     > + 'a {
+        self.lock_epoch_and_connections_write_with(|epoch, connections| (epoch, connections))
+    }
+
+    // One original fair acquisition loop. The inline consumer runs exactly
+    // once after the two real grants exist, before returning to its caller.
+    #[track_caller]
+    fn lock_epoch_and_connections_write_with<'a, F, T>(
+        &'a self,
+        finish: F,
+    ) -> impl std::future::Future<Output = T> + 'a
+    where
+        F: FnOnce(crate::peer::NetworkEpochGuard<'a>, ConnectionsWriteGuard<'a>) -> T + 'a,
+    {
         let caller = crate::peer::epoch_gate::EpochLockCaller::capture();
         let connections_caller = crate::peer::connections::ConnectionsLockCaller::caller();
         async move {
             loop {
                 let epoch_guard = self.network_epoch_gate.lock_for(caller).await;
                 match self.connections.try_write_for(connections_caller) {
-                    Ok(connections) => return (epoch_guard, connections),
+                    Ok(connections) => return finish(epoch_guard, connections),
                     Err(_) => {
                         drop(epoch_guard);
                         let connections = self.connections.write_for(connections_caller).await;
@@ -987,7 +1000,7 @@ impl PeerManager {
                         // forever. Retain it only across a nonblocking epoch
                         // attempt: no reverse-order await may hold connections.
                         if let Ok(epoch_guard) = self.network_epoch_gate.try_lock_for(caller) {
-                            return (epoch_guard, connections);
+                            return finish(epoch_guard, connections);
                         }
                         drop(connections);
                     }

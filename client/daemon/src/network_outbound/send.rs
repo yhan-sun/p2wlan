@@ -236,15 +236,16 @@ async fn encrypt_then_send_bounded(
             serialized_buffer_lease,
         ) = {
             let epoch_gate_wait_started = Instant::now();
-            let (_epoch_guard, path_connections) = peers.lock_epoch_and_connections_write().await;
-            let epoch_gate_acquired = Instant::now();
+            let preparation_grant = peers
+                .lock_original_identity_preparation(prepared_read_view)
+                .await;
+            let epoch_gate_acquired = preparation_grant.acquired_at();
             if sampled_trace.is_some() {
                 epoch_profile.waited(epoch_gate_acquired.duration_since(epoch_gate_wait_started));
             }
-            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Generation);
-            let current_generation = peers.current_network_generation_sync();
+            let current_generation = preparation_grant.current_generation();
             if current_generation != expected_generation {
-                drop(path_connections);
+                drop(preparation_grant);
                 preparation_log.generation_rejected(current_generation);
                 return Err(EncryptSendOutcome::Retryable {
                 packet: preparation_retry,
@@ -254,26 +255,15 @@ async fn encrypt_then_send_bounded(
                 ),
             });
             }
-            let Some((mut _epoch_guard, selection)) = peers
-                .select_path_with_original_identity_epoch(
-                    _epoch_guard,
-                    path_connections,
-                    prepared_read_view,
-                    &preparation_retry.peer_id,
-                    prefer_direct,
-                    relay_available || relay_expected,
-                    udp_local_endpoint,
-                    current_generation,
-                    false,
-                    Some(&mut path_log),
-                )
-            else {
-                return Err(EncryptSendOutcome::Terminal {
-                    packet: preparation_retry,
-                    reason_code: "outbound_preparation_owner_changed",
-                    reason: "original preparation grants have a different owner".into(),
-                });
-            };
+            let (mut _epoch_guard, selection) = preparation_grant.select(
+                &preparation_retry.peer_id,
+                prefer_direct,
+                relay_available || relay_expected,
+                udp_local_endpoint,
+                current_generation,
+                false,
+                Some(&mut path_log),
+            );
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::DirectBudget);
             let mut force_relay = false;
             // A sealed Relay REQUEST echo must use its original Relay writer.
@@ -467,7 +457,6 @@ async fn encrypt_then_send_bounded(
                     });
                 }
             };
-            let _epoch_guard = _epoch_guard.finish();
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::PhysicalMetadata);
             // The original plaintext has been consumed by the crypto call.
             // Bind the returned wire owner before any further awaited work.
@@ -499,6 +488,10 @@ async fn encrypt_then_send_bounded(
                         .await;
                 }
             }
+            // The operations through DirectFirst preserve generation,
+            // membership lifecycle, online state and VIP. Retire only after
+            // their real mutations end, immediately before actual unlock.
+            drop(_epoch_guard.finish());
             (
                 result,
                 direct_business_plan,
