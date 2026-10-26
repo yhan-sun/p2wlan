@@ -410,17 +410,36 @@ impl Daemon {
                 }
 
                 if let Some(relay) = relay {
-                    let relay_result = transport
-                        .encrypt_and_emit_outbound(build_packet(), move |encrypted| async move {
-                            timeout(Duration::from_secs(2), relay.send_packet(&encrypted))
-                                .await
-                                .map_err(|_| {
-                                    DaemonError::Relay(
-                                        "relay rekey confirmation send timed out".to_string(),
+                    let relay_result = async {
+                        let __control_packet = build_packet();
+                        let mut __relay_post =
+                            relay.prepare_deferred_send(&__control_packet.peer_id);
+                        let __relay_post_ref = &mut __relay_post;
+                        let __outcome = transport
+                            .encrypt_and_emit_outbound(
+                                __control_packet,
+                                move |encrypted| async move {
+                                    timeout(
+                                        Duration::from_secs(2),
+                                        relay.send_packet_deferred(
+                                            &encrypted,
+                                            None,
+                                            __relay_post_ref,
+                                        ),
                                     )
-                                })?
-                        })
-                        .await;
+                                    .await
+                                    .map_err(|_| {
+                                        DaemonError::Relay(
+                                            "relay rekey confirmation send timed out".to_string(),
+                                        )
+                                    })?
+                                },
+                            )
+                            .await;
+                        __relay_post.finish().await;
+                        __outcome
+                    }
+                    .await;
                     match relay_result {
                         Ok(true) => wireguard_sent = wireguard_sent.saturating_add(1),
                         Ok(false) => debug!(

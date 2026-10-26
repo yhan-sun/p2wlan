@@ -85,15 +85,17 @@ pub(crate) async fn run_relay_peer_validation_loop(
                 );
                 let result = tokio::time::timeout(
                     RELAY_CONTROL_SEND_TIMEOUT,
-                    send_transport.encrypt_and_emit_outbound(
-                        OutboundPacket {
+                    async {
+    let __control_packet = OutboundPacket {
                             room_authorization: None,
                             peer_id: send_peer_id.clone(),
                             dst_ip: send_peer_virtual_ip,
                             packet,
                             trace: None,
-                        },
-                        move |encrypted| async move {
+                        };
+    let mut __relay_post = send_relay.prepare_deferred_send(&__control_packet.peer_id);
+    let __relay_post_ref = &mut __relay_post;
+    let __outcome = send_transport.encrypt_and_emit_outbound(__control_packet, move |encrypted| async move {
                             let Some(peer_session_generation) = send_peers
                                 .relay_validation_write_permit_for_transport(
                                     &expectation_peer_id,
@@ -108,8 +110,7 @@ pub(crate) async fn run_relay_peer_validation_loop(
                                     expectation_peer_id, send_connection_id
                                 )));
                             };
-                            send_relay
-                                .send_packet_with_write_boundary(&encrypted, move |sent_at| {
+                            send_relay.send_packet_deferred(&encrypted, Some(Box::new(move |sent_at| {
                                     boundary_permit.commit(|| {
                                         send_peers.register_relay_validation_expectation_at_write_boundary(
                                             &expectation_peer_id,
@@ -122,10 +123,12 @@ pub(crate) async fn run_relay_peer_validation_loop(
                                             sent_at,
                                         )
                                     })
-                                })
+                                })), __relay_post_ref)
                                 .await
-                        },
-                    ),
+                        }).await;
+    __relay_post.finish().await;
+    __outcome
+},
                 )
                 .await;
                 (
@@ -229,18 +232,27 @@ pub(crate) async fn send_relay_validation_packet(
         validation.sequence,
         &payload,
     );
-    let sent = transport
-        .encrypt_and_emit_outbound(
-            OutboundPacket {
-                room_authorization: None,
-                peer_id: validation.peer_id.to_string(),
-                dst_ip: validation.peer_virtual_ip.to_string(),
-                packet,
-                trace: None,
-            },
-            |encrypted| async move { relay.send_packet(&encrypted).await },
-        )
-        .await?;
+    let sent = async {
+        let __control_packet = OutboundPacket {
+            room_authorization: None,
+            peer_id: validation.peer_id.to_string(),
+            dst_ip: validation.peer_virtual_ip.to_string(),
+            packet,
+            trace: None,
+        };
+        let mut __relay_post = relay.prepare_deferred_send(&__control_packet.peer_id);
+        let __relay_post_ref = &mut __relay_post;
+        let __outcome = transport
+            .encrypt_and_emit_outbound(__control_packet, |encrypted| async move {
+                relay
+                    .send_packet_deferred(&encrypted, None, __relay_post_ref)
+                    .await
+            })
+            .await;
+        __relay_post.finish().await;
+        __outcome
+    }
+    .await?;
     if !sent {
         return Err(DaemonError::Peer(format!(
             "WireGuard session for peer {} is not ready",

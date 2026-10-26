@@ -194,3 +194,5 @@ Darwin 上同时设置 `NAT_SIM_PROCESS_BIRTH=1 NAT_SIM_TCP_OBSERVER=1` 可诊�
 原控制写窗口的预期输入可从现有只读发布单元查询；该查询只携带注册时的 producer 标签和同一计划 Arc，不产生原生读取、Full、SystemTun 或当前 owner 事实。命令仍在原期限内取得真实登记锁，重新遍历唯一 producer、检查原形状及同一 Arc，再按原顺序检查跨窗口冲突、当前时钟和重复写入后安装元数据。
 
 Linux TUN 失败采证只保留原报告摘要绑定的实际程序，不重建或执行。普通、Relay 和房间撤销范围共用 `linux-tun-original-images`，按 daemon/control/relay 最多保存三个镜像，每个上限 1 GiB；各范围保留独立 manifest。共用目录绑定相同 checkout、run ID 和 attempt，已有镜像必须与当前原程序和报告摘要一致。schema 2 的 `images[].archive_member` 指向归档内共用成员；未启用 `--image-store` 时仍输出 schema 1 的范围内镜像。缺少原程序或摘要、身份变化、冲突、符号链接与容量超限均不能获得采证资格。
+
+Relay控制包继续使用原counter emit锁保护加密和实际writer结果。单次控制尝试可冻结一份Relay发送诊断和最多4KiB错误摘要，在该锁释放后输出并记录原advisory尝试；取消只输出实际已提交的诊断，不生成发送成功或当前owner事实。两个Relay writer仍在真实write_all和原Full观察之后通知原completion，再调用同步诊断，避免订阅回调阻止已经完成的结果被调用方接收。原队列、writer边界、超时、错误分类和物理观察来源保持。
