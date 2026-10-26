@@ -118,7 +118,7 @@ async fn assert_lifecycle_commit_drives_granted_lane(lane: ContendedLifecycleLan
         .get_connection(peer_id)
         .await
         .expect("peer lifecycle disappeared after the contended commit");
-    assert_eq!(connection.last_seen, 7);
+    assert_eq!(connection.last_seen.get(), 7);
     assert_eq!(connection.state, ConnectionState::HolePunching);
 }
 
@@ -444,7 +444,7 @@ async fn last_seen_only_peer_update_refreshes_diagnostics_without_handshake_rese
             if peers
                 .get_connection(peer_id)
                 .await
-                .is_some_and(|conn| conn.last_seen == 11)
+                .is_some_and(|conn| conn.last_seen.get() == 11)
             {
                 break;
             }
@@ -785,7 +785,7 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
             if peers
                 .get_connection(peer_id)
                 .await
-                .is_some_and(|connection| connection.last_seen == heartbeat.last_seen)
+                .is_some_and(|connection| connection.last_seen.get() == heartbeat.last_seen)
             {
                 break;
             }
@@ -1070,7 +1070,7 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
             if peers
                 .get_connection(peer_id)
                 .await
-                .is_some_and(|connection| connection.last_seen == 7)
+                .is_some_and(|connection| connection.last_seen.get() == 7)
             {
                 break;
             }

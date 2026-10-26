@@ -9,6 +9,13 @@ pub(crate) struct OriginalKernelReadPeer {
     observed_at: Instant,
 }
 
+// This marker satisfies only the peer expectation for retaining actual read
+// bytes. It is never accepted by a native/current-owner/once transaction.
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) struct ReadRetentionIdentity {
+    _private: (),
+}
+
 impl OriginalKernelReadPeer {
     #[cfg(unix)]
     pub(crate) fn generation(&self) -> u64 {
@@ -84,6 +91,36 @@ impl OriginalKernelReadPeer {
             return self.try_identity_at(peers, at);
         }
         self.try_identity_at_inner(peers, at, context)
+    }
+
+    /// Retention keeps the same one real identity try. A view observed before
+    /// that try may cover only its metadata expectation while the same actual
+    /// epoch guard owns identity-preserving preparation. Final native identity
+    /// and once admission continue to use the strict entry points above.
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(crate) fn try_read_retention_identity_at_observed(
+        &self,
+        peers: &PeerManager,
+        at: Instant,
+        context: Option<crate::peer::EpochTryContext>,
+    ) -> std::result::Result<ReadRetentionIdentity, OverlayCreditOutcome> {
+        let preobserved = peers.kernel_read_views.observe(&self.peer, self.target);
+        match self.try_identity_at_observed(peers, at, context) {
+            Ok(()) => Ok(ReadRetentionIdentity { _private: () }),
+            Err(error @ OverlayCreditOutcome::Contended(CreditLock::Epoch)) => {
+                let compatible = preobserved.is_some_and(|(view, generation, lifecycle)| {
+                    generation == self.generation
+                        && lifecycle == self.lifecycle
+                        && view.is_live(Instant::now())
+                });
+                if compatible {
+                    Ok(ReadRetentionIdentity { _private: () })
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn try_identity_at_inner(
@@ -195,7 +232,13 @@ impl PeerManager {
             .network_epoch_gate
             .try_lock()
             .map_err(|_| Contended(CreditLock::Epoch))?;
-        self.try_kernel_read_peer_values_in_epoch(&_epoch, peer, target)
+        self.try_kernel_read_peer_values_in_epoch(
+            &_epoch,
+            peer,
+            target,
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            context,
+        )
     }
 
     fn try_kernel_read_peer_values_in_epoch(
@@ -203,12 +246,28 @@ impl PeerManager {
         _epoch: &tokio::sync::MutexGuard<'_, ()>,
         peer: &str,
         target: std::net::Ipv4Addr,
+        #[cfg(any(target_os = "linux", all(unix, test)))] context: Option<
+            crate::peer::EpochTryContext,
+        >,
+    ) -> std::result::Result<(u64, PeerSessionGeneration), OverlayCreditOutcome> {
+        use OverlayCreditOutcome::Contended;
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        let connections = self.connections.try_read_original(context);
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
+        let connections = self.connections.try_read();
+        let connections = connections.map_err(|_| Contended(CreditLock::Connections))?;
+        self.try_kernel_read_peer_values_from_connections(&connections, peer, target)
+    }
+
+    // Both callers retain the actual original connection grant throughout
+    // this copy. Only its epoch-fenced generation/lifecycle/route are frozen.
+    fn try_kernel_read_peer_values_from_connections(
+        &self,
+        connections: &HashMap<String, PeerConnection>,
+        peer: &str,
+        target: std::net::Ipv4Addr,
     ) -> std::result::Result<(u64, PeerSessionGeneration), OverlayCreditOutcome> {
         use OverlayCreditOutcome::{Contended, Stale};
-        let connections = self
-            .connections
-            .try_read()
-            .map_err(|_| Contended(CreditLock::Connections))?;
         let membership = self
             .peer_membership
             .try_lock()

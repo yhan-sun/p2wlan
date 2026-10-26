@@ -41,10 +41,12 @@ def unavailable(reason: str) -> dict:
 
 class ProbeCapture:
     def __init__(self, root: Path, stem: str, config, transport: str,
-                 capture_id: str, producer_scope: str, namespace: str | None):
+                 capture_id: str, producer_scope: str, namespace: str | None, *, defer_pipe=False):
         if not isinstance(stem, str) or re.fullmatch(r"[a-z0-9-]+", stem) is None:
             raise ValueError("original_capture_stem_invalid")
         self.reader = self.writer = None
+        self.pipe_opened = False
+        self.closed = False
         self.stream = None
         self.raw = bytearray()
         self.eof = False
@@ -60,6 +62,13 @@ class ProbeCapture:
         udp.write_report(self.plan_path, document)
         self.prepared = plans.load_plan(self.plan_path, config, transport,
                                        document["tool_sha256"], document["shared_config_tool_sha256"])
+        if not defer_pipe:
+            self._open_pipe()
+
+    def _open_pipe(self) -> None:
+        if self.pipe_opened or self.closed or self.stream is not None or self.result is not None or self.gap is not None:
+            raise ValueError("original_capture_pipe_already_admitted_or_closed")
+        self.pipe_opened = True  # An acquisition failure never admits a retry.
         try:
             self.reader, self.writer = os.pipe()
             os.set_blocking(self.reader, False)
@@ -86,6 +95,7 @@ class ProbeCapture:
                 self.gap = self.gap or "owned_capture_descriptor_close_failed"
 
     def close(self) -> None:
+        self.closed = True
         if self.live_window_bridge is not None:
             self.live_window_bridge.seal()
         self._close("writer")
@@ -202,15 +212,15 @@ class WriteCaptures:
         self.scopes, self.nonces, self.captures = set(), set(), []
 
     def prepare(self, groups, entry: dict, transport: str, bind: tuple,
-                target: tuple, stem: str, namespace_name: str) -> ProbeCapture | None:
+                target: tuple, stem: str, namespace_name: str, *, defer_pipe=False) -> ProbeCapture | None:
         capture = None
         if len(self.captures) >= self.expected_probes:
             entry["original_write_stream"] = unavailable("original_capture_registry_full")
             return None
         self.captures.append((entry, None))  # Admission precedes file/pipe acquisition.
         try:
-            if any(c is not None and (c.reader is not None or c.writer is not None)
-                   for _, c in self.captures):
+            if not defer_pipe and any(c is not None and (c.reader is not None or c.writer is not None)
+                                     for _, c in self.captures):
                 raise ValueError("previous_original_capture_still_open")
             config = udp.Config(bind, target, entry["run_nonce"], entry["round_nonce"], entry["count"],
                                 entry["interval_ms"], entry["timeout_ms"], entry["duration_ms"], entry["payload_bytes"])
@@ -225,7 +235,8 @@ class WriteCaptures:
                 if namespace_name not in getattr(groups, "owned_namespace_names", ()):
                     raise ValueError("original_created_namespace_missing")
                 namespace = "net:[" + str(os.stat("/var/run/netns/" + namespace_name).st_ino) + "]"
-            capture = ProbeCapture(self.root, stem, config, transport, self.capture_id, scope, namespace)
+            capture = ProbeCapture(self.root, stem, config, transport, self.capture_id, scope, namespace,
+                                   defer_pipe=defer_pipe)
             if self.nonces.intersection(capture.prepared.nonces):
                 raise ValueError("cross_probe_nonce_collision_no_retry")
             self.scopes.add(scope)
@@ -237,6 +248,15 @@ class WriteCaptures:
                 capture.close()
             entry["original_write_stream"] = unavailable("capture_prepare_failed:" + type(error).__name__)
             return None
+
+    def activate(self, capture: ProbeCapture) -> None:
+        # Plans may be registered before either phase sends traffic. Only the
+        # original registry admits a pipe, after the previous pipe is closed.
+        if (capture is None or sum(c is capture for _, c in self.captures) != 1
+                or any(c is not None and (c.reader is not None or c.writer is not None)
+                       for _, c in self.captures)):
+            raise ValueError("original_capture_owner_missing_or_previous_pipe_open")
+        capture._open_pipe()
 
     def close(self) -> None:
         for entry, capture in self.captures:

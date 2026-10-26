@@ -173,6 +173,7 @@ pub(super) struct FullPacketSnapshot {
     encryption_session_instance: u64,
     encryption_peer_lifecycle: Option<u64>,
     physical_path: &'static str,
+    initial_queue_intervals: Option<super::queue_observation::QueueIntervals>,
 }
 
 // The bounded original-read index is installed by the actual read producer.
@@ -212,6 +213,7 @@ pub(super) fn snapshot(
             packet_len: read.packet_len,
             packet_sha256: read.packet_sha256,
             spans: read.spans.clone(),
+            initial_queue_intervals: read.initial_queue_intervals.get().copied(),
             attempt_id: record.attempt_id(),
             encryption_generation: record.encryption_generation(),
             encryption_session_instance: record.encryption().session_instance(),

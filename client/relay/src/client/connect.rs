@@ -388,17 +388,18 @@ impl RelayClient {
                                     }
                                     Err(err) => Err(err),
                                 };
-                                let failed = result.is_err();
-                                let boundary_rejected =
-                                    matches!(&result, Err(RelayError::WriteBoundaryRejected));
-                                if !failed {
+                                // Both actual writers notify after the same original Full
+                                // observer and before subscriber callbacks can block it.
+                                let (failed, boundary_rejected) = super::data_completion::finish(
+                                    completion, result, |diagnostic| {
+                                if !diagnostic.failed {
                                     debug!(
                                         event = "relay_write_completed",
                                         peer_id = %dst,
                                         bytes = data_len,
                                         "relay writer completed write_all; this is not a peer-delivery acknowledgement"
                                     );
-                                } else if boundary_rejected {
+                                } else if diagnostic.boundary_rejected {
                                     debug!(
                                         event = "relay_write_boundary_rejected",
                                         peer_id = %dst,
@@ -411,11 +412,12 @@ impl RelayClient {
                                         peer_id = %dst,
                                         bytes = data_len,
                                         reason_code = "relay_write_uncertain_or_failed",
-                                        error = ?result.as_ref().err(),
+                                        error = %diagnostic.error.as_deref().unwrap_or("None"),
                                         "relay writer failed after command acceptance; ciphertext delivery is uncertain"
                                     );
                                 }
-                                let _ = completion.send(result);
+                                    },
+                                );
                                 if failed && !boundary_rejected {
                                     note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
                                     break;

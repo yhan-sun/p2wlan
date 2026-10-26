@@ -122,7 +122,7 @@ async fn relay_transport_sends_encrypted_datagrams() {
     let conn_a = peers_a.get_connection("node-b").await.unwrap();
     assert_eq!(conn_a.state, ConnectionState::Idle);
     assert_eq!(conn_a.relay_server, Some(relay_endpoint.clone()));
-    assert_eq!(conn_a.bytes_sent, 0);
+    assert_eq!(conn_a.bytes_sent.get(), 0);
 
     let conn_b = peers_b.get_connection("node-a").await.unwrap();
     assert_eq!(conn_b.state, ConnectionState::Idle);

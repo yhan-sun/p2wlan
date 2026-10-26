@@ -30,7 +30,7 @@ environment:
 # versions available, run `flutter pub outdated`.
 dependencies:
   app_links: 7.2.1
-  crypto: ^3.0.7
+  crypto: ^3.0.8
   flutter:
     sdk: flutter
   tray_manager: ^0.5.3

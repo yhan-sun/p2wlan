@@ -132,7 +132,12 @@ async fn observed_workload(enabled: bool) -> serde_json::Value {
     assert_eq!(latency_us.len(), PACKETS);
     assert_eq!(readouts.len(), PACKETS * READS_PER_PACKET);
     assert_eq!(
-        peers.get_connection("peer-a").await.unwrap().bytes_received,
+        peers
+            .get_connection("peer-a")
+            .await
+            .unwrap()
+            .bytes_received
+            .get(),
         expected_bytes
     );
     if let Some(c) = &capture {

@@ -55,7 +55,7 @@ async fn routes_tun_packet_to_peer_by_virtual_ip() {
     assert_eq!(routed.packet, packet);
 
     let conn = peers.get_connection("peer-b").await.unwrap();
-    assert_eq!(conn.bytes_sent, routed.packet.len() as u64);
+    assert_eq!(conn.bytes_sent.get(), routed.packet.len() as u64);
 
     task.abort();
 }
@@ -357,7 +357,7 @@ async fn writes_inbound_peer_packet_to_tun() {
     assert_eq!(written, packet);
 
     let conn = peers.get_connection("peer-b").await.unwrap();
-    assert_eq!(conn.bytes_received, written.len() as u64);
+    assert_eq!(conn.bytes_received.get(), written.len() as u64);
 
     task.abort();
 }
@@ -397,7 +397,12 @@ async fn drops_inbound_packet_with_spoofed_peer_virtual_ip() {
         .await
         .is_err());
     assert_eq!(
-        peers.get_connection("peer-b").await.unwrap().bytes_received,
+        peers
+            .get_connection("peer-b")
+            .await
+            .unwrap()
+            .bytes_received
+            .get(),
         0
     );
     task.abort();
@@ -444,7 +449,12 @@ async fn normalizes_inbound_non_overlay_source_pollution() {
     assert_eq!(parsed.dst_addr(), Ipv4Addr::new(10, 20, 0, 1));
     assert!(parsed.verify_checksum());
     assert_eq!(
-        peers.get_connection("peer-b").await.unwrap().bytes_received,
+        peers
+            .get_connection("peer-b")
+            .await
+            .unwrap()
+            .bytes_received
+            .get(),
         written.len() as u64
     );
     task.abort();
@@ -486,7 +496,12 @@ async fn keeps_blocking_inbound_overlay_source_spoofing() {
         .await
         .is_err());
     assert_eq!(
-        peers.get_connection("peer-b").await.unwrap().bytes_received,
+        peers
+            .get_connection("peer-b")
+            .await
+            .unwrap()
+            .bytes_received
+            .get(),
         0
     );
     task.abort();
@@ -523,7 +538,12 @@ async fn normalizes_outbound_non_overlay_source_pollution() {
     assert_eq!(parsed.dst_addr(), Ipv4Addr::new(10, 20, 0, 2));
     assert!(parsed.verify_checksum());
     assert_eq!(
-        peers.get_connection("peer-b").await.unwrap().bytes_sent,
+        peers
+            .get_connection("peer-b")
+            .await
+            .unwrap()
+            .bytes_sent
+            .get(),
         routed.packet.len() as u64
     );
     task.abort();
@@ -553,7 +573,15 @@ async fn keeps_blocking_outbound_overlay_source_spoofing() {
     assert!(timeout(Duration::from_millis(100), outbound_rx.recv())
         .await
         .is_err());
-    assert_eq!(peers.get_connection("peer-b").await.unwrap().bytes_sent, 0);
+    assert_eq!(
+        peers
+            .get_connection("peer-b")
+            .await
+            .unwrap()
+            .bytes_sent
+            .get(),
+        0
+    );
     task.abort();
 }
 
@@ -602,7 +630,12 @@ async fn live_acl_denies_matching_inbound_packet() {
         .await
         .is_err());
     assert_eq!(
-        peers.get_connection("peer-b").await.unwrap().bytes_received,
+        peers
+            .get_connection("peer-b")
+            .await
+            .unwrap()
+            .bytes_received
+            .get(),
         0
     );
     task.abort();

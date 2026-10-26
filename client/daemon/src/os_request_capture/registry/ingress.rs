@@ -59,6 +59,8 @@ pub(crate) struct KernelIngressBinding {
     flow: usize,
     spans: Vec<ReadFrameSpan>,
     original_rooms: Vec<Arc<OriginalIncomingRoom>>,
+    // The same canonical invalidation cell owned by the original input flow.
+    inbound_invalid: Arc<AtomicBool>,
     packet_len: usize,
     packet_sha256: [u8; 32],
     authenticated_observed_monotonic_ns: Option<u64>,
@@ -66,6 +68,13 @@ pub(crate) struct KernelIngressBinding {
 }
 
 pub(super) struct InboundHistory {
+    // Read projection of the sole SystemWriteState appender, never a second
+    // history or another production append site.
+    pub(super) writes: Published<Arc<KernelIngressBinding>>,
+}
+
+pub(super) struct SystemWriteState {
+    pub(super) system_device: First<Weak<DeviceLease>>,
     pub(super) writes: Published<Arc<KernelIngressBinding>>,
 }
 
@@ -164,12 +173,12 @@ impl CaptureSession {
             }
             #[cfg(unix)]
             let mut state = self
-                .state
+                .system_write_state
                 .try_system_write_lock(original.ordinal())
                 .map_err(|_| CaptureFailure::Contended)?;
             #[cfg(not(unix))]
             let mut state = self
-                .state
+                .system_write_state
                 .try_lock()
                 .map_err(|_| CaptureFailure::Contended)?;
             if state
@@ -179,18 +188,13 @@ impl CaptureSession {
             {
                 return Err(CaptureFailure::ForeignDevice);
             }
-            if state.flows[binding.flow]
-                .inbound
-                .invalid
-                .load(Ordering::Acquire)
-            {
+            if binding.inbound_invalid.load(Ordering::Acquire) {
                 return Err(CaptureFailure::FrameConflict);
             }
-            if state.inbound_history.writes.len() >= MAX_SYSTEM_WRITES {
+            if state.writes.len() >= MAX_SYSTEM_WRITES {
                 return Err(CaptureFailure::Capacity);
             }
             state
-                .inbound_history
                 .writes
                 .try_reserve(1)
                 .map_err(|_| CaptureFailure::Capacity)?;
@@ -198,7 +202,7 @@ impl CaptureSession {
                 .write
                 .set(original)
                 .map_err(|_| CaptureFailure::DuplicateWrite)?;
-            state.inbound_history.writes.push(binding)?;
+            state.writes.push(binding)?;
             #[cfg(any(target_os = "linux", all(unix, test)))]
             {
                 let mut completion = native::completion::NativeCompletionBatch::new();
@@ -430,6 +434,7 @@ impl KernelCaptureRuntime {
                 flow.inbound.original_room[span.slot()].get_or_insert_with(|| new_room.clone());
             original_rooms.push(saved.clone());
         }
+        let inbound_invalid = flow.inbound.invalid.clone();
         // The original flow updates and first room-permit selection are done.
         // Build the immutable binding without retaining the registry guard.
         drop(state);
@@ -439,6 +444,7 @@ impl KernelCaptureRuntime {
             flow: index,
             spans,
             original_rooms,
+            inbound_invalid,
             packet_len: packet.packet.len(),
             packet_sha256: Sha256::digest(&packet.packet).into(),
             authenticated_observed_monotonic_ns: super::super::clock::monotonic_ns(),
@@ -512,6 +518,11 @@ impl InboundHistory {
         })
     }
 
+    #[cfg(unix)]
+    pub(super) fn published_len(&self) -> usize {
+        self.writes.len()
+    }
+
     #[cfg(any(target_os = "linux", all(unix, test)))]
     pub(super) fn frame_complete(
         &self,
@@ -532,11 +543,13 @@ impl InboundHistory {
     #[cfg(unix)]
     pub(super) fn snapshot_coverage(
         &self,
+        published_prefix: usize,
         mut rows: Vec<(usize, Vec<ReadFrameSpan>)>,
     ) -> super::snapshot::SnapshotCoverage {
         rows.extend(
             self.writes
                 .iter()
+                .take(published_prefix)
                 .filter(|binding| binding.write.get().is_some())
                 .map(|binding| (binding.flow, binding.spans.clone())),
         );
@@ -544,48 +557,58 @@ impl InboundHistory {
     }
 
     #[cfg(unix)]
-    pub(super) fn snapshot(&self, mut output: Vec<WriteSnapshot>) -> Vec<WriteSnapshot> {
-        output.extend(self.writes.iter().filter_map(|binding| {
-            let write = binding.write.get()?;
-            Some(WriteSnapshot {
-                scope: "original_authenticated_system_tun_full_history_only",
-                flow: binding.flow,
-                spans: binding.spans.clone(),
-                write_ordinal: write.ordinal(),
-                write_observed_monotonic_ns: write.monotonic_ns(),
-                authenticated_observed_monotonic_ns: binding.authenticated_observed_monotonic_ns,
-                packet_len: binding.packet_len,
-                packet_sha256: binding.packet_sha256,
-                network_generation: binding.source.network_generation(),
-                session_instance: binding.source.session().session_instance(),
-                peer_lifecycle: binding
-                    .source
-                    .session()
-                    .authorized_peer_lifecycle()
-                    .map(|life| life.value()),
-                original_session_role: match binding.source.session().original_role() {
-                    OriginalSessionRole::Active => "active",
-                    OriginalSessionRole::Pending => "pending",
-                    OriginalSessionRole::Previous => "previous",
-                },
-                original_room_captured: binding
-                    .original_rooms
-                    .iter()
-                    .map(|room| room.permit.is_ok())
-                    .collect(),
-                original_room_restricted: binding
-                    .original_rooms
-                    .iter()
-                    .map(|room| matches!(room.permit, Ok(Some(_))))
-                    .collect(),
-                original_room_owner_live: binding
-                    .original_rooms
-                    .iter()
-                    .map(|room| room.owner.upgrade().is_some())
-                    .collect(),
-                canonical_current_owner_verified: false,
-            })
-        }));
+    pub(super) fn snapshot(
+        &self,
+        published_prefix: usize,
+        mut output: Vec<WriteSnapshot>,
+    ) -> Vec<WriteSnapshot> {
+        output.extend(
+            self.writes
+                .iter()
+                .take(published_prefix)
+                .filter_map(|binding| {
+                    let write = binding.write.get()?;
+                    Some(WriteSnapshot {
+                        scope: "original_authenticated_system_tun_full_history_only",
+                        flow: binding.flow,
+                        spans: binding.spans.clone(),
+                        write_ordinal: write.ordinal(),
+                        write_observed_monotonic_ns: write.monotonic_ns(),
+                        authenticated_observed_monotonic_ns: binding
+                            .authenticated_observed_monotonic_ns,
+                        packet_len: binding.packet_len,
+                        packet_sha256: binding.packet_sha256,
+                        network_generation: binding.source.network_generation(),
+                        session_instance: binding.source.session().session_instance(),
+                        peer_lifecycle: binding
+                            .source
+                            .session()
+                            .authorized_peer_lifecycle()
+                            .map(|life| life.value()),
+                        original_session_role: match binding.source.session().original_role() {
+                            OriginalSessionRole::Active => "active",
+                            OriginalSessionRole::Pending => "pending",
+                            OriginalSessionRole::Previous => "previous",
+                        },
+                        original_room_captured: binding
+                            .original_rooms
+                            .iter()
+                            .map(|room| room.permit.is_ok())
+                            .collect(),
+                        original_room_restricted: binding
+                            .original_rooms
+                            .iter()
+                            .map(|room| matches!(room.permit, Ok(Some(_))))
+                            .collect(),
+                        original_room_owner_live: binding
+                            .original_rooms
+                            .iter()
+                            .map(|room| room.owner.upgrade().is_some())
+                            .collect(),
+                        canonical_current_owner_verified: false,
+                    })
+                }),
+        );
         output
     }
 }

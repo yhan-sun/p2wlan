@@ -222,7 +222,8 @@ async fn held_tun_write(normalize: bool, result: WriteResult) {
         .get_connection("rx-peer")
         .await
         .unwrap()
-        .bytes_received;
+        .bytes_received
+        .get();
     assert_eq!(received, if result == WriteResult::Full { len } else { 0 });
 }
 

@@ -116,8 +116,8 @@ impl WireWriteWindow {
     }
 }
 
-// This is a fenced reference to the sole immutable registration input, not a
-// second mutable flow state. The exact Arc is rechecked under the real owner.
+// A fenced reference to the sole immutable published registration input.
+// The exact Arc is rechecked under the window/registration metadata owner.
 struct OriginalWindowPlan {
     producer: [u8; 16],
     flow: usize,
@@ -140,6 +140,7 @@ impl OriginalWindowPlan {
         wire.validate(received, frame_bytes, &nonce)
     }
 
+    #[cfg(all(unix, test))]
     fn is_current(&self, index: usize, flow: &FlowState) -> bool {
         self.flow == index
             && self.producer == flow.producer_scope
@@ -218,19 +219,20 @@ impl CaptureSession {
             .as_ref()
             .map_err(|error| *error)
             .and_then(|plan| plan.validate_registered_wire(&wire, received));
-        let mut state = self.state.lock_until(end).await?;
+        let window_owner = self.window_commands.lock_until(end).await?;
         let now = monotonic_ns().ok_or(CaptureFailure::InvalidPlan)?;
         if !self.is_live(Instant::now()) {
             return Err(CaptureFailure::Expired);
         }
         let prepared = prepared?;
-        // This sole actual guard repeats the original unique producer/shape
-        // checks and exact Arc fence before any metadata can be installed.
-        let flow_index = selection::current_original_index(&prepared, &state)?;
-        let flow = &mut state.flows[flow_index];
+        // This guard serializes all window writes and registration appends.
+        // Recheck the sole published registration cells, unique producer,
+        // original shape and exact plan Arc. The cells are the same Firsts
+        // retained by the read registry, never copied mutable window facts.
+        let flow = selection::current_published_source(&prepared, &self.sources)?;
         if flow.requests.iter().any(|request| {
             request
-                .original_write_window
+                .window
                 .as_ref()
                 .is_some_and(|old| old.original_started_ns != wire.original_started_ns)
         }) {
@@ -248,13 +250,13 @@ impl CaptureSession {
         }
         let request = flow
             .requests
-            .get_mut(wire.sequence as usize)
+            .get(wire.sequence as usize)
             .ok_or(CaptureFailure::InvalidPlan)?;
-        if request.original_write_window.is_some() {
+        if request.window.is_some() {
             return Err(CaptureFailure::DuplicateWrite);
         }
-        request
-            .original_write_window
+        let mut original_window = request.window.clone();
+        original_window
             .set(WriteWindow {
                 scope: "original_controller_write_window_only",
                 request_nonce: wire.request_nonce,
@@ -270,9 +272,9 @@ impl CaptureSession {
             })
             .map_err(|_| CaptureFailure::DuplicateWrite)?;
         // The descriptor actor owns completion work. Release this registration
-        // guard before waking it so real input/SystemTun retention keeps its
-        // original single try while this command only installs its metadata.
-        drop(state);
+        // owner before waking it. Real input/SystemTun retention retains its
+        // original single try against the separate actual packet registry.
+        drop(window_owner);
         self.pending_full.request_window();
         Ok(())
     }

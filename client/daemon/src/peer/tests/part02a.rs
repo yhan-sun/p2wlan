@@ -60,12 +60,12 @@ fn test_peer_connection_relay() {
 
 #[test]
 fn test_peer_connection_bytes() {
-    let mut conn = PeerConnection::new("peer1", "10.20.0.2");
+    let conn = PeerConnection::new("peer1", "10.20.0.2");
     conn.record_sent(100);
     conn.record_sent(50);
     conn.record_received(200);
-    assert_eq!(conn.bytes_sent, 150);
-    assert_eq!(conn.bytes_received, 200);
+    assert_eq!(conn.bytes_sent.get(), 150);
+    assert_eq!(conn.bytes_received.get(), 200);
 }
 
 #[tokio::test]

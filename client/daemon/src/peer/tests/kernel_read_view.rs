@@ -230,3 +230,63 @@ async fn actual_guard_invalidates_latch_before_unlock_even_without_phase_drop() 
     assert!(!active.load(Ordering::Acquire));
     assert!(gate.try_lock().is_ok());
 }
+
+#[tokio::test]
+async fn actual_view_metadata_readers_share_the_same_live_guard_without_final_native_permission() {
+    let (peers, _active) = fixture().await;
+    let gate = peers.network_epoch_gate();
+    let prepared = peers
+        .prepare_original_kernel_read_view(PEER, TARGET)
+        .unwrap();
+    let mut epoch = gate.lock().await;
+    let phase = peers
+        .publish_original_kernel_read_view(&mut epoch, &prepared)
+        .unwrap();
+    let first = peers.with_original_kernel_view_read_held_for_test(|| {
+        peers
+            .try_capture_original_kernel_read_peer(PEER, TARGET.parse().unwrap(), None)
+            .unwrap()
+    });
+    assert_eq!(
+        first.try_identity_at(&peers, Instant::now()),
+        Err(OverlayCreditOutcome::Contended(CreditLock::Epoch))
+    );
+    drop(phase);
+    assert!(peers
+        .with_original_kernel_view_read_held_for_test(|| {
+            peers.try_capture_original_kernel_read_peer(PEER, TARGET.parse().unwrap(), None)
+        })
+        .is_err());
+    drop(epoch);
+    assert!(first.try_identity_at(&peers, Instant::now()).is_ok());
+}
+
+#[tokio::test]
+async fn actual_view_metadata_writer_contention_still_fails_closed_without_replacing_the_original_try(
+) {
+    let (peers, _active) = fixture().await;
+    let gate = peers.network_epoch_gate();
+    let prepared = peers
+        .prepare_original_kernel_read_view(PEER, TARGET)
+        .unwrap();
+    let mut epoch = gate.lock().await;
+    let phase = peers
+        .publish_original_kernel_read_view(&mut epoch, &prepared)
+        .unwrap();
+    assert!(peers
+        .with_original_kernel_view_write_held_for_test(|| {
+            peers.try_capture_original_kernel_read_peer(PEER, TARGET.parse().unwrap(), None)
+        })
+        .is_err());
+    drop(phase);
+    drop(epoch);
+}
+
+#[path = "kernel_read_view/captured_values.rs"]
+mod captured_values;
+
+#[path = "kernel_read_view/preparation_phase.rs"]
+mod preparation_phase;
+
+#[path = "kernel_read_view/preparation_grant.rs"]
+mod preparation_grant;

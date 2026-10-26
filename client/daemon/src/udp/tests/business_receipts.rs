@@ -410,7 +410,7 @@ async fn real_workflow(change_owner: bool) -> FixtureFacts {
             async {
                 loop {
                     let connection = peers.get_connection("peer-a").await.unwrap();
-                    if connection.bytes_received == raw.len() as u64 {
+                    if connection.bytes_received.get() == raw.len() as u64 {
                         assert_eq!(connection.endpoint, Some(source));
                         assert_ne!(connection.state.to_string(), "direct");
                         break;

@@ -90,7 +90,11 @@ impl CaptureSession {
     }
 
     pub(in crate::os_request_capture) async fn full_metadata_released(&self) {
-        self.state.completion_released().await;
+        tokio::select! {
+            _ = self.state.completion_released() => {},
+            _ = self.window_commands.completion_released() => {},
+            _ = self.system_write_state.completion_released() => {},
+        }
     }
 
     pub(in crate::os_request_capture) fn full_completion_pending(&self) -> bool {

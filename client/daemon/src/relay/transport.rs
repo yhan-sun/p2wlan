@@ -315,9 +315,9 @@ impl RelayTransport {
 
     /// Send a single encrypted packet through the relay.
     pub async fn send_packet(&self, packet: &EncryptedPeerPacket) -> Result<()> {
-        self.send_packet_inner(packet, None, None, None).await
+        self.send_packet_inner(packet, None, None, None, None).await
     }
-
+    #[cfg(test)]
     /// Send a control packet whose expectation must be installed at the relay
     /// client's real writer boundary, after local command-queue delay.
     pub(crate) async fn send_packet_with_write_boundary<F>(
@@ -328,7 +328,7 @@ impl RelayTransport {
     where
         F: FnOnce(Instant) -> bool + Send + 'static,
     {
-        self.send_packet_inner(packet, Some(Box::new(write_boundary)), None, None)
+        self.send_packet_inner(packet, Some(Box::new(write_boundary)), None, None, None)
             .await
     }
 
@@ -340,7 +340,7 @@ impl RelayTransport {
         packet: &EncryptedPeerPacket,
         origin: Arc<RelaySendCapture>,
     ) -> Result<()> {
-        self.send_packet_inner(packet, None, Some(origin), None)
+        self.send_packet_inner(packet, None, Some(origin), None, None)
             .await
     }
 
@@ -356,7 +356,30 @@ impl RelayTransport {
                 error: p2pnet_relay::RelayError::WriteBoundaryRejected,
             });
         }
-        self.send_packet_inner(packet, None, None, Some(echo)).await
+        self.send_packet_inner(packet, None, None, Some(echo), None)
+            .await
+    }
+
+    /// Frozen control diagnostics and advisory updates complete after the
+    /// caller releases its actual counter fence. Wire/prewrite order is shared.
+    pub(crate) fn prepare_deferred_send(&self, peer: &str) -> DeferredRelaySend {
+        DeferredRelaySend::new(self, peer)
+    }
+
+    pub(crate) async fn send_packet_deferred(
+        &self,
+        packet: &EncryptedPeerPacket,
+        boundary: Option<Box<dyn FnOnce(Instant) -> bool + Send + 'static>>,
+        log: &mut DeferredRelaySend,
+    ) -> Result<()> {
+        if !log.capture(self, packet) {
+            return Err(DaemonError::RelaySend {
+                endpoint: self.relay_endpoint.clone(),
+                error: p2pnet_relay::RelayError::WriteBoundaryRejected,
+            });
+        }
+        self.send_packet_inner(packet, boundary, None, None, Some(log))
+            .await
     }
 
     async fn send_packet_inner(
@@ -365,19 +388,22 @@ impl RelayTransport {
         write_boundary: Option<Box<dyn FnOnce(Instant) -> bool + Send + 'static>>,
         origin: Option<Arc<RelaySendCapture>>,
         echo: Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>>,
+        mut deferred: Option<&mut DeferredRelaySend>,
     ) -> Result<()> {
-        debug!(
-            event = "relay_outbound_write_submitted",
-            peer_id = %packet.peer_id,
-            relay_connection_id = self.relay_connection_id,
-            relay_region = %self.relay_region,
-            bytes = packet.wire_bytes.len(),
-            counter = ?crate::transport::wire_counter(&packet.wire_bytes),
-            is_business = packet.is_business,
-            wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
-            relay_endpoint = %self.relay_endpoint,
-            "opaque encrypted frame submitted to the relay client's bounded command queue"
-        );
+        if deferred.is_none() {
+            debug!(
+                event = "relay_outbound_write_submitted",
+                peer_id = %packet.peer_id,
+                relay_connection_id = self.relay_connection_id,
+                relay_region = %self.relay_region,
+                bytes = packet.wire_bytes.len(),
+                counter = ?crate::transport::wire_counter(&packet.wire_bytes),
+                is_business = packet.is_business,
+                wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
+                relay_endpoint = %self.relay_endpoint,
+                "opaque encrypted frame submitted to the relay client's bounded command queue"
+            );
+        }
         let clients = if let Some(origin) = origin.as_ref() {
             let (clients, selected) = self
                 .rendezvous
@@ -469,25 +495,33 @@ impl RelayTransport {
             }
         };
         if let Err(error) = send_result {
-            warn!(
-                event = "relay_outbound_write_failed",
-                peer_id = %packet.peer_id,
-                relay_connection_id = self.relay_connection_id,
-                relay_region = %self.relay_region,
-                bytes = packet.wire_bytes.len(),
-                counter = ?crate::transport::wire_counter(&packet.wire_bytes),
-                is_business = packet.is_business,
-                wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
-                relay_endpoint = %self.relay_endpoint,
-                error = %error,
-                "relay client writer rejected or failed the encrypted frame"
-            );
+            if let Some(log) = deferred.as_deref_mut() {
+                log.failed(&error);
+            } else {
+                warn!(
+                    event = "relay_outbound_write_failed",
+                    peer_id = %packet.peer_id,
+                    relay_connection_id = self.relay_connection_id,
+                    relay_region = %self.relay_region,
+                    bytes = packet.wire_bytes.len(),
+                    counter = ?crate::transport::wire_counter(&packet.wire_bytes),
+                    is_business = packet.is_business,
+                    wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
+                    relay_endpoint = %self.relay_endpoint,
+                    error = %error,
+                    "relay client writer rejected or failed the encrypted frame"
+                );
+            }
             return Err(DaemonError::RelaySend {
                 endpoint: self.relay_endpoint.clone(),
                 error,
             });
         }
 
+        if let Some(log) = deferred {
+            log.sent();
+            return Ok(());
+        }
         self.peers
             .record_relay_attempt(&packet.peer_id, &self.relay_endpoint)
             .await;

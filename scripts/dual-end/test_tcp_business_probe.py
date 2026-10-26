@@ -2,6 +2,7 @@
 """Real local TCP controls; no kernel TUN or remote-device claim."""
 import copy
 import errno
+import json
 import socket
 import struct
 import threading
@@ -53,7 +54,13 @@ class TcpControls(unittest.TestCase):
             listener.close()
         self.assertFalse(worker.is_alive())
         records = tool.validate_probe(report)
-        self.assertEqual([r["status"] for r in records], ["success", "success"])
+        self.assertEqual(
+            [r["status"] for r in records], ["success", "success"],
+            msg=json.dumps({"original_probe_report": report,
+                            "original_echo_report": result.get("echo"),
+                            "echo_worker_alive_after_join": worker.is_alive()},
+                           sort_keys=True),
+        )
         self.assertEqual(result["echo"]["responses_sent"], 2)
         self.assertEqual(result["echo"]["accepted_connections"], 1)
         self.assertNotIn("connection_attempts", result["echo"])

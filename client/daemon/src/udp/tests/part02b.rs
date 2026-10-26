@@ -31,7 +31,15 @@ async fn sends_encrypted_packet_to_peer_endpoint() {
         .unwrap()
         .unwrap();
     assert_eq!(&buf[..n], payload.as_slice());
-    assert_eq!(peers.get_connection("peer-b").await.unwrap().bytes_sent, 0);
+    assert_eq!(
+        peers
+            .get_connection("peer-b")
+            .await
+            .unwrap()
+            .bytes_sent
+            .get(),
+        0
+    );
 }
 
 #[tokio::test]

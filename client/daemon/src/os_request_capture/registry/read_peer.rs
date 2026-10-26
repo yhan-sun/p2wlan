@@ -89,7 +89,9 @@ impl FirstReadPeer {
         self.original
             .as_ref()
             .map_err(|reason| *reason)
-            .and_then(|original| original.try_identity_at_observed(peers, at, context))
+            .and_then(|original| {
+                original.try_read_retention_identity_at_observed(peers, at, context)
+            })
             .err()
             .map(FullRetentionLossReason::read_peer)
     }

@@ -236,16 +236,16 @@ async fn encrypt_then_send_bounded(
             serialized_buffer_lease,
         ) = {
             let epoch_gate_wait_started = Instant::now();
-            let (mut _epoch_guard, mut path_connections) =
-                peers.lock_epoch_and_connections_write().await;
-            let epoch_gate_acquired = Instant::now();
+            let preparation_grant = peers
+                .lock_original_identity_preparation(prepared_read_view)
+                .await;
+            let epoch_gate_acquired = preparation_grant.acquired_at();
             if sampled_trace.is_some() {
                 epoch_profile.waited(epoch_gate_acquired.duration_since(epoch_gate_wait_started));
             }
-            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Generation);
-            let current_generation = peers.current_network_generation_sync();
+            let current_generation = preparation_grant.current_generation();
             if current_generation != expected_generation {
-                drop(path_connections);
+                drop(preparation_grant);
                 preparation_log.generation_rejected(current_generation);
                 return Err(EncryptSendOutcome::Retryable {
                 packet: preparation_retry,
@@ -255,9 +255,7 @@ async fn encrypt_then_send_bounded(
                 ),
             });
             }
-            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Path);
-            let selection = peers.select_path_for_data_with_local_endpoint_in_epoch_with_conns(
-                &mut path_connections,
+            let (mut _epoch_guard, selection) = preparation_grant.select(
                 &preparation_retry.peer_id,
                 prefer_direct,
                 relay_available || relay_expected,
@@ -266,7 +264,6 @@ async fn encrypt_then_send_bounded(
                 false,
                 Some(&mut path_log),
             );
-            drop(path_connections);
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::DirectBudget);
             let mut force_relay = false;
             // A sealed Relay REQUEST echo must use its original Relay writer.
@@ -430,9 +427,7 @@ async fn encrypt_then_send_bounded(
                 }
             }
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Encryption);
-            let read_view_phase = prepared_read_view.as_ref().and_then(|prepared| {
-                peers.publish_original_kernel_read_view(&mut _epoch_guard, prepared)
-            });
+            _epoch_guard.begin_encryption();
             let mut result = match transport
                 .encrypt_request_with_prepared_buffer_diagnostics(
                     packet,
@@ -462,7 +457,6 @@ async fn encrypt_then_send_bounded(
                     });
                 }
             };
-            drop(read_view_phase);
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::PhysicalMetadata);
             // The original plaintext has been consumed by the crypto call.
             // Bind the returned wire owner before any further awaited work.
@@ -494,6 +488,10 @@ async fn encrypt_then_send_bounded(
                         .await;
                 }
             }
+            // The operations through DirectFirst preserve generation,
+            // membership lifecycle, online state and VIP. Retire only after
+            // their real mutations end, immediately before actual unlock.
+            drop(_epoch_guard.finish());
             (
                 result,
                 direct_business_plan,

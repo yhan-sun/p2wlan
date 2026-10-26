@@ -218,7 +218,12 @@ async fn missing_physical_metadata_keeps_actual_mock_delivery_and_typed_gap() {
             deadline.min(TokioInstant::now() + Duration::from_secs(1)),
             async {
                 loop {
-                    if peers.get_connection("peer-a").await.unwrap().bytes_received
+                    if peers
+                        .get_connection("peer-a")
+                        .await
+                        .unwrap()
+                        .bytes_received
+                        .get()
                         == raw.len() as u64
                     {
                         break;

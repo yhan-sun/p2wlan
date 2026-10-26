@@ -52,6 +52,9 @@ mod relay_only_diagnostics;
 #[path = "tests/peer_update_resources.rs"]
 mod peer_update_resources;
 
+#[path = "tests/heartbeat_metadata.rs"]
+mod heartbeat_metadata;
+
 #[path = "tests/emit_preparation_logging.rs"]
 mod emit_preparation_logging;
 #[path = "tests/path_selection_logging.rs"]
@@ -72,3 +75,13 @@ mod kernel_read_view;
 #[cfg(unix)]
 #[path = "tests/authenticated_endpoint_learning.rs"]
 mod authenticated_endpoint_learning;
+
+#[cfg(unix)]
+#[path = "tests/kernel_read_retention.rs"]
+mod kernel_read_retention;
+
+#[path = "tests/traffic_counters.rs"]
+mod traffic_counters;
+
+#[path = "tests/relay_first_log_release.rs"]
+mod relay_first_log_release;

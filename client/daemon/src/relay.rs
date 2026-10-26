@@ -27,6 +27,10 @@ use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 const RELAY_INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_TICKET_REFRESH_MARGIN_SECS: i64 = 60;
 
+const RELAY_SEND_LOG_TARGET: &str = module_path!();
+mod deferred_send;
+use deferred_send::DeferredRelaySend;
+
 mod original_member;
 pub(crate) use original_member::RelayMemberFailure;
 #[cfg(any(target_os = "linux", all(unix, test)))]

@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::LockResult;
-use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError, TryLockResult};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError, TryLockResult};
 use tokio::sync::Notify;
 
 mod refusal;
@@ -26,7 +26,7 @@ pub(super) struct ControlState<T> {
     metadata_version: AtomicU64,
     changed: Notify,
     completion_released: Notify,
-    waiting: AtomicBool,
+    waiting: Arc<AtomicBool>,
     refusals: refusal::RefusalDiagnostics,
 }
 
@@ -54,9 +54,18 @@ impl<T> ControlState<T> {
             metadata_version: AtomicU64::new(0),
             changed: Notify::new(),
             completion_released: Notify::new(),
-            waiting: AtomicBool::new(false),
+            waiting: Arc::new(AtomicBool::new(false)),
             refusals: refusal::RefusalDiagnostics::new(),
         }
+    }
+
+    /// A disjoint metadata partition shares the original one-waiter budget.
+    /// Its state and write version remain independent, never a second fact.
+    #[cfg(any(target_os = "linux", test))]
+    pub(super) fn sibling<U>(&self, value: U) -> ControlState<U> {
+        let mut state = ControlState::new(value);
+        state.waiting = self.waiting.clone();
+        state
     }
 
     fn wrap<'a>(&'a self, inner: MutexGuard<'a, T>, site: refusal::Site) -> StateGuard<'a, T> {
