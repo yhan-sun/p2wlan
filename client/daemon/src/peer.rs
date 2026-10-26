@@ -683,6 +683,8 @@ pub use path_telemetry::{
     PathTelemetryObservation, PathTelemetryPayload, PathTelemetrySender,
 };
 
+mod path_transition_log;
+use path_transition_log::DeferredPathTransitionLog;
 mod path_state_machine;
 pub(crate) use path_state_machine::{
     ActiveBusinessPath, DirectAttemptNumber, DirectCandidateContinuity, DirectValidationIdentity,

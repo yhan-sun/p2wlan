@@ -779,6 +779,16 @@ impl PeerConnection {
         event: PathEvent,
         apply_side_effects: impl FnOnce(&mut Self),
     ) -> PathTransitionOutcome {
+        let mut log = DeferredPathTransitionLog::new(&self.node_id);
+        self.commit_path_transition_deferred(event, apply_side_effects, &mut log)
+    }
+
+    pub(crate) fn commit_path_transition_deferred(
+        &mut self,
+        event: PathEvent,
+        apply_side_effects: impl FnOnce(&mut Self),
+        log: &mut DeferredPathTransitionLog,
+    ) -> PathTransitionOutcome {
         let event_epoch = event.epoch();
         let observability_event = event.clone();
         let previous_active = self.path_state_machine.active_path();
@@ -788,26 +798,20 @@ impl PeerConnection {
         self.path_observability
             .record(&observability_event, &outcome, Instant::now());
         if !outcome.accepted() {
-            debug!(
-                target: "p2pnet_daemon::peer::path_state_machine",
-                event = "path_transition_rejected",
-                peer_id = %self.node_id,
-                epoch = ?event_epoch,
-                decision = ?outcome.decision,
-                revision = outcome.snapshot.revision,
-                "rejected stale or illegal path event"
+            log.refused(
+                event_epoch,
+                outcome.decision,
+                outcome.snapshot.revision,
+                false,
             );
             return outcome;
         }
         if !outcome.applies_side_effects() {
-            debug!(
-                target: "p2pnet_daemon::peer::path_state_machine",
-                event = "path_transition_duplicate",
-                peer_id = %self.node_id,
-                epoch = ?event_epoch,
-                decision = ?outcome.decision,
-                revision = outcome.snapshot.revision,
-                "ignored duplicate path event without executing side effects"
+            log.refused(
+                event_epoch,
+                outcome.decision,
+                outcome.snapshot.revision,
+                true,
             );
             return outcome;
         }
@@ -834,28 +838,10 @@ impl PeerConnection {
         self.sync_path_telemetry();
 
         if previous_state != new_state || previous_active != current_active {
-            info!(target: "p2pnet_daemon::peer::connection",
-                event = "peer_connection_state_changed",
-                peer_id = %self.node_id,
-                previous_state = ?previous_state,
-                new_state = ?new_state,
-                previous_active_path = ?previous_active,
-                active_path = ?current_active,
-                path_revision = outcome.snapshot.revision,
-                direct_generation = self.direct_generation,
-                relay_ready_generation = ?self.relay_ready_generation,
-                relay_confirmed_generation = ?self.relay_confirmed_generation,
-                relay_confirmed_connection_id = ?self.relay_confirmed_connection_id,
-                relay_server = ?self.relay_server,
-                direct_endpoint = ?self.endpoint,
-                "peer connection state changed peer_id={} previous={:?} new={:?}",
-                self.node_id,
-                previous_state,
-                new_state,
-            );
-            info!(
-                "Peer {} state: {} → {}",
-                self.node_id, previous_state, new_state
+            log.changed(
+                self,
+                (previous_state, new_state, previous_active, current_active),
+                outcome.snapshot.revision,
             );
         }
         outcome

@@ -82,3 +82,6 @@ mod kernel_read_retention;
 
 #[path = "tests/traffic_counters.rs"]
 mod traffic_counters;
+
+#[path = "tests/relay_first_log_release.rs"]
+mod relay_first_log_release;
