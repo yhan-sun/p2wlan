@@ -416,13 +416,13 @@ mod tests {
 
         // Poll one actual capture while contended, then release the original
         // reader/writer. The same future must recover a fresh peer snapshot.
-        let mut recovering_peer = Box::pin(build_peer_scoped_snapshot(
-            context_probe.clone(),
-            "node-b",
-        ));
-        assert!(tokio::time::timeout(Duration::ZERO, recovering_peer.as_mut())
-            .await
-            .is_err());
+        let mut recovering_peer =
+            Box::pin(build_peer_scoped_snapshot(context_probe.clone(), "node-b"));
+        assert!(
+            tokio::time::timeout(Duration::ZERO, recovering_peer.as_mut())
+                .await
+                .is_err()
+        );
         drop(connection_reader);
         queued_writer.await.unwrap();
         let recovered = tokio::time::timeout(Duration::from_secs(2), recovering_peer)
@@ -528,7 +528,10 @@ mod tests {
             .await
             .unwrap();
         let mut missing_response = String::new();
-        missing_stream.read_to_string(&mut missing_response).await.unwrap();
+        missing_stream
+            .read_to_string(&mut missing_response)
+            .await
+            .unwrap();
         assert!(missing_response.starts_with("HTTP/1.1 404 Not Found"));
 
         let mut runtime_stream = TcpStream::connect(addr).await.unwrap();
