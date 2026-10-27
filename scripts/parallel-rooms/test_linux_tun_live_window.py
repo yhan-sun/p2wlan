@@ -84,6 +84,7 @@ class MetadataControls(unittest.TestCase):
         rows[0] = dict(sequence=0, complete=True, original_sent_ns=100,
                        original_deadline_ns=200, last_returned_ns=101)
         capture.stream = SimpleNamespace(child=original, gap=None, owner_verified=True, clock_verified=True,
+                                         records=5, headers=[None] * 5,
                                          requests=rows, started=1, expected_frames=[(191, "a" * 64)] * 8,
                                          accepted_in_time=lambda r: r["complete"])
         capture.prepared = SimpleNamespace(producer_scope="b" * 32, nonces=[f"{i:032x}" for i in range(8)])
@@ -109,6 +110,23 @@ class MetadataControls(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         self.assertFalse(bridge.summary()["requests"][1]["delivered"])
 
+    def test_incomplete_ordered_headers_wait_without_delivery_or_terminal_identity_failure(self):
+        capture, bridge, sent = self.bridge()
+        for count in range(5):
+            capture.stream.records = count
+            capture.stream.owner_verified = count >= 3
+            capture.stream.clock_verified = count >= 4
+            bridge.observe(capture, 102)
+            self.assertIsNone(bridge.gap)
+            self.assertEqual(bridge.seen, set())
+            self.assertEqual(sent, [])
+        capture.stream.records = 5
+        bridge.observe(capture, 103)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(bridge.seen, {0})
+        self.assertEqual(sent[0]["original_sent_ns"], 100)
+        self.assertEqual(sent[0]["original_deadline_ns"], 200)
+
     def test_late_first_complete_window_is_not_repaired_when_given_earlier_time(self):
         capture, bridge, sent = self.bridge()
         bridge.observe(capture, 200)
@@ -128,6 +146,9 @@ class MetadataControls(unittest.TestCase):
             bridge.observe(capture, 102)
             self.assertEqual(sent, [])
             self.assertIsNotNone(bridge.summary()["gap_reason"])
+            capture.stream.clock_verified = True
+            bridge.observe(capture, 103)
+            self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ class DeferredMetadataTests(unittest.TestCase):
         capture = Capture()
         original = SimpleNamespace(unavailable_reason=None, boot_id="a" * 36)
         capture.stream = SimpleNamespace(child=original, gap=None, owner_verified=True, clock_verified=True,
+            records=5, headers=[None] * 5,
             requests=[dict(sequence=i, complete=True, original_sent_ns=100+i,
                            original_deadline_ns=200+i, last_returned_ns=101+i) for i in range(8)],
             started=1, expected_frames=[(191, "a" * 64)] * 8, accepted_in_time=lambda r:r["complete"])
