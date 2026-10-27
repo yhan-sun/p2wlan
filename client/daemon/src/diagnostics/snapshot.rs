@@ -506,7 +506,7 @@ fn peer_snapshot_core_matches(
 async fn build_peer_scoped_snapshot(
     context: DiagnosticsContext,
     peer_id: &str,
-) -> PeerScopedDiagnosticsSnapshot {
+) -> Option<PeerScopedDiagnosticsSnapshot> {
     let relay_connected = context.relay_transport.read().await.is_some();
     let udp_local_endpoint = context
         .udp_transport
@@ -514,25 +514,38 @@ async fn build_peer_scoped_snapshot(
         .await
         .as_ref()
         .and_then(|udp| udp.local_addr().ok());
-    let peer_snapshot = context
-        .peers
-        .diagnostic_with_path_selection(
-            peer_id,
-            context.config.relay.prefer_direct,
-            relay_connected,
-            DIRECT_RETRY_BASE_INTERVAL,
-            udp_local_endpoint,
-        )
-        .await;
-    let (network_generation, peer) = peer_snapshot
-        .map(|(generation, peer)| (generation, Some(peer)))
-        .unwrap_or_else(|| (context.peers.current_network_generation_sync(), None));
+    // Match /status's existing bounded read policy without joining the
+    // writer-preferred lock queue or returning cached peer state as current.
+    // The enclosing original HTTP timeout still cancels this entire future.
+    let mut captured = None;
+    for _ in 0..32 {
+        if let Some((generation, peer)) = context
+            .peers
+            .diagnostic_with_path_selection(
+                peer_id,
+                context.config.relay.prefer_direct,
+                relay_connected,
+                DIRECT_RETRY_BASE_INTERVAL,
+                udp_local_endpoint,
+            )
+            .await
+        {
+            captured = Some((generation, Some(peer)));
+            break;
+        }
+        if context.peers.try_connection_exists(peer_id) == Some(false) {
+            captured = Some((context.peers.current_network_generation_sync(), None));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let (network_generation, peer) = captured?;
     let network_peer_count = context.peers.active_connection_count().await;
     let captured_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default();
-    PeerScopedDiagnosticsSnapshot {
+    Some(PeerScopedDiagnosticsSnapshot {
         node_id: context.config.node.node_id.clone(),
         network_id: context.config.network.network_id.clone(),
         network_generation,
@@ -543,7 +556,7 @@ async fn build_peer_scoped_snapshot(
         network_peer_count,
         captured_at_ms,
         peer,
-    }
+    })
 }
 
 async fn build_runtime_snapshot(context: DiagnosticsContext) -> RuntimeDiagnosticsSnapshot {
