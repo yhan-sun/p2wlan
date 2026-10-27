@@ -94,6 +94,15 @@ impl PeerManager {
             .map(|connections| connections.values().cloned().collect())
     }
 
+    /// Observe absence only after a real non-queuing connection-map read.
+    /// A busy map is unknown, never proof that a peer does not exist.
+    pub(crate) fn try_connection_exists(&self, node_id: &str) -> Option<bool> {
+        self.connections
+            .try_read()
+            .ok()
+            .map(|connections| connections.contains_key(node_id))
+    }
+
     /// Return peers that need an active relay data-plane confirmation.
     pub async fn relay_validation_targets(
         &self,

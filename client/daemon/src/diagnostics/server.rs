@@ -200,10 +200,19 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             )
             .await
             {
-                Ok(snapshot) => {
+                Ok(Some(snapshot)) => {
                     let status = if snapshot.peer.is_some() { 200 } else { 404 };
                     let body = serde_json::to_string_pretty(&snapshot)?;
                     write_response(&mut stream, status, "application/json", &body, cors_origin)
+                        .await?;
+                }
+                Ok(None) => {
+                    let body = serde_json::json!({
+                        "error": "peer_snapshot_busy",
+                        "retryable": true,
+                    })
+                    .to_string();
+                    write_response(&mut stream, 503, "application/json", &body, cors_origin)
                         .await?;
                 }
                 Err(_) => {
