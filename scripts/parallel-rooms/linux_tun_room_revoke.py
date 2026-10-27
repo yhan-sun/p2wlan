@@ -26,6 +26,7 @@ class Revocation:
 
     def complete(self, entry, capture, kernel, application_report):
         bridge = self.bridge
+        entry["original_live_write_windows"] = bridge.summary() if bridge is not None else None
         require(entry["protocol"] == "udp" and entry["direction"] == "b-to-a"
                 and len(entry["records"]) == 8
                 and all(r["status"] == "success" for r in entry["records"]),

@@ -175,7 +175,12 @@ def wait_child(child: subprocess.Popen, deadline: float, *, capture=None) -> int
             capture.drain()
             if time.monotonic() >= deadline:
                 break
-        result = child.poll()
+        # Keep the original child unreaped until its owned pipe reaches EOF.
+        # One read can leave a tail (the eight-write stream exceeds 4096 bytes);
+        # polling first could retire the owner before live delivery sees it.
+        # Every iteration keeps the same read cap, sleep and absolute deadline.
+        stream_open = capture is not None and capture.reader is not None and capture.gap is None
+        result = None if stream_open else child.poll()
         if result is not None:
             return result
         time.sleep(.02)

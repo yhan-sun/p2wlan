@@ -48,6 +48,51 @@ class PlatformControls(unittest.TestCase):
             self.assertIs(result[key], False)
 
 
+@unittest.skipUnless(os.name == "posix", "actual nonblocking pipe required")
+class PipeReapOrderingControls(unittest.TestCase):
+    """Actual pipe bytes and explicit child-poll controls; no OS-write/native facts."""
+    def pipe_capture(self):
+        reader, writer = os.pipe()
+        os.set_blocking(reader, False)
+        capture = captures.ProbeCapture.__new__(captures.ProbeCapture)
+        capture.reader, capture.writer, capture.gap = reader, writer, None
+        capture.raw, capture.eof = bytearray(), False
+        capture.stream = SimpleNamespace(gap=None, feed=lambda _raw: None)
+        capture.live_window_bridge = None
+        self.addCleanup(capture.close)
+        return capture
+
+    def test_original_pipe_tail_and_EOF_precede_child_reap_with_one_read_per_poll(self):
+        capture = self.pipe_capture()
+        payload = b"x" * 4176  # More than one original 4096-byte read.
+        self.assertEqual(os.write(capture.writer, payload), len(payload))
+        capture._close("writer")
+        states = []
+        capture.live_window_bridge = SimpleNamespace(
+            observe=lambda owner, _now: states.append(bytes(owner.raw)), seal=lambda: None)
+        child = SimpleNamespace(poll=unittest.mock.Mock(return_value=0))
+        with patch.object(harness.time, "sleep"), patch.object(captures.os, "read", wraps=os.read) as reads:
+            self.assertEqual(harness.wait_child(child, time.monotonic() + 1, capture=capture), 0)
+        self.assertEqual(bytes(capture.raw), payload)
+        self.assertTrue(capture.eof)
+        self.assertIsNone(capture.reader)
+        self.assertEqual(states, [payload[:4096], payload])
+        self.assertEqual([call.args[1] for call in reads.call_args_list], [4096, 4096, 4096])
+        child.poll.assert_called_once_with()
+
+    def test_open_pipe_uses_original_deadline_without_polling_or_catchup(self):
+        capture = self.pipe_capture()
+        child = SimpleNamespace(poll=unittest.mock.Mock(return_value=0))
+        clock = [0.0]
+        with patch.object(harness.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(harness.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            with self.assertRaisesRegex(TimeoutError, "original application child deadline"):
+                harness.wait_child(child, .05, capture=capture)
+        child.poll.assert_not_called()
+        self.assertFalse(capture.eof)
+        self.assertEqual(capture.raw, b"")
+
+
 @unittest.skipUnless(os.name == "posix", "owned probe captures require POSIX pipes and process groups")
 class OwnedCaptureControls(unittest.TestCase):
     @classmethod

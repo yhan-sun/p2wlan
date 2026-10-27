@@ -45,7 +45,15 @@ class OriginalWriteWindows:
                 or stream is None or stream.child is not self.original or stream.gap is not None):
             self.gap = "original_window_owner_or_stream_unavailable"
             return
-        if not stream.owner_verified or not stream.clock_verified or self.original.unavailable_reason is not None:
+        if self.original.unavailable_reason is not None:
+            self.gap = "original_window_birth_and_same_boot_unavailable"
+            return
+        # The ordered source/owner/clock headers can span original pipe reads.
+        # Incomplete input has not established either identity or a failure;
+        # it cannot deliver a window. Parser errors remain terminal above.
+        if stream.records < len(stream.headers):
+            return
+        if not stream.owner_verified or not stream.clock_verified:
             self.gap = "original_window_birth_and_same_boot_unavailable"
             return
         if len(stream.requests) != 8 or [r["sequence"] for r in stream.requests] != list(range(8)):
