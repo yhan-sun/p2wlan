@@ -216,6 +216,7 @@ scoped AS (
 		END AS reporter_online,
 		CASE
 			WHEN rd.online = 1
+				AND o.registration_seq = rd.registration_seq
 				AND rd.last_seen > 0
 				AND rd.last_seen >= ?
 				AND o.received_at >= ?
@@ -260,6 +261,7 @@ WITH scoped AS (
 		END AS reporter_online,
 		CASE
 			WHEN rd.online = 1
+				AND o.registration_seq = rd.registration_seq
 				AND rd.last_seen > 0
 				AND rd.last_seen >= ?
 				AND o.received_at >= ?

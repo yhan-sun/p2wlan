@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::super::path_observability::PathObservabilitySnapshot;
 use super::wire::{
     observation_from_snapshot, PathTelemetryFrame, PathTelemetryObservation, PathTelemetryPayload,
+    MAX_PATH_TELEMETRY_FRAME_BYTES,
 };
 
 pub const MAX_DIRTY_PEERS: usize = 128;
@@ -28,6 +29,8 @@ pub struct PathTelemetryMetrics {
     pub sent_observations: u64,
     pub ack_received: u64,
     pub send_failures: u64,
+    pub oversized_observations: u64,
+    pub trimmed_transition_items: u64,
 }
 
 /// The authoritative active-path telemetry hub.
@@ -149,6 +152,84 @@ impl PathTelemetryHub {
         }
 
         results
+    }
+
+    /// Drain a batch bounded by both observation count and complete serialized
+    /// WebSocket bytes. Overflow stays dirty and is re-read from the latest
+    /// coalesced snapshot on the next flush. This budget also bounds HTTP.
+    pub fn drain_bounded_frame(&self, max_batch: usize) -> Option<PathTelemetryFrame> {
+        let mut pending = self
+            .drain_dirty(max_batch.min(DEFAULT_BATCH_OBSERVATIONS))
+            .into_iter();
+        let mut frame = self.build_frame(Vec::new());
+        while let Some(observation) = pending.next() {
+            frame.payload.observations.push(observation);
+            loop {
+                let fits = serde_json::to_vec(&frame)
+                    .map(|bytes| bytes.len() <= MAX_PATH_TELEMETRY_FRAME_BYTES)
+                    .unwrap_or(false);
+                if fits {
+                    break;
+                }
+                if frame.payload.observations.len() > 1 {
+                    // The last observation belongs in a new frame. Never trim
+                    // normal history just to fit an already populated batch.
+                    if let Some(last) = frame.payload.observations.pop() {
+                        self.requeue_unsent(std::iter::once(last).chain(pending));
+                    }
+                    return Some(frame);
+                }
+                // An oversized single observation must never trigger an endless
+                // reconnect loop. Retain its authoritative snapshot, dropping
+                // oldest optional history first and exposing the loss in metrics.
+                let transitions = &mut frame.payload.observations[0].transitions;
+                let trimmed = !transitions.is_empty();
+                if trimmed {
+                    transitions.remove(0);
+                }
+                if let Ok(mut metrics) = self.metrics.lock() {
+                    if trimmed {
+                        metrics.trimmed_transition_items =
+                            metrics.trimmed_transition_items.saturating_add(1);
+                    } else {
+                        metrics.oversized_observations =
+                            metrics.oversized_observations.saturating_add(1);
+                        metrics.dropped_events = metrics.dropped_events.saturating_add(1);
+                    }
+                }
+                if !trimmed {
+                    tracing::warn!(
+                        reason_code = "path_telemetry_observation_too_large",
+                        limit_bytes = MAX_PATH_TELEMETRY_FRAME_BYTES,
+                        "Path telemetry observation exceeds message budget"
+                    );
+                    frame.payload.observations.clear();
+                    break;
+                }
+            }
+        }
+        (!frame.payload.observations.is_empty()).then_some(frame)
+    }
+
+    fn requeue_unsent(&self, observations: impl Iterator<Item = PathTelemetryObservation>) {
+        if let (Ok(mut peers), Ok(mut set), Ok(mut metrics)) = (
+            self.dirty_peers.lock(),
+            self.dirty_set.lock(),
+            self.metrics.lock(),
+        ) {
+            for observation in observations {
+                let peer = observation.remote_device_id;
+                if set.contains(&peer) {
+                    continue;
+                }
+                if peers.len() == MAX_DIRTY_PEERS {
+                    metrics.dropped_events = metrics.dropped_events.saturating_add(1);
+                    continue;
+                }
+                set.insert(peer.clone());
+                peers.push_back(peer);
+            }
+        }
     }
 
     /// Check if there are any pending dirty peers.

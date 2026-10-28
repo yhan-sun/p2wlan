@@ -355,9 +355,7 @@ async fn run_signal_websocket_with_lifecycle(
 
                         if send_telemetry {
                             if let Some(hub) = &telemetry_hub {
-                                let batch = hub.drain_dirty(32);
-                                if !batch.is_empty() {
-                                    let frame = hub.build_frame(batch);
+                                if let Some(frame) = hub.drain_bounded_frame(32) {
                                     if let Ok(text) = serde_json::to_string(&frame) {
                                         let count = frame.payload.observations.len();
                                         match time::timeout(

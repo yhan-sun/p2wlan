@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -141,4 +143,33 @@ func startMetricsTestRelay(t *testing.T, metricsBind string, allowPublic bool) *
 	}
 	go server.Serve()
 	return server
+}
+
+func TestMetricsDoesNotWaitForAuthenticationSourceSnapshots(t *testing.T) {
+	limiter, err := newAuthFailureLimiter(1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &RelayServer{hub: newHub(), authFailures: limiter}
+	limiter.mu.Lock()
+	done := make(chan struct{})
+	w := httptest.NewRecorder()
+	go func() {
+		s.handleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		close(done)
+	}()
+	blocked := false
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		blocked = true
+	}
+	limiter.mu.Unlock()
+	<-done
+	if blocked {
+		t.Fatal("aggregate metrics waited for the authentication-source limiter")
+	}
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "auth_failure_sources") {
+		t.Fatalf("aggregate metrics exposed source details: HTTP %d body=%s", w.Code, w.Body.String())
+	}
 }

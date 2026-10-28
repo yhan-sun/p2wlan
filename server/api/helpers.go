@@ -45,5 +45,5 @@ func isValidLoginIdentifier(identifier string) bool {
 }
 
 func isValidPassword(password string) bool {
-	return len(password) >= 6
+	return len(password) >= 6 && len(password) <= 72
 }

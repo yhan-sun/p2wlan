@@ -97,7 +97,7 @@ func (s *RelayServer) rejectAuthRateLimited(conn net.Conn, source string) bool {
 func (s *RelayServer) handleConn(conn net.Conn) {
 	p := &peer{
 		conn: conn,
-		send: make(chan []byte, s.config.SendQueueCapacity),
+		send: make(chan queuedFrame, s.config.SendQueueCapacity),
 		done: make(chan struct{}),
 	}
 	connStarted := time.Now()
@@ -140,8 +140,16 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 					return
 				}
 				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				err := writeFull(conn, frame)
-				p.releaseFrame(frame)
+				// This is the forwarding write-start boundary. An already-started
+				// write may finish during revocation; queued frames cannot borrow
+				// a newer source connection. Never hold hub locks across writeFull.
+				if _, business := forwardedSource(frame.data); business && !s.hub.currentForward(frame.source, p) {
+					p.releaseFrame(frame.data)
+					atomic.AddUint64(&s.stats.forwardErrorsTotal, 1)
+					continue
+				}
+				err := writeFull(conn, frame.data)
+				p.releaseFrame(frame.data)
 				if err != nil {
 					p.writeFailed.Store(true)
 					setCloseCause("write_failed")
@@ -382,7 +390,7 @@ func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, network
 				queue(p, errorFrame(4000, "malformed forward payload"))
 				continue
 			}
-			status, message := s.hub.forward(networkID, p.id, dstID, data, s.config.MaxFramePayload)
+			status, message := s.hub.forward(p, dstID, data, s.config.MaxFramePayload)
 			if status != 0 {
 				atomic.AddUint64(&s.stats.forwardErrorsTotal, 1)
 				queue(p, errorFrame(status, message))

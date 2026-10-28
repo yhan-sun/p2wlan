@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { build } from 'esbuild'
 import { createRequire } from 'node:module'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { summarizeNetworks, topologyForNetwork } from '../src/features/relationships/relationships.ts'
 import { withPageParams, connectionLink, relationshipLink } from '../src/pageState.ts'
 
@@ -28,6 +30,21 @@ test('default private devices remain visible and never form a cross-account defa
   assert.deepEqual(alice.nodes.map(({ id }) => id), ['account:a', 'device:a'])
   assert.equal(alice.edges.length, 1)
   assert.equal(fixture.nodes.length, 4)
+})
+
+test('summary account existence flags expose personal groups without loading devices', () => {
+  const summary = {
+    scope: 'global', view: 'summary',
+    nodes: [
+      { id: 'account:a', kind: 'account', account_id: 'a', label: 'Alice', has_personal_devices: true },
+      { id: 'account:b', kind: 'account', account_id: 'b', label: 'Bob', has_personal_devices: false },
+    ],
+    edges: [],
+  }
+  const groups = summarizeNetworks(summary)
+  assert.deepEqual(groups.map(({ id, memberCount }) => ({ id, memberCount })), [{ id: 'personal:a', memberCount: 1 }])
+  assert.equal(groups[0].deviceCount, 0)
+  assert.equal(summary.nodes.length, 2)
 })
 
 test('shared network summaries follow actual attachments rather than a device primary network field', () => {
@@ -68,7 +85,7 @@ test('diagnostic links encode identifiers and retain private-default account sco
   assert.equal(personal.searchParams.get('account_id'), 'owner&1')
 })
 
-const built = await build({ entryPoints: ['src/refresh.tsx'], bundle: true, platform: 'node', format: 'cjs', write: false, loader: { '.css': 'empty' } })
+const built = await build({ entryPoints: ['src/refresh.tsx'], bundle: true, platform: 'node', format: 'cjs', write: false, loader: { '.css': 'empty' }, external: ['react', 'react/jsx-runtime'] })
 const exported = { exports: {} }
 new Function('module', 'exports', 'require', built.outputFiles[0].text)(exported, exported.exports, createRequire(import.meta.url))
 
@@ -82,4 +99,13 @@ test('offline and failed background refreshes are recognized even with retained 
     paused: false, failed: true, fetching: false, updatedAt: 1000,
   })
   assert.equal(queryFreshness([{ dataUpdatedAt: 0, fetchStatus: 'paused' }]).updatedAt, 0)
+})
+
+test('a manual snapshot page does not promise polling when global auto refresh is on', () => {
+  const queries = [{ dataUpdatedAt: 1000, fetchStatus: 'idle', refetch() {} }]
+  const manual = renderToStaticMarkup(createElement(exported.exports.QueryStatus, { queries, refreshMode: 'manual' }))
+  assert.match(manual, /此页为手动关系快照/)
+  assert.doesNotMatch(manual, /自动刷新已开启/)
+  const automatic = renderToStaticMarkup(createElement(exported.exports.QueryStatus, { queries }))
+  assert.match(automatic, /自动刷新已开启/)
 })

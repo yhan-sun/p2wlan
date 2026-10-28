@@ -154,6 +154,9 @@ func (s *Server) serveConsole(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
+		if errors.Is(err, fs.ErrNotExist) && serveLegacyChunkUpgrade(w, r, asset) {
+			return
+		}
 		// BrowserRouter uses clean paths such as /admin/accounts/:id. Any path
 		// without a file extension is an SPA route and must receive index.html so
 		// refresh/deep-link navigation works. Unknown asset-looking paths remain

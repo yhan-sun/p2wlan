@@ -42,14 +42,15 @@ export function queryFreshness(queries: Pick<QueryState, 'dataUpdatedAt' | 'fetc
   }
 }
 
-export function QueryStatus({ queries, label }: { queries: QueryState[]; label?: string }) {
-  const enabled = useContext(RefreshContext).enabled
+export function QueryStatus({ queries, label, refreshMode = 'automatic' }: { queries: QueryState[]; label?: string; refreshMode?: 'automatic' | 'manual' }) {
+  const preferenceEnabled = useContext(RefreshContext).enabled
+  const enabled = refreshMode === 'automatic' && preferenceEnabled
   const state = queryFreshness(queries)
   const degraded = state.paused || state.failed
   const time = state.updatedAt ? new Intl.DateTimeFormat(getLocale(), { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(state.updatedAt) : ''
   // Only changes to availability or refresh preference are announced. A normal
   // polling cycle and its timestamp must not interrupt reading every 15 seconds.
-  const announcement = tr(state.paused ? '当前离线，更新已暂停。' : state.failed ? state.updatedAt ? '刷新失败。' : '读取失败，尚无成功快照。' : !enabled ? state.updatedAt ? '自动刷新已关闭，显示上次读取的快照，可手动刷新。' : '自动刷新已关闭；尚无成功快照，可手动读取。' : '自动刷新已开启。')
+  const announcement = tr(state.paused ? '当前离线，更新已暂停。' : state.failed ? state.updatedAt ? '刷新失败。' : '读取失败，尚无成功快照。' : refreshMode === 'manual' ? '此页为手动关系快照；点击刷新读取最新资源。' : !enabled ? state.updatedAt ? '自动刷新已关闭，显示上次读取的快照，可手动刷新。' : '自动刷新已关闭；尚无成功快照，可手动读取。' : '自动刷新已开启。')
   return <div className={`query-status${degraded ? ' degraded' : ''}${!enabled ? ' snapshot' : ''}`}>
     <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{label ? `${tr(label)}：` : ''}{announcement}</span>
     {state.paused ? <WifiOff size={15} aria-hidden /> : <Clock3 size={15} aria-hidden />}

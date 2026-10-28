@@ -190,8 +190,8 @@ func (db *DB) AdminOverviewSnapshot() (*AdminOverview, error) {
 		(SELECT COUNT(*) FROM devices),
 		(SELECT COUNT(*) FROM devices WHERE ` + adminOnlineLeaseSQL("devices") + `),
 		(SELECT COUNT(*) FROM tunnels WHERE active = 1),
-		(SELECT COUNT(*) FROM signals)`
-	if err := tx.QueryRow(countQuery, cutoff).Scan(
+		(SELECT COUNT(*) FROM signals WHERE created_at >= ?)`
+	if err := tx.QueryRow(countQuery, cutoff, result.GeneratedAt-signalTTLSeconds).Scan(
 		&result.Users,
 		&result.Networks,
 		&result.Rooms,

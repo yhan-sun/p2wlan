@@ -66,6 +66,9 @@ func TestConnectionMetricsRollupFollowsAcceptedTelemetry(t *testing.T) {
 	// A new registration owner may replay the same latest snapshot after
 	// takeover. Current Rust wire does not mark mark_all_dirty() payloads with
 	// is_resync, so owner advancement itself fences the long-term trend sample.
+	if _, err := db.Exec(`UPDATE devices SET registration_seq=2 WHERE id=?`, devAID); err != nil {
+		t.Fatal(err)
+	}
 	resyncSummary, err := db.RecordPathObservations(devAID, netID, 2, []PathObservation{second}, false)
 	if err != nil || resyncSummary.Accepted != 1 {
 		t.Fatalf("owner-advance resync telemetry: summary=%+v err=%v", resyncSummary, err)
@@ -260,7 +263,6 @@ func TestConnectionMetricsPercentileOverflowDoesNotFabricateBound(t *testing.T) 
 		t.Fatalf("p10 should be bounded by 10s, got %+v", got)
 	}
 }
-
 
 func TestConnectionMetricsDropsAbsurdValidationRTT(t *testing.T) {
 	db, _, netID, devAID, devBID := setupTelemetryTestDB(t)

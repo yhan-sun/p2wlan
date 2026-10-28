@@ -10,7 +10,7 @@ import {
   type Node,
 } from '@xyflow/react'
 import { CircleAlert, Expand, Eye, EyeOff, Info, MonitorSmartphone, Shrink } from 'lucide-react'
-import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { getFlowAriaLabelConfig, tr, useLocale } from '../../i18n'
 import { TopologyViewport } from '../../shared/TopologyViewport'
 import type { AdminConnection } from '../../types'
@@ -202,6 +202,7 @@ export function ConnectionTopology({
   directionOnly = false,
 }: ConnectionTopologyProps) {
   const [fullscreen, setFullscreen] = useState(false)
+  const surfaceRef = useRef<HTMLDivElement>(null)
   const [legendOpen, setLegendOpen] = useState(false)
   const locale = useLocale()
   const [narrow, setNarrow] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 650px)').matches)
@@ -232,7 +233,7 @@ export function ConnectionTopology({
 
   const activeConnectionCount = visibleConnections.filter((connection) => Boolean(connection.current_path)).length
 
-  useOverlay(fullscreen && graph.nodes.length > 0, () => setFullscreen(false))
+  useOverlay(fullscreen && graph.nodes.length > 0, () => setFullscreen(false), { modalRef: surfaceRef })
   useEffect(() => {
     if (connections.length === 0) setFullscreen(false)
   }, [connections.length])
@@ -244,14 +245,14 @@ export function ConnectionTopology({
       <label>{tr('设备一跳视图')}<select className="select-field" value={activeDevice} onChange={(event) => { setFocusDevice(event.target.value); onClearSelection?.(); }}>{activeDevice && !devices.some((device) => device.id === activeDevice) && <option value={activeDevice}>{activeDevice}</option>}{devices.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}</select></label>
       <button className="button secondary compact" onClick={() => setShowCanvas((value) => !value)}>{tr(showCanvas ? '查看方向清单' : '打开连接图')}</button>
     </div>}
-    <div className={`connection-topology ${fullscreen ? 'fullscreen' : ''} ${listMode ? 'list-mode' : ''}`}>
+    <div ref={surfaceRef} role={fullscreen ? 'dialog' : undefined} aria-modal={fullscreen ? true : undefined} aria-label={fullscreen ? tr('全屏连接拓扑') : undefined} tabIndex={fullscreen ? -1 : undefined} className={`connection-topology ${fullscreen ? 'fullscreen' : ''} ${listMode ? 'list-mode' : ''}`}>
     <div className="connection-topology-head">
       <div><strong>{networkName}</strong><span>{activeConnectionCount} {tr("条单向路径观测")}{partial ? ` · ${tr('当前视图已截断')}` : ''}</span></div>
       <div>
         <button className={`topology-filter-button ${showStale ? 'active' : ''}`} onClick={() => onShowStaleChange(!showStale)} aria-pressed={showStale} aria-label={tr('显示过期观测')}>
           {showStale ? <Eye size={15} /> : <EyeOff size={15} />}{tr("Stale")}</button>
         <button className={`topology-filter-button connection-legend-toggle ${legendOpen ? 'active' : ''}`} onClick={() => setLegendOpen((value) => !value)} aria-expanded={legendOpen} aria-controls="connection-topology-legend"><Info size={15} />{tr('图例')}</button>
-        <button className="icon-button connection-topology-fullscreen-button" disabled={graph.nodes.length === 0} onClick={() => setFullscreen((value) => !value)} aria-label={tr(fullscreen ? '退出全屏' : '全屏')}>
+        <button data-fullscreen-toggle className="icon-button connection-topology-fullscreen-button" disabled={graph.nodes.length === 0} onClick={() => setFullscreen((value) => !value)} aria-label={tr(fullscreen ? '退出全屏' : '全屏')}>
           {fullscreen ? <Shrink size={16} /> : <Expand size={16} />}
         </button>
       </div>

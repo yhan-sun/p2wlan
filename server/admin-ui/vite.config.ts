@@ -87,9 +87,9 @@ export default defineConfig(({ mode }) => ({
 
           return undefined
         },
-        entryFileNames: 'app.js',
-        chunkFileNames: '[name].js',
-        assetFileNames: (assetInfo) => assetInfo.name?.endsWith('.css') ? 'app.css' : '[name][extname]',
+        entryFileNames: 'app-[hash].js',
+        chunkFileNames: '[name]-[hash].js',
+        assetFileNames: (assetInfo) => assetInfo.name?.endsWith('.css') ? 'app-[hash].css' : '[name]-[hash][extname]',
       },
     },
   },

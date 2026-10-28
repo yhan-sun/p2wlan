@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strconv"
@@ -49,6 +50,7 @@ type AdminConnectionPage struct {
 }
 
 type AdminConnectionFilter struct {
+	Context           context.Context
 	Query             string
 	NetworkID         string
 	AccountID         string
@@ -83,6 +85,7 @@ type AdminConnectionTransitionPage struct {
 }
 
 type AdminConnectionTransitionFilter struct {
+	Context           context.Context
 	ReportingDeviceID string
 	RemoteDeviceID    string
 	NetworkID         string
@@ -94,6 +97,15 @@ type AdminConnectionTransitionFilter struct {
 // not materialize every observation in a large deployment.
 func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) (*AdminConnectionPage, error) {
 	limit, offset = normalizeAdminPage(limit, offset)
+	ctx := filter.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin admin connections snapshot: %w", err)
+	}
+	defer tx.Rollback()
 	now := time.Now().Unix()
 	freshCutoff := now - DeviceOnlineTTL
 
@@ -101,8 +113,8 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 	var args []interface{}
 
 	if query := strings.ToLower(strings.TrimSpace(filter.Query)); query != "" {
-		like := "%" + query + "%"
-		conditions = append(conditions, "(LOWER(rd.device_name) LIKE ? OR LOWER(remd.device_name) LIKE ? OR LOWER(ru.username) LIKE ? OR LOWER(remu.username) LIKE ? OR LOWER(n.name) LIKE ?)")
+		like := "%" + strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(query) + "%"
+		conditions = append(conditions, "(LOWER(rd.device_name) LIKE ? ESCAPE '!' OR LOWER(remd.device_name) LIKE ? ESCAPE '!' OR LOWER(ru.username) LIKE ? ESCAPE '!' OR LOWER(remu.username) LIKE ? ESCAPE '!' OR LOWER(n.name) LIKE ? ESCAPE '!')")
 		args = append(args, like, like, like, like, like)
 	}
 
@@ -136,7 +148,7 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 		}
 	}
 
-	freshSQL := "(rd.online = 1 AND rd.last_seen > 0 AND rd.last_seen >= ? AND o.received_at >= ?)"
+	freshSQL := "(o.registration_seq = rd.registration_seq AND rd.online = 1 AND rd.last_seen > 0 AND rd.last_seen >= ? AND o.received_at >= ?)"
 	switch strings.ToLower(strings.TrimSpace(filter.Freshness)) {
 	case "fresh":
 		conditions = append(conditions, freshSQL)
@@ -161,7 +173,7 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 		` + whereClause
 
 	var total int
-	if err := db.QueryRow("SELECT COUNT(*) "+baseQuery, args...).Scan(&total); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) "+baseQuery, args...).Scan(&total); err != nil {
 		return nil, fmt.Errorf("count admin connections: %w", err)
 	}
 
@@ -174,6 +186,8 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 			ru.username,
 			rd.online,
 			rd.last_seen,
+			o.registration_seq,
+			rd.registration_seq,
 			o.remote_device_id,
 			remd.device_name,
 			remd.user_id,
@@ -202,7 +216,7 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 	`
 	queryArgs := append(append([]interface{}{}, args...), limit, offset)
 
-	rows, err := db.Query(query, queryArgs...)
+	rows, err := tx.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("query admin connections: %w", err)
 	}
@@ -216,6 +230,8 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 		var (
 			reportingOnline         int
 			reportingLastSeen       int64
+			observationSession      int64
+			reportingSession        int64
 			currentPath             sql.NullString
 			previousPath            sql.NullString
 			selectedPathMTU         sql.NullInt64
@@ -232,6 +248,8 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 			&item.ReportingUsername,
 			&reportingOnline,
 			&reportingLastSeen,
+			&observationSession,
+			&reportingSession,
 			&item.RemoteDeviceID,
 			&item.RemoteDeviceName,
 			&item.RemoteUserID,
@@ -283,7 +301,7 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 		}
 
 		reporterOnline := reportingOnline == 1 && reportingLastSeen > 0 && reportingLastSeen >= freshCutoff
-		timeFresh := item.ReceivedAt >= freshCutoff
+		timeFresh := item.ReceivedAt >= freshCutoff && observationSession == reportingSession
 		item.Fresh = reporterOnline && timeFresh
 
 		if !reporterOnline {
@@ -299,6 +317,12 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate admin connections: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit admin connections snapshot: %w", err)
+	}
 
 	return &AdminConnectionPage{
 		Total:  total,
@@ -311,6 +335,10 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 // AdminConnectionTransitions returns transition history for connection paths,
 // ordered newest-first with stable cursor pagination.
 func (db *DB) AdminConnectionTransitions(filter AdminConnectionTransitionFilter, limit int, cursor string) (*AdminConnectionTransitionPage, error) {
+	ctx := filter.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if limit <= 0 {
 		limit = adminDefaultPageSize
 	}
@@ -373,7 +401,7 @@ func (db *DB) AdminConnectionTransitions(filter AdminConnectionTransitionFilter,
 	`, whereClause)
 
 	args = append(args, limit+1)
-	rows, err := db.Query(query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query admin connection transitions: %w", err)
 	}

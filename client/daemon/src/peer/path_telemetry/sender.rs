@@ -71,13 +71,11 @@ impl PathTelemetrySender {
             return Ok(0);
         }
 
-        let observations = self.hub.drain_dirty(DEFAULT_BATCH_OBSERVATIONS);
-        if observations.is_empty() {
+        let Some(frame) = self.hub.drain_bounded_frame(DEFAULT_BATCH_OBSERVATIONS) else {
             return Ok(0);
-        }
-
-        let count = observations.len();
-        let payload = self.hub.build_payload(observations);
+        };
+        let payload = frame.payload;
+        let count = payload.observations.len();
         let url = format!("{}{}", self.base_url, TELEMETRY_HTTP_PATH);
 
         let mut req = self.http.post(&url).bearer_auth(&self.token).json(&payload);

@@ -10,10 +10,13 @@ import (
 
 // connections handles GET /admin/api/v1/connections.
 func (s *Server) connections(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := adminReadRequestContext(r)
+	defer cancel()
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 
 	filter := database.AdminConnectionFilter{
+		Context:           ctx,
 		Query:             strings.TrimSpace(r.URL.Query().Get("q")),
 		NetworkID:         strings.TrimSpace(r.URL.Query().Get("network_id")),
 		AccountID:         strings.TrimSpace(r.URL.Query().Get("account_id")),
@@ -40,10 +43,13 @@ func (s *Server) connections(w http.ResponseWriter, r *http.Request) {
 
 // connectionTransitions handles GET /admin/api/v1/connection-transitions.
 func (s *Server) connectionTransitions(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := adminReadRequestContext(r)
+	defer cancel()
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	cursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
 
 	filter := database.AdminConnectionTransitionFilter{
+		Context:           ctx,
 		ReportingDeviceID: strings.TrimSpace(r.URL.Query().Get("reporting_device")),
 		RemoteDeviceID:    strings.TrimSpace(r.URL.Query().Get("remote_device")),
 		NetworkID:         strings.TrimSpace(r.URL.Query().Get("network")),

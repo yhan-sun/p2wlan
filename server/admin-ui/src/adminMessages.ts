@@ -1,4 +1,16 @@
 export const adminMessages: Record<string, string> = {
+  '关系数据范围': 'Relationship data scope',
+  '账号与网络': 'Accounts and networks',
+  '包含设备与信令': 'Include devices and signaling',
+  '设备详情按需加载': 'Device details load on demand',
+  '加载更多关系': 'Load more relationships',
+  '关系快照已加载完成': 'Relationship snapshot fully loaded',
+  '已加载成员：': 'Loaded members: ',
+  '个资源': ' resources',
+  '条关系': ' relationships',
+  '此页为手动关系快照；点击刷新读取最新资源。': 'This page shows a manual relationship snapshot. Refresh to load the latest resources.',
+  '全屏资源关系图': 'Fullscreen resource relationship graph',
+  '全屏连接拓扑': 'Fullscreen connection topology',
   '主题：跟随系统': 'Theme: system', '主题：浅色': 'Theme: light', '主题：深色': 'Theme: dark',
   '跟随系统': 'System', '浅色': 'Light', '深色': 'Dark', '打开导航': 'Open navigation', '关闭导航': 'Close navigation',
 

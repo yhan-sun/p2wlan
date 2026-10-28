@@ -10,9 +10,10 @@ import (
 )
 
 const (
-	PathTelemetrySchemaVersion      = 1
-	MaxTransitionsPerPair           = 50
-	MaxPathTelemetryValidationRTTMS = 24 * 60 * 60 * 1000
+	PathTelemetrySchemaVersion        = 1
+	MaxTransitionsPerPair             = 50
+	MaxPathTelemetryBatchObservations = 32
+	MaxPathTelemetryValidationRTTMS   = 24 * 60 * 60 * 1000
 )
 
 var (
@@ -74,7 +75,7 @@ var validTransitionReasons = map[string]struct{}{
 	"relay_transport_ready":           {},
 	"relay_peer_confirmed":            {},
 	"relay_business_usable":           {},
-	"relay_health_observed":            {},
+	"relay_health_observed":           {},
 	"relay_transport_lost":            {},
 	"relay_path_failed":               {},
 	"direct_probe_started":            {},
@@ -234,48 +235,46 @@ func (db *DB) RecordPathObservations(
 		return nil, errors.New("reporting_device_id and network_id are required")
 	}
 
-	// 1. Verify reporting device belongs to network_id
-	var reportingExists int
-	err := db.QueryRow(
-		`SELECT COUNT(*) FROM devices WHERE id = ? AND network_id = ?`,
-		reportingDeviceID, networkID,
-	).Scan(&reportingExists)
-	if err != nil {
-		return nil, fmt.Errorf("validating reporting device: %w", err)
-	}
-	if reportingExists == 0 {
-		return nil, ErrInvalidReportingDevice
+	if len(observations) > MaxPathTelemetryBatchObservations {
+		return nil, errors.New("path telemetry batch exceeds observation limit")
 	}
 
-	summary := &PathTelemetryIngestSummary{
-		Total: len(observations),
-	}
-	if len(observations) == 0 {
-		return summary, nil
-	}
-
-	now := time.Now().Unix()
-
-	tx, err := db.Begin()
+	// Registration and room authorization share the same write transaction as
+	// persistence. A callback may have crossed a registration/revocation boundary
+	// after the WebSocket hub or HTTP middleware checked its identity.
+	tx, err := db.beginRoomWrite()
 	if err != nil {
 		return nil, fmt.Errorf("begin telemetry tx: %w", err)
 	}
 	defer tx.Rollback()
+	var currentSequence, currentIncarnation int64
+	err = tx.QueryRow(`SELECT registration_seq, registration_incarnation FROM devices WHERE id = ? AND network_id = ?`, reportingDeviceID, networkID).Scan(&currentSequence, &currentIncarnation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrInvalidReportingDevice
+	}
+	if err != nil {
+		return nil, fmt.Errorf("validating reporting device: %w", err)
+	}
+	if registrationSeq != currentSequence {
+		return nil, &RegistrationSessionConflictError{CurrentSequence: currentSequence, CurrentIncarnation: currentIncarnation}
+	}
+	summary := &PathTelemetryIngestSummary{Total: len(observations)}
+	now := time.Now().Unix()
 
 	for _, obs := range observations {
 		remoteID := obs.RemoteDeviceID
-		if remoteID == "" || remoteID == reportingDeviceID {
+		if remoteID == "" || remoteID == reportingDeviceID || (obs.NetworkID != "" && obs.NetworkID != networkID) {
 			summary.Rejected++
 			continue
 		}
 
-		// Verify remote device exists in the same network
-		var remoteExists int
-		err := tx.QueryRow(
-			`SELECT COUNT(*) FROM devices WHERE id = ? AND network_id = ?`,
-			remoteID, networkID,
-		).Scan(&remoteExists)
-		if err != nil || remoteExists == 0 {
+		// Apply the same account isolation and room membership/device policy as
+		// actual peer signaling, rather than accepting every device in a network.
+		var allowed bool
+		if err := tx.QueryRow(devicesMayCommunicateSQL, reportingDeviceID, remoteID).Scan(&allowed); err != nil {
+			return nil, fmt.Errorf("validating remote communication permission: %w", err)
+		}
+		if !allowed {
 			summary.Rejected++
 			continue
 		}

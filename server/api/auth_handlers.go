@@ -28,9 +28,6 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 	if identifier == "" {
 		identifier = strings.TrimSpace(req.Email)
 	}
-	if isValidEmail(identifier) {
-		identifier = strings.ToLower(identifier)
-	}
 	if !isValidLoginIdentifier(identifier) {
 		http.Error(w, `{"error":"invalid email or username"}`, http.StatusBadRequest)
 		return
@@ -75,7 +72,7 @@ func (s *Server) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !isValidPassword(req.Password) {
-		http.Error(w, `{"error":"invalid password (min 6 characters)"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"invalid password (6–72 UTF-8 bytes)"}`, http.StatusBadRequest)
 		return
 	}
 

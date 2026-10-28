@@ -108,6 +108,15 @@ func (s *RelayServer) UDPObserverAddr() net.Addr {
 }
 
 func (s *RelayServer) Stats() RelayStatsSnapshot {
+	snapshot := s.statsSnapshot()
+	if s != nil {
+		snapshot.AuthFailureSources = s.authFailures.snapshots(time.Now(), authFailureSourceSnapshotLimit)
+	}
+	return snapshot
+}
+
+// Aggregate metrics need no authentication-source table scan or limiter lock.
+func (s *RelayServer) statsSnapshot() RelayStatsSnapshot {
 	if s == nil {
 		return RelayStatsSnapshot{}
 	}
@@ -141,7 +150,6 @@ func (s *RelayServer) Stats() RelayStatsSnapshot {
 		ForwardErrorsTotal:              atomic.LoadUint64(&s.stats.forwardErrorsTotal),
 		RevocationRefreshesTotal:        atomic.LoadUint64(&s.stats.revocationRefreshesTotal),
 		RevocationRefreshFailuresTotal:  atomic.LoadUint64(&s.stats.revocationRefreshFailuresTotal),
-		AuthFailureSources:              s.authFailures.snapshots(time.Now(), authFailureSourceSnapshotLimit),
 	}
 }
 

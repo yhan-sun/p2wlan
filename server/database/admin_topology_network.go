@@ -134,6 +134,8 @@ func adminNetworkSignals(ctx context.Context, tx *sql.Tx, network, owner string,
 	if personal {
 		where, args = `f.network_id='default' AND t.network_id='default' AND f.user_id=? AND t.user_id=?`, []any{owner, owner}
 	}
+	where += ` AND s.created_at >= ?`
+	args = append(args, page.GeneratedAt-signalTTLSeconds)
 	args = append(args, page.EdgeBudget-len(page.Edges)+1)
 	rows, err := tx.QueryContext(ctx, `SELECT s.from_node_id,s.to_node_id,s.type,COUNT(*),MAX(s.created_at)
   FROM signals s JOIN devices f ON f.id=s.from_node_id JOIN devices t ON t.id=s.to_node_id

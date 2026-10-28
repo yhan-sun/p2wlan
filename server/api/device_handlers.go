@@ -480,17 +480,9 @@ func (s *Server) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if req.DeviceName != "" {
-		if err := s.db.UpdateDeviceName(pathDeviceID, req.DeviceName); err != nil {
-			writeDeviceMutationError(w, err, "device update failed")
-			return
-		}
-	}
-	if req.VirtualIP != "" {
-		if err := s.db.UpdateDeviceVirtualIP(pathDeviceID, req.VirtualIP); err != nil {
-			writeDeviceMutationError(w, err, "virtual_ip update failed")
-			return
-		}
+	if err := s.db.UpdateDeviceSettings(pathDeviceID, req.DeviceName, req.VirtualIP); err != nil {
+		writeDeviceMutationError(w, err, "device update failed")
+		return
 	}
 	device, err := s.db.GetDevice(pathDeviceID)
 	if err != nil {

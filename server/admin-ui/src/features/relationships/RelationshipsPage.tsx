@@ -160,7 +160,7 @@ export function RelationshipsPage({ accountScope }: { accountScope?: { id: strin
       {!accountId && !selectedNetworkId && <select className="select-field" aria-label={tr('关系数据范围')} value={topologyView} onChange={(event) => update({ topology_view: event.target.value })}><option value="summary">{tr('账号与网络')}</option><option value="full">{tr('包含设备与信令')}</option></select>}
       {!accountScope && <AccountScopePicker value={account} onChange={(next) => update({ account_id: next?.id || '', account_name: next?.username || '', network_id: '', resource_q: '', relationship_page: '' })} />}
     </div></div>
-    <QueryStatus queries={[active]} />
+    <QueryStatus queries={[active]} refreshMode={!accountId && !selectedNetworkId ? 'manual' : 'automatic'} />
     <Panel className="topology-main-panel">
       <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>{tr('连线表示成员关系和设备挂载。实时 Direct / Relay 路径请到「连接排障」查看。')}</span></div>
       {selectedNetworkId ? <>

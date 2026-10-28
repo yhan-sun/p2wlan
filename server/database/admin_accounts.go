@@ -85,24 +85,25 @@ type AdminTopologyPage struct {
 }
 
 type AdminTopologyNode struct {
-	ID          string `json:"id"`
-	Kind        string `json:"kind"`
-	Label       string `json:"label"`
-	AccountID   string `json:"account_id,omitempty"`
-	Username    string `json:"username,omitempty"`
-	OwnerID     string `json:"owner_id,omitempty"`
-	NetworkID   string `json:"network_id,omitempty"`
-	NetworkKind string `json:"network_kind,omitempty"`
-	CIDR        string `json:"cidr,omitempty"`
-	RoomCode    string `json:"room_code,omitempty"`
-	VirtualIP   string `json:"virtual_ip,omitempty"`
-	Platform    string `json:"platform,omitempty"`
-	NATType     string `json:"nat_type,omitempty"`
-	AppVersion  string `json:"app_version,omitempty"`
-	RelayRTTMS  *int64 `json:"relay_rtt_ms,omitempty"`
-	LastSeen    int64  `json:"last_seen,omitempty"`
-	Online      *bool  `json:"online,omitempty"`
-	Focus       bool   `json:"focus,omitempty"`
+	ID                 string `json:"id"`
+	Kind               string `json:"kind"`
+	Label              string `json:"label"`
+	AccountID          string `json:"account_id,omitempty"`
+	Username           string `json:"username,omitempty"`
+	OwnerID            string `json:"owner_id,omitempty"`
+	NetworkID          string `json:"network_id,omitempty"`
+	NetworkKind        string `json:"network_kind,omitempty"`
+	CIDR               string `json:"cidr,omitempty"`
+	RoomCode           string `json:"room_code,omitempty"`
+	VirtualIP          string `json:"virtual_ip,omitempty"`
+	Platform           string `json:"platform,omitempty"`
+	NATType            string `json:"nat_type,omitempty"`
+	AppVersion         string `json:"app_version,omitempty"`
+	RelayRTTMS         *int64 `json:"relay_rtt_ms,omitempty"`
+	LastSeen           int64  `json:"last_seen,omitempty"`
+	Online             *bool  `json:"online,omitempty"`
+	Focus              bool   `json:"focus,omitempty"`
+	HasPersonalDevices bool   `json:"has_personal_devices,omitempty"`
 }
 
 type AdminTopologyEdge struct {
@@ -551,8 +552,8 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 
 	// Signaling is durable coordination state, not proof of a connected data path.
 	signalRows, err := db.Query(`SELECT from_node_id, to_node_id, type, COUNT(*), MAX(created_at)
-		FROM signals GROUP BY from_node_id, to_node_id, type
-		ORDER BY MAX(created_at) DESC, from_node_id ASC, to_node_id ASC, type ASC`)
+		FROM signals WHERE created_at >= ? GROUP BY from_node_id, to_node_id, type
+		ORDER BY MAX(created_at) DESC, from_node_id ASC, to_node_id ASC, type ASC`, result.GeneratedAt-signalTTLSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("topology pending signals: %w", err)
 	}
@@ -873,10 +874,10 @@ func (db *DB) AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget 
 		} else {
 			devicePlaceholders := adminTopologyPlaceholders(len(deviceIDs))
 			signalArgs := append(stringsToAny(deviceIDs), stringsToAny(deviceIDs)...)
-			signalArgs = append(signalArgs, remainingEdges+1)
+			signalArgs = append(signalArgs, page.GeneratedAt-signalTTLSeconds, remainingEdges+1)
 			signalRows, err := db.Query(`SELECT from_node_id, to_node_id, type, COUNT(*), MAX(created_at)
 				FROM signals
-				WHERE from_node_id IN (`+devicePlaceholders+`) OR to_node_id IN (`+devicePlaceholders+`)
+				WHERE (from_node_id IN (`+devicePlaceholders+`) OR to_node_id IN (`+devicePlaceholders+`)) AND created_at >= ?
 				GROUP BY from_node_id, to_node_id, type
 				ORDER BY MAX(created_at) DESC
 				LIMIT ?`, signalArgs...)

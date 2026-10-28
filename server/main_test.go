@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -94,6 +95,26 @@ func TestRateLimitUsesForwardedForOnlyFromTrustedProxy(t *testing.T) {
 		handler(recorder, req)
 		if recorder.Code != http.StatusNoContent {
 			t.Fatalf("independent client %s was merged at proxy: got %d", clientIP, recorder.Code)
+		}
+	}
+}
+
+func TestWithCORSPreflightAllowsRoomPolicyPUT(t *testing.T) {
+	t.Setenv("CONTROL_ALLOWED_ORIGINS", "https://console.example.test")
+	handler := withCORS(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("preflight reached application handler")
+	}))
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/rooms/room/devices/device/policy", nil)
+	req.Header.Set("Origin", "https://console.example.test")
+	req.Header.Set("Access-Control-Request-Method", http.MethodPut)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatal(w.Code)
+	}
+	for _, method := range []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"} {
+		if !strings.Contains(", "+w.Header().Get("Access-Control-Allow-Methods")+", ", ", "+method+", ") {
+			t.Fatalf("preflight omits %s: %s", method, w.Header().Get("Access-Control-Allow-Methods"))
 		}
 	}
 }
