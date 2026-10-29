@@ -18,6 +18,7 @@ impl CandidateLaneTestHarness {
                 crate::config::ControlProxyMode::Direct,
                 "http://127.0.0.1:9",
                 None,
+                None,
             )
             .0,
             auth_tx,
@@ -64,9 +65,13 @@ impl CandidateLaneTestHarness {
 async fn queued_candidate_refresh_rejects_replaced_network_before_http() {
     let server = MockControlServer::spawn(|_, _| MockAction::Ok).await;
     let base_url = format!("http://{}", server.address);
-    let http =
-        route_aware_control_http_clients(crate::config::ControlProxyMode::Direct, &base_url, None)
-            .0;
+    let http = route_aware_control_http_clients(
+        crate::config::ControlProxyMode::Direct,
+        &base_url,
+        None,
+        None,
+    )
+    .0;
     let (auth_tx, auth_rx) = dispatch_auth_for_test();
     let mut auth = auth_tx.borrow().clone().unwrap();
     auth.base_url = base_url;
@@ -386,9 +391,13 @@ async fn critical_answer_dispatches_while_hh_waits_for_full_candidate_lane_capac
     })
     .await;
     let base_url = format!("http://{}", server.address);
-    let http =
-        route_aware_control_http_clients(crate::config::ControlProxyMode::Direct, &base_url, None)
-            .0;
+    let http = route_aware_control_http_clients(
+        crate::config::ControlProxyMode::Direct,
+        &base_url,
+        None,
+        None,
+    )
+    .0;
     let (auth_tx, auth_rx) = dispatch_auth_for_test();
     auth_tx.send_modify(|auth| auth.as_mut().unwrap().base_url = base_url);
     let (answer_tx, answer_rx) = mpsc::channel(CRITICAL_ANSWER_QUEUE_CAPACITY);

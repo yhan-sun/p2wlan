@@ -3,7 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 fn release_transport(base: &str) -> RouteAwareControlHttpClient {
-    route_aware_control_http_clients(ControlProxyMode::Direct, base, None).0
+    route_aware_control_http_clients(ControlProxyMode::Direct, base, None, None).0
 }
 
 fn registration(

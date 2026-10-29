@@ -122,7 +122,8 @@ impl CommandHarness {
     fn new(base_url: &str) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         Self {
-            http: route_aware_control_http_clients(ControlProxyMode::Direct, base_url, None).0,
+            http: route_aware_control_http_clients(ControlProxyMode::Direct, base_url, None, None)
+                .0,
             base_url: base_url.to_string(),
             token: "dc-test-device".to_string(),
             config: test_config(),
@@ -348,6 +349,7 @@ async fn update_endpoint_publishes_the_snapshot_and_device_lease_health() {
             ControlCommand::UpdateEndpoint {
                 endpoint: "203.0.113.7:41000".to_string(),
                 nat_type: "p2v2:m=address_or_port_dependent".to_string(),
+                publication_fence: None,
                 response_tx,
             },
             None,
@@ -384,6 +386,7 @@ async fn update_endpoint_failure_clears_the_device_lease_without_touching_the_sn
             ControlCommand::UpdateEndpoint {
                 endpoint: "203.0.113.8:41000".to_string(),
                 nat_type: "p2v2:m=endpoint_independent".to_string(),
+                publication_fence: None,
                 response_tx,
             },
             None,
@@ -426,6 +429,7 @@ async fn update_endpoint_permanent_auth_re_registers_before_answering_the_caller
             ControlCommand::UpdateEndpoint {
                 endpoint: "203.0.113.9:41000".to_string(),
                 nat_type: "p2v2:m=endpoint_independent".to_string(),
+                publication_fence: None,
                 response_tx,
             },
             None,
@@ -459,6 +463,7 @@ async fn update_endpoint_lifecycle_conflict_exits_the_control_loop() {
             ControlCommand::UpdateEndpoint {
                 endpoint: "203.0.113.10:41000".to_string(),
                 nat_type: "p2v2:m=endpoint_independent".to_string(),
+                publication_fence: None,
                 response_tx,
             },
             None,

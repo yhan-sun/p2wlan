@@ -309,6 +309,10 @@ impl ControlClient {
                 config.control.proxy_mode,
                 &config.control.server_url,
                 Some(server_clock.clone()),
+                Some(network_change::ControlRouteChangeNotifier::new(
+                    network_changes.clone(),
+                    cmd_tx.clone(),
+                )),
             );
             let config = config.clone();
             let event_tx = client.event_tx.clone();
@@ -568,11 +572,33 @@ impl ControlClient {
 
     /// Send our updated endpoint to the control server.
     pub async fn update_endpoint(&self, endpoint: &str, nat_type: &str) -> Result<()> {
+        self.update_endpoint_with_fence(endpoint, nat_type, None)
+            .await
+    }
+
+    /// Retain the candidate gatherer's socket/network identity while queued.
+    pub(crate) async fn update_endpoint_fenced(
+        &self,
+        endpoint: &str,
+        nat_type: &str,
+        publication_fence: crate::EndpointPublicationFence,
+    ) -> Result<()> {
+        self.update_endpoint_with_fence(endpoint, nat_type, Some(publication_fence))
+            .await
+    }
+
+    async fn update_endpoint_with_fence(
+        &self,
+        endpoint: &str,
+        nat_type: &str,
+        publication_fence: Option<crate::EndpointPublicationFence>,
+    ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.cmd_tx
             .send(ControlCommand::UpdateEndpoint {
                 endpoint: endpoint.to_string(),
                 nat_type: nat_type.to_string(),
+                publication_fence,
                 response_tx,
             })
             .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
@@ -591,11 +617,33 @@ impl ControlClient {
         endpoint: &str,
         nat_type: &str,
     ) -> Result<()> {
+        self.update_endpoint_for_handshake_with_fence(endpoint, nat_type, None)
+            .await
+    }
+
+    /// Recheck the candidate gatherer's identity at the handshake HTTP boundary.
+    pub(crate) async fn update_endpoint_for_handshake_fenced(
+        &self,
+        endpoint: &str,
+        nat_type: &str,
+        publication_fence: crate::EndpointPublicationFence,
+    ) -> Result<()> {
+        self.update_endpoint_for_handshake_with_fence(endpoint, nat_type, Some(publication_fence))
+            .await
+    }
+
+    async fn update_endpoint_for_handshake_with_fence(
+        &self,
+        endpoint: &str,
+        nat_type: &str,
+        publication_fence: Option<crate::EndpointPublicationFence>,
+    ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.critical_ctrl_tx
             .send(CriticalControlCommand::UpdateEndpoint {
                 endpoint: endpoint.to_string(),
                 nat_type: nat_type.to_string(),
+                publication_fence,
                 response_tx,
             })
             .await

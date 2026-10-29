@@ -542,6 +542,12 @@ impl UdpTransport {
         self.inbound_publication_owner.load(Ordering::Acquire)
     }
 
+    /// Observe the existing publication identity without retaining the
+    /// transport or its socket resources in a delayed control command.
+    pub(crate) fn inbound_publication_owner_weak(&self) -> std::sync::Weak<AtomicU64> {
+        Arc::downgrade(&self.inbound_publication_owner)
+    }
+
     /// Allocate a fresh dynamic socket index that never collides with the pool.
     pub(crate) fn next_dynamic_index(&self) -> usize {
         DYNAMIC_SOCKET_INDEX_BASE

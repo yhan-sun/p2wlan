@@ -32,6 +32,7 @@ impl StartAckRetryHarness {
             crate::config::ControlProxyMode::Direct,
             base_url,
             None,
+            None,
         )
         .0;
         let worker = tokio::spawn(run_candidate_offer_worker(

@@ -1,10 +1,46 @@
-//! Capacity-one wakeup for the latest authorized Android network edge.
-//! This is a projection of JNI publication order, not a network-state owner.
+//! Capacity-one wakeup for authorized Android and confirmed route edges.
+//! This projects existing network observers, without owning network state.
 
 use super::*;
 use crate::AndroidNetworkChangeHint;
 
-type NetworkEdgeSnapshot = Option<Arc<AndroidNetworkChangeHint>>;
+pub(super) enum ControlNetworkEdge {
+    Android(AndroidNetworkChangeHint),
+    ConfirmedRoute,
+}
+
+impl ControlNetworkEdge {
+    pub(super) fn requires_http_rebuild(&self) -> bool {
+        matches!(self, Self::Android(_))
+    }
+}
+
+type NetworkEdgeSnapshot = Option<Arc<ControlNetworkEdge>>;
+
+pub(super) struct ControlRouteChangeNotifier {
+    changes: Arc<ControlNetworkChanges>,
+    commands: mpsc::UnboundedSender<ControlCommand>,
+}
+
+impl ControlRouteChangeNotifier {
+    pub(super) fn new(
+        changes: Arc<ControlNetworkChanges>,
+        commands: mpsc::UnboundedSender<ControlCommand>,
+    ) -> Self {
+        Self { changes, commands }
+    }
+
+    pub(super) fn notify(&self) {
+        if self
+            .changes
+            .observe_edge(ControlNetworkEdge::ConfirmedRoute)
+        {
+            let _ = self
+                .commands
+                .send(ControlCommand::NetworkChanged(self.changes.clone()));
+        }
+    }
+}
 
 #[derive(Default)]
 struct NetworkEdgeState {
@@ -31,8 +67,12 @@ impl ControlNetworkChanges {
     /// Returns true only when the caller must enqueue the one wakeup. Arc
     /// identity follows accepted order even when a new service resets gen to 1.
     pub(super) fn observe(&self, hint: AndroidNetworkChangeHint) -> bool {
+        self.observe_edge(ControlNetworkEdge::Android(hint))
+    }
+
+    fn observe_edge(&self, edge: ControlNetworkEdge) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.latest = Some(Arc::new(hint));
+        state.latest = Some(Arc::new(edge));
         let enqueue = !state.wake_queued;
         state.wake_queued = true;
         drop(state);

@@ -7,6 +7,7 @@ async fn critical_router_bounds_waiting_tasks_without_blocking_other_lanes_or_sh
         crate::config::ControlProxyMode::Direct,
         "http://127.0.0.1:9",
         None,
+        None,
     )
     .0;
     let (auth_tx, auth_rx) = watch::channel(None);
@@ -94,6 +95,7 @@ async fn critical_router_bounds_waiting_tasks_without_blocking_other_lanes_or_sh
         CriticalControlCommand::UpdateEndpoint {
             endpoint: "192.0.2.1:41000".into(),
             nat_type: "Hard".into(),
+            publication_fence: None,
             response_tx,
         }
     };

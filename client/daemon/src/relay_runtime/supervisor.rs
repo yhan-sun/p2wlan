@@ -6,6 +6,15 @@ impl RelaySupervisor {
         let max_retry_delay = Duration::from_secs(30);
         let mut cooldowns: HashMap<String, Instant> = HashMap::new();
         loop {
+            // An edge accepted before this attempt is already reflected by
+            // its fresh sockets. Do not let a queued burst retire that new link.
+            if let Some(receiver) = &self.android_network_change_rx {
+                crate::android_network_change::take_latest(receiver).await;
+            }
+            let attempt_routes =
+                tokio::task::spawn_blocking(|| crate::netenv::network_route_signature(&[]))
+                    .await
+                    .unwrap_or_default();
             let now = Instant::now();
             cooldowns.retain(|_, until| *until > now);
 
@@ -37,6 +46,9 @@ impl RelaySupervisor {
                 .candidates
                 .iter()
                 .any(|candidate| candidate.error_code.as_deref() == Some("permanent_auth"));
+            // A failed alternative must not put a successfully selected
+            // transport's later network handover into an auth cooldown.
+            let permanent_auth_failure = transport.is_none() && permanent_auth;
             let failure_summary = relay_failure_summary(&diagnostics);
             *self.relay_selection.write().await = diagnostics;
 
@@ -201,7 +213,7 @@ impl RelaySupervisor {
             } else {
                 *self.relay_transport.write().await = None;
                 let _ = self.relay_available_tx.send(false);
-                if permanent_auth {
+                if permanent_auth_failure {
                     retry_delay = max_retry_delay;
                 }
                 warn!(
@@ -218,8 +230,28 @@ impl RelaySupervisor {
             debug!(
                 "Relay supervisor sleeping {jittered:?} before the next selection attempt (base={retry_delay:?})"
             );
-            sleep(jittered).await;
-            retry_delay = retry_delay.saturating_mul(2).min(max_retry_delay);
+            if retry::wait_for_retry(
+                jittered,
+                self.android_network_change_rx.clone(),
+                attempt_routes,
+                !permanent_auth_failure,
+            )
+            .await
+            {
+                // Failures/cooldowns from the old route do not describe the
+                // replacement. Keep a nonzero floor even during rapid flaps.
+                cooldowns.clear();
+                retry_delay = Duration::from_millis(100);
+                self.timeline.emit(
+                    "relay_retry_network_changed",
+                    Some("relay"),
+                    Some("physical_network_changed"),
+                    None,
+                );
+                sleep(relay_retry_delay_with_jitter(retry_delay)).await;
+            } else {
+                retry_delay = retry_delay.saturating_mul(2).min(max_retry_delay);
+            }
         }
     }
 }

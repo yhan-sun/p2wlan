@@ -299,6 +299,28 @@ fn observe_stable_route_change(
     }
 }
 
+#[derive(Clone, Copy)]
+enum ControlPoolReplacement {
+    ConfirmedRoute,
+    Forced,
+    BuildRetry,
+}
+
+fn publish_control_http_pools(
+    state: &tokio::sync::watch::Sender<ControlHttpPoolState>,
+    replacement: ControlHttpPoolState,
+    cause: ControlPoolReplacement,
+    route_changes: Option<&super::network_change::ControlRouteChangeNotifier>,
+) {
+    // The registration owner must see the replacement before its wakeup.
+    state.send_replace(replacement);
+    if matches!(cause, ControlPoolReplacement::ConfirmedRoute) {
+        if let Some(notifier) = route_changes {
+            notifier.notify();
+        }
+    }
+}
+
 /// Create two independently pooled clients whose binding is replaced after a
 /// route/interface/gateway signature change is observed twice consecutively.
 /// Direct mode fails closed under foreign TUN capture when no physical bypass
@@ -308,6 +330,7 @@ pub(super) fn route_aware_control_http_clients(
     mode: ControlProxyMode,
     server_url: &str,
     timing: Option<Arc<ServerClockEstimate>>,
+    route_changes: Option<super::network_change::ControlRouteChangeNotifier>,
 ) -> (RouteAwareControlHttpClient, RouteAwareControlHttpClient) {
     let route_aware = mode == ControlProxyMode::Direct && !control_server_is_local(server_url);
     let initial_binding = control_route_binding(mode, Some(server_url));
@@ -397,7 +420,12 @@ pub(super) fn route_aware_control_http_clients(
                     if let Some(clock) = &timing {
                         clock.activate_http_pool(replacement.pool_id);
                     }
-                    state_tx.send_replace(replacement);
+                    publish_control_http_pools(
+                        &state_tx,
+                        replacement,
+                        ControlPoolReplacement::Forced,
+                        route_changes.as_ref(),
+                    );
                     continue;
                 }
                 let replacement =
@@ -416,7 +444,12 @@ pub(super) fn route_aware_control_http_clients(
                     if let Some(clock) = &timing {
                         clock.activate_http_pool(replacement.pool_id);
                     }
-                    state_tx.send_replace(replacement);
+                    publish_control_http_pools(
+                        &state_tx,
+                        replacement,
+                        ControlPoolReplacement::ConfirmedRoute,
+                        route_changes.as_ref(),
+                    );
                     continue;
                 }
 
@@ -434,7 +467,12 @@ pub(super) fn route_aware_control_http_clients(
                         if let Some(clock) = &timing {
                             clock.activate_http_pool(retry.pool_id);
                         }
-                        state_tx.send_replace(retry);
+                        publish_control_http_pools(
+                            &state_tx,
+                            retry,
+                            ControlPoolReplacement::BuildRetry,
+                            route_changes.as_ref(),
+                        );
                     }
                 }
             }
@@ -519,6 +557,51 @@ mod proxy_tests {
             observe_stable_route_change(&active, &mut pending, replacement.clone()),
             Some(replacement)
         );
+    }
+
+    #[tokio::test]
+    async fn confirmed_route_publishes_pool_before_wakeup_and_forced_rebuilds_do_not_loop() {
+        use crate::control::network_change::{ControlNetworkChanges, ControlRouteChangeNotifier};
+        use crate::control::ControlCommand;
+
+        let changes = Arc::new(ControlNetworkChanges::default());
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let notifier = ControlRouteChangeNotifier::new(changes.clone(), commands);
+        let build = || {
+            build_control_http_pools(
+                ControlProxyMode::Direct,
+                "http://127.0.0.1:9",
+                test_binding("confirmed-route", None),
+            )
+        };
+        let (state_tx, state_rx) = tokio::sync::watch::channel(build());
+        let replacement = build();
+        let expected_pool = replacement.pool_id;
+        publish_control_http_pools(
+            &state_tx,
+            replacement,
+            ControlPoolReplacement::ConfirmedRoute,
+            Some(&notifier),
+        );
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(ControlCommand::NetworkChanged(_))
+        ));
+        assert_eq!(state_rx.borrow().pool_id, expected_pool);
+        let (edge, changed) = changes.begin_registration();
+        assert!(changed);
+        assert!(changes.take_pending(true).is_none());
+
+        for cause in [
+            ControlPoolReplacement::Forced,
+            ControlPoolReplacement::Forced,
+            ControlPoolReplacement::BuildRetry,
+        ] {
+            publish_control_http_pools(&state_tx, build(), cause, Some(&notifier));
+            assert!(command_rx.is_empty(), "pool rebuild must not notify itself");
+            assert!(changes.commit_if_current(&edge, || {}));
+        }
+        assert_ne!(state_rx.borrow().pool_id, expected_pool);
     }
 
     #[test]

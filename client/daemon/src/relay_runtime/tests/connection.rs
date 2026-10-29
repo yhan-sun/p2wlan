@@ -7,12 +7,20 @@ async fn relay_route_monitor_requires_two_nonempty_matching_changes() {
     let replacement = vec!["default:en1:192.168.2.1".to_string()];
     let mut monitor = RelayRouteMonitor::new(original.clone());
 
-    assert!(monitor.enabled());
     assert!(monitor.observe(replacement.clone()).is_none());
     assert!(monitor.observe(Vec::new()).is_none());
     assert!(monitor.observe(original).is_none());
     assert!(monitor.observe(replacement.clone()).is_none());
     assert_eq!(monitor.observe(replacement.clone()), Some(replacement));
+}
+
+#[tokio::test]
+async fn relay_route_monitor_recovers_from_an_initially_missing_route() {
+    let mut monitor = RelayRouteMonitor::new(Vec::new());
+    let restored = vec!["default:physical:gateway".to_string()];
+    assert!(monitor.observe(Vec::new()).is_none());
+    assert!(monitor.observe(restored.clone()).is_none());
+    assert_eq!(monitor.observe(restored.clone()), Some(restored));
 }
 
 #[test]

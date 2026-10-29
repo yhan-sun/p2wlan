@@ -288,6 +288,7 @@ include!("tests/peers.rs");
 include!("tests/messages.rs");
 include!("tests/client.rs");
 include!("tests/commands.rs");
+include!("tests/endpoint_publication.rs");
 include!("tests/recovery.rs");
 include!("tests/server_restart.rs");
 

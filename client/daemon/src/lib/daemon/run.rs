@@ -612,6 +612,7 @@ impl Daemon {
                     candidate_refresh_lock: self.candidate_refresh_lock.clone(),
                     nat_profile: self.nat_profile.clone(),
                     udp_transport: self.udp_transport.clone(),
+                    udp_transport_publication: self.udp_transport_publication.clone(),
                     runtime_stun_servers: self.runtime_stun_servers.clone(),
                     runtime_stun_timeout: self.runtime_stun_timeout.clone(),
                     udp_advertise: self.config.network.udp_advertise.clone(),

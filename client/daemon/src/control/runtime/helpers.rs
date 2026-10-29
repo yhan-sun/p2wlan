@@ -3,6 +3,14 @@ fn has_control_credential(config: &Config) -> bool {
         || !config.control.device_credential.trim().is_empty()
 }
 
+fn endpoint_publication_is_current(fence: Option<&crate::EndpointPublicationFence>) -> bool {
+    fence.is_none_or(crate::EndpointPublicationFence::is_current)
+}
+
+fn endpoint_publication_superseded() -> DaemonError {
+    DaemonError::ControlPlane("endpoint publication superseded by a newer socket or network".into())
+}
+
 /// Maximum exponential-backoff delay before giving up.
 const MAX_BACKOFF_SECS: u64 = 300;
 const INITIAL_BACKOFF_SECS: u64 = 2;

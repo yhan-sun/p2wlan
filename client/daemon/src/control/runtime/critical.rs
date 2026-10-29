@@ -96,12 +96,13 @@ async fn run_critical_control_loop(
             }
             Some(command) = ctrl_rx.recv(), if ctrls.len() < CRITICAL_CTRL_MAX_INFLIGHT => {
                 match command {
-                    CriticalControlCommand::UpdateEndpoint { endpoint, nat_type, response_tx } => {
+                    CriticalControlCommand::UpdateEndpoint { endpoint, nat_type, publication_fence, response_tx } => {
                         ctrls.spawn(run_critical_endpoint_command(
                             http.clone(),
                             auth_rx.clone(),
                             endpoint,
                             nat_type,
+                            publication_fence,
                             response_tx,
                             event_tx.clone(),
                             ctrl_permits.clone(),
@@ -627,6 +628,7 @@ async fn run_critical_endpoint_command(
     auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
     endpoint: String,
     nat_type: String,
+    publication_fence: Option<crate::EndpointPublicationFence>,
     mut response_tx: oneshot::Sender<Result<()>>,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     permits: Arc<Semaphore>,
@@ -635,6 +637,10 @@ async fn run_critical_endpoint_command(
     advertised_snapshot: Arc<std::sync::Mutex<AdvertisedEndpointSnapshot>>,
     lifecycle_tx: mpsc::UnboundedSender<ControlCommand>,
 ) {
+    if !endpoint_publication_is_current(publication_fence.as_ref()) {
+        let _ = response_tx.send(Err(endpoint_publication_superseded()));
+        return;
+    }
     let Some(_permit) = acquire_critical_permit_or_skip(&permits, &mut response_tx).await else {
         return;
     };
@@ -661,6 +667,10 @@ async fn run_critical_endpoint_command(
     }
     let relay_rtt_ms = current_relay_rtt_ms(relay_selection.as_ref()).await;
     let published_nat_type = control_label_with_registration_seq(&nat_type, auth.registration_seq);
+    if !endpoint_publication_is_current(publication_fence.as_ref()) {
+        let _ = response_tx.send(Err(endpoint_publication_superseded()));
+        return;
+    }
     let remaining = deadline.saturating_duration_since(Instant::now());
     let mut result = if remaining.is_zero() {
         Err(DaemonError::ControlPlane(
@@ -693,6 +703,12 @@ async fn run_critical_endpoint_command(
             }
         }
     };
+    // An in-flight HTTP request can already have a remote effect; a retired
+    // owner must nevertheless never replace the current local advertisement.
+    if !endpoint_publication_is_current(publication_fence.as_ref()) {
+        let _ = response_tx.send(Err(endpoint_publication_superseded()));
+        return;
+    }
     // A successful response must still belong to the registration that issued
     // it.  This prevents an old critical task from updating its local
     // snapshot or reporting a healthy lease after a concurrent re-register.
@@ -708,13 +724,17 @@ async fn run_critical_endpoint_command(
     }
     match &result {
         Ok(()) => {
+            {
+                let mut advertised = advertised_snapshot.lock().unwrap();
+                if !endpoint_publication_is_current(publication_fence.as_ref()) {
+                    let _ = response_tx.send(Err(endpoint_publication_superseded()));
+                    return;
+                }
+                advertised.update(endpoint.clone(), published_nat_type.clone());
+            }
             if let Some(health) = health.as_ref() {
                 health.mark_device_lease_success().await;
             }
-            advertised_snapshot
-                .lock()
-                .unwrap()
-                .update(endpoint.clone(), published_nat_type.clone());
             debug!(
                 "Updated endpoint for {} through handshake control lane: {} ({})",
                 auth.self_node_id, endpoint, published_nat_type

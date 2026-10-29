@@ -17,6 +17,7 @@ impl RecoveryWaitHarness {
             ControlProxyMode::Direct,
             "http://127.0.0.1:9",
             Some(clock.clone()),
+            None,
         )
         .0;
         let (_, pool_id) = http.current_with_pool_id().unwrap();
@@ -50,6 +51,7 @@ async fn registration_backoff_keeps_network_hint_and_revokes_previous_auth() {
         .send(ControlCommand::UpdateEndpoint {
             endpoint: "192.0.2.1:41000".into(),
             nat_type: "unknown".into(),
+            publication_fence: None,
             response_tx,
         })
         .unwrap();
@@ -80,6 +82,61 @@ async fn registration_backoff_keeps_network_hint_and_revokes_previous_auth() {
         Err(oneshot::error::TryRecvError::Closed)
     ));
     assert!(command_rx.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn confirmed_route_wakes_sleeping_registration_backoff() {
+    let harness = RecoveryWaitHarness::new();
+    let (commands, mut command_rx) = mpsc::unbounded_channel();
+    let notifier = network_change::ControlRouteChangeNotifier::new(
+        Arc::new(ControlNetworkChanges::default()),
+        commands,
+    );
+    let wait = wait_control_recovery(
+        ControlRecoveryDelay::Transient(Duration::from_secs(300)),
+        &harness.http,
+        &mut command_rx,
+        &harness.event_tx,
+        &harness.auth_tx,
+        &harness.clock,
+        None,
+    );
+    tokio::pin!(wait);
+    assert!(futures_util::poll!(&mut wait).is_pending());
+    time::advance(Duration::from_secs(1)).await;
+    let changed_at = time::Instant::now();
+    notifier.notify();
+    assert!(wait.await);
+    assert_eq!(time::Instant::now(), changed_at);
+    assert!(harness.auth_tx.borrow().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn confirmed_route_preserves_permanent_auth_cooldown() {
+    let harness = RecoveryWaitHarness::new();
+    let (commands, mut command_rx) = mpsc::unbounded_channel();
+    let notifier = network_change::ControlRouteChangeNotifier::new(
+        Arc::new(ControlNetworkChanges::default()),
+        commands,
+    );
+    let started = time::Instant::now();
+    let wait = wait_control_recovery(
+        ControlRecoveryDelay::PermanentAuth,
+        &harness.http,
+        &mut command_rx,
+        &harness.event_tx,
+        &harness.auth_tx,
+        &harness.clock,
+        None,
+    );
+    tokio::pin!(wait);
+    assert!(futures_util::poll!(&mut wait).is_pending());
+    time::advance(Duration::from_secs(59)).await;
+    notifier.notify();
+    assert!(futures_util::poll!(&mut wait).is_pending());
+    time::advance(Duration::from_secs(1)).await;
+    assert!(wait.await);
+    assert_eq!(time::Instant::now() - started, Duration::from_secs(60));
 }
 
 #[tokio::test(start_paused = true)]

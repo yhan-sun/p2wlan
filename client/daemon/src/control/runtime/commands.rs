@@ -94,22 +94,29 @@ async fn handle_control_command(
             }
         }
         ControlCommand::NetworkChanged(changes) => {
-            let Some(hint) = changes.take_pending(true) else {
+            let Some(edge) = changes.take_pending(true) else {
                 debug!(
-                    event = "android_network_hint_absorbed",
+                    event = "control_network_edge_absorbed",
                     "Registration already covers this network notification"
                 );
                 return ControlCommandDisposition::Continue;
             };
-            http.notify_network_changed();
+            if edge.requires_http_rebuild() {
+                http.notify_network_changed();
+            }
             if let Some(task) = signal_ws_task {
                 task.abort();
             }
-            info!(
-                kotlin_network_generation = hint.kotlin_network_generation,
-                network_identity_hash = %hint.network_identity_hash,
-                "Android physical network changed; restarting control registration and signaling transports"
-            );
+            match edge.as_ref() {
+                network_change::ControlNetworkEdge::Android(hint) => info!(
+                    kotlin_network_generation = hint.kotlin_network_generation,
+                    network_identity_hash = %hint.network_identity_hash,
+                    "Android physical network changed; restarting control registration and signaling transports"
+                ),
+                network_change::ControlNetworkEdge::ConfirmedRoute => info!(
+                    "Physical network route changed; restarting control registration and signaling transports"
+                ),
+            }
             ControlCommandDisposition::Reregister
         }
         ControlCommand::CreateTunnel {
@@ -168,11 +175,20 @@ async fn handle_control_command(
         ControlCommand::UpdateEndpoint {
             endpoint,
             nat_type,
+            publication_fence,
             response_tx,
         } => {
+            if !endpoint_publication_is_current(publication_fence.as_ref()) {
+                let _ = response_tx.send(Err(endpoint_publication_superseded()));
+                return ControlCommandDisposition::Continue;
+            }
             let relay_rtt_ms = current_relay_rtt_ms(relay_selection).await;
             let published_nat_type =
                 control_label_with_registration_seq(&nat_type, registration_seq);
+            if !endpoint_publication_is_current(publication_fence.as_ref()) {
+                let _ = response_tx.send(Err(endpoint_publication_superseded()));
+                return ControlCommandDisposition::Continue;
+            }
             let res = async {
                 let current_http = http.current()?;
                 update_endpoint(
@@ -188,12 +204,23 @@ async fn handle_control_command(
                 .await
             }
             .await;
+            // HTTP may already have reached the server. Only suppress this
+            // retired owner's local publication; remote g/o/l fencing remains
+            // authoritative for any request accepted before the handover.
+            if !endpoint_publication_is_current(publication_fence.as_ref()) {
+                let _ = response_tx.send(Err(endpoint_publication_superseded()));
+                return ControlCommandDisposition::Continue;
+            }
             match &res {
                 Ok(()) => {
-                    advertised_snapshot
-                        .lock()
-                        .unwrap()
-                        .update(endpoint.clone(), published_nat_type.clone());
+                    {
+                        let mut advertised = advertised_snapshot.lock().unwrap();
+                        if !endpoint_publication_is_current(publication_fence.as_ref()) {
+                            let _ = response_tx.send(Err(endpoint_publication_superseded()));
+                            return ControlCommandDisposition::Continue;
+                        }
+                        advertised.update(endpoint.clone(), published_nat_type.clone());
+                    }
                     debug!(
                         "Updated endpoint for {self_node_id}: {endpoint} ({published_nat_type})"
                     );

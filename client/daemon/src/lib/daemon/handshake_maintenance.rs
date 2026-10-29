@@ -1,4 +1,5 @@
 include!("handshake_maintenance_retry.rs");
+include!("pre_signal_candidate_commit.rs");
 
 struct HandshakeMaintenanceContext {
     peers: Arc<PeerManager>,
@@ -13,6 +14,7 @@ struct HandshakeMaintenanceContext {
     candidate_refresh_lock: Arc<Mutex<()>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    udp_transport_publication: UdpTransportPublication,
     runtime_stun_servers: Arc<RwLock<Vec<SocketAddr>>>,
     runtime_stun_timeout: Arc<RwLock<Duration>>,
     udp_advertise: Option<String>,
@@ -103,6 +105,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
         candidate_refresh_lock,
         nat_profile,
         udp_transport,
+        udp_transport_publication,
         runtime_stun_servers,
         runtime_stun_timeout,
         udp_advertise,
@@ -330,6 +333,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                         &peers,
                         &control,
                         &udp_transport,
+                        &udp_transport_publication,
                         &runtime_stun_servers,
                         &runtime_stun_timeout,
                         udp_advertise.as_deref(),
@@ -697,6 +701,7 @@ async fn refresh_candidate_cache_for_maintenance_signal(
     peers: &Arc<PeerManager>,
     control: &ControlClient,
     udp_transport: &Arc<RwLock<Option<UdpTransport>>>,
+    udp_transport_publication: &UdpTransportPublication,
     runtime_stun_servers: &Arc<RwLock<Vec<SocketAddr>>>,
     runtime_stun_timeout: &Arc<RwLock<Duration>>,
     udp_advertise: Option<&str>,
@@ -710,6 +715,13 @@ async fn refresh_candidate_cache_for_maintenance_signal(
 ) -> Option<(Vec<String>, HashMap<String, String>)> {
     let refresh_guard = candidate_refresh_lock.lock().await;
     let udp = udp_transport.read().await.clone()?;
+    let gather_fence = crate::candidate_refresh::CandidateGatherFence::capture(
+        &refresh_guard,
+        &udp,
+        peers,
+        candidate_snapshot,
+    )
+    .await;
     let stun_servers = runtime_stun_servers.read().await.clone();
     if stun_servers.is_empty() {
         return None;
@@ -725,9 +737,6 @@ async fn refresh_candidate_cache_for_maintenance_signal(
             return None;
         }
     };
-
-    let nat_publication = peers.update_nat_profile(report.nat_profile.clone()).await;
-    *nat_profile.write().await = Some(report.nat_profile.clone());
 
     let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
     let include_host_candidate = peers.gather_host_candidates().await;
@@ -756,69 +765,37 @@ async fn refresh_candidate_cache_for_maintenance_signal(
             });
     }
 
-    let previous_snapshot = candidate_snapshot.read().await.clone();
-    let previous_candidates = previous_snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.candidates.clone())
-        .unwrap_or_default();
-    let previous_candidate_sources = previous_snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.candidate_sources.clone())
-        .unwrap_or_default();
-    let next_network_identity = prepare_signal_candidates_and_network_identity(
-        &previous_candidates,
-        &previous_candidate_sources,
-        &mut candidates,
-        &mut candidate_sources,
-    );
-    let previous_network_identity = previous_snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.network_identity.clone())
-        .unwrap_or_default();
-    let should_advance_generation =
-        network_identity_changed(&previous_network_identity, &next_network_identity);
-    let changed = previous_candidates != candidates
-        || previous_candidate_sources != candidate_sources
-        || previous_network_identity != next_network_identity;
-
-    if changed {
-        publish_candidate_snapshot_to_store(
-            candidate_snapshot,
-            candidates.clone(),
-            candidate_sources.clone(),
-            next_network_identity.clone(),
-        )
-        .await;
-        *local_candidates.write().await = candidates.clone();
-        *local_candidate_sources.write().await = candidate_sources.clone();
-        *local_network_identity.write().await = next_network_identity;
-        if should_advance_generation {
-            peers
-                .advance_network_generation("pre-signal UDP network identity changed")
-                .await;
+    let committed = commit_pre_signal_candidates(
+        PreSignalCandidateCommitContext {
+            publication: udp_transport_publication,
+            peers,
+            nat_profile,
+            snapshot: candidate_snapshot,
+            candidates: local_candidates,
+            sources: local_candidate_sources,
+            network_identity: local_network_identity,
+        },
+        &refresh_guard,
+        &gather_fence,
+        &udp,
+        report,
+        candidates,
+        candidate_sources,
+    )
+    .await?;
+    drop(refresh_guard);
+    if let Some(endpoint) =
+        control_udp_endpoint_from_candidates(&committed.candidates, &committed.sources)
+    {
+        if let Err(err) = control
+            .update_endpoint_fenced(&endpoint, &committed.nat_type, committed.endpoint_fence)
+            .await
+        {
+            warn!("Failed to publish pre-signal UDP endpoint '{endpoint}' for {reason}: {err}");
         }
-        info!(
-            "Pre-signal UDP candidates refreshed for {reason}; {} candidates (mapping={:?}, public={:?})",
-            candidates.len(),
-            report.nat_profile.mapping_behavior,
-            report.nat_profile.public_endpoint
-        );
     }
-
-    if let Some(endpoint) = control_udp_endpoint_from_candidates(&candidates, &candidate_sources) {
-        drop(refresh_guard);
-        let nat_type = report
-            .nat_profile
-            .control_label_with_generation_and_observation(
-                nat_publication.generation,
-                nat_publication.observation,
-            );
-        if let Err(err) = control.update_endpoint(&endpoint, &nat_type).await {
-            warn!("Failed to publish pre-signal UDP endpoint '{endpoint}': {err}");
-        }
-    } else {
-        drop(refresh_guard);
-    }
-
-    Some((candidates, candidate_sources))
+    Some((committed.candidates, committed.sources))
 }
+
+#[cfg(test)]
+include!("pre_signal_gather_tests.rs");

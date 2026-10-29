@@ -849,6 +849,7 @@ enum CriticalControlCommand {
     UpdateEndpoint {
         endpoint: String,
         nat_type: String,
+        publication_fence: Option<crate::EndpointPublicationFence>,
         response_tx: oneshot::Sender<Result<()>>,
     },
     /// Stop the worker during daemon shutdown.
@@ -1006,6 +1007,7 @@ enum ControlCommand {
     UpdateEndpoint {
         endpoint: String,
         nat_type: String,
+        publication_fence: Option<crate::EndpointPublicationFence>,
         response_tx: oneshot::Sender<Result<()>>,
     },
     /// Send a relay-assisted peer-reflexive observation.
@@ -1021,9 +1023,8 @@ enum ControlCommand {
     /// the regular peer roster poll can be up to one second away,
     /// and a cold-start handshake must not wait out that cadence.
     PollPeersNow,
-    /// Rebind the existing control HTTP/WebSocket lifecycle after an Android
-    /// physical-network handoff.
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    /// Rebind the existing control HTTP/WebSocket lifecycle after an authorized
+    /// Android handoff or a confirmed physical-route change.
     NetworkChanged(Arc<ControlNetworkChanges>),
     /// Create a tunnel.
     CreateTunnel {

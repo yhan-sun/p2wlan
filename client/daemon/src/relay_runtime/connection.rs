@@ -21,7 +21,7 @@ pub(super) struct RelayRouteMonitor {
 }
 
 impl RelayRouteMonitor {
-    fn new(baseline: Vec<String>) -> Self {
+    pub(super) fn new(baseline: Vec<String>) -> Self {
         let mut ticker = interval(RELAY_ROUTE_POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         Self {
@@ -29,10 +29,6 @@ impl RelayRouteMonitor {
             pending: None,
             ticker,
         }
-    }
-
-    fn enabled(&self) -> bool {
-        !self.baseline.is_empty()
     }
 
     fn reset(&mut self, baseline: Vec<String>) {
@@ -66,7 +62,7 @@ impl RelayRouteMonitor {
         }
     }
 
-    async fn wait_for_change(&mut self) -> Vec<String> {
+    pub(super) async fn wait_for_change(&mut self) -> Vec<String> {
         loop {
             self.ticker.tick().await;
             let observed =
@@ -190,7 +186,7 @@ impl RelaySupervisor {
                         )],
                     });
                 }
-                changed = route_monitor.wait_for_change(), if route_monitor.enabled() => {
+                changed = route_monitor.wait_for_change() => {
                     connection_generation.fetch_add(
                         1,
                         std::sync::atomic::Ordering::SeqCst,
@@ -476,14 +472,7 @@ pub(super) async fn wait_for_android_network_change(
     receiver: Option<crate::AndroidNetworkChangeReceiver>,
 ) -> Option<crate::AndroidNetworkChangeHint> {
     let receiver = receiver?;
-    let mut receiver = receiver.lock().await;
-    loop {
-        match receiver.recv().await {
-            Ok(hint) => return Some(hint),
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-        }
-    }
+    crate::android_network_change::recv_latest(&receiver).await
 }
 
 /// End signal of one relay inbound drain: `(connection generation, result)`.

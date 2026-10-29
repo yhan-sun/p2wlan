@@ -14,7 +14,10 @@ fn burst_has_one_wakeup_and_registration_absorbs_the_latest_edge() {
     assert!(!changes.observe(hint(1, "new-service")));
     let (edge, changed) = changes.begin_registration();
     assert!(changed);
-    assert_eq!(edge.as_ref().unwrap().network_identity_hash, "new-service");
+    let ControlNetworkEdge::Android(latest_hint) = edge.as_ref().unwrap().as_ref() else {
+        panic!("expected the latest Android edge");
+    };
+    assert_eq!(latest_hint.network_identity_hash, "new-service");
     let published = std::cell::Cell::new(false);
     assert!(changes.commit_if_current(&edge, || published.set(true)));
     assert!(published.get());
@@ -51,6 +54,37 @@ async fn edge_before_notification_registration_is_not_a_lost_wakeup() {
     let initial = changes.snapshot();
     changes.observe(hint(1, "new"));
     assert!(futures_util::poll!(Box::pin(changes.changed_since(&initial))).is_ready());
+}
+
+#[tokio::test]
+async fn confirmed_route_cancels_registration_and_fences_its_late_result() {
+    let changes = Arc::new(ControlNetworkChanges::default());
+    let (commands, mut command_rx) = mpsc::unbounded_channel();
+    let notifier = ControlRouteChangeNotifier::new(changes.clone(), commands);
+    let (edge, _) = changes.begin_registration();
+    let (auth, _auth_rx) = watch::channel(Some(current_auth()));
+    let clock = ServerClockEstimate::default();
+    let work = changes.during_registration(&edge, &auth, &clock, std::future::pending::<()>());
+    tokio::pin!(work);
+    assert!(futures_util::poll!(&mut work).is_pending());
+    notifier.notify();
+    notifier.notify();
+    assert_eq!(work.await, None);
+    assert!(auth.borrow().is_none());
+    assert!(!changes.commit_if_current(&edge, || panic!("stale route registered")));
+    let (current, changed) = changes.begin_registration();
+    assert!(changed);
+    assert!(!current.as_ref().unwrap().requires_http_rebuild());
+    assert!(matches!(
+        command_rx.try_recv(),
+        Ok(ControlCommand::NetworkChanged(_))
+    ));
+    assert!(
+        command_rx.is_empty(),
+        "route bursts share one queued wakeup"
+    );
+    assert!(changes.take_pending(true).is_none());
+    assert!(changes.commit_if_current(&current, || {}));
 }
 
 fn current_auth() -> CriticalControlAuth {

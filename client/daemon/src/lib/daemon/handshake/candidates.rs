@@ -78,7 +78,8 @@ impl Daemon {
             }
         }
         let stale = self.leased_candidate_set().await;
-        if let Some(udp) = self.udp_transport.read().await.clone() {
+        let udp = self.udp_transport.read().await.clone();
+        if let Some(udp) = udp {
             if let Some(refreshed) = self
                 .refresh_local_candidates_for_imminent_signal(&udp, reason)
                 .await
@@ -302,27 +303,16 @@ impl Daemon {
             }
         }
         let refreshed = self.refresh_local_candidates_core(udp, reason).await?;
-        if let Some(endpoint) = control_udp_endpoint_from_candidates(&refreshed.0, &refreshed.1) {
-            let nat_type = self
-                .nat_profile
-                .read()
-                .await
-                .as_ref()
-                .map(|profile| {
-                    profile.control_label_with_generation_and_observation(
-                        self.peers.current_local_profile_generation_sync(),
-                        self.peers.current_local_profile_observation_sync(),
-                    )
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-            // The endpoint publish travels the handshake control lane with a
-            // short caller budget: the ordinary lane may be congested by
-            // candidate-only traffic and must never delay the signal that
-            // follows this refresh.
+        if let Some(endpoint) =
+            control_udp_endpoint_from_candidates(&refreshed.candidates, &refreshed.sources)
+        {
             match tokio::time::timeout(
                 Duration::from_millis(PRE_SIGNAL_ENDPOINT_PUBLISH_BUDGET_MS),
-                self.control
-                    .update_endpoint_for_handshake(&endpoint, &nat_type),
+                self.control.update_endpoint_for_handshake_fenced(
+                    &endpoint,
+                    &refreshed.nat_type,
+                    refreshed.endpoint_fence,
+                ),
             )
             .await
             {
@@ -335,15 +325,15 @@ impl Daemon {
                 }
             }
         }
-        Some(refreshed)
+        Some((refreshed.candidates, refreshed.sources))
     }
 
     async fn refresh_local_candidates_core(
         &self,
         udp: &UdpTransport,
         reason: &str,
-    ) -> Option<(Vec<String>, HashMap<String, String>)> {
-        let _refresh_guard = self.candidate_refresh_lock.lock().await;
+    ) -> Option<PreSignalCandidateCommit> {
+        let refresh_guard = self.candidate_refresh_lock.lock().await;
         // Another initiator may have completed the gather while this caller
         // waited for the single-flight lock. Re-check the lease after lock
         // acquisition or concurrent offers will serialize duplicate STUN
@@ -354,9 +344,33 @@ impl Daemon {
                     "Pre-signal UDP candidates reused after refresh lock handoff for {reason} ({} candidates)",
                     leased.0.len()
                 );
-                return Some(leased);
+                let nat_type = self
+                    .nat_profile
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|profile| {
+                        profile.control_label_with_generation_and_observation(
+                            self.peers.current_local_profile_generation_sync(),
+                            self.peers.current_local_profile_observation_sync(),
+                        )
+                    })
+                    .unwrap_or_else(|| "unknown".into());
+                return Some(PreSignalCandidateCommit {
+                    candidates: leased.0,
+                    sources: leased.1,
+                    nat_type,
+                    endpoint_fence: EndpointPublicationFence::new(udp, &self.peers),
+                });
             }
         }
+        let gather_fence = crate::candidate_refresh::CandidateGatherFence::capture(
+            &refresh_guard,
+            udp,
+            &self.peers,
+            &self.candidate_snapshot,
+        )
+        .await;
         let stun_servers = self.runtime_stun_servers.read().await.clone();
         if stun_servers.is_empty() {
             return None;
@@ -372,11 +386,6 @@ impl Daemon {
                 return None;
             }
         };
-
-        self.peers
-            .update_nat_profile(report.nat_profile.clone())
-            .await;
-        *self.nat_profile.write().await = Some(report.nat_profile.clone());
 
         let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
         let include_host_candidate = self.peers.gather_host_candidates().await;
@@ -416,85 +425,24 @@ impl Daemon {
                 });
         }
 
-        let previous_snapshot = self.cached_candidate_snapshot().await;
-        let previous_candidates = previous_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.candidates.clone())
-            .unwrap_or_default();
-        let previous_candidate_sources = previous_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.candidate_sources.clone())
-            .unwrap_or_default();
-        let next_network_identity = prepare_signal_candidates_and_network_identity(
-            &previous_candidates,
-            &previous_candidate_sources,
-            &mut candidates,
-            &mut candidate_sources,
-        );
-        let previous_network_identity = previous_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.network_identity.clone())
-            .unwrap_or_default();
-        let should_advance_generation =
-            network_identity_changed(&previous_network_identity, &next_network_identity);
-        let change_reason = candidate_set_change_reason(
-            &previous_candidates,
-            &candidates,
-            &previous_candidate_sources,
-            &candidate_sources,
-        );
-        let old_hash = candidate_set_hash(&previous_candidates, &previous_candidate_sources);
-        let new_hash = candidate_set_hash(&candidates, &candidate_sources);
-        let old_candidate_count = previous_candidates.len();
-        let new_candidate_count = candidates.len();
-        let real_change = change_reason != "no_change" && change_reason != "order_only";
-
-        if candidate_refresh_requires_commit(real_change, should_advance_generation) {
-            // The committed set becomes the shared snapshot lease: every
-            // signaling path for the next TTL reuses it without a live gather.
-            self.publish_candidate_snapshot(
-                candidates.clone(),
-                candidate_sources.clone(),
-                next_network_identity.clone(),
-            )
-            .await;
-            *self.local_candidates.write().await = candidates.clone();
-            *self.local_candidate_sources.write().await = candidate_sources.clone();
-            *self.local_network_identity.write().await = next_network_identity.clone();
-            if should_advance_generation {
-                self.peers
-                    // A replaced physical/public identity is a true network
-                    // handover.  Fully invalidate the old Direct proof so
-                    // the imminent signal cannot be suppressed as an
-                    // already-healthy Direct path.
-                    .advance_network_generation("pre-signal UDP network identity changed")
-                    .await;
-            }
-            info!(
-                "Pre-signal UDP candidates refreshed for {reason}; {} candidates (mapping={:?}, public={:?}, old_hash={old_hash}, new_hash={new_hash}, changed_reason={change_reason}, old_candidate_count={old_candidate_count}, new_candidate_count={new_candidate_count})",
-                candidates.len(),
-                report.nat_profile.mapping_behavior,
-                report.nat_profile.public_endpoint
-            );
-            debug!(
-                "Pre-signal UDP candidate set diff for {reason}: changed_reason={change_reason} old_candidates={previous_candidates:?} new_candidates={candidates:?}"
-            );
-        } else {
-            debug!(
-                "Pre-signal UDP candidate refresh for {reason} kept the existing {} candidates (old_hash={old_hash} new_hash={new_hash} changed_reason={change_reason})",
-                candidates.len()
-            );
-            // Even an unchanged gather refreshes the lease so later signals
-            // reuse this snapshot instead of gathering again.
-            self.publish_candidate_snapshot(
-                candidates.clone(),
-                candidate_sources.clone(),
-                next_network_identity,
-            )
-            .await;
-        }
-
-        Some((candidates, candidate_sources))
+        commit_pre_signal_candidates(
+            PreSignalCandidateCommitContext {
+                publication: &self.udp_transport_publication,
+                peers: &self.peers,
+                nat_profile: &self.nat_profile,
+                snapshot: &self.candidate_snapshot,
+                candidates: &self.local_candidates,
+                sources: &self.local_candidate_sources,
+                network_identity: &self.local_network_identity,
+            },
+            &refresh_guard,
+            &gather_fence,
+            udp,
+            report,
+            candidates,
+            candidate_sources,
+        )
+        .await
     }
 
     async fn start_hole_punch(&self, node_id: &str) {

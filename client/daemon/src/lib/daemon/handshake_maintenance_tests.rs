@@ -113,6 +113,7 @@ mod maintenance_integration_tests {
             candidate_refresh_lock: daemon.candidate_refresh_lock.clone(),
             nat_profile: daemon.nat_profile.clone(),
             udp_transport: daemon.udp_transport.clone(),
+            udp_transport_publication: daemon.udp_transport_publication.clone(),
             runtime_stun_servers: daemon.runtime_stun_servers.clone(),
             runtime_stun_timeout: daemon.runtime_stun_timeout.clone(),
             udp_advertise: None,

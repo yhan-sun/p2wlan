@@ -148,6 +148,7 @@ pub(crate) use validation::send_relay_validation_packet;
 mod configuration;
 mod connection;
 mod probes;
+mod retry;
 mod supervisor;
 mod validation;
 mod write_boundary;

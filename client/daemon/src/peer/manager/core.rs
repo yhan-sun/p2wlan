@@ -493,12 +493,26 @@ impl PeerManager {
     /// heartbeats never call this method and therefore replay, rather than
     /// manufacture, the last observation sequence.
     pub async fn update_nat_profile(&self, profile: NatProfile) -> NatProfilePublication {
+        let current = self.lock_local_nat_profile_for_commit().await;
+        self.update_nat_profile_with_guard(profile, current).await
+    }
+
+    pub(crate) async fn lock_local_nat_profile_for_commit(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, Option<NatProfile>> {
+        self.local_nat_profile.write().await
+    }
+
+    pub(crate) async fn update_nat_profile_with_guard(
+        &self,
+        profile: NatProfile,
+        mut current: tokio::sync::RwLockWriteGuard<'_, Option<NatProfile>>,
+    ) -> NatProfilePublication {
         let live_observation = profile
             .observations
             .iter()
             .any(|observation| observation.mapped_address.is_some());
         let (profile_generation, capabilities_changed, observation) = {
-            let mut current = self.local_nat_profile.write().await;
             let substantive_same = current.as_ref().is_some_and(|curr| {
                 curr.local_addr == profile.local_addr
                     && curr.udp_blocked == profile.udp_blocked
@@ -544,6 +558,7 @@ impl PeerManager {
                 )
             }
         };
+        drop(current);
         let network_generation = self.current_network_generation_sync();
         let capabilities =
             NatCapabilities::from_profile(&profile).with_profile_generation(profile_generation);
@@ -1228,9 +1243,21 @@ impl PeerManager {
     /// returns every generation-sensitive transition belongs to the new
     /// generation.
     pub async fn advance_network_generation(&self, reason: impl Into<String>) -> u64 {
-        let reason = reason.into();
         let epoch_gate = self.network_epoch_gate();
-        let _epoch_gate = epoch_gate.lock().await;
+        let epoch_guard = epoch_gate.lock().await;
+        self.advance_network_generation_in_epoch(&epoch_guard, reason)
+            .await
+    }
+
+    /// Continue the existing complete transition while its caller already
+    /// holds the authoritative epoch gate. Once begun this operation must not
+    /// be dropped by a preparation timeout after publishing the new generation.
+    pub(crate) async fn advance_network_generation_in_epoch(
+        &self,
+        _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        reason: impl Into<String>,
+    ) -> u64 {
+        let reason = reason.into();
         let generation = {
             let mut generation = self.network_generation.write().await;
             *generation = generation.saturating_add(1);

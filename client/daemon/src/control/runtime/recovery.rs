@@ -46,8 +46,10 @@ async fn wait_control_recovery(
                     // This also invalidates in-flight timing samples. On
                     // Android the route signature may be empty, so the
                     // explicit pool-rebuild hint cannot be discarded.
-                    if changes.take_pending(true).is_some() {
-                        http.notify_network_changed();
+                    if let Some(edge) = changes.take_pending(true) {
+                        if edge.requires_http_rebuild() {
+                            http.notify_network_changed();
+                        }
                         if matches!(delay, ControlRecoveryDelay::Transient(_)) {
                             return true;
                         }

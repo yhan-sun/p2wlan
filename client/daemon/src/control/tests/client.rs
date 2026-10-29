@@ -399,6 +399,7 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
             ControlProxyMode::Direct,
             &format!("http://{address}"),
             None,
+            None,
         )
         .0,
     )
@@ -531,6 +532,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
             ControlProxyMode::Direct,
             &format!("http://{address}"),
             None,
+            None,
         )
         .0,
     )
@@ -569,6 +571,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         &route_aware_control_http_clients(
             ControlProxyMode::Direct,
             &format!("http://{address}"),
+            None,
             None,
         )
         .0,
@@ -617,6 +620,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         &route_aware_control_http_clients(
             ControlProxyMode::Direct,
             &format!("http://{address}"),
+            None,
             None,
         )
         .0,

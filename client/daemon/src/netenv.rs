@@ -19,6 +19,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod network_signature;
+#[cfg(windows)]
+mod windows;
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
@@ -419,6 +423,31 @@ fn route_path_for_destination(_destination: &str) -> Option<(String, Option<Stri
     None
 }
 
+/// Observation only: IPv6-only hosts also need a handover baseline. Do not
+/// feed this into the existing IPv4 physical socket-binding choice.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn ipv6_default_route_path() -> Option<(String, Option<String>)> {
+    if cfg!(target_os = "macos") {
+        let output = Command::new("route")
+            .args(["-n", "get", "-inet6", "default"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        return parse_route_get_interface(&text)
+            .map(|interface| (interface, parse_route_get_gateway(&text)));
+    }
+    let output = Command::new("ip")
+        .args(["-6", "route", "show", "default"])
+        .output()
+        .ok()?;
+    parse_route_default_path(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn ipv6_default_route_path() -> Option<(String, Option<String>)> {
+    None
+}
+
 /// Select the underlying non-virtual default interface. This remains useful
 /// when public destinations are captured by more-specific TUN routes.
 pub fn physical_route_interface(excluded: &[String]) -> Option<String> {
@@ -472,8 +501,8 @@ fn capture_interface(
 }
 
 /// Stable local route signature used to notice interface/gateway/TUN changes.
-/// It includes gateways so switching between two networks on the same `en0`
-/// still causes the UDP transport to be rebuilt in the common case.
+/// It includes gateways and the relevant physical interface addresses so a
+/// DHCP address change on the same interface/gateway also retires old sockets.
 pub fn network_route_signature(excluded: &[String]) -> Vec<String> {
     direct_route_snapshot(excluded).signature
 }
@@ -551,6 +580,28 @@ fn capture_direct_route_snapshot(excluded: &[String]) -> DirectRouteSnapshot {
                 .and_then(|(_, gateway)| gateway.as_deref())
                 .unwrap_or_default()
         ));
+    }
+    #[cfg(unix)]
+    {
+        let mut observed_interfaces = public_route_interfaces.clone();
+        if let Some(interface) = network_signature::append_ipv6_default(
+            &mut signature,
+            ipv6_default_route_path(),
+            excluded,
+        ) {
+            observed_interfaces.push(interface);
+        }
+        network_signature::append_unix_addresses(
+            &mut signature,
+            default_route_interface.as_deref(),
+            physical_route_interface.as_deref(),
+            &observed_interfaces,
+            excluded,
+        );
+    }
+    #[cfg(windows)]
+    if let Some(windows_signature) = windows::network_signature(excluded) {
+        signature.extend(windows_signature);
     }
     signature.sort();
     signature.dedup();

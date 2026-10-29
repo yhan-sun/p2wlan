@@ -49,10 +49,15 @@ async fn run_control_loop(
             loop {
                 let (network_edge, changed) = network_changes.begin_registration();
                 if changed {
-                    http.notify_network_changed();
+                    if network_edge
+                        .as_ref()
+                        .is_some_and(|edge| edge.requires_http_rebuild())
+                    {
+                        http.notify_network_changed();
+                    }
                     debug!(
-                        event = "android_network_hint_absorbed",
-                        "Registration starts on the latest authorized network edge"
+                        event = "control_network_edge_absorbed",
+                        "Registration starts on the latest network edge"
                     );
                 }
                 let Some(mut registration_state) = network_changes
@@ -657,7 +662,11 @@ async fn run_control_loop(
                                 warn!("Polling failed {poll_failures} times; re-registering with control plane");
                                 break;
                             }
-                            tokio::time::sleep(delay).await;
+                            tokio::select! {
+                                biased;
+                                _ = network_changes.changed_since(&network_edge) => break,
+                                _ = tokio::time::sleep(delay) => {}
+                            }
                         }
                         Ok(_) => {
                             if poll_failures > 0 {
