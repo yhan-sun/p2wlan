@@ -11,6 +11,23 @@ import '../rooms/room_profiles.dart';
 import '../security/local_config_secret.dart';
 import '../security/secure_token_repository.dart';
 
+class SettingsCredentialRestoreException implements Exception {
+  const SettingsCredentialRestoreException(
+    this.saveError,
+    this.restoreError, {
+    this.clearError,
+  });
+  final Object saveError;
+  final Object restoreError;
+  final Object? clearError;
+  bool get credentialCleared => clearError == null;
+
+  @override
+  String toString() => credentialCleared
+      ? 'Settings could not be saved and the previous credential could not be restored. The stored credential was cleared; sign in again before reconnecting.'
+      : 'Settings could not be saved and credential recovery failed. Sign in again before reconnecting.';
+}
+
 class SettingsStore extends ChangeNotifier {
   SettingsStore({File? settingsFile, SecureTokenRepository? tokenRepository})
     : _settingsFileOverride = settingsFile {
@@ -27,6 +44,8 @@ class SettingsStore extends ChangeNotifier {
   )?
   applySessionChange;
   Future<void>? _pendingSettingsWrite;
+  final _writeOwnerKey = Object();
+  Object? _activeWriteOwner;
 
   AppSettings _settings = const AppSettings();
   var _loaded = false;
@@ -116,9 +135,10 @@ class SettingsStore extends ChangeNotifier {
 
   Future<void> updateDiagnosticsUrl(String diagnosticsUrl) async {
     final normalized = normalizeDiagnosticsUrl(diagnosticsUrl);
-    _settings = _settings.copyWith(diagnosticsUrl: normalized);
-    await _save();
-    notifyListeners();
+    await _mutateSettings(
+      (current) => current.copyWith(diagnosticsUrl: normalized),
+      accountScoped: true,
+    );
   }
 
   /// Persist the non-secret identity returned by the control server so the
@@ -134,15 +154,15 @@ class SettingsStore extends ChangeNotifier {
         (normalizedUsername == null || normalizedUsername.isEmpty)) {
       return;
     }
-    final nextSettings = _settings.copyWith(
-      accountEmail: normalizedEmail.isEmpty
-          ? _settings.accountEmail
-          : normalizedEmail,
-      accountUsername: normalizedUsername ?? _settings.accountUsername,
+    await _mutateSettings(
+      (current) => current.copyWith(
+        accountEmail: normalizedEmail.isEmpty
+            ? current.accountEmail
+            : normalizedEmail,
+        accountUsername: normalizedUsername ?? current.accountUsername,
+      ),
+      accountScoped: true,
     );
-    // Use the normal queued settings transition so a profile response that
-    // races with logout cannot write identity data back into a new session.
-    await updateSettings(nextSettings);
   }
 
   Future<void> updateConnectionSettings({
@@ -170,51 +190,42 @@ class SettingsStore extends ChangeNotifier {
         ? defaultNetworkId
         : networkId.trim();
     final normalizedSocketPool = normalizeSocketPool(socketPool);
-    final normalizedDeviceName = deviceName.trim().isEmpty
-        ? await resolveDefaultDeviceName()
-        : deviceName.trim();
     final enteredToken = authToken.trim();
     // A blank draft may retain a credential only for its existing server.
     // Publishing a different server with that token would immediately allow
     // profile and room requests to send it to the new destination.
-    if (enteredToken.isEmpty &&
-        _settings.authToken.trim().isNotEmpty &&
-        normalizedControlServer !=
-            normalizeControlServer(_settings.controlServer)) {
-      throw const FormatException(
-        'Changing servers requires a new credential. Sign in to the new server or enter its credential.',
+    await _mutateSettings((current) {
+      if (enteredToken.isEmpty &&
+          current.authToken.trim().isNotEmpty &&
+          normalizedControlServer !=
+              normalizeControlServer(current.controlServer)) {
+        throw const FormatException(
+          'Changing servers requires a new credential. Sign in to the new server or enter its credential.',
+        );
+      }
+      // Resolve a blank credential against the latest queued value, never a
+      // snapshot captured before another settings write completed.
+      return current.copyWith(
+        diagnosticsUrl: normalizedDiagnosticsUrl,
+        controlServer: normalizedControlServer,
+        authToken: enteredToken.isNotEmpty ? enteredToken : current.authToken,
+        networkId: normalizedNetworkId,
+        virtualIp: virtualIp.trim(),
+        deviceName: deviceName.trim(),
+        overlayCidr: overlayCidr.trim().isEmpty
+            ? defaultOverlayCidr
+            : overlayCidr.trim(),
+        tunInterface: tunInterface.trim().isEmpty
+            ? defaultTunInterface
+            : tunInterface.trim(),
+        mtu: mtu,
+        udpBind: udpBind.trim().isEmpty ? defaultUdpBind : udpBind.trim(),
+        udpAdvertise: udpAdvertise.trim(),
+        socketPool: normalizedSocketPool,
+        relayServers: relayServers.trim(),
+        closeBehavior: normalizeCloseBehavior(closeBehavior),
       );
-    }
-    // Only explicit logout clears a retained credential; connection settings
-    // cannot enable an offline mode.
-    final resolvedAuthToken = enteredToken.isNotEmpty
-        ? enteredToken
-        : _settings.authToken;
-    final nextSettings = _settings.copyWith(
-      diagnosticsUrl: normalizedDiagnosticsUrl,
-      controlServer: normalizedControlServer,
-      authToken: resolvedAuthToken,
-      networkId: normalizedNetworkId,
-      virtualIp: virtualIp.trim(),
-      deviceName: normalizedDeviceName,
-      overlayCidr: overlayCidr.trim().isEmpty
-          ? defaultOverlayCidr
-          : overlayCidr.trim(),
-      tunInterface: tunInterface.trim().isEmpty
-          ? defaultTunInterface
-          : tunInterface.trim(),
-      mtu: mtu,
-      udpBind: udpBind.trim().isEmpty ? defaultUdpBind : udpBind.trim(),
-      udpAdvertise: udpAdvertise.trim(),
-      socketPool: normalizedSocketPool,
-      relayServers: relayServers.trim(),
-      closeBehavior: normalizeCloseBehavior(closeBehavior),
-    );
-    final errors = validateAppSettings(nextSettings);
-    if (errors.isNotEmpty) {
-      throw FormatException(errors.join('\n'));
-    }
-    await updateSettings(nextSettings);
+    }, accountScoped: true);
   }
 
   Future<void> updateSettings(AppSettings settings) {
@@ -227,10 +238,48 @@ class SettingsStore extends ChangeNotifier {
       return _updateSettings(settings);
     }
 
+    return _enqueueSettingsWrite(apply);
+  }
+
+  Future<void> _mutateSettings(
+    AppSettings Function(AppSettings current) change, {
+    bool accountScoped = false,
+  }) {
+    final expectedSession = accountSessionKey(_settings);
+    return _enqueueSettingsWrite(() {
+      if (accountScoped && accountSessionKey(_settings) != expectedSession) {
+        throw const FormatException('账号已变化，未保存旧账号设置。请重新打开页面后操作。');
+      }
+      return _updateSettings(change(_settings));
+    });
+  }
+
+  Future<void> _enqueueSettingsWrite(
+    Future<void> Function() apply, {
+    bool allowOwnerReentry = false,
+  }) {
+    // A macOS stop performed inside account transition can prompt and save
+    // its machine credential. Queueing that callback behind its own caller
+    // would deadlock; only that transaction's async context may reenter.
+    if (allowOwnerReentry &&
+        _activeWriteOwner != null &&
+        identical(Zone.current[_writeOwnerKey], _activeWriteOwner)) {
+      return apply();
+    }
+    Future<void> run() async {
+      final owner = Object();
+      _activeWriteOwner = owner;
+      try {
+        await runZoned(apply, zoneValues: {_writeOwnerKey: owner});
+      } finally {
+        _activeWriteOwner = null;
+      }
+    }
+
     final previousWrite = _pendingSettingsWrite;
     final write = previousWrite == null
-        ? apply()
-        : previousWrite.then((_) => apply());
+        ? run()
+        : previousWrite.then((_) => run());
     final tail = write.then<void>((_) {}, onError: (Object _, StackTrace _) {});
     _pendingSettingsWrite = tail;
     unawaited(
@@ -284,13 +333,16 @@ class SettingsStore extends ChangeNotifier {
       );
     }
     Future<void> commit() async {
-      _settings = normalizedSettings;
-      try {
-        await _save();
-      } catch (_) {
-        _settings = previous;
-        rethrow;
+      if (_settings.macosAdminPassword != previous.macosAdminPassword ||
+          _settings.macosAdminPasswordCiphertext !=
+              previous.macosAdminPasswordCiphertext) {
+        normalizedSettings = normalizedSettings.copyWith(
+          macosAdminPassword: _settings.macosAdminPassword,
+          macosAdminPasswordCiphertext: _settings.macosAdminPasswordCiphertext,
+        );
       }
+      await _save(normalizedSettings);
+      _settings = normalizedSettings;
       notifyListeners();
     }
 
@@ -308,8 +360,7 @@ class SettingsStore extends ChangeNotifier {
     if (password.isEmpty) {
       throw const FormatException('管理员密码不能为空。');
     }
-    final previous = _settings;
-    try {
+    await _enqueueSettingsWrite(() async {
       final file = Platform.isAndroid
           ? await _settingsFile()
           : _settingsFileSync();
@@ -317,83 +368,80 @@ class SettingsStore extends ChangeNotifier {
         password,
         keyFile: _adminPasswordKeyFile(file),
       );
-      _settings = previous.copyWith(
-        macosAdminPassword: password,
-        macosAdminPasswordCiphertext: ciphertext,
+      await _updateSettings(
+        _settings.copyWith(
+          macosAdminPassword: password,
+          macosAdminPasswordCiphertext: ciphertext,
+        ),
       );
-      await _save();
-    } catch (_) {
-      _settings = previous;
-      rethrow;
-    }
-    notifyListeners();
+    }, allowOwnerReentry: true);
   }
 
   /// Forget the local macOS administrator credential without touching the
   /// P2WLAN login token or the rest of the settings.
-  Future<void> clearMacosAdminPassword() async {
-    final previous = _settings;
-    _settings = previous.copyWith(
-      macosAdminPassword: '',
-      macosAdminPasswordCiphertext: '',
-    );
-    try {
-      await _save();
-    } catch (_) {
-      _settings = previous;
-      rethrow;
-    }
-    notifyListeners();
-  }
+  Future<void> clearMacosAdminPassword() => _enqueueSettingsWrite(
+    () => _updateSettings(
+      _settings.copyWith(
+        macosAdminPassword: '',
+        macosAdminPasswordCiphertext: '',
+      ),
+    ),
+    allowOwnerReentry: true,
+  );
 
-  Future<void> updateLanguageCode(String languageCode) async {
-    _settings = _settings.copyWith(languageCode: languageCode);
-    notifyListeners();
-    await _save();
-    notifyListeners();
-  }
+  Future<void> updateLanguageCode(String languageCode) => _mutateSettings(
+    (current) => current.copyWith(languageCode: languageCode),
+  );
 
-  Future<void> updateThemeMode(String themeMode) async {
-    _settings = _settings.copyWith(themeMode: themeMode);
-    await _save();
-    notifyListeners();
-  }
+  Future<void> updateThemeMode(String themeMode) =>
+      _mutateSettings((current) => current.copyWith(themeMode: themeMode));
 
   /// Persist that the local-node onboarding flow is complete. Idempotent.
   Future<void> markOnboardingCompleted() async {
     if (_settings.onboardingCompleted) return;
-    final previous = _settings;
-    _settings = previous.copyWith(onboardingCompleted: true);
-    try {
-      await _save();
-    } catch (_) {
-      // Do not leave the in-memory state ahead of disk. Otherwise a failed
-      // completion can appear to succeed on the next tap but will reappear
-      // after the next app restart.
-      _settings = previous;
-      rethrow;
-    }
-    notifyListeners();
+    await _mutateSettings(
+      (current) => current.copyWith(onboardingCompleted: true),
+      accountScoped: true,
+    );
   }
 
-  Future<void> resetDiagnosticsUrl() async {
-    _settings = _settings.copyWith(diagnosticsUrl: defaultDiagnosticsUrl);
-    await _save();
-    notifyListeners();
-  }
+  Future<void> resetDiagnosticsUrl() =>
+      updateDiagnosticsUrl(defaultDiagnosticsUrl);
 
-  Future<void> _save() async {
+  Future<void> _save(AppSettings candidate) async {
+    final previousToken = _settings.authToken;
+    var credentialWritten = false;
     try {
       final file = Platform.isAndroid
           ? await _settingsFile()
           : _settingsFileSync();
       _configPath = file.path;
-      // Keep the credential in the local token file in lockstep with the
-      // in-memory value. A blank token clears the local token file.
-      await _tokenRepository.write(_settings.authToken);
-      await _writeSettingsFile(file);
+      // A blank token clears the local token file. Publish the candidate only
+      // after both this protected store and the settings JSON have committed.
+      await _tokenRepository.write(candidate.authToken);
+      credentialWritten = true;
+      await _writeSettingsFile(file, candidate: candidate);
       _lastError = null;
     } catch (error) {
+      if (credentialWritten && candidate.authToken != previousToken) {
+        try {
+          await _tokenRepository.write(previousToken);
+        } catch (restoreError) {
+          Object? clearError;
+          try {
+            await _tokenRepository.clear();
+          } catch (error) {
+            clearError = error;
+          }
+          final failure = SettingsCredentialRestoreException(
+            error,
+            restoreError,
+            clearError: clearError,
+          );
+          _lastError = failure.toString();
+          throw failure;
+        }
+      }
       _lastError = 'Failed to save local settings: $error';
       rethrow;
     }
@@ -427,7 +475,7 @@ class SettingsStore extends ChangeNotifier {
     return null;
   }
 
-  Future<void> _writeSettingsFile(File file) async {
+  Future<void> _writeSettingsFile(File file, {AppSettings? candidate}) async {
     await file.parent.create(recursive: true);
     await _restrictDirectory(file.parent);
     // The auth token lives in the separate local token file, never in this
@@ -440,7 +488,7 @@ class SettingsStore extends ChangeNotifier {
     try {
       await temp.writeAsString(
         const JsonEncoder.withIndent('  ')
-            .convert(_persistedSettings().toJson()),
+            .convert(_persistedSettings(candidate).toJson()),
         flush: true,
       );
       await _restrictFile(temp);
@@ -453,7 +501,9 @@ class SettingsStore extends ChangeNotifier {
         if (await file.exists()) await file.delete();
         await temp.rename(file.path);
       }
-      await _restrictFile(file);
+      // rename preserves the permissions already set on the flushed temporary
+      // file. Keep all fallible preparation before the commit point so an
+      // error cannot roll back the token after the new JSON was installed.
     } finally {
       if (await temp.exists()) await temp.delete();
     }
@@ -461,8 +511,8 @@ class SettingsStore extends ChangeNotifier {
 
   /// Settings as they should be written to disk: the auth token and plaintext
   /// administrator password are blanked (only their protected stores remain).
-  AppSettings _persistedSettings() =>
-      _settings.copyWith(authToken: '', macosAdminPassword: '');
+  AppSettings _persistedSettings([AppSettings? source]) =>
+      (source ?? _settings).copyWith(authToken: '', macosAdminPassword: '');
 
   File _adminPasswordKeyFile(File settingsFile) =>
       File('${settingsFile.path}.key');

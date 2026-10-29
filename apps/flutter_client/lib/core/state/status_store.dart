@@ -16,6 +16,7 @@ import '../rooms/room_profiles.dart';
 import '../rooms/room_api.dart';
 
 part 'status_store_session.dart';
+part 'status_store_configuration.dart';
 
 class StatusStore extends ChangeNotifier {
   StatusStore({
@@ -53,6 +54,9 @@ class StatusStore extends ChangeNotifier {
            ) {
     _lastDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
     _lastAccountSession = accountSessionKey(settingsStore.settings);
+    _committedPrimaryConfiguration = _primaryLaunchConfiguration(
+      settingsStore.settings,
+    );
     settingsStore.applySessionChange = _applyAccountChange;
     settingsStore.addListener(_handleSettingsChanged);
   }
@@ -144,8 +148,13 @@ class StatusStore extends ChangeNotifier {
   late String _lastAccountSession;
   bool _sessionChanging = false;
   bool _accountRequiresRestart = false;
+  late _PrimaryLaunchConfiguration _committedPrimaryConfiguration;
+  _PrimaryLaunchConfiguration? _appliedPrimaryConfiguration;
+  bool _primaryConfigurationPending = false;
+  _PrimaryStartWitness? _primaryStartWitness;
 
   int get sessionRevision => _refreshGeneration;
+  bool get primaryConfigurationPending => _primaryConfigurationPending;
   DiagnosticsSnapshot? get snapshot => _snapshot;
   bool get healthReachable => _healthReachable;
   bool get daemonReachable => _healthReachable || _snapshot != null;
@@ -691,6 +700,9 @@ class StatusStore extends ChangeNotifier {
                   snapshot.processId ||
               daemonTransition.oldIdentity.daemonRuntimeIncarnation !=
                   snapshot.runtimeIncarnation) {
+            // A replacement runtime does not prove which configuration it
+            // received. Only this owner's successful start can confirm that.
+            _appliedPrimaryConfiguration = null;
             _eventLoopFuture = null;
             if (_snapshot != null) cancelSpeedTest();
           }
@@ -698,6 +710,7 @@ class StatusStore extends ChangeNotifier {
         _updatePeerTrafficRates(snapshot, fetchedAt, throttle: throttleMetrics);
         recordPeerPresence(snapshot.peers);
         _snapshot = snapshot;
+        _primaryStartWitness?.observe(snapshot, generation);
         _routeHealthy = routeHealthy;
         if (routeVerifiedAt != null) _lastRouteVerificationAt = routeVerifiedAt;
         _lastError = null;
@@ -942,19 +955,38 @@ class StatusStore extends ChangeNotifier {
         message: 'All networks are shutting down.',
       );
     }
-    return _runDaemonCommand(() async {
-      final result = await daemonController.start(settingsStore.settings);
-      if (result.ok) _accountRequiresRestart = false;
+    final launchSettings = settingsStore.settings;
+    final revision = _refreshGeneration;
+    final witness = _PrimaryStartWitness(revision);
+    bool acceptsOwner() =>
+        !_disposed &&
+        revision == _refreshGeneration &&
+        launchSettings.diagnosticsUrl ==
+            settingsStore.settings.diagnosticsUrl &&
+        accountSessionKey(launchSettings) ==
+            accountSessionKey(settingsStore.settings);
+    try {
+      final result = await _runDaemonCommand(() async {
+        final started = await daemonController.start(launchSettings);
+        if (started.ok && acceptsOwner()) {
+          _accountRequiresRestart = false;
+          _primaryStartWitness = witness;
+        }
+        return started;
+      }, settlePeerCatalog: true);
+      if (result.ok && acceptsOwner() && witness.matches(_snapshot)) {
+        _confirmPrimaryConfiguration(launchSettings);
+      }
       return result;
-    }, settlePeerCatalog: true);
+    } finally {
+      if (identical(_primaryStartWitness, witness)) _primaryStartWitness = null;
+    }
   }
 
   Future<DaemonCommandResult> stopDaemon() {
     cancelSpeedTest();
     return _runDaemonCommand(() {
-      final primaryFuture = daemonController.stop(
-        settingsStore.settings.diagnosticsUrl,
-      );
+      final primaryFuture = _stopPrimaryRuntime();
       if (!parallelRooms.hasSessions) {
         return primaryFuture;
       }
@@ -976,9 +1008,7 @@ class StatusStore extends ChangeNotifier {
 
   Future<DaemonCommandResult> stopPrimaryDaemon() {
     cancelSpeedTest();
-    return _runDaemonCommand(
-      () => daemonController.stop(settingsStore.settings.diagnosticsUrl),
-    );
+    return _runDaemonCommand(_stopPrimaryRuntime);
   }
 
   Future<void> runSpeedTest(PeerSnapshot peer) async {
@@ -1157,6 +1187,12 @@ class StatusStore extends ChangeNotifier {
   void _handleSettingsChanged() {
     final nextSession = accountSessionKey(settingsStore.settings);
     final accountChanged = nextSession != _lastAccountSession;
+    final nextDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
+    final ownerChanged =
+        accountChanged || nextDiagnosticsUrl != _lastDiagnosticsUrl;
+    final pendingChanged = _observePrimaryConfiguration(
+      ownerChanged: ownerChanged,
+    );
     if (accountChanged) {
       _lastAccountSession = nextSession;
       _accountRequiresRestart = settingsStore.settings.authToken
@@ -1165,8 +1201,10 @@ class StatusStore extends ChangeNotifier {
       unawaited(parallelRooms.credentialsChanged());
       _clearAccountHistory();
     }
-    final nextDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
-    if (!accountChanged && nextDiagnosticsUrl == _lastDiagnosticsUrl) return;
+    if (!ownerChanged) {
+      if (pendingChanged) notifyListeners();
+      return;
+    }
     _lastDiagnosticsUrl = nextDiagnosticsUrl;
     _refreshGeneration += 1;
     cancelSpeedTest();

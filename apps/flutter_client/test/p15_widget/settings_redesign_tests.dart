@@ -23,7 +23,7 @@ void _registerSettingsRedesignTests() {
         repository.pauseNextWrite();
         await _tapSave(tester);
         await _waitFor(tester, () => repository.waiting);
-        expect(stores.settingsStore.settings.deviceName, 'Demo updated device');
+        expect(stores.settingsStore.settings.deviceName, originalName);
         final save = find.byKey(const Key('settings-save-button'));
         expect(save, findsOneWidget);
         expect(tester.widget<FilledButton>(save).onPressed, isNull);
@@ -57,6 +57,56 @@ void _registerSettingsRedesignTests() {
       },
     );
   }
+
+  testWidgets(
+    'credential recovery failure keeps settings draft and asks for sign in',
+    (tester) async {
+      final repository = _PausedSettingsTokenRepository();
+      addTearDown(repository.release);
+      final dirtyStates = <bool>[];
+      final stores = await _pumpSettings(
+        tester,
+        api: _FakeDiagnosticsApi(health: false),
+        tokenRepository: repository,
+        onDirtyChanged: dirtyStates.add,
+      );
+      await _openCategory(tester, 'General');
+      final original = stores.settingsStore.settings.deviceName;
+      await tester.enterText(
+        _settingsTextField('Device name'),
+        'Unsaved device',
+      );
+      await tester.pump();
+      repository.pauseNextWrite();
+      await _tapSave(tester);
+      await _waitFor(tester, () => repository.waiting);
+      repository.release(
+        error: SettingsCredentialRestoreException(
+          StateError('private file error'),
+          StateError('private restore error'),
+        ),
+      );
+      const message =
+          'Settings could not be saved and your sign-in credential could not be restored. Sign in again before reconnecting.';
+      await _waitFor(tester, () => find.text(message).evaluate().isNotEmpty);
+      expect(stores.settingsStore.settings.deviceName, original);
+      expect(
+        tester
+            .widget<TextField>(_settingsTextField('Device name'))
+            .controller!
+            .text,
+        'Unsaved device',
+      );
+      expect(dirtyStates.last, isTrue);
+      expect(
+        tester
+            .widget<FilledButton>(find.byKey(const Key('settings-save-button')))
+            .onPressed,
+        isNotNull,
+      );
+      expect(find.textContaining('private restore error'), findsNothing);
+    },
+  );
 
   testWidgets('username draft survives categories and uses the leave guard', (
     tester,
@@ -529,10 +579,12 @@ class _PausedSettingsTokenRepository implements SecureTokenRepository {
   bool waiting = false;
 
   void pauseNextWrite() => _write = Completer<void>();
-  void release({bool fail = false}) {
+  void release({bool fail = false, Object? error}) {
     final write = _write;
     if (write == null || write.isCompleted) return;
-    if (fail) {
+    if (error != null) {
+      write.completeError(error);
+    } else if (fail) {
       write.completeError(
         const SecureTokenStorageException('test storage unavailable'),
       );

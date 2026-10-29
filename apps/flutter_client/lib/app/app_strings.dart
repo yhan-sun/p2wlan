@@ -298,19 +298,19 @@ class AppStrings {
   String get healthEndpointOffline =>
       isZh ? '健康端点不可达' : 'Health endpoint offline';
   String get overviewHealthyTitle =>
-      isZh ? 'P2WLAN 运行正常' : 'P2WLAN is running normally';
+      isZh ? '本机默认连接运行正常' : 'Default local connection is healthy';
   String get overviewHealthyDetail => isZh
       ? '默认本机服务未报告异常。具体应用的连通性仍需通过虚拟 IP 验证。'
       : 'The default local service reports no issues. Verify application connectivity using the virtual IP.';
   String get overviewAttentionTitle =>
-      isZh ? 'P2WLAN 需要检查' : 'P2WLAN needs attention';
+      isZh ? '本机默认连接需要检查' : 'Default local connection needs attention';
   String get overviewAttentionDetail =>
       isZh ? '部分网络功能当前可能受影响。' : 'Some network features may be affected.';
   String get overviewUnavailableTitle =>
       isZh ? '暂时无法获取诊断状态' : 'Diagnostics unavailable';
   String get overviewUnavailableDetail => isZh
-      ? '无法读取 P2WLAN 当前运行状态，请稍后重试。'
-      : 'Unable to read the current P2WLAN status. Please try again.';
+      ? '无法读取本机默认连接的状态。请确认已启动该连接，或重新检查。'
+      : 'Unable to read the default local connection. Check that it is started, or try again.';
   String get overviewStaleTitle =>
       isZh ? '诊断数据已过期' : 'Diagnostics data is stale';
   String get overviewStaleDetail => isZh

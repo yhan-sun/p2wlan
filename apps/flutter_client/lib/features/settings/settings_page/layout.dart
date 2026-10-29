@@ -311,7 +311,7 @@ class _CategoryDetailView extends StatelessWidget {
     final statusSensitive =
         category == SettingsCategory.advancedNetwork ||
         category == SettingsCategory.developer ||
-        state._restartRequired;
+        state.widget.statusStore.primaryConfigurationPending;
     if (!statusSensitive) return _buildDetail(context);
     return AnimatedBuilder(
       animation: state._statusViewNotifier,
@@ -343,7 +343,7 @@ class _CategoryDetailView extends StatelessWidget {
                 _SettingsErrorNotice(message: state._formError!),
                 const SizedBox(height: AppTokens.space12),
               ],
-              if (state._restartRequired) ...[
+              if (state.widget.statusStore.primaryConfigurationPending) ...[
                 _PendingRestartNotice(
                   busy: state._saving || state.widget.statusStore.daemonBusy,
                   canRestart: state._capabilities.canControlLocalDaemon,
@@ -366,7 +366,7 @@ class _CategoryDetailView extends StatelessWidget {
               builder: (context, _) => _SaveBar(
                 busy: state._saving,
                 restartRequired:
-                    state._restartRequired ||
+                    state.widget.statusStore.primaryConfigurationPending ||
                     state._draftNeedsRestart(category),
                 onUndo: () => state._resetCategory(category),
                 onSave: () => state._saveCategory(category),

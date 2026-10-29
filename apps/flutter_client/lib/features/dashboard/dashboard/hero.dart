@@ -75,8 +75,10 @@ class _NetworkHero extends StatelessWidget {
     required this.canControlLocalDaemon,
     required this.daemonBusy,
     required this.initialProbePending,
+    required this.configuredRoom,
     required this.onStartDaemon,
     required this.onStopDaemon,
+    this.onOpenRooms,
   });
 
   final DiagnosticsSnapshot? snapshot;
@@ -85,8 +87,10 @@ class _NetworkHero extends StatelessWidget {
   final bool canControlLocalDaemon;
   final bool daemonBusy;
   final bool initialProbePending;
+  final bool configuredRoom;
   final Future<void> Function() onStartDaemon;
   final Future<void> Function() onStopDaemon;
+  final VoidCallback? onOpenRooms;
 
   @override
   Widget build(BuildContext context) {
@@ -145,6 +149,7 @@ class _NetworkHero extends StatelessWidget {
 
     final showStartGuide =
         status == _NetworkStatus.stopped && canControlLocalDaemon;
+    final showRoomGuide = showStartGuide && onOpenRooms != null;
 
     final infoBlock = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -193,6 +198,8 @@ class _NetworkHero extends StatelessWidget {
           Text(
             startupPending
                 ? (strings.isZh ? '正在连接 P2WLAN' : 'Connecting to P2WLAN')
+                : showRoomGuide
+                ? (strings.isZh ? '连接这台设备' : 'Connect this device')
                 : showStartGuide
                 ? strings.homeStoppedTitle
                 : status == _NetworkStatus.unavailable
@@ -211,6 +218,10 @@ class _NetworkHero extends StatelessWidget {
                 ? (strings.isZh
                       ? '正在等待本地网络服务就绪；如出现系统授权，请完成授权。'
                       : 'Waiting for the local network service. Complete the system permission prompt if shown.')
+                : showRoomGuide
+                ? (strings.isZh
+                      ? '在房间页面选择要连接的房间，也可加入或创建房间。'
+                      : 'Choose a room to connect to. You can also join or create a room.')
                 : showStartGuide
                 ? strings.homeStoppedDetail
                 : status == _NetworkStatus.unavailable
@@ -231,6 +242,8 @@ class _NetworkHero extends StatelessWidget {
       daemonBusy: daemonBusy,
       initialProbePending: initialProbePending,
       canControlLocalDaemon: canControlLocalDaemon,
+      configuredRoom: configuredRoom,
+      onOpenRooms: onOpenRooms,
       onStartDaemon: () => _handleStart(context),
     );
 

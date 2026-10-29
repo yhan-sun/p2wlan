@@ -199,7 +199,7 @@ void _expectOnlyPrimaryRestarted(_Harness harness) {
 
 void main() {
   testWidgets(
-    'applying settings restarts only primary and preserves parallel rooms',
+    'pending settings survive page remount and restart only primary',
     (tester) async {
       final harness = (await tester.runAsync(_harness))!;
       addTearDown(harness.dispose);
@@ -226,6 +226,16 @@ void main() {
         tester,
         () => find.byKey(const Key('settings-save-button')).evaluate().isEmpty,
       );
+      expect(harness.status.primaryConfigurationPending, isTrue);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _pump(
+        tester,
+        SettingsPage(
+          settingsStore: harness.settings,
+          statusStore: harness.status,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
+        ),
+      );
       await tester.drag(find.byType(ListView).last, const Offset(0, 1600));
       await tester.pumpAndSettle();
       final restart = find.text('Restart and apply');
@@ -236,6 +246,8 @@ void main() {
       await _waitFor(tester, () => harness.controller.starts == 1);
       await tester.pumpAndSettle();
       _expectOnlyPrimaryRestarted(harness);
+      expect(harness.status.primaryConfigurationPending, isFalse);
+      expect(find.text('P2WLAN restart required'), findsNothing);
       expect(tester.takeException(), isNull);
     },
   );
@@ -283,5 +295,21 @@ void main() {
     await tester.pumpAndSettle();
     _expectOnlyPrimaryRestarted(harness);
     expect(tester.takeException(), isNull);
+  });
+
+  test('parallel room lifecycle cannot clear primary apply intent', () async {
+    final harness = await _harness();
+    addTearDown(harness.dispose);
+    await harness.settings.updateSettings(
+      harness.settings.settings.copyWith(mtu: 1300),
+    );
+    expect(harness.status.primaryConfigurationPending, isTrue);
+    final room = harness.room.plan.room;
+    expect((await harness.status.parallelRooms.disconnect(room.id)).ok, isTrue);
+    expect(harness.status.primaryConfigurationPending, isTrue);
+    expect((await harness.status.parallelRooms.connect(room)).ok, isTrue);
+    expect(harness.status.primaryConfigurationPending, isTrue);
+    expect(harness.controller.starts, 0);
+    expect(harness.controller.stops, 0);
   });
 }

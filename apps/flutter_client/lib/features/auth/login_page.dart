@@ -533,6 +533,12 @@ class _LoginPageState extends State<LoginPage> {
 }
 
 _LoginError _errorTextFor(AppStrings strings, Object error) {
+  if (error is SettingsCredentialRestoreException) {
+    return _LoginError(
+      title: strings.loginFailedTitle,
+      body: strings.isZh ? '配置保存失败，登录凭据未能恢复，请重新登录后再连接。' : 'Settings could not be saved and your sign-in credential could not be restored. Sign in again before reconnecting.',
+    );
+  }
   switch (loginErrorKindOf(error)) {
     case LoginErrorKind.validation:
       return _LoginError(

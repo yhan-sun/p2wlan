@@ -28,7 +28,7 @@ void _registerDiagnosticsTests() {
       expect(find.text('Troubleshooting'), findsOneWidget);
       // System status is the first visual.
       expect(find.text('System status'), findsOneWidget);
-      expect(find.text('P2WLAN is running normally'), findsOneWidget);
+      expect(find.text('Default local connection is healthy'), findsOneWidget);
       expect(
         find.text(
           'The default local service reports no issues. Verify application connectivity using the virtual IP.',
@@ -111,7 +111,7 @@ void _registerDiagnosticsTests() {
       ),
     );
 
-    expect(find.text('P2WLAN is running normally'), findsOneWidget);
+    expect(find.text('Default local connection is healthy'), findsOneWidget);
     expect(find.text('No action needed'), findsNothing);
     expect(find.textContaining('Relay'), findsNothing);
 
@@ -198,10 +198,13 @@ void _registerDiagnosticsTests() {
 
     expect(find.text('Diagnostics unavailable'), findsOneWidget);
     expect(
-      find.text('Unable to read the current P2WLAN status. Please try again.'),
+      find.text(
+        'Unable to read the default local connection. Check that it is started, or try again.',
+      ),
       findsOneWidget,
     );
-    expect(find.text('Cannot reach the P2WLAN service'), findsOneWidget);
+    expect(find.text('Cannot reach the P2WLAN service'), findsNothing);
+    expect(find.text('Check again'), findsOneWidget);
     expect(find.textContaining('SocketException'), findsNothing);
     expect(find.textContaining('ClientException'), findsNothing);
     expect(find.textContaining('GET /health failed'), findsNothing);
@@ -240,7 +243,7 @@ void _registerDiagnosticsTests() {
       ),
       findsOneWidget,
     );
-    expect(find.text('P2WLAN is running normally'), findsNothing);
+    expect(find.text('Default local connection is healthy'), findsNothing);
     // With no status snapshot the service check reports the reachable fact
     // instead of claiming full health.
     expect(find.text('reachable'), findsOneWidget);
@@ -274,10 +277,11 @@ void _registerDiagnosticsTests() {
       find.text('Showing data from the last successful refresh.'),
       findsOneWidget,
     );
-    expect(find.text('Running normally'), findsOneWidget);
-    expect(find.text('Try refreshing the status.'), findsOneWidget);
-    // The stale issue offers a real recheck action.
-    expect(find.text('Check again'), findsWidgets);
+    expect(find.text('Running normally'), findsNothing);
+    expect(find.text('Last reported: Running normally'), findsOneWidget);
+    expect(find.text('Try refreshing the status.'), findsNothing);
+    // The status card owns the only retry; cached checks are labeled.
+    expect(find.text('Check again'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -303,7 +307,10 @@ void _registerDiagnosticsTests() {
     );
 
     // Stale data plus a real bad issue: attention wins, never the stale hero.
-    expect(find.text('P2WLAN needs attention'), findsOneWidget);
+    expect(
+      find.text('Default local connection needs attention'),
+      findsOneWidget,
+    );
     expect(find.text('Diagnostics data is stale'), findsNothing);
     expect(find.text('Re-authentication required'), findsWidgets);
     expect(tester.takeException(), isNull);

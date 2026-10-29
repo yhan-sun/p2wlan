@@ -10,6 +10,7 @@ import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/daemon/daemon_controller.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/presentation/network_overview.dart';
+import '../../core/rooms/room_profiles.dart';
 import '../../shared/network_overview_presentation.dart';
 import '../../shared/widgets/network_scope_picker.dart';
 import '../../core/state/settings_store.dart';
@@ -185,6 +186,10 @@ class _DashboardPageState extends State<DashboardPage> {
                 canControlLocalDaemon: capabilities.canControlLocalDaemon,
                 daemonBusy: widget.statusStore.daemonBusy,
                 initialProbePending: initialProbePending,
+                configuredRoom: isRoomNetwork(
+                  widget.settingsStore.settings.networkId,
+                ),
+                onOpenRooms: widget.onOpenRooms,
                 onStartDaemon: widget.statusStore.startDaemon,
                 onStopDaemon: widget.statusStore.stopPrimaryDaemon,
               )
@@ -260,6 +265,8 @@ class _DashboardPageState extends State<DashboardPage> {
             if (capabilities.canActAsLocalVpnNode &&
                 !showRoomOverview &&
                 snapshot == null &&
+                !(capabilities.canControlLocalDaemon &&
+                    status == _NetworkStatus.stopped) &&
                 widget.onOpenRooms != null) ...[
               const SizedBox(height: AppTokens.space12),
               _RoomEntryAction(onOpenRooms: widget.onOpenRooms!),

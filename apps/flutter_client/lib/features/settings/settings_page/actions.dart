@@ -148,16 +148,9 @@ extension _SettingsPageActions on _SettingsPageState {
         relayServers: relayServers,
         closeBehavior: closeBehavior,
       );
-      final restartRequiredNow =
-          daemonWasRunning &&
-          _daemonLaunchSettingsChanged(current, widget.settingsStore.settings);
       await widget.statusStore.refresh();
       if (mounted) {
         _updateState(() {
-          // A pending restart must survive unrelated saves: once a
-          // daemon-launch setting changed while the daemon was running, it
-          // stays sticky until the daemon is actually restarted.
-          _restartRequired = _restartRequired || restartRequiredNow;
           // Clear this category's errors on successful save.
           if (category == SettingsCategory.developer) {
             _diagnosticsError = null;
@@ -170,7 +163,7 @@ extension _SettingsPageActions on _SettingsPageState {
       }
       if (mounted) _resetCategory(category, afterSave: true);
       _showSnackBar(
-        _restartRequired
+        widget.statusStore.primaryConfigurationPending
             ? strings.settingsSavedRestartRequired
             : strings.diagnosticsUrlSaved,
       );
@@ -189,6 +182,15 @@ extension _SettingsPageActions on _SettingsPageState {
             ? strings.diagnosticsUrlNotSaved
             : strings.failedToSaveLocalSettings,
       );
+    } on SettingsCredentialRestoreException {
+      final message = strings.isZh
+          ? '配置保存失败，登录凭据未能恢复，请重新登录后再连接。'
+          : 'Settings could not be saved and your sign-in credential could not be restored. Sign in again before reconnecting.';
+      _updateState(() {
+        _formError = message;
+        _formErrorCategory = category;
+      });
+      _showSnackBar(message);
     } catch (error) {
       _updateState(() {
         _formError = strings.settingsSaveFailed;
@@ -230,26 +232,14 @@ extension _SettingsPageActions on _SettingsPageState {
         _showSnackBar(strings.tunnelRestartFailed);
         return;
       }
-      if (mounted) _updateState(() => _restartRequired = false);
-      _showSnackBar(strings.settingsApplied);
+      _showSnackBar(
+        widget.statusStore.primaryConfigurationPending
+            ? strings.settingsSavedRestartRequired
+            : strings.settingsApplied,
+      );
     } finally {
       if (mounted) _updateState(() => _saving = false);
     }
-  }
-
-  bool _daemonLaunchSettingsChanged(AppSettings before, AppSettings after) {
-    return before.controlServer != after.controlServer ||
-        before.authToken != after.authToken ||
-        before.networkId != after.networkId ||
-        before.virtualIp != after.virtualIp ||
-        before.deviceName != after.deviceName ||
-        before.tunInterface != after.tunInterface ||
-        before.overlayCidr != after.overlayCidr ||
-        before.mtu != after.mtu ||
-        before.udpBind != after.udpBind ||
-        before.udpAdvertise != after.udpAdvertise ||
-        before.socketPool != after.socketPool ||
-        before.relayServers != after.relayServers;
   }
 
   Future<void> _resetDiagnosticsUrl() async {

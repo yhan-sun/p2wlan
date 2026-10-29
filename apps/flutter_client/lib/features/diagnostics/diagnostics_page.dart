@@ -22,6 +22,7 @@ import '../../shared/formatters.dart';
 import '../../shared/permission_copy.dart';
 import '../../shared/log_tail.dart';
 import '../../shared/log_presentation.dart';
+import '../../shared/network_overview_presentation.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
@@ -31,6 +32,7 @@ part 'diagnostics/actions.dart';
 part 'diagnostics/advanced.dart';
 part 'diagnostics/checks.dart';
 part 'diagnostics/overview.dart';
+part 'diagnostics/rooms.dart';
 part 'diagnostics/issues.dart';
 part 'diagnostics/network.dart';
 part 'diagnostics/platform_panel.dart';
@@ -53,6 +55,7 @@ class DiagnosticsPage extends StatefulWidget {
     this.onOpenSettings,
     this.onReauthenticate,
     this.onOpenRooms,
+    this.onOpenRoom,
   });
 
   final StatusStore statusStore;
@@ -87,6 +90,7 @@ class DiagnosticsPage extends StatefulWidget {
   final VoidCallback? onOpenSettings;
   final VoidCallback? onReauthenticate;
   final VoidCallback? onOpenRooms;
+  final ValueChanged<String>? onOpenRoom;
 
   @override
   State<DiagnosticsPage> createState() => _DiagnosticsPageState();
@@ -131,6 +135,7 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
       builder: (context, _) {
         final statusStore = widget.statusStore;
         final snapshot = statusStore.snapshot;
+        final overview = NetworkOverview.read(statusStore);
         final model = buildDiagnosticsModel(
           strings: strings,
           healthReachable: statusStore.healthReachable,
@@ -142,12 +147,28 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
             _capabilities.canActAsLocalVpnNode &&
             _capabilities.canControlLocalDaemon;
         final refreshing = statusStore.refreshActivityVisible;
+        // The overview already explains these conditions. Keep distinct
+        // recovery issues without repeating the same warning and retry.
+        final visibleIssues = model.issues.where((issue) {
+          return !(model.overall == DiagnosticOverall.unavailable &&
+                  issue.kind == DiagnosticIssueKind.serviceUnavailable) &&
+              !(model.overall == DiagnosticOverall.stale &&
+                  issue.kind == DiagnosticIssueKind.stale);
+        }).toList();
         return PageScaffold(
           title: strings.troubleshooting,
           subtitle: strings.diagnosticsSubtitle,
           showHeader: widget.showHeader,
           maxWidth: diagnosticsPageMaxWidth,
           children: [
+            if (overview.hasRooms) ...[
+              _RoomConnectionsPanel(
+                scopes: overview.rooms.toList(),
+                onOpenRoom: widget.onOpenRoom,
+                onOpenRooms: widget.onOpenRooms,
+              ),
+              const SizedBox(height: AppTokens.space20),
+            ],
             Wrap(
               spacing: AppTokens.space12,
               runSpacing: AppTokens.space4,
@@ -162,16 +183,6 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                     color: Theme.of(context).colorScheme.onSurfaceVariant,
                   ),
                 ),
-                if (NetworkOverview.read(statusStore).hasRooms &&
-                    widget.onOpenRooms != null)
-                  TextButton.icon(
-                    key: const Key('diagnostics-open-rooms'),
-                    onPressed: widget.onOpenRooms,
-                    icon: const Icon(Icons.meeting_room_outlined, size: 17),
-                    label: Text(
-                      strings.isZh ? '查看独立房间连接' : 'Check room connections',
-                    ),
-                  ),
               ],
             ),
             const SizedBox(height: AppTokens.space10),
@@ -183,17 +194,17 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
             // Issues only appear when there is something to do; a healthy page
             // never shows a redundant "no issues" card (the status card above
             // already says everything is fine).
-            if (model.issues.isNotEmpty) ...[
+            if (visibleIssues.isNotEmpty) ...[
               const SizedBox(height: AppTokens.space14),
               _IssuesPanel(
-                issues: model.issues,
-                refreshing: refreshing,
-                onRecheck: statusStore.refresh,
+                issues: visibleIssues,
                 onOpenDevices: widget.onOpenDevices,
                 onOpenSettings: widget.onOpenSettings,
                 onReauthenticate: widget.onReauthenticate,
                 onOpenTechnicalDetails: _openAdvanced,
               ),
+            ],
+            if (model.issues.isNotEmpty) ...[
               const SizedBox(height: AppTokens.space8),
               _SupportTools(statusStore: statusStore),
             ],

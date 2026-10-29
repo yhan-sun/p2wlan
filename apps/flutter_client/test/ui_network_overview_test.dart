@@ -18,6 +18,7 @@ import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
 import 'package:p2wlan_flutter_client/features/dashboard/dashboard_page.dart';
+import 'package:p2wlan_flutter_client/features/diagnostics/diagnostics_page.dart';
 import 'package:p2wlan_flutter_client/features/nodes/nodes_page.dart';
 import 'package:p2wlan_flutter_client/shared/network_overview_presentation.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/app_nav_rail.dart';
@@ -165,6 +166,57 @@ Widget _app(Widget child, {double textScale = 1}) => AppStringsScope(
 );
 
 void main() {
+  for (final largeText in [false, true]) {
+    testWidgets('diagnostics keeps room recovery scoped (large: $largeText)', (
+      tester,
+    ) async {
+      final harness = (await tester.runAsync(_harness))!;
+      addTearDown(harness.dispose);
+      final failedRoom = harness.store.parallelRooms.session(_roomTwo)!;
+      failedRoom.phase = RoomConnectionPhase.failed;
+      failedRoom.snapshot = null;
+      final opened = <String>[];
+      await tester.binding.setSurfaceSize(
+        largeText ? const Size(390, 844) : const Size(800, 628),
+      );
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        _app(
+          DiagnosticsPage(statusStore: harness.store, onOpenRoom: opened.add),
+          textScale: largeText ? 2 : 1,
+        ),
+      );
+      expect(find.text('Room 1'), findsOneWidget);
+      expect(find.text('Room 2'), findsOneWidget);
+      expect(find.text('Running'), findsOneWidget);
+      expect(find.text('Connection failed'), findsOneWidget);
+      expect(find.text('Diagnostics unavailable'), findsOneWidget);
+      expect(find.text('Default local connection is healthy'), findsNothing);
+      expect(find.text('Check again'), findsOneWidget);
+      final action = find.byKey(ValueKey('diagnostics-room-$_roomTwo'));
+      await tester.ensureVisible(action);
+      await tester.pumpAndSettle();
+      await tester.tap(action);
+      expect(opened, [_roomTwo]);
+      expect(harness.store.parallelRooms.sessions, hasLength(2));
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('diagnostics labels an incomplete primary catalog as cached', (
+    tester,
+  ) async {
+    final harness = (await tester.runAsync(() => _harness(rooms: 0)))!;
+    addTearDown(harness.dispose);
+    harness.store.primary = _snapshot('default', 0, capturedMismatch: true);
+    await tester.pumpWidget(_app(DiagnosticsPage(statusStore: harness.store)));
+    expect(find.text('Diagnostics data is stale'), findsOneWidget);
+    expect(find.text('Last reported: Running normally'), findsOneWidget);
+    expect(find.text('Running normally'), findsNothing);
+    expect(find.text('Check again'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets(
     'disconnected device catalog explains its scope and opens rooms',
     (tester) async {

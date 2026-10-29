@@ -8,8 +8,6 @@ part of '../diagnostics_page.dart';
 class _IssuesPanel extends StatelessWidget {
   const _IssuesPanel({
     required this.issues,
-    required this.refreshing,
-    this.onRecheck,
     this.onOpenDevices,
     this.onOpenSettings,
     this.onReauthenticate,
@@ -17,8 +15,6 @@ class _IssuesPanel extends StatelessWidget {
   });
 
   final List<DiagnosticIssue> issues;
-  final bool refreshing;
-  final VoidCallback? onRecheck;
   final VoidCallback? onOpenDevices;
   final VoidCallback? onOpenSettings;
   final VoidCallback? onReauthenticate;
@@ -36,8 +32,6 @@ class _IssuesPanel extends StatelessWidget {
             if (index != 0) const SizedBox(height: AppTokens.space10),
             _IssueRow(
               issue: issues[index],
-              refreshing: refreshing,
-              onRecheck: onRecheck,
               onOpenDevices: onOpenDevices,
               onOpenSettings: onOpenSettings,
               onReauthenticate: onReauthenticate,
@@ -53,8 +47,6 @@ class _IssuesPanel extends StatelessWidget {
 class _IssueRow extends StatelessWidget {
   const _IssueRow({
     required this.issue,
-    required this.refreshing,
-    this.onRecheck,
     this.onOpenDevices,
     this.onOpenSettings,
     this.onReauthenticate,
@@ -62,8 +54,6 @@ class _IssueRow extends StatelessWidget {
   });
 
   final DiagnosticIssue issue;
-  final bool refreshing;
-  final VoidCallback? onRecheck;
   final VoidCallback? onOpenDevices;
   final VoidCallback? onOpenSettings;
   final VoidCallback? onReauthenticate;
@@ -141,12 +131,8 @@ class _IssueRow extends StatelessWidget {
       case DiagnosticIssueKind.stale:
       case DiagnosticIssueKind.serviceUnavailable:
       case DiagnosticIssueKind.statusUnavailable:
-        if (onRecheck == null) return null;
-        return OutlinedButton.icon(
-          onPressed: refreshing ? null : onRecheck,
-          icon: const Icon(Icons.refresh_rounded, size: 16),
-          label: Text(strings.checkAgain),
-        );
+        // The primary status card owns the one recheck action.
+        return null;
       case DiagnosticIssueKind.peerPath:
         if (onOpenDevices == null) return null;
         return OutlinedButton.icon(

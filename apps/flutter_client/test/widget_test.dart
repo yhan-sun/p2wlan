@@ -13,6 +13,7 @@ import 'package:p2wlan_flutter_client/features/dashboard/dashboard_page.dart';
 import 'package:p2wlan_flutter_client/features/auth/login_page.dart';
 import 'package:p2wlan_flutter_client/features/diagnostics/diagnostics_page.dart';
 import 'package:p2wlan_flutter_client/features/nodes/nodes_page.dart';
+import 'package:p2wlan_flutter_client/features/rooms/rooms_page.dart';
 import 'package:p2wlan_flutter_client/features/settings/settings_page.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/app_nav_rail.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/desktop_sidebar.dart';
@@ -519,6 +520,38 @@ void main() {
       settings.settingsStore.settings.controlServer,
       original.controlServer,
     );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('rooms reauthentication returns and replaces expired owner', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await _pumpTestApp(tester);
+    await tester.tap(find.text('房间').last);
+    await tester.pumpAndSettle();
+    final rooms = tester.widget<RoomsPage>(find.byType(RoomsPage));
+    final oldState = tester.state(find.byType(RoomsPage));
+    rooms.onReauthenticate!();
+    await tester.pumpAndSettle();
+    expect(find.byType(LoginPage), findsOneWidget);
+    tester.widget<LoginPage>(find.byType(LoginPage)).onCancel!();
+    await tester.pumpAndSettle();
+    expect(tester.state(find.byType(RoomsPage)), same(oldState));
+
+    // A successful credential refresh must discard the old page's API and
+    // cached account data, even though the selected section stays Rooms.
+    await tester.runAsync(
+      () => rooms.settingsStore.updateSettings(
+        rooms.settingsStore.settings.copyWith(authToken: 'renewed-test-token'),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(RoomsPage), findsOneWidget);
+    expect(tester.state(find.byType(RoomsPage)), isNot(same(oldState)));
     expect(tester.takeException(), isNull);
   });
 }

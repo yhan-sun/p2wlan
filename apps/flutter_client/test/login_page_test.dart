@@ -880,6 +880,57 @@ void main() {
     expect(stores.settingsStore.settings.authToken, isEmpty);
   });
 
+  for (final language in ['en', 'zh-Hans']) {
+    testWidgets(
+      'credential recovery failure explains sign in again in $language',
+      (tester) async {
+        final stores = (await tester.runAsync(_makeStores))!;
+        addTearDown(stores.dispose);
+        final fake = _FakeControlApi(
+          error: SettingsCredentialRestoreException(
+            StateError('private save detail'),
+            StateError('private restore detail'),
+          ),
+        );
+        await _pumpLogin(
+          tester,
+          stores,
+          controlApi: fake,
+          controlServer: 'https://control.example.com',
+          languageCode: language,
+        );
+        await tester.enterText(
+          find.byKey(const ValueKey('login-identifier')),
+          'demo@example.com',
+        );
+        await tester.enterText(
+          find.byKey(const ValueKey('login-password')),
+          'demo-password',
+        );
+        final submit = find.text(AppStrings.fromCode(language).signIn);
+        await tester.ensureVisible(submit);
+        await tester.tap(submit);
+        await tester.pumpAndSettle();
+        expect(
+          find.text(
+            language == 'en'
+                ? 'Settings could not be saved and your sign-in credential could not be restored. Sign in again before reconnecting.'
+                : '配置保存失败，登录凭据未能恢复，请重新登录后再连接。',
+          ),
+          findsOneWidget,
+        );
+        expect(find.textContaining('private restore detail'), findsNothing);
+        expect(
+          tester
+              .widget<TextField>(find.byKey(const ValueKey('login-identifier')))
+              .controller!
+              .text,
+          'demo@example.com',
+        );
+      },
+    );
+  }
+
   for (final size in const [Size(390, 844), Size(700, 1000), Size(1280, 900)]) {
     testWidgets('layout fits ${size.width.toInt()}x${size.height.toInt()}', (
       tester,

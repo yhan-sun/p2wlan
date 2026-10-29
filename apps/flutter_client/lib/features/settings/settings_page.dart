@@ -40,6 +40,7 @@ typedef _SettingsStatusProjection = ({
   bool daemonBusy,
   bool daemonReachable,
   bool refreshActivityVisible,
+  bool primaryConfigurationPending,
   String daemonBuildSignature,
 });
 
@@ -150,7 +151,6 @@ class _SettingsPageState extends State<SettingsPage> {
   var _saving = false;
   SettingsCategory? _savingCategory;
   var _socketPool = defaultSocketPool;
-  var _restartRequired = false;
   var _closeBehavior = defaultCloseBehavior;
   var _showTokenField = false;
   var _uploadingLogs = false;
@@ -293,6 +293,7 @@ class _SettingsPageState extends State<SettingsPage> {
       daemonBusy: store.daemonBusy,
       daemonReachable: store.daemonReachable,
       refreshActivityVisible: store.refreshActivityVisible,
+      primaryConfigurationPending: store.primaryConfigurationPending,
       daemonBuildSignature: build == null
           ? ''
           : [
@@ -326,8 +327,8 @@ class _SettingsPageState extends State<SettingsPage> {
   /// True when any visible category has unsaved drafts (excludes immediate-save
   /// language/theme which never count as dirty).
   bool get _anyCategoryDirty {
-    // The store publishes the proposed value before disk persistence finishes.
-    // Keep the leave guard active until this category's save has completed.
+    // Keep the leave guard active through persistence and the subsequent
+    // status refresh, until the category's save operation has completed.
     if (_savingCategory != null) return true;
     if (_usernameController.isDirty) return true;
     for (final category in _visibleCategories) {

@@ -245,7 +245,6 @@ class _SidebarFooter extends StatelessWidget {
           StatusTone.bad => colors.dangerDot,
           StatusTone.neutral => colors.neutralDot,
         };
-        final wrapStatus = MediaQuery.textScalerOf(context).scale(13) > 18;
         final description = '$label, $detail';
         return Semantics(
           label: description,
@@ -298,10 +297,6 @@ class _SidebarFooter extends StatelessWidget {
                                     children: [
                                       Text(
                                         label,
-                                        maxLines: wrapStatus ? null : 1,
-                                        overflow: wrapStatus
-                                            ? TextOverflow.visible
-                                            : TextOverflow.ellipsis,
                                         style: TextStyle(
                                           fontSize: 13,
                                           fontWeight: FontWeight.w600,
@@ -311,10 +306,6 @@ class _SidebarFooter extends StatelessWidget {
                                       const SizedBox(height: 2),
                                       Text(
                                         detail,
-                                        maxLines: wrapStatus ? null : 1,
-                                        overflow: wrapStatus
-                                            ? TextOverflow.visible
-                                            : TextOverflow.ellipsis,
                                         style: TextStyle(
                                           fontSize: 12,
                                           color: theme

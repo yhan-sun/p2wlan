@@ -23,6 +23,7 @@ final _token =
     'a.${base64Url.encode(utf8.encode(jsonEncode({'user_id': 'member'})))}.b';
 
 const _roomId = 'room-0123456789abcdef0123456789abcdef';
+const _expired = RoomException('登录状态已失效，请重新登录', code: 'auth_expired');
 Map<String, dynamic> _room(String role) => {
   'id': _roomId,
   'room_code': '12345678',
@@ -45,6 +46,13 @@ class _FakeRoomApi extends RoomApi {
   bool deviceOnline = true;
   String? joinError;
   String? listError;
+  RoomException? listException;
+  RoomException? rosterException;
+  RoomException? inviteException;
+  RoomException? joinException;
+  RoomException? mutationException;
+  Completer<Map<String, dynamic>>? pendingMutation;
+  final bannedUserIds = <String>[];
   Completer<Map<String, dynamic>>? pendingDeviceAction;
   Completer<Map<String, dynamic>>? pendingInvite;
   Completer<FriendRoom>? pendingJoin;
@@ -59,6 +67,7 @@ class _FakeRoomApi extends RoomApi {
   Future<List<FriendRoom>> list() async {
     listCalls++;
     if (pendingList != null) return pendingList!.future;
+    if (listException != null) throw listException!;
     if (listError != null) throw RoomException(listError!);
     userId = role == 'owner' ? 'owner' : 'member';
     return empty
@@ -79,6 +88,7 @@ class _FakeRoomApi extends RoomApi {
   @override
   Future<RoomRoster> roster(String room) async {
     rosterCalls++;
+    if (rosterException != null) throw rosterException!;
     if (rosterError != null) throw RoomException(rosterError!);
     return RoomRoster.fromJson({
       'room': {..._room(role), if (controls) 'device_controls_version': 1},
@@ -109,7 +119,7 @@ class _FakeRoomApi extends RoomApi {
           'online': deviceOnline,
         },
       ],
-      'banned_user_ids': [],
+      'banned_user_ids': bannedUserIds,
     });
   }
 
@@ -120,6 +130,13 @@ class _FakeRoomApi extends RoomApi {
     Map<String, dynamic>? payload,
   ]) async {
     calls.add('$method ${segments.join('/')} ${jsonEncode(payload)}');
+    if (method != 'GET' && pendingMutation != null) {
+      return pendingMutation!.future;
+    }
+    if (method != 'GET' && mutationException != null) throw mutationException!;
+    if (method == 'DELETE' && segments.contains('bans')) {
+      bannedUserIds.remove(segments.last);
+    }
     if (method == 'POST' && segments.contains('device-access')) {
       if (pendingDeviceAction != null) return pendingDeviceAction!.future;
       accessState = segments.last == 'block' ? 'blocked' : 'paused';
@@ -133,6 +150,7 @@ class _FakeRoomApi extends RoomApi {
       return pendingInvite!.future;
     }
     if (method == 'GET' && segments.last == 'invites') {
+      if (inviteException != null) throw inviteException!;
       if (inviteError != null) throw RoomException(inviteError!);
       return {'invites': []};
     }
@@ -154,6 +172,7 @@ class _FakeRoomApi extends RoomApi {
   }) async {
     calls.add('join:$code:$password:$invitation');
     if (pendingJoin != null) return pendingJoin!.future;
+    if (joinException != null) throw joinException!;
     if (joinError != null) throw RoomException(joinError!);
     empty = false;
     return FriendRoom.fromJson(_room('member'));
@@ -269,6 +288,7 @@ void main() {
     bool shell = false,
     bool enterRoom = true,
     bool settleInitial = true,
+    VoidCallback? onReauthenticate,
     bool enableDaemonPolling = false,
     bool controls = false,
     bool canConnect = false,
@@ -371,6 +391,7 @@ void main() {
                 settingsStore: settings,
                 statusStore: status,
                 api: api,
+                onReauthenticate: onReauthenticate,
                 capabilities: PlatformCapabilities.fromPlatform(
                   canConnect ? 'linux' : 'ios',
                 ),
@@ -385,6 +406,289 @@ void main() {
     }
     return api;
   }
+
+  testWidgets(
+    'expired room login pauses polling, keeps context and permits local disconnect',
+    (tester) async {
+      var reauthenticationCalls = 0;
+      late VoidCallback statusPulse;
+      late ParallelRooms parallel;
+      final api = await pump(
+        tester,
+        canConnect: true,
+        snapshot: _snapshot(),
+        onReauthenticate: () => reauthenticationCalls++,
+        onStatusPulse: (pulse) => statusPulse = pulse,
+        onStores: (_, _, _, rooms) => parallel = rooms,
+      );
+      api.listException = _expired;
+      await tester.tap(find.byTooltip('刷新房间'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('自动刷新已暂停'), findsOneWidget);
+      expect(find.text('10.21.1.3'), findsOneWidget);
+      expect(find.byKey(const ValueKey('retry-room-roster')), findsOneWidget);
+      final callsAfterFailure = api.listCalls;
+      statusPulse();
+      await tester.pump(const Duration(seconds: 30));
+      await tester.pumpAndSettle();
+      expect(api.listCalls, callsAfterFailure);
+      await tester.ensureVisible(find.text('重新登录'));
+      await tester.tap(find.text('重新登录'));
+      expect(reauthenticationCalls, 1);
+      final connection = find.byKey(
+        const ValueKey('room-detail-connection-$_roomId'),
+      );
+      await tester.ensureVisible(connection);
+      await tester.pumpAndSettle();
+      expect(tester.widget<FilledButton>(connection).onPressed, isNotNull);
+      await tester.tap(connection);
+      await tester.pumpAndSettle();
+      expect(parallel.session(_roomId), isNull);
+      expect(api.listCalls, callsAfterFailure);
+      expect(tester.widget<FilledButton>(connection).onPressed, isNull);
+      api.listException = null;
+      await tester.ensureVisible(find.text('重试验证登录'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('重试验证登录'));
+      await tester.pumpAndSettle();
+      expect(find.text('重新登录'), findsNothing);
+      final callsAfterRecovery = api.listCalls;
+      expect(callsAfterRecovery, callsAfterFailure + 1);
+      await tester.pump(const Duration(seconds: 6));
+      await tester.pumpAndSettle();
+      expect(api.listCalls, greaterThan(callsAfterRecovery));
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets('an older refresh cannot clear a newer authentication failure', (
+    tester,
+  ) async {
+    final api = await pump(tester, onReauthenticate: () {});
+    final mutation = Completer<Map<String, dynamic>>();
+    api.pendingMutation = mutation;
+    await tester.ensureVisible(find.text('房间设置'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('房间设置'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('锁定新成员加入'));
+    await tester.tap(find.text('锁定新成员加入'));
+    await tester.pump();
+    final oldList = Completer<List<FriendRoom>>();
+    api.pendingList = oldList;
+    // Pull-to-refresh can start while a server mutation is pending. Its view
+    // generation is newer, but its authentication evidence is still older.
+    final refresh = tester
+        .widget<RefreshIndicator>(find.byType(RefreshIndicator))
+        .onRefresh();
+    await tester.pump();
+    mutation.completeError(_expired);
+    await tester.pumpAndSettle();
+    expect(find.text('重新登录'), findsOneWidget);
+    api.pendingList = null;
+    oldList.complete([FriendRoom.fromJson(_room('owner'))]);
+    await refresh;
+    await tester.pumpAndSettle();
+    expect(find.text('重新登录'), findsOneWidget);
+    expect(find.byKey(const ValueKey('retry-room-roster')), findsOneWidget);
+    final calls = api.listCalls;
+    await tester.pump(const Duration(seconds: 15));
+    await tester.pumpAndSettle();
+    expect(api.listCalls, calls);
+    api.rosterError = '成员信息仍暂不可用';
+    await tester.ensureVisible(find.text('重试验证登录'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('重试验证登录'));
+    await tester.pumpAndSettle();
+    expect(find.text('重新登录'), findsOneWidget);
+    api.rosterError = null;
+    api.inviteError = '邀请信息仍暂不可用';
+    await tester.ensureVisible(find.text('重试验证登录'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('重试验证登录'));
+    await tester.pumpAndSettle();
+    expect(find.text('重新登录'), findsOneWidget);
+    api.inviteError = null;
+    await tester.ensureVisible(find.text('重试验证登录'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('重试验证登录'));
+    await tester.pumpAndSettle();
+    expect(find.text('重新登录'), findsNothing);
+    final recoveredCalls = api.listCalls;
+    await tester.pump(const Duration(seconds: 6));
+    await tester.pumpAndSettle();
+    expect(api.listCalls, greaterThan(recoveredCalls));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  for (final source in ['roster', 'invites']) {
+    testWidgets(
+      '$source authentication failure offers login and pauses automatic retries',
+      (tester) async {
+        final api = await pump(
+          tester,
+          enterRoom: source != 'roster',
+          onReauthenticate: () {},
+          configureApi: (api) {
+            if (source == 'roster') {
+              api.rosterException = _expired;
+            } else {
+              api.inviteException = _expired;
+            }
+          },
+        );
+        expect(find.text('重新登录'), findsOneWidget);
+        expect(find.text('和好友连接到同一房间'), findsNothing);
+        expect(find.textContaining('尚未生成邀请'), findsNothing);
+        final calls = api.listCalls;
+        await tester.pump(const Duration(seconds: 15));
+        await tester.pumpAndSettle();
+        expect(api.listCalls, calls);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
+
+  testWidgets(
+    'join authentication failure closes its form and offers the shared recovery action',
+    (tester) async {
+      final api = await pump(tester, empty: true, onReauthenticate: () {});
+      api.joinException = _expired;
+      await tester.tap(find.text('加入房间'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(const ValueKey('房间号')), '12345678');
+      await tester.enterText(find.byKey(const ValueKey('房间密码')), 'password123');
+      await tester.tap(find.text('确认'));
+      await tester.pumpAndSettle();
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(find.text('重新登录'), findsOneWidget);
+      expect(find.text('返回房间'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'server mutation authentication failure is kept as a recovery state',
+    (tester) async {
+      final api = await pump(tester, onReauthenticate: () {});
+      api.mutationException = _expired;
+      await tester.ensureVisible(find.text('房间设置'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('房间设置'));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('锁定新成员加入'));
+      await tester.tap(find.text('锁定新成员加入'));
+      await tester.pumpAndSettle();
+      expect(find.text('重新登录'), findsOneWidget);
+      final calls = api.listCalls;
+      await tester.pump(const Duration(seconds: 15));
+      await tester.pumpAndSettle();
+      expect(api.listCalls, calls);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'banned accounts use full unique IDs and repeat the chosen target before unbanning',
+    (tester) async {
+      tester.view.physicalSize = const Size(360, 1000);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      const first = 'account-shared-prefix-00000000-aaaaaaaa';
+      const second = 'account-shared-prefix-00000000-bbbbbbbb';
+      final api = await pump(
+        tester,
+        textScale: 1.5,
+        configureApi: (api) => api.bannedUserIds.addAll([first, second]),
+      );
+      await tester.ensureVisible(find.text('邀请管理'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('邀请管理'));
+      await tester.pumpAndSettle();
+      expect(find.text(first), findsOneWidget);
+      expect(find.text(second), findsOneWidget);
+      final action = find.byTooltip('解除账号 $second 的封禁');
+      await tester.ensureVisible(action);
+      await tester.pumpAndSettle();
+      await tester.tap(action);
+      await tester.pumpAndSettle();
+      expect(find.textContaining('解除账号 $second 的封禁后'), findsOneWidget);
+      expect(find.textContaining('解除账号 $first 的封禁后'), findsNothing);
+      await tester.tap(find.text('确认'));
+      await tester.pumpAndSettle();
+      expect(
+        api.calls.where((call) => call.startsWith('DELETE $_roomId/bans/')),
+        ['DELETE $_roomId/bans/$second null'],
+      );
+      expect(api.bannedUserIds, [first]);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  for (final restoreToken in [false, true]) {
+    testWidgets(
+      'late authentication failure cannot pause another session (restore token: $restoreToken)',
+      (tester) async {
+        late SettingsStore settings;
+        final api = await pump(
+          tester,
+          enterRoom: false,
+          onReauthenticate: () {},
+          onStores: (store, _, _, _) => settings = store,
+        );
+        final pending = Completer<List<FriendRoom>>();
+        api.pendingList = pending;
+        await tester.tap(find.byTooltip('刷新房间'));
+        await tester.pump();
+        await tester.runAsync(() async {
+          await settings.updateSettings(
+            settings.settings.copyWith(authToken: '${_token}new'),
+          );
+          if (restoreToken) {
+            await settings.updateSettings(
+              settings.settings.copyWith(authToken: _token),
+            );
+          }
+        });
+        api.pendingList = null;
+        pending.completeError(_expired);
+        await tester.pumpAndSettle();
+        expect(find.text('重新登录'), findsNothing);
+        expect(find.textContaining('自动刷新已暂停'), findsNothing);
+        if (restoreToken) {
+          final calls = api.listCalls;
+          await tester.pump(const Duration(seconds: 6));
+          await tester.pumpAndSettle();
+          expect(api.listCalls, greaterThan(calls));
+        }
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
+
+  testWidgets(
+    'authentication wording without its typed code does not stop polling',
+    (tester) async {
+      final api = await pump(tester, enterRoom: false, onReauthenticate: () {});
+      api.listError = _expired.message;
+      await tester.tap(find.byTooltip('刷新房间'));
+      await tester.pumpAndSettle();
+      expect(find.text('重新登录'), findsNothing);
+      final calls = api.listCalls;
+      await tester.pump(const Duration(seconds: 6));
+      await tester.pumpAndSettle();
+      expect(api.listCalls, greaterThan(calls));
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
 
   testWidgets('creation waits until initial ownership is known', (
     tester,
@@ -1036,7 +1340,10 @@ void main() {
   testWidgets('invite failure does not hide a successful room roster', (
     tester,
   ) async {
-    await pump(tester, configureApi: (api) => api.inviteError = '邀请请求失败');
+    final api = await pump(
+      tester,
+      configureApi: (api) => api.inviteError = '邀请请求失败',
+    );
     expect(find.text('10.21.1.3'), findsOneWidget);
     await tester.ensureVisible(find.text('邀请管理'));
     await tester.pumpAndSettle();
@@ -1044,6 +1351,14 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('邀请信息更新失败'), findsOneWidget);
     expect(find.text('邀请请求失败'), findsOneWidget);
+    expect(find.textContaining('尚未生成邀请'), findsNothing);
+    api.inviteError = null;
+    await tester.ensureVisible(find.text('重试'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('重试'));
+    await tester.pumpAndSettle();
+    expect(find.text('邀请信息更新失败'), findsNothing);
+    expect(find.textContaining('尚未生成邀请'), findsOneWidget);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 

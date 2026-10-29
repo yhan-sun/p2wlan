@@ -75,6 +75,32 @@ void main() {
       expect(model.issues.single.kind, DiagnosticIssueKind.serviceUnavailable);
     });
 
+    for (final mismatch in [false, true]) {
+      test(
+        'incomplete catalog is cached (revision mismatch: $mismatch)',
+        () async {
+          final snapshot = mutate(await loadFixture(), (raw) {
+            clearPeerErrors(raw);
+            raw['revision'] = 8;
+            raw['captured_revision'] = mismatch ? 7 : 8;
+            raw['peer_snapshot_stale'] = !mismatch;
+            return raw;
+          });
+          final model = build(snapshot: snapshot);
+          expect(model.overall, DiagnosticOverall.stale);
+          expect(model.issues.single.kind, DiagnosticIssueKind.stale);
+          expect(
+            model.checks.map((check) => check.severity),
+            everyElement(DiagnosticSeverity.neutral),
+          );
+          expect(
+            model.checks.map((check) => check.value),
+            everyElement(startsWith('Last reported: ')),
+          );
+        },
+      );
+    }
+
     test('status unavailable when health reachable but no snapshot', () async {
       final model = build(healthReachable: true, snapshot: null);
       expect(model.overall, DiagnosticOverall.attention);
