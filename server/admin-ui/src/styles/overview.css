@@ -118,7 +118,7 @@
   .overview-details > summary { padding-right: 16px; padding-left: 16px; }
   .overview-details-body, .overview-snapshot-notice { padding-right: 16px; padding-left: 16px; }
   .overview-evidence { padding-right: 16px; padding-left: 16px; gap: 12px; }
-  .overview-evidence > div { padding-left: 12px; }
+  .overview-evidence > div { padding-left: 12px; flex-direction: column; align-items: flex-start; gap: 6px; }
 }
 @media (max-width: 560px) {
   .overview-page .console-page-header { align-items: flex-start; }
