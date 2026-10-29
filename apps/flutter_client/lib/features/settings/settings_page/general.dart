@@ -17,6 +17,10 @@ class _GeneralSection extends StatelessWidget {
           children: [
             _SettingsField(
               controller: state._deviceNameController,
+              focusNode: state._focusFor(state._deviceNameController),
+              errorText: state._fieldErrors[state._deviceNameController],
+              onChanged: (_) =>
+                  state._clearFieldError(state._deviceNameController),
               label: strings.deviceName,
               helper: strings.deviceNameHelper,
               textInputAction: TextInputAction.done,

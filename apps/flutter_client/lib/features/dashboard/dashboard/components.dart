@@ -38,10 +38,10 @@ class _NetworkComponentsSection extends StatelessWidget {
         ),
       _ComponentRow(
         label: strings.componentPeerConnectivity,
-        value: '${counts.online} / ${counts.total}',
+        value: '${counts.direct + counts.relay} / ${counts.total}',
         tone: counts.total == 0
             ? StatusTone.neutral
-            : counts.online == counts.total
+            : counts.direct + counts.relay == counts.total
             ? StatusTone.good
             : StatusTone.warn,
       ),
@@ -52,8 +52,6 @@ class _NetworkComponentsSection extends StatelessWidget {
       children: [
         Text(
           strings.networkComponents,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
           style: TextStyle(
             color: theme.colorScheme.onSurface,
             fontSize: 15,
@@ -66,6 +64,10 @@ class _NetworkComponentsSection extends StatelessWidget {
           if (index > 0) const SizedBox(height: AppTokens.space10),
           rows[index],
         ],
+        const SizedBox(height: AppTokens.space12),
+        const Divider(height: 1),
+        const SizedBox(height: AppTokens.space12),
+        _NatSummary(natProfile: snapshot.natProfile),
       ],
     );
   }
@@ -110,6 +112,47 @@ class _ComponentRow extends StatelessWidget {
     final text = _tonePanelColors(context, tone).text;
     return LayoutBuilder(
       builder: (context, constraints) {
+        if (MediaQuery.textScalerOf(context).scale(13) > 18) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontSize: 13,
+                  height: 1.4,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Container(
+                    width: 7,
+                    height: 7,
+                    decoration: BoxDecoration(
+                      color: text,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 7),
+                  Expanded(
+                    child: Text(
+                      value,
+                      style: TextStyle(
+                        color: text,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        height: 1.4,
+                        fontFeatures: AppTokens.tabularFontFeatures,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          );
+        }
         // Keep the status group anchored to the same right edge for every row.
         // It stays compact on a narrow window while remaining flush with the
         // section's right content edge on desktop.
@@ -168,6 +211,55 @@ class _ComponentRow extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+}
+
+/// NAT is context for connection checks rather than a primary health metric.
+class _NatSummary extends StatelessWidget {
+  const _NatSummary({required this.natProfile});
+  final NatProfileSnapshot? natProfile;
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final nat = natProfile;
+    final natValue = nat == null
+        ? '—'
+        : strings.natTraversalTypeCompactLabel(nat.displayTraversalType);
+    final tooltip = nat == null
+        ? strings.natDetectionUnavailable
+        : nat.displayTypeIsConservativeFallback
+        ? strings.natTypeConservativeFallbackDetail
+        : nat.traversalType == NatTraversalType.unknown
+        ? strings.natTypeDetectionInProgressDetail
+        : strings.natTraversalTypeLabel(nat.displayTraversalType);
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            strings.natType,
+            style: TextStyle(
+              fontSize: 12,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Flexible(
+          child: Tooltip(
+            key: const Key('dashboard-nat-type'),
+            message: tooltip,
+            child: Text(
+              natValue,
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+              textAlign: TextAlign.end,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

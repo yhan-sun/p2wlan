@@ -10,7 +10,6 @@ class _PreferenceRow extends StatelessWidget {
     this.value,
     this.onTap,
     this.trailing,
-    this.leading,
     this.showDivider = true,
   });
 
@@ -24,7 +23,6 @@ class _PreferenceRow extends StatelessWidget {
   /// Optional explicit control (switch, dropdown, …); when present it wins
   /// over [value].
   final Widget? trailing;
-  final Widget? leading;
   final bool showDivider;
 
   @override
@@ -34,10 +32,6 @@ class _PreferenceRow extends StatelessWidget {
     final labelContent = Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        if (leading != null) ...[
-          leading!,
-          const SizedBox(width: AppTokens.space12),
-        ],
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -115,10 +109,10 @@ class _PreferenceRow extends StatelessWidget {
           ),
           child: LayoutBuilder(
             builder: (context, constraints) {
-              final stack =
-                  trailing != null &&
-                  (constraints.maxWidth < 500 ||
-                      MediaQuery.textScalerOf(context).scale(14) > 18);
+              final largeText = MediaQuery.textScalerOf(context).scale(14) > 18;
+              final stack = trailing != null
+                  ? constraints.maxWidth < 500 || largeText
+                  : value != null && (constraints.maxWidth < 300 || largeText);
               if (stack) {
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -177,7 +171,7 @@ class _SettingsSurface extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = P2WlanColors.of(context);
-    final radius = BorderRadius.circular(AppTokens.radiusLg);
+    final radius = BorderRadius.circular(12);
     return Container(
       decoration: BoxDecoration(borderRadius: radius),
       child: Material(
@@ -220,7 +214,7 @@ class _DetailHeader extends StatelessWidget {
             title,
             style: TextStyle(
               fontSize: 18,
-              fontWeight: FontWeight.w600,
+              fontWeight: FontWeight.w700,
               color: theme.colorScheme.onSurface,
             ),
           ),
@@ -265,34 +259,36 @@ class _SettingsGroup extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Padding(
-      padding: const EdgeInsets.only(bottom: 24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Text(
-            title,
-            style: theme.textTheme.titleSmall?.copyWith(
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          if (subtitle != null) ...[
-            const SizedBox(height: 4),
+      padding: const EdgeInsets.only(bottom: 16),
+      child: _SettingsSurface(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
             Text(
-              subtitle!,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
+              title,
+              style: TextStyle(
+                fontSize: 14,
+                height: 1.3,
+                fontWeight: FontWeight.w600,
+                color: theme.colorScheme.onSurface,
               ),
             ),
+            if (subtitle != null) ...[
+              const SizedBox(height: 4),
+              Text(
+                subtitle!,
+                style: TextStyle(
+                  fontSize: 12,
+                  height: 1.45,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+            const SizedBox(height: 18),
+            ...children,
           ],
-          const SizedBox(height: 10),
-          _SettingsSurface(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: children,
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -354,6 +350,8 @@ class _SettingsField extends StatelessWidget {
     this.errorText,
     this.onSubmitted,
     this.textInputAction,
+    this.focusNode,
+    this.onChanged,
   });
 
   final TextEditingController controller;
@@ -365,6 +363,8 @@ class _SettingsField extends StatelessWidget {
   final String? errorText;
   final ValueChanged<String>? onSubmitted;
   final TextInputAction? textInputAction;
+  final FocusNode? focusNode;
+  final ValueChanged<String>? onChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -374,6 +374,8 @@ class _SettingsField extends StatelessWidget {
         constraints: const BoxConstraints(maxWidth: 640),
         child: TextField(
           controller: controller,
+          focusNode: focusNode,
+          onChanged: onChanged,
           keyboardType: keyboardType,
           textInputAction: textInputAction,
           obscureText: obscureText,
@@ -434,7 +436,9 @@ class _SaveBar extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                strings.unsavedChanges,
+                busy
+                    ? (strings.isZh ? '正在保存更改' : 'Saving changes')
+                    : strings.unsavedChanges,
                 style: TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
@@ -462,7 +466,9 @@ class _SaveBar extends StatelessWidget {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
                 : const Icon(Icons.save_outlined, size: 16),
-            label: Text(strings.saveChanges),
+            label: Text(
+              busy ? (strings.isZh ? '保存中…' : 'Saving…') : strings.saveChanges,
+            ),
           );
           final actions = Wrap(
             alignment: WrapAlignment.end,

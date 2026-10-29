@@ -30,7 +30,9 @@ void _registerDiagnosticsTests() {
       expect(find.text('System status'), findsOneWidget);
       expect(find.text('P2WLAN is running normally'), findsOneWidget);
       expect(
-        find.text('No issues found that need your attention.'),
+        find.text(
+          'The default local service reports no issues. Verify application connectivity using the virtual IP.',
+        ),
         findsOneWidget,
       );
       expect(find.text('Check again'), findsOneWidget);
@@ -350,6 +352,46 @@ void _registerDiagnosticsTests() {
   });
 
   testWidgets(
+    'reauth action signs in directly and exposes one support summary',
+    (tester) async {
+      final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final expired = _mutateSnapshot(snapshot, (raw) {
+        raw['health']['reauth_required'] = true;
+        return raw;
+      });
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: true, snapshot: expired),
+        ),
+      ))!;
+      addTearDown(stores.dispose);
+      await stores.statusStore.refresh();
+      var signedIn = false;
+      var openedSettings = false;
+      await tester.pumpWidget(
+        _TestApp(
+          child: DiagnosticsPage(
+            statusStore: stores.statusStore,
+            capabilities: PlatformCapabilities.fromPlatform('ios'),
+            onOpenSettings: () => openedSettings = true,
+            onReauthenticate: () => signedIn = true,
+          ),
+        ),
+      );
+      await tester.ensureVisible(
+        find.byKey(const Key('diagnostics-reauthenticate')),
+      );
+      await tester.tap(find.byKey(const Key('diagnostics-reauthenticate')));
+      expect(signedIn, isTrue);
+      expect(openedSettings, isFalse);
+      expect(find.text('Copy diagnostics summary'), findsOneWidget);
+      await _expandAdvanced(tester);
+      expect(find.text('Copy diagnostics summary'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
     'critical task errors stay out of the default view and redacted',
     (tester) async {
       final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
@@ -593,8 +635,8 @@ void _registerDiagnosticsTests() {
       ),
     );
 
-    // Copy is demoted to Advanced → Support tools, not the page's first action.
-    expect(find.text('Copy diagnostics summary'), findsNothing);
+    // A reported peer issue exposes the redacted summary beside recovery.
+    expect(find.text('Copy diagnostics summary'), findsOneWidget);
     await _expandAdvanced(tester);
     expect(find.text('Copy diagnostics summary'), findsOneWidget);
 

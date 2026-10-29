@@ -52,28 +52,35 @@ class _DetailLine extends StatelessWidget {
 /// near the top of the detail surface. The first level remains quiet; opening
 /// a device is what reveals its path and verified latency.
 class _ConnectionSummary extends StatelessWidget {
-  const _ConnectionSummary({required this.peer, required this.strings});
+  const _ConnectionSummary({
+    required this.peer,
+    required this.strings,
+    required this.current,
+  });
 
   final PeerSnapshot peer;
   final AppStrings strings;
+  final bool current;
 
   @override
   Widget build(BuildContext context) {
     final colors = P2WlanColors.of(context);
-    final pathColor = _rowStatusColor(context, peer);
+    final pathColor = current
+        ? _rowStatusColor(context, peer)
+        : colors.warningText;
     return LayoutBuilder(
       builder: (context, constraints) {
         final metrics = [
           _DetailMetric(
             icon: Icons.route_outlined,
             label: strings.connectionType,
-            value: _connectionLabel(strings, peer),
+            value: current ? _connectionLabel(strings, peer) : strings.stale,
             valueColor: pathColor,
           ),
           _DetailMetric(
             icon: Icons.speed_rounded,
             label: strings.latency,
-            value: formatLatency(peer.latencyMs),
+            value: formatLatency(current ? peer.latencyMs : null),
           ),
         ];
         return Container(
@@ -195,6 +202,7 @@ class _PeerDetailsContent extends StatelessWidget {
   const _PeerDetailsContent({
     required this.peer,
     required this.strings,
+    this.current = true,
     this.copiedKey,
     this.busy = false,
     this.onCopy,
@@ -205,6 +213,7 @@ class _PeerDetailsContent extends StatelessWidget {
 
   final PeerSnapshot peer;
   final AppStrings strings;
+  final bool current;
   final String? copiedKey;
   final bool busy;
   final Future<void> Function(String value, String key)? onCopy;
@@ -218,9 +227,9 @@ class _PeerDetailsContent extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _DetailHeader(peer: peer, strings: strings),
+        _DetailHeader(peer: peer, strings: strings, current: current),
         const SizedBox(height: AppTokens.space12),
-        _ConnectionSummary(peer: peer, strings: strings),
+        _ConnectionSummary(peer: peer, strings: strings, current: current),
         const SizedBox(height: AppTokens.space12),
         _DetailSection(
           key: const Key('peer-detail-network-card'),
@@ -257,7 +266,7 @@ class _PeerDetailsContent extends StatelessWidget {
             onCopy: onCopy,
             onEdit: onEdit,
             onDelete: onDelete,
-            onSpeedTest: onSpeedTest,
+            onSpeedTest: current ? onSpeedTest : null,
           ),
         ],
       ],
@@ -268,16 +277,25 @@ class _PeerDetailsContent extends StatelessWidget {
 /// Header answers the three first questions: who is it, is it online, how is
 /// it connected. No Node ID, no version, no raw state on the first level.
 class _DetailHeader extends StatelessWidget {
-  const _DetailHeader({required this.peer, required this.strings});
+  const _DetailHeader({
+    required this.peer,
+    required this.strings,
+    required this.current,
+  });
 
   final PeerSnapshot peer;
   final AppStrings strings;
+  final bool current;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = P2WlanColors.of(context);
-    final statusLabel = peer.online ? strings.online : strings.offline;
+    final statusLabel = !current
+        ? strings.stale
+        : peer.online
+        ? strings.online
+        : strings.offline;
     return Container(
       key: const Key('peer-detail-header'),
       width: double.infinity,
@@ -339,7 +357,11 @@ class _DetailHeader extends StatelessWidget {
           const SizedBox(width: AppTokens.space10),
           StatusBadge(
             label: statusLabel,
-            tone: peer.online ? StatusTone.good : StatusTone.neutral,
+            tone: !current
+                ? StatusTone.warn
+                : peer.online
+                ? StatusTone.good
+                : StatusTone.neutral,
           ),
         ],
       ),
@@ -878,6 +900,7 @@ class DeviceDetailsDialog extends StatelessWidget {
     Widget details(PeerSnapshot currentPeer) => _PeerDetailsContent(
       peer: currentPeer,
       strings: strings,
+      current: _primaryPeerCurrent(statusStore, currentPeer.nodeId),
       copiedKey: copiedKey,
       busy: busyPeerId == currentPeer.nodeId,
       onCopy: onCopy,
@@ -1018,6 +1041,7 @@ class _MobilePeerDetails extends StatelessWidget {
     Widget details(PeerSnapshot currentPeer) => _PeerDetailsContent(
       peer: currentPeer,
       strings: strings,
+      current: _primaryPeerCurrent(statusStore, currentPeer.nodeId),
       copiedKey: copiedKey,
       busy: busyPeerId == currentPeer.nodeId,
       onCopy: onCopy,
@@ -1072,6 +1096,12 @@ class _MobilePeerDetails extends StatelessWidget {
     );
   }
 }
+
+bool _primaryPeerCurrent(StatusStore? store, String nodeId) =>
+    store == null ||
+    NetworkOverview.read(store).peers.any(
+      (item) => item.isPrimary && item.current && item.peer.nodeId == nodeId,
+    );
 
 PeerSnapshot _latestPeer(StatusStore? store, PeerSnapshot fallback) {
   final peers = store?.snapshot?.peers;

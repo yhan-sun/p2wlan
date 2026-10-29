@@ -174,8 +174,19 @@ class SettingsStore extends ChangeNotifier {
         ? await resolveDefaultDeviceName()
         : deviceName.trim();
     final enteredToken = authToken.trim();
-    // An empty token draft preserves the secure credential. Only explicit
-    // logout clears it; connection settings cannot enable an offline mode.
+    // A blank draft may retain a credential only for its existing server.
+    // Publishing a different server with that token would immediately allow
+    // profile and room requests to send it to the new destination.
+    if (enteredToken.isEmpty &&
+        _settings.authToken.trim().isNotEmpty &&
+        normalizedControlServer !=
+            normalizeControlServer(_settings.controlServer)) {
+      throw const FormatException(
+        'Changing servers requires a new credential. Sign in to the new server or enter its credential.',
+      );
+    }
+    // Only explicit logout clears a retained credential; connection settings
+    // cannot enable an offline mode.
     final resolvedAuthToken = enteredToken.isNotEmpty
         ? enteredToken
         : _settings.authToken;

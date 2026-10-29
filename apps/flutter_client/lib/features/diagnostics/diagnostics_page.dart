@@ -14,6 +14,7 @@ import '../../core/capabilities/permission_preflight.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/daemon/diagnostics_auth.dart';
 import '../../core/models/diagnostics_models.dart';
+import '../../core/presentation/network_overview.dart';
 import '../../core/security/redactor.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -50,6 +51,8 @@ class DiagnosticsPage extends StatefulWidget {
     this.openLogs,
     this.onOpenDevices,
     this.onOpenSettings,
+    this.onReauthenticate,
+    this.onOpenRooms,
   });
 
   final StatusStore statusStore;
@@ -82,6 +85,8 @@ class DiagnosticsPage extends StatefulWidget {
 
   /// Shell callback for the "open settings" (reauth) issue action.
   final VoidCallback? onOpenSettings;
+  final VoidCallback? onReauthenticate;
+  final VoidCallback? onOpenRooms;
 
   @override
   State<DiagnosticsPage> createState() => _DiagnosticsPageState();
@@ -90,6 +95,23 @@ class DiagnosticsPage extends StatefulWidget {
 class _DiagnosticsPageState extends State<DiagnosticsPage> {
   late final PlatformCapabilities _capabilities;
   var _advancedExpanded = false;
+  final _advancedKey = GlobalKey();
+
+  void _openAdvanced() {
+    setState(() => _advancedExpanded = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final target = _advancedKey.currentContext;
+      if (mounted && target != null) {
+        Scrollable.ensureVisible(
+          target,
+          duration: MediaQuery.disableAnimationsOf(context)
+              ? Duration.zero
+              : AppTokens.durationMedium,
+          alignment: 0,
+        );
+      }
+    });
+  }
 
   @override
   void initState() {
@@ -101,7 +123,11 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return AnimatedBuilder(
-      animation: Listenable.merge([widget.statusStore, widget.settingsStore]),
+      animation: Listenable.merge([
+        widget.statusStore,
+        widget.settingsStore,
+        widget.statusStore.parallelRooms,
+      ]),
       builder: (context, _) {
         final statusStore = widget.statusStore;
         final snapshot = statusStore.snapshot;
@@ -122,6 +148,33 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
           showHeader: widget.showHeader,
           maxWidth: diagnosticsPageMaxWidth,
           children: [
+            Wrap(
+              spacing: AppTokens.space12,
+              runSpacing: AppTokens.space4,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                Text(
+                  strings.isZh
+                      ? '检查范围：本机默认连接'
+                      : 'Checking: default local connection',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                if (NetworkOverview.read(statusStore).hasRooms &&
+                    widget.onOpenRooms != null)
+                  TextButton.icon(
+                    key: const Key('diagnostics-open-rooms'),
+                    onPressed: widget.onOpenRooms,
+                    icon: const Icon(Icons.meeting_room_outlined, size: 17),
+                    label: Text(
+                      strings.isZh ? '查看独立房间连接' : 'Check room connections',
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: AppTokens.space10),
             _SystemStatusCard(
               model: model,
               refreshing: refreshing,
@@ -138,21 +191,29 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                 onRecheck: statusStore.refresh,
                 onOpenDevices: widget.onOpenDevices,
                 onOpenSettings: widget.onOpenSettings,
+                onReauthenticate: widget.onReauthenticate,
+                onOpenTechnicalDetails: _openAdvanced,
               ),
+              const SizedBox(height: AppTokens.space8),
+              _SupportTools(statusStore: statusStore),
             ],
             if (model.checks.isNotEmpty) ...[
               const SizedBox(height: AppTokens.space14),
               _ChecksPanel(checks: model.checks),
             ],
             const SizedBox(height: AppTokens.space14),
-            _AdvancedDisclosure(
-              open: _advancedExpanded,
-              onToggle: () =>
-                  setState(() => _advancedExpanded = !_advancedExpanded),
-              children: _buildAdvancedChildren(
-                statusStore: statusStore,
-                snapshot: snapshot,
-                canLocal: canLocal,
+            KeyedSubtree(
+              key: _advancedKey,
+              child: _AdvancedDisclosure(
+                open: _advancedExpanded,
+                onToggle: () =>
+                    setState(() => _advancedExpanded = !_advancedExpanded),
+                children: _buildAdvancedChildren(
+                  statusStore: statusStore,
+                  snapshot: snapshot,
+                  canLocal: canLocal,
+                  showSupportTools: model.issues.isEmpty,
+                ),
               ),
             ),
           ],
@@ -169,6 +230,7 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
     required StatusStore statusStore,
     required DiagnosticsSnapshot? snapshot,
     required bool canLocal,
+    required bool showSupportTools,
   }) {
     if (!_advancedExpanded) return const [];
     final children = <Widget>[];
@@ -219,8 +281,10 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
     }
 
     // 6. Support tools: copy diagnostics summary (kept, but demoted here).
-    children.add(const SizedBox(height: AppTokens.space14));
-    children.add(_SupportTools(statusStore: statusStore));
+    if (showSupportTools) {
+      children.add(const SizedBox(height: AppTokens.space14));
+      children.add(_SupportTools(statusStore: statusStore));
+    }
 
     // 7. Raw JSON stays the lowest-level disclosure.
     children.add(const SizedBox(height: AppTokens.space14));

@@ -10,6 +10,10 @@ import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/rooms/room_api.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../app/app_strings.dart';
+import '../../app/p2wlan_colors.dart';
+import '../../app/app_tokens.dart';
+import '../../shared/widgets/status_badge.dart';
+import 'room_join_dialog.dart';
 import '../nodes/nodes_page.dart';
 import '../../core/rooms/room_profiles.dart';
 import '../../core/rooms/room_connectivity.dart';
@@ -51,9 +55,13 @@ class _RoomsPageState extends State<RoomsPage> {
   List<FriendRoom> _rooms = [];
   RoomRoster? _roster;
   final Map<String, RoomRoster> _rosters = {};
+  final _rosterErrors = <String, String>{};
+  final _rosterUpdatedAt = <String, DateTime>{};
+  String? _invitesError;
   final _localIdentities = <String, Map<String, String>>{};
   final _autoConnect = <String, bool>{};
   List<Map<String, dynamic>> _invites = [];
+  String? _invitesRoomId;
   String? _selectedId;
   String? _error;
   String? _operationError;
@@ -151,6 +159,20 @@ class _RoomsPageState extends State<RoomsPage> {
     }
   }
 
+  bool Function() _sessionGuard() {
+    final settings = widget.settingsStore;
+    final status = widget.statusStore;
+    final account = accountSessionKey(settings.settings);
+    final revision = status.sessionRevision;
+    return () =>
+        mounted &&
+        identical(settings, widget.settingsStore) &&
+        identical(status, widget.statusStore) &&
+        _sameSession &&
+        accountSessionKey(settings.settings) == account &&
+        status.sessionRevision == revision;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -159,7 +181,7 @@ class _RoomsPageState extends State<RoomsPage> {
     final settings = widget.settingsStore.settings;
     try {
       if (settings.authToken.trim().isEmpty) {
-        throw const RoomException('请先登录控制服务器后使用好友房间');
+        throw const RoomException('请先登录控制服务器后使用房间');
       }
       _apiInstance =
           widget.api ??
@@ -190,8 +212,11 @@ class _RoomsPageState extends State<RoomsPage> {
     if (invitation == null) return;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
-      await _joinWithLink(invitation.toString());
-      if (mounted) widget.onInvitationHandled?.call();
+      final isCurrent = _sessionGuard();
+      await _join(invitation.toString());
+      if (isCurrent() && widget.initialInvitation == invitation) {
+        widget.onInvitationHandled?.call();
+      }
     });
   }
 
@@ -207,13 +232,12 @@ class _RoomsPageState extends State<RoomsPage> {
   }
 
   Future<void> _loadLocalIdentity(FriendRoom room) async {
+    final isCurrent = _sessionGuard();
     final settings = widget.settingsStore.settings;
     try {
       final identity = await widget.statusStore.daemonController
           .roomDeviceIdentity(selectRoomSettings(settings, room));
-      if (!mounted ||
-          !_sameSession ||
-          widget.settingsStore.settings.authToken != settings.authToken) {
+      if (!isCurrent()) {
         return;
       }
       if (identity != null &&
@@ -229,60 +253,95 @@ class _RoomsPageState extends State<RoomsPage> {
   Future<void> _refresh({bool silent = false}) async {
     if (!mounted || !_sameSession || _refreshing) return;
     _refreshing = true;
+    final isCurrent = _sessionGuard();
     final generation = ++_generation;
     final selected = _selectedId;
     try {
       final rooms = await _api.list();
-      if (!_sameSession) return;
+      if (!isCurrent()) return;
       if (_parallel.supported) {
         for (final room in rooms) {
           unawaited(_parallel.recover(room));
         }
       }
       final id = rooms.any((room) => room.id == selected) ? selected : null;
-      final roster = id == null ? null : await _api.roster(id);
+      final summaries = <String, RoomRoster>{};
+      final errors = <String, String>{};
+      Future<void> loadRoster(FriendRoom room) async {
+        if (!isCurrent()) return;
+        try {
+          summaries[room.id] = await _api.roster(room.id);
+        } catch (error) {
+          errors[room.id] = _message(error);
+        }
+      }
+
+      final requested = rooms
+          .where((room) => room.id == id || room.memberCount == null)
+          .toList();
+      // Keep legacy-server summary requests bounded and independent: a single
+      // failed roster must not hide the list or another room's details.
+      for (var offset = 0; offset < requested.length; offset += 4) {
+        await Future.wait(requested.skip(offset).take(4).map(loadRoster));
+        if (!isCurrent()) return;
+      }
+      final roster = summaries[id];
+      bool? autoConnect;
       if (roster != null && _parallel.supported && _canConnect) {
         final preference = await _parallel.connectionPreference(roster.room);
-        _autoConnect[roster.room.id] = preference.autoConnect;
+        if (!isCurrent()) return;
+        autoConnect = preference.autoConnect;
       }
+      List<Map<String, dynamic>>? invites;
+      String? invitesError;
+      if (roster?.room.isOwner == true) {
+        try {
+          final data = await _api.request('GET', [id!, 'invites']);
+          invites = (data['invites'] as List? ?? const [])
+              .map((item) => Map<String, dynamic>.from(item as Map))
+              .toList();
+        } catch (error) {
+          invitesError = _message(error);
+        }
+      }
+      if (generation != _generation || !isCurrent()) return;
+      setState(() {
+        _rooms = rooms;
+        bool removed(String roomId) => !rooms.any((room) => room.id == roomId);
+        _rosters.removeWhere((roomId, _) => removed(roomId));
+        _rosterErrors.removeWhere((roomId, _) => removed(roomId));
+        _rosterUpdatedAt.removeWhere((roomId, _) => removed(roomId));
+        _rosters.addAll(summaries);
+        for (final roomId in summaries.keys) {
+          _rosterErrors.remove(roomId);
+          _rosterUpdatedAt[roomId] = DateTime.now();
+        }
+        _rosterErrors.addAll(errors);
+        _selectedId = id;
+        _roster = _rosters[id];
+        if (autoConnect != null && id != null) _autoConnect[id] = autoConnect;
+        if (id != _invitesRoomId || roster?.room.isOwner == false) {
+          _invites = [];
+        }
+        _invitesRoomId = id;
+        if (invites != null) _invites = invites;
+        _invitesError = invitesError;
+        _error = null;
+      });
       if (roster != null && _canConnect) {
         unawaited(_loadLocalIdentity(roster.room));
       }
-      // Older servers lack card summaries; fetch their rosters in bounded batches.
-      final summaries = <String, RoomRoster>{};
-      final legacy = rooms
-          .where((room) => room.memberCount == null && room.id != id)
-          .toList();
-      for (var offset = 0; offset < legacy.length; offset += 4) {
-        final batch = legacy.skip(offset).take(4);
-        await Future.wait(
-          batch.map((room) async {
-            summaries[room.id] = await _api.roster(room.id);
-          }),
-        );
-      }
-      if (roster != null) summaries[roster.room.id] = roster;
-      final invites = roster?.room.isOwner == true
-          ? (await _api.request('GET', [id!, 'invites']))['invites'] as List? ??
-                const []
-          : const [];
-      if (!mounted || generation != _generation || !_sameSession) return;
-      setState(() {
-        _rooms = rooms;
-        _rosters.removeWhere((id, _) => !rooms.any((room) => room.id == id));
-        _rosters.addAll(summaries);
-        _selectedId = id;
-        _roster = roster;
-        _invites = invites
-            .map((item) => Map<String, dynamic>.from(item as Map))
-            .toList();
-        _error = null;
-      });
       _roomViewRevision.value++;
       widget.onRoomSelected?.call(id);
     } catch (error) {
-      if (mounted && generation == _generation && _sameSession) {
-        setState(() => _error = _message(error));
+      if (generation == _generation && isCurrent()) {
+        setState(() {
+          _error = _message(error);
+          // A failed list also makes cached control-plane device presence stale.
+          for (final room in _rooms) {
+            _rosterErrors[room.id] = _message(error);
+          }
+        });
       }
     } finally {
       _refreshing = false;
@@ -330,7 +389,7 @@ class _RoomsPageState extends State<RoomsPage> {
           : (session == null ? '未连接' : '连接中');
     }
 
-    if (currentSnapshot.peerSnapshotStale) return '状态待更新';
+    if (_snapshotStale(currentSnapshot)) return '状态待更新';
     return RoomConnectivitySummary.fromSnapshot(currentSnapshot).label;
   }
 
@@ -338,7 +397,7 @@ class _RoomsPageState extends State<RoomsPage> {
       error is RoomException ? error.message : '操作未完成，请检查连接后重试';
 
   Future<void> _run(
-    Future<void> Function() operation, {
+    Future<void> Function(bool Function() isCurrent) operation, {
     String? success,
   }) async {
     if (_busy || !mounted) return;
@@ -346,50 +405,78 @@ class _RoomsPageState extends State<RoomsPage> {
       setState(() => _operationError = '登录账号或服务器已变化，请重新登录。');
       return;
     }
+    final isCurrent = _sessionGuard();
     _generation++;
     setState(() {
       _busy = true;
       _operationError = null;
     });
     try {
-      await operation();
-      if (mounted && _sameSession && success != null) _notify(success);
+      await operation(isCurrent);
+      if (isCurrent() && success != null) _notify(success);
     } catch (error) {
-      if (mounted && _sameSession) {
+      if (isCurrent()) {
         setState(() => _operationError = _message(error));
       }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
-    while (mounted && _refreshing) {
+    while (isCurrent() && _refreshing) {
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
-    if (mounted) await _refresh();
+    if (isCurrent()) await _refresh();
   }
 
   void _notify(String message) {
     showAppNotice(context, content: Text(message));
   }
 
+  bool _snapshotStale(DiagnosticsSnapshot snapshot) =>
+      snapshot.peerSnapshotStale ||
+      snapshot.capturedRevision != snapshot.revision;
+
+  String _deviceDataLabel(
+    Map<String, dynamic> device,
+    DiagnosticsSnapshot? snapshot,
+  ) => snapshot != null && _snapshotStale(snapshot)
+      ? '状态待更新'
+      : roomDeviceDataLabel(device, snapshot);
+
+  Future<bool> _copyText(String value, {String? success}) async {
+    final isCurrent = _sessionGuard();
+    if (!isCurrent()) return false;
+    try {
+      await Clipboard.setData(ClipboardData(text: value));
+    } catch (_) {
+      if (isCurrent()) _notify('复制失败，请手动选择并复制');
+      return false;
+    }
+    if (!isCurrent()) return false;
+    if (success != null) _notify(success);
+    return true;
+  }
+
   Future<bool> _confirm(String title, String message) async {
-    return await showDialog<bool>(
-          context: context,
-          builder: (context) => AlertDialog(
-            title: Text(title),
-            content: Text(message),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('取消'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.pop(context, true),
-                child: const Text('确认'),
-              ),
-            ],
+    final isCurrent = _sessionGuard();
+    if (!isCurrent()) return false;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
           ),
-        ) ??
-        false;
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('确认'),
+          ),
+        ],
+      ),
+    );
+    return confirmed == true && isCurrent();
   }
 
   Future<List<String>?> _form(
@@ -398,10 +485,11 @@ class _RoomsPageState extends State<RoomsPage> {
     String? description,
   }) async {
     if (!_sameSession) {
-      setState(() => _error = '请先登录当前控制服务器后使用好友房间');
+      setState(() => _error = '请先登录当前控制服务器后使用房间');
       return null;
     }
-    return showDialog<List<String>>(
+    final isCurrent = _sessionGuard();
+    final result = await showDialog<List<String>>(
       context: context,
       builder: (_) => _RoomInputDialog(
         title: title,
@@ -409,6 +497,7 @@ class _RoomsPageState extends State<RoomsPage> {
         description: description,
       ),
     );
+    return isCurrent() ? result : null;
   }
 
   _RoomField get _passwordField => _RoomField(
@@ -435,71 +524,65 @@ class _RoomsPageState extends State<RoomsPage> {
   );
 
   Future<void> _create() async {
-    final values = await _form('创建好友房间', [
+    final values = await _form('创建房间', [
       _nameField(),
       _passwordField,
     ], description: '每个账号可以创建一个房间。服务器会分配独立的 10.21.x.0/24 网段，不改变你的个人网络。');
     if (values == null || !mounted) return;
-    await _run(() async {
-      _selectedId = (await _api.create(values[0].trim(), values[1])).id;
+    await _run((isCurrent) async {
+      final room = await _api.create(values[0].trim(), values[1]);
+      if (isCurrent()) _selectedId = room.id;
     }, success: '房间已创建');
   }
 
-  Future<void> _join() async {
-    final values = await _form('通过房间号加入', [
-      _RoomField(
-        '房间号',
-        maxLength: 8,
-        number: true,
-        validate: (value) => RegExp(r'^[0-9]{8}$').hasMatch(value?.trim() ?? '')
-            ? null
-            : '请输入 8 位房间号',
-      ),
-      _passwordField,
-    ], description: '加入后可在房间列表中连接此网络。加入多个房间不会自动把不同房间桥接在一起。');
-    if (values == null || !mounted) return;
-    await _run(() async {
-      _selectedId = (await _api.join(values[0].trim(), password: values[1])).id;
-    }, success: '账号已加入房间，点击“连接本机”开始互联');
-  }
-
-  Future<void> _joinWithLink([String initial = '']) async {
+  Future<void> _join([String initial = '']) async {
     if (!mounted || _busy) return;
-    final values = await _form('通过邀请链接加入', [
-      _RoomField(
-        '邀请链接',
+    if (!_sameSession) {
+      setState(() => _operationError = '请先登录当前控制服务器后使用房间');
+      return;
+    }
+    final isCurrent = _sessionGuard();
+    final room = await showDialog<FriendRoom>(
+      context: context,
+      builder: (_) => RoomJoinDialog(
+        server: _api.server,
         initial: initial,
-        multiline: true,
-        maxLength: 4096,
-        validate: (value) {
+        isCurrent: isCurrent,
+        onJoin: (request) async {
+          if (!isCurrent()) return null;
           try {
-            RoomInvitation.parse(value ?? '', _api.server);
-            return null;
-          } catch (error) {
-            return _message(error);
+            final joined = await _api.join(
+              request.code,
+              password: request.password,
+              invitation: request.invitation,
+            );
+            return isCurrent() ? joined : null;
+          } catch (_) {
+            if (!isCurrent()) return null;
+            rethrow;
           }
         },
       ),
-    ], description: '仅加入当前控制服务器上的房间。确认前不会发送邀请，也不会自动切换服务器。');
-    if (values == null || !mounted) return;
-    await _run(() async {
-      final invite = RoomInvitation.parse(values[0], _api.server);
-      _selectedId = (await _api.join(invite.code, invitation: invite.token)).id;
+    );
+    if (room == null || !isCurrent()) return;
+    await _run((isCurrent) async {
+      if (isCurrent()) _selectedId = room.id;
     }, success: '账号已加入房间，点击“连接本机”开始互联');
   }
 
   Future<void> _connect(FriendRoom? room) async {
     if (!_canConnect || _busy) return;
     if (_parallel.supported && room != null) {
-      await _run(() async {
+      await _run((isCurrent) async {
         if (widget.settingsStore.settings.networkId == room.id) {
           final stopped = await widget.statusStore.stopPrimaryDaemon();
+          if (!isCurrent()) return;
           if (!stopped.ok) throw const RoomException('旧的单房间运行时未能停止');
           await widget.settingsStore.updateSettings(
             personalNetworkSettings(widget.settingsStore.settings),
           );
         }
-        if (!mounted || !_sameSession) return;
+        if (!isCurrent()) return;
         final result = await _parallel.connect(room);
         if (!result.ok) throw RoomException(result.message);
       }, success: '已连接房间');
@@ -515,10 +598,10 @@ class _RoomsPageState extends State<RoomsPage> {
         !mounted) {
       return;
     }
-    await _run(() async {
+    await _run((isCurrent) async {
       final stopped = await widget.statusStore.stopPrimaryDaemon();
+      if (!isCurrent()) return;
       if (!stopped.ok) throw const RoomException('旧网络未能停止，未切换网络');
-      if (!mounted || !_sameSession) return;
       final current = widget.settingsStore.settings;
       final next = room == null
           ? (isRoomNetwork(current.networkId)
@@ -527,19 +610,20 @@ class _RoomsPageState extends State<RoomsPage> {
           : selectRoomSettings(current, room);
       if (room != null) roomProfileId(next);
       await widget.settingsStore.updateSettings(next);
-      if (!mounted || !_sameSession) return;
+      if (!isCurrent()) return;
       final started = await widget.statusStore.startDaemon();
       if (!started.ok) throw RoomException(started.message);
     }, success: '网络连接已启动');
   }
 
   Future<void> _disconnectRoom(FriendRoom room) async {
-    await _run(() async {
+    await _run((isCurrent) async {
       final result =
           _parallel.session(room.id) == null &&
               widget.settingsStore.settings.networkId == room.id
           ? await widget.statusStore.stopPrimaryDaemon()
           : await _parallel.disconnect(room.id);
+      if (!isCurrent()) return;
       if (!result.ok) throw RoomException(result.message);
       await _parallel.forgetConnectionIntent(room);
     }, success: '已断开本机，其他设备和房间保持运行');
@@ -554,7 +638,7 @@ class _RoomsPageState extends State<RoomsPage> {
           : null,
     );
     if (values == null || !mounted) return;
-    await _run(() async {
+    await _run((isCurrent) async {
       await _api.request(
         'PATCH',
         [room.id],
@@ -583,7 +667,7 @@ class _RoomsPageState extends State<RoomsPage> {
       ),
     ], description: '链接持有者可免密码加入。可以随时撤销；同一账号重复加入不重复消耗次数。');
     if (values == null || !mounted) return;
-    await _run(() async {
+    await _run((isCurrent) async {
       final data = await _api.request(
         'POST',
         [room.id, 'invites'],
@@ -592,6 +676,7 @@ class _RoomsPageState extends State<RoomsPage> {
           'max_uses': int.parse(values[1].trim()),
         },
       );
+      if (!isCurrent()) return;
       final token = data['invite_token'] as String? ?? '';
       final link = RoomInvitation(
         _api.server,
@@ -599,7 +684,7 @@ class _RoomsPageState extends State<RoomsPage> {
         token,
       ).toUri().toString();
       RoomInvitation.parse(link, _api.server);
-      if (!mounted) return;
+      if (!mounted || !isCurrent()) return;
       await showDialog<void>(
         context: context,
         builder: (context) => AlertDialog(
@@ -627,8 +712,15 @@ class _RoomsPageState extends State<RoomsPage> {
             ),
             FilledButton.icon(
               onPressed: () async {
-                await Clipboard.setData(ClipboardData(text: link));
-                if (context.mounted) Navigator.pop(context);
+                if (!isCurrent()) return;
+                final route = ModalRoute.of(context);
+                final copied = await _copyText(link);
+                if (copied &&
+                    isCurrent() &&
+                    context.mounted &&
+                    route?.isCurrent == true) {
+                  Navigator.pop(context);
+                }
               },
               icon: const Icon(Icons.copy_rounded),
               label: const Text('复制邀请链接'),
@@ -656,7 +748,7 @@ class _RoomsPageState extends State<RoomsPage> {
         !mounted) {
       return;
     }
-    await _run(() async {
+    await _run((isCurrent) async {
       await _api.request(ban ? 'PUT' : 'DELETE', [
         room.id,
         ban ? 'bans' : 'members',
@@ -681,13 +773,13 @@ class _RoomsPageState extends State<RoomsPage> {
       _notify('地址未变化，无需重新连接');
       return;
     }
-    await _run(() async {
+    await _run((isCurrent) async {
       final result = await _api.request(
         'PATCH',
         [room.id, 'devices', device['id'] as String],
         {'virtual_ip': values[0].trim()},
       );
-      if (mounted && _sameSession) {
+      if (isCurrent()) {
         _notify(
           result['reconnect_required'] == false
               ? '地址未变化，无需重新连接'
@@ -705,7 +797,7 @@ class _RoomsPageState extends State<RoomsPage> {
         !mounted) {
       return;
     }
-    await _run(() async {
+    await _run((isCurrent) async {
       await _api.request('DELETE', [
         room.id,
         'devices',
@@ -757,19 +849,22 @@ class _RoomsPageState extends State<RoomsPage> {
       _ => '设备获得连接资格，但不会自动上线。请在该设备上点击“连接本机”。',
     };
     if (!await _confirm(title, message) || !mounted) return;
-    await _run(() async {
+    await _run((isCurrent) async {
       await _api.request('POST', [
         room.id,
         'device-access',
         access['id'] as String,
         action,
       ]);
+      if (!isCurrent()) return;
       if (_isLocalDevice(room, device) &&
           (action == 'disconnect' || action == 'block')) {
         final stopped = await _parallel.disconnect(room.id);
+        if (!isCurrent()) return;
         if (!stopped.ok) throw RoomException(stopped.message);
         if (widget.settingsStore.settings.networkId == room.id && _canConnect) {
           final primary = await widget.statusStore.stopPrimaryDaemon();
+          if (!isCurrent()) return;
           if (!primary.ok) throw RoomException(primary.message);
         }
         await _parallel.forgetConnectionIntent(room);
@@ -787,40 +882,42 @@ class _RoomsPageState extends State<RoomsPage> {
         !mounted) {
       return;
     }
-    await _run(() async {
+    await _run((isCurrent) async {
       final result = await _parallel.disconnect(room.id);
+      if (!isCurrent()) return;
       if (!result.ok) throw const RoomException('本地并行房间未能停止，尚未退出');
       if (widget.settingsStore.settings.networkId == room.id) {
         if (_canConnect) {
           final stopped = await widget.statusStore.stopPrimaryDaemon();
+          if (!isCurrent()) return;
           if (!stopped.ok) throw const RoomException('本地房间网络无法停止，尚未退出房间');
         }
       }
       await _parallel.forgetConnectionIntent(room);
+      if (!isCurrent()) return;
       await _api.request(room.isOwner ? 'DELETE' : 'POST', [
         room.id,
         if (!room.isOwner) 'leave',
       ]);
+      if (!isCurrent()) return;
       if (widget.settingsStore.settings.networkId == room.id) {
         await widget.settingsStore.updateSettings(
           personalNetworkSettings(widget.settingsStore.settings),
         );
       }
-      _selectedId = null;
+      if (isCurrent()) _selectedId = null;
     }, success: room.isOwner ? '房间已解散' : '已退出房间');
   }
 
   Widget _surfaceCard({required Widget child, bool selected = false}) {
-    final colors = Theme.of(context).colorScheme;
+    final colors = P2WlanColors.of(context);
     return Card(
       elevation: 0,
       margin: const EdgeInsets.only(bottom: 8),
-      color: selected ? colors.secondaryContainer : colors.surface,
+      color: selected ? colors.selectedSurface : colors.surface,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(12),
-        side: BorderSide(
-          color: selected ? colors.primary : colors.outlineVariant,
-        ),
+        side: BorderSide(color: selected ? colors.borderStrong : colors.border),
       ),
       clipBehavior: Clip.antiAlias,
       child: child,
@@ -828,41 +925,79 @@ class _RoomsPageState extends State<RoomsPage> {
   }
 
   Future<void> _selectRoom(String id) async {
+    final isCurrent = _sessionGuard();
+    if (!isCurrent()) return;
     setState(() {
       _selectedId = id;
-      _roster = null;
+      _roster = _rosters[id];
       _loading = true;
     });
     _generation++;
-    while (mounted && _refreshing) {
+    while (isCurrent() && _refreshing) {
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
-    if (mounted) await _refresh();
+    if (isCurrent()) await _refresh();
   }
 
   Widget _roomList() {
     if (_rooms.isEmpty) {
-      return _loading
-          ? const SizedBox.shrink()
-          : const Padding(
-              padding: EdgeInsets.all(32),
-              child: Text(
-                '还没有房间，创建一个或向好友索取房间号与密码。',
-                textAlign: TextAlign.center,
+      if (_loading) return const SizedBox.shrink();
+      final palette = P2WlanColors.of(context);
+      return _surfaceCard(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 40),
+          child: Column(
+            children: [
+              Container(
+                width: 56,
+                height: 56,
+                decoration: BoxDecoration(
+                  color: palette.selectedSurface,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Icon(
+                  Icons.meeting_room_outlined,
+                  size: 28,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
               ),
-            );
+              const SizedBox(height: 18),
+              Text(
+                '和好友连接到同一房间',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 8),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 380),
+                child: Text(
+                  '输入好友发来的房间号或邀请链接。也可以创建房间，邀请其他设备加入。',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodyMedium
+                      ?.copyWith(color: palette.textSecondary),
+                ),
+              ),
+              const SizedBox(height: 20),
+              TextButton.icon(
+                onPressed: _busy ? null : () => _join(),
+                icon: const Icon(Icons.login_rounded),
+                label: const Text('输入房间号或邀请链接'),
+              ),
+            ],
+          ),
+        ),
+      );
     }
     return LayoutBuilder(
       builder: (context, constraints) {
-        const gap = 12.0;
-        final columns = ((constraints.maxWidth + gap) / 292).floor().clamp(
+        const gap = 16.0;
+        final columns = ((constraints.maxWidth + gap) / 340).floor().clamp(
           1,
-          6,
+          4,
         );
         final width = (constraints.maxWidth - gap * (columns - 1)) / columns;
         return Wrap(
-          spacing: 12,
-          runSpacing: 12,
+          spacing: gap,
+          runSpacing: gap,
           children: [
             for (final room in _rooms)
               SizedBox(width: width, child: _roomCard(room)),
@@ -892,121 +1027,180 @@ class _RoomsPageState extends State<RoomsPage> {
     }
     if (room.isOwner) owner = owner.isEmpty ? '我' : '$owner（我）';
     final session = _parallel.session(room.id);
-    return Material(
-      color: Colors.transparent,
-      borderRadius: BorderRadius.circular(14),
-      clipBehavior: Clip.antiAlias,
-      child: Ink(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-            color: Theme.of(context).brightness == Brightness.dark
-                ? const Color(0xff315448)
-                : const Color(0xffdcebe2),
-          ),
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            stops: const [0, 0.48, 1],
-            colors: Theme.of(context).brightness == Brightness.dark
-                ? const [
-                    Color(0xff202926),
-                    Color(0xff22362b),
-                    Color(0xff28513a),
-                  ]
-                : const [Colors.white, Color(0xfff5fbf7), Color(0xffccefd8)],
-          ),
-        ),
-        child: InkWell(
-          key: ValueKey('room-card-${room.id}'),
-          borderRadius: BorderRadius.circular(12),
-          onTap: _busy ? null : () => _selectRoom(room.id),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    const Icon(Icons.meeting_room_outlined),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        room.name,
-                        style: Theme.of(context).textTheme.titleMedium,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
+    final snapshot = _roomSnapshot(room);
+    final colors = P2WlanColors.of(context);
+    return _surfaceCard(
+      child: InkWell(
+        key: ValueKey('room-card-${room.id}'),
+        onTap: _busy ? null : () => _selectRoom(room.id),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Wrap(
+                      spacing: 10,
+                      runSpacing: 6,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Text(
+                          room.name,
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(fontWeight: FontWeight.w700),
+                        ),
+                        _connectionBadge(room),
+                        if (room.locked)
+                          const Tooltip(
+                            message: '已锁定新成员加入',
+                            child: Icon(Icons.lock_outline, size: 16),
+                          ),
+                      ],
                     ),
-                    const Icon(Icons.chevron_right_rounded),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  '房主 · ${owner.isEmpty ? '未设置用户名' : owner}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-                const SizedBox(height: 12),
-                Wrap(
-                  spacing: 24,
-                  runSpacing: 12,
-                  children: [
-                    _deviceMetric(
-                      '在线 / 总人数',
-                      '${online ?? '—'} / ${total ?? '—'}',
-                    ),
+                  ),
+                  Icon(
+                    Icons.chevron_right_rounded,
+                    color: colors.textMuted,
+                    size: 20,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '房主 · ${owner.isEmpty ? '未设置用户名' : owner}',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 24,
+                runSpacing: 8,
+                children: [
+                  _roomMetric('在线 / 总人数', '${online ?? '—'} / ${total ?? '—'}'),
+                  if (!room.isOwner)
                     Tooltip(
                       message: '本机到房主在线设备的实测延迟；多台设备取最低值。',
-                      child: _deviceMetric('房主延迟', _ownerLatency(room, roster)),
+                      child: _roomMetric('房主延迟', _ownerLatency(room, roster)),
                     ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        '房间号 ${room.code}',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                    ),
-                    if (room.locked)
-                      const Tooltip(
-                        message: '已锁定新成员加入',
-                        child: Icon(Icons.lock_outline, size: 16),
-                      ),
-                    Text(
-                      _connectionLabel(session, _roomSnapshot(room)),
-                      style: Theme.of(context).textTheme.labelMedium,
-                    ),
-                  ],
-                ),
-                if (_roomSnapshot(room) case final snapshot?) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    snapshot.peerSnapshotStale
-                        ? '链路信息待更新'
-                        : RoomConnectivitySummary.fromSnapshot(snapshot)
-                              .details,
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
                 ],
-                if (session?.message case final message?) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    message,
-                    maxLines: 3,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                ],
+              ),
+              if (_rosterErrors.containsKey(room.id)) ...[
+                const SizedBox(height: 10),
+                Text(
+                  roster == null ? '成员信息暂不可用，点击房间可重试' : '成员信息更新失败，显示上次结果',
+                  style: Theme.of(context).textTheme.bodySmall
+                      ?.copyWith(color: colors.warningText),
+                ),
               ],
-            ),
+              if (snapshot != null && _snapshotStale(snapshot)) ...[
+                const SizedBox(height: 10),
+                Text('链路信息待更新', style: Theme.of(context).textTheme.bodySmall),
+              ],
+              if (session?.message case final message?) ...[
+                const SizedBox(height: 10),
+                Text(message, style: Theme.of(context).textTheme.bodySmall),
+              ],
+              const SizedBox(height: 10),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final code = Text(
+                    '房间号 ${room.code}',
+                    style: Theme.of(context).textTheme.bodySmall
+                        ?.copyWith(fontFeatures: AppTokens.tabularFontFeatures),
+                  );
+                  if (!_canConnect) return code;
+                  final button = _connectionButton(room, card: true);
+                  if (constraints.maxWidth < 280 ||
+                      MediaQuery.textScalerOf(context).scale(14) > 20) {
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [code, const SizedBox(height: 10), button],
+                    );
+                  }
+                  return Row(
+                    children: [
+                      Expanded(child: code),
+                      const SizedBox(width: 12),
+                      button,
+                    ],
+                  );
+                },
+              ),
+            ],
           ),
         ),
       ),
+    );
+  }
+
+  bool get _connectionBusy =>
+      _busy || _parallel.busy || widget.statusStore.daemonBusy;
+
+  Widget _connectionBadge(FriendRoom room) {
+    final session = _parallel.session(room.id);
+    final snapshot = _roomSnapshot(room);
+    final tone = session?.phase == RoomConnectionPhase.failed
+        ? StatusTone.bad
+        : session?.phase == RoomConnectionPhase.unavailable ||
+              snapshot != null && _snapshotStale(snapshot)
+        ? StatusTone.warn
+        : snapshot == null
+        ? StatusTone.neutral
+        : RoomConnectivitySummary.fromSnapshot(snapshot).dataWarning != null
+        ? StatusTone.warn
+        : RoomConnectivitySummary.fromSnapshot(snapshot).established > 0
+        ? StatusTone.good
+        : StatusTone.neutral;
+    final primaryStarting =
+        session == null &&
+        widget.settingsStore.settings.networkId == room.id &&
+        widget.statusStore.daemonStarting;
+    return StatusBadge(
+      label: primaryStarting ? '本机启动' : _connectionLabel(session, snapshot),
+      tone: tone,
+    );
+  }
+
+  Widget _connectionButton(FriendRoom room, {bool card = false}) {
+    final connection = _parallel.session(room.id);
+    final primaryConnected = connection == null && _roomSnapshot(room) != null;
+    final disconnect = connection != null || primaryConnected;
+    final primaryStarting =
+        connection == null &&
+        widget.settingsStore.settings.networkId == room.id &&
+        widget.statusStore.daemonStarting;
+    final transitioning =
+        primaryStarting ||
+        connection?.phase == RoomConnectionPhase.starting ||
+        connection?.phase == RoomConnectionPhase.stopping;
+    final label = primaryStarting
+        ? '本机启动'
+        : transitioning
+        ? _connectionLabel(connection)
+        : disconnect
+        ? '断开本机'
+        : widget.settingsStore.settings.networkId == room.id
+        ? '重新连接本机'
+        : '连接本机';
+    final palette = P2WlanColors.of(context);
+    return FilledButton.tonalIcon(
+      style: disconnect
+          ? FilledButton.styleFrom(
+              backgroundColor: palette.surfaceMuted,
+              foregroundColor: palette.textPrimary,
+              side: BorderSide(color: palette.border),
+            )
+          : null,
+      key: ValueKey(
+        '${card ? 'room-card' : 'room-detail'}-connection-${room.id}',
+      ),
+      onPressed: _connectionBusy || transitioning
+          ? null
+          : () => disconnect ? _disconnectRoom(room) : _connect(room),
+      icon: Icon(disconnect ? Icons.link_off_rounded : Icons.lan_outlined),
+      label: Text(label),
     );
   }
 
@@ -1014,7 +1208,7 @@ class _RoomsPageState extends State<RoomsPage> {
     if (room.isOwner) return '我是房主';
     final snapshot = _roomSnapshot(room);
     if (snapshot == null) return '连接后测量';
-    if (snapshot.peerSnapshotStale) return '待更新';
+    if (_snapshotStale(snapshot)) return '待更新';
     final ips = room.memberCount != null
         ? room.ownerDeviceIps
         : [
@@ -1025,17 +1219,17 @@ class _RoomsPageState extends State<RoomsPage> {
     if (ips.isEmpty) {
       return roster != null || room.memberCount != null ? '房主离线' : '未测得';
     }
+    if (roster == null) return '进入房间后查看';
     final latencies =
         snapshot.peers
             .where(
               (p) =>
                   ips.contains(p.virtualIp) &&
-                  (roster?.devices.any(
-                        (device) =>
-                            device['user_id'] == room.ownerId &&
-                            roomPeerForDevice(device, [p]) != null,
-                      ) ??
-                      false),
+                  (roster.devices.any(
+                    (device) =>
+                        device['user_id'] == room.ownerId &&
+                        roomPeerForDevice(device, [p]) != null,
+                  )),
             )
             .map((p) => p.latencyMs)
             .whereType<int>()
@@ -1069,33 +1263,10 @@ class _RoomsPageState extends State<RoomsPage> {
     return device['online'] == true;
   }
 
-  Widget _stateBadge(String label, Color color) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-    decoration: BoxDecoration(
-      color: color.withValues(alpha: 0.10),
-      borderRadius: BorderRadius.circular(20),
-    ),
-    child: Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(Icons.circle, size: 6, color: color),
-        const SizedBox(width: 5),
-        Text(
-          label,
-          style: TextStyle(
-            color: color,
-            fontSize: 12,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-      ],
-    ),
-  );
-
   Widget _deviceList(RoomRoster roster) {
     final snapshot = _roomSnapshot(roster.room);
-    final peers = snapshot?.peerSnapshotStale == false
-        ? snapshot!.peers
+    final peers = snapshot != null && !_snapshotStale(snapshot)
+        ? snapshot.peers
         : <PeerSnapshot>[];
     final devices = [
       for (final device in roster.devices) {...device},
@@ -1143,38 +1314,104 @@ class _RoomsPageState extends State<RoomsPage> {
         'online': true,
       });
     }
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Text(
-          '设备与连接 · ${devices.length}',
-          style: Theme.of(context).textTheme.titleMedium,
-        ),
-        const SizedBox(height: 8),
-        if (devices.isEmpty)
-          const Padding(
-            padding: EdgeInsets.all(20),
-            child: Text('还没有设备连接。连接房间后，设备 IP 和连接质量会显示在这里。'),
-          ),
-        for (final user in <String>{
-          ...roster.members.map((member) => member['user_id'] as String? ?? ''),
-          ...devices.map((device) => device['user_id'] as String? ?? ''),
-        }) ...[
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 12),
-            child: Text(
-              '${user.isEmpty ? '成员信息同步中' : _memberLabel(user)} · ${user == roster.room.ownerId ? '房主' : '成员'} · ${devices.where((d) => (d['user_id'] ?? '') == user).length} 台设备',
-              style: Theme.of(context).textTheme.titleSmall,
+    final users = <String>{
+      ...roster.members.map((member) => member['user_id'] as String? ?? ''),
+      ...devices.map((device) => device['user_id'] as String? ?? ''),
+    };
+    bool onlyLocalDevices(String user) {
+      final owned = devices.where(
+        (device) => (device['user_id'] ?? '') == user,
+      );
+      return owned.isNotEmpty &&
+          owned.every(
+            (device) =>
+                _isLocalDevice(roster.room, device) ||
+                roomDeviceIsSnapshotLocal(device, snapshot),
+          );
+    }
+
+    final prioritizedUsers = MediaQuery.sizeOf(context).width < 700
+        ? [
+            ...users.where((user) => !onlyLocalDevices(user)),
+            ...users.where(onlyLocalDevices),
+          ]
+        : users;
+    bool hasDevices(String user) =>
+        devices.any((device) => (device['user_id'] ?? '') == user);
+    final orderedUsers = [
+      ...prioritizedUsers.where(hasDevices),
+      ...prioritizedUsers.where((user) => !hasDevices(user)),
+    ];
+    final palette = P2WlanColors.of(context);
+    return _surfaceCard(
+      child: LayoutBuilder(
+        builder: (context, constraints) => Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 18, 18, 14),
+              child: Text(
+                '设备与连接 · ${devices.length}',
+                style: Theme.of(context).textTheme.titleMedium
+                    ?.copyWith(fontSize: 15, fontWeight: FontWeight.w700),
+              ),
             ),
-          ),
-          if (!devices.any((d) => (d['user_id'] ?? '') == user))
-            const Text('尚无设备连接'),
-          for (final device in devices.where(
-            (d) => (d['user_id'] ?? '') == user,
-          ))
-            _deviceCard(roster.room, device, snapshot, peers),
-        ],
-      ],
+            if (constraints.maxWidth >= 1028 &&
+                MediaQuery.textScalerOf(context).scale(14) < 20)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(14, 0, 14, 10),
+                child: DefaultTextStyle(
+                  style: Theme.of(context).textTheme.bodySmall!,
+                  child: const Row(
+                    children: [
+                      Expanded(flex: 3, child: Text('设备')),
+                      SizedBox(width: 16),
+                      SizedBox(width: 180, child: Text('虚拟 IP')),
+                      SizedBox(width: 110, child: Text('连接')),
+                      Expanded(flex: 2, child: Text('房间数据')),
+                      SizedBox(width: 110, child: Text('端到端延迟')),
+                      SizedBox(width: 88, child: Text('状态')),
+                      SizedBox(width: 66),
+                    ],
+                  ),
+                ),
+              ),
+            if (devices.isEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 8, 18, 24),
+                child: Text(
+                  '还没有设备连接。连接房间后，设备 IP 和连接质量会显示在这里。',
+                  style: Theme.of(context).textTheme.bodyMedium
+                      ?.copyWith(color: palette.textSecondary),
+                ),
+              ),
+            for (final user in orderedUsers) ...[
+              Container(
+                color: palette.surfaceMuted,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 18,
+                  vertical: 8,
+                ),
+                child: Text(
+                  '${user.isEmpty ? '成员信息同步中' : _memberLabel(user)} · ${user == roster.room.ownerId ? '房主' : '成员'} · ${devices.where((d) => (d['user_id'] ?? '') == user).length} 台设备',
+                  style: Theme.of(context).textTheme.bodySmall
+                      ?.copyWith(fontWeight: FontWeight.w600),
+                ),
+              ),
+              for (final device in devices.where(
+                (d) => (d['user_id'] ?? '') == user,
+              ))
+                _deviceCard(
+                  roster.room,
+                  device,
+                  snapshot,
+                  peers,
+                  withinList: true,
+                ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 
@@ -1188,7 +1425,7 @@ class _RoomsPageState extends State<RoomsPage> {
         animation: _roomViewRevision,
         builder: (context, _) {
           final snapshot = _sameSession ? _roomSnapshot(room) : null;
-          final peers = snapshot != null && !snapshot.peerSnapshotStale
+          final peers = snapshot != null && !_snapshotStale(snapshot)
               ? snapshot.peers
               : <PeerSnapshot>[];
           final candidates =
@@ -1212,7 +1449,7 @@ class _RoomsPageState extends State<RoomsPage> {
             contextHeader: Align(
               alignment: Alignment.centerLeft,
               child: Text(
-                '${room.name} · ${user == room.ownerId ? '房主' : '成员'} · ${_memberLabel(user)}\n房间数据：${roomDeviceDataLabel(current, snapshot)}\n链路与收包状态不代表系统 ping 一定可达。',
+                '${room.name} · ${user == room.ownerId ? '房主' : '成员'} · ${_memberLabel(user)}\n房间数据：${_deviceDataLabel(current, snapshot)}\n链路与收包状态不代表系统 ping 一定可达。',
               ),
             ),
             content: !available
@@ -1244,8 +1481,7 @@ class _RoomsPageState extends State<RoomsPage> {
                     ],
                   ),
             onCopy: (value, _) async {
-              await Clipboard.setData(ClipboardData(text: value));
-              if (mounted) _notify('已复制');
+              await _copyText(value, success: '已复制');
             },
           );
         },
@@ -1259,6 +1495,7 @@ class _RoomsPageState extends State<RoomsPage> {
     DiagnosticsSnapshot? snapshot,
     List<PeerSnapshot> peers, {
     bool interactive = true,
+    bool withinList = false,
   }) {
     final ip = device['virtual_ip'] as String? ?? '';
     final local =
@@ -1267,7 +1504,7 @@ class _RoomsPageState extends State<RoomsPage> {
     final peer = roomPeerForDevice(device, peers);
     final mappingMismatch =
         snapshot != null &&
-        !snapshot.peerSnapshotStale &&
+        !_snapshotStale(snapshot) &&
         roomDeviceMappingMismatch(device, peers);
     final access = _accessFor(room, device);
     final state = access?['state'] as String? ?? 'allowed';
@@ -1278,7 +1515,7 @@ class _RoomsPageState extends State<RoomsPage> {
         ? '未连接'
         : snapshot == null
         ? '本机未连接'
-        : snapshot.peerSnapshotStale
+        : _snapshotStale(snapshot)
         ? '状态待更新'
         : mappingMismatch
         ? '地址待同步'
@@ -1292,10 +1529,8 @@ class _RoomsPageState extends State<RoomsPage> {
           };
     final latency = peer?.latencyMs;
     final colors = Theme.of(context).colorScheme;
-    final green = Theme.of(context).brightness == Brightness.dark
-        ? const Color(0xff72dba0)
-        : const Color(0xff18834b);
-    final statusColor = online ? green : colors.onSurfaceVariant;
+    final green = P2WlanColors.of(context).successText;
+    final statusColor = colors.onSurfaceVariant;
     final userId = device['user_id'] as String? ?? '';
     final owner = userId.isNotEmpty && userId == room.ownerId;
     final username = userId.isEmpty ? '成员信息同步中' : _memberLabel(userId);
@@ -1306,360 +1541,462 @@ class _RoomsPageState extends State<RoomsPage> {
         ? '—'
         : snapshot == null
         ? '连接后测量'
-        : snapshot.peerSnapshotStale
+        : _snapshotStale(snapshot)
         ? '待更新'
         : latency == null
         ? '未测得'
         : '$latency ms';
-    return _surfaceCard(
-      child: InkWell(
-        key: ValueKey(
-          'room-device-${device['id'] ?? device['public_key'] ?? ip}',
+    final management =
+        ((room.isOwner ||
+                userId == _api.userId &&
+                    state != 'pending' &&
+                    (state != 'blocked' ||
+                        access?['blocked_by'] == _api.userId)) &&
+            (access != null || room.isOwner && device['id'] is String))
+        ? PopupMenuButton<String>(
+            tooltip: '管理设备',
+            enabled: !_busy,
+            onSelected: (action) => action == 'ip'
+                ? _changeIp(room, device)
+                : action == 'delete'
+                ? _deleteDevice(room, device)
+                : _controlDevice(room, device, access!, action),
+            itemBuilder: (_) => [
+              if (room.isOwner &&
+                  device['id'] is String &&
+                  (device['id'] as String).isNotEmpty)
+                const PopupMenuItem(value: 'ip', child: Text('分配 IP')),
+              if (access != null) ...[
+                if (state == 'allowed')
+                  const PopupMenuItem(
+                    value: 'disconnect',
+                    child: Text('断开此设备'),
+                  ),
+                if (state != 'blocked' && (state != 'pending' || room.isOwner))
+                  const PopupMenuItem(
+                    value: 'block',
+                    child: Text('禁止此设备连接此房间'),
+                  ),
+                if (state == 'blocked' &&
+                    (room.isOwner || access['blocked_by'] == _api.userId))
+                  const PopupMenuItem(value: 'unblock', child: Text('解除设备限制')),
+                if (state == 'pending' && room.isOwner)
+                  const PopupMenuItem(value: 'approve', child: Text('批准此设备')),
+              ] else if (room.isOwner)
+                const PopupMenuItem(value: 'delete', child: Text('删除设备')),
+            ],
+          )
+        : null;
+    final staleRoster = _rosterErrors.containsKey(room.id);
+    final status = StatusBadge(
+      label: state == 'blocked'
+          ? '已禁止'
+          : state == 'pending'
+          ? '待审批'
+          : state == 'paused'
+          ? '已断开'
+          : staleRoster && peer == null && !local
+          ? '状态待更新'
+          : online
+          ? '在线'
+          : '离线',
+      tone: state == 'blocked'
+          ? StatusTone.bad
+          : state == 'pending' || staleRoster && peer == null && !local
+          ? StatusTone.warn
+          : online
+          ? StatusTone.good
+          : StatusTone.neutral,
+    );
+    final ipWidget = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Flexible(
+          child: SelectableText(
+            ip.isEmpty ? '待分配' : ip,
+            style: const TextStyle(fontWeight: FontWeight.w600),
+          ),
         ),
-        onTap: interactive ? () => _showRoomDeviceDetails(room, device) : null,
-        borderRadius: BorderRadius.circular(12),
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Row(
-                children: [
-                  Icon(Icons.computer_rounded, color: statusColor),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '${device['device_name'] ?? '设备'}${local ? '（本机）' : ''}',
-                          style: Theme.of(context).textTheme.titleSmall,
-                        ),
-                        const SizedBox(height: 4),
+        if (ip.isNotEmpty)
+          IconButton(
+            tooltip: '复制 IP',
+            iconSize: 16,
+            style: _desktopLayout(context)
+                ? IconButton.styleFrom(
+                    minimumSize: const Size(40, 40),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  )
+                : null,
+            icon: const Icon(Icons.copy_rounded),
+            onPressed: () async {
+              await _copyText(ip, success: 'IP 已复制');
+            },
+          ),
+      ],
+    );
+    final latencyWidget = Text(
+      latencyLabel,
+      style: TextStyle(
+        fontWeight: FontWeight.w600,
+        color: latency == null
+            ? colors.onSurfaceVariant
+            : latency < 80
+            ? green
+            : latency < 150
+            ? colors.onSurface
+            : colors.error,
+      ),
+    );
+    final pathWidget = Text(
+      staleRoster && peer == null && !local ? '成员信息待更新' : path,
+    );
+    final dataWidget = Text(_deviceDataLabel(device, snapshot));
+    final content = InkWell(
+      key: ValueKey(
+        'room-device-${device['id'] ?? device['public_key'] ?? ip}',
+      ),
+      onTap: interactive ? () => _showRoomDeviceDetails(room, device) : null,
+      child: Padding(
+        padding: EdgeInsets.symmetric(
+          horizontal: 14,
+          vertical: _desktopLayout(context) ? 8 : 10,
+        ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final wide =
+                constraints.maxWidth >= 1000 &&
+                MediaQuery.textScalerOf(context).scale(14) < 20;
+            final header = Row(
+              children: [
+                Icon(Icons.computer_rounded, color: statusColor, size: 22),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '${device['device_name'] ?? '设备'}${local ? '（本机）' : ''}',
+                        style: Theme.of(context).textTheme.titleSmall,
+                      ),
+                      if (!withinList) ...[
+                        const SizedBox(height: 3),
                         Text(
                           identity,
                           style: Theme.of(context).textTheme.bodySmall,
                         ),
                       ],
-                    ),
+                    ],
                   ),
-                  const SizedBox(width: 8),
-                  _stateBadge(
-                    state == 'blocked'
-                        ? '已禁止'
-                        : state == 'pending'
-                        ? '待审批'
-                        : state == 'paused'
-                        ? '已断开'
-                        : online
-                        ? '在线'
-                        : '离线',
-                    statusColor,
-                  ),
-                  if (interactive) ...[
-                    const SizedBox(width: 6),
-                    Icon(
-                      Icons.chevron_right_rounded,
-                      size: 18,
-                      color: colors.onSurfaceVariant,
-                    ),
-                  ],
-                  if ((room.isOwner ||
-                          userId == _api.userId &&
-                              state != 'pending' &&
-                              (state != 'blocked' ||
-                                  access?['blocked_by'] == _api.userId)) &&
-                      (access != null ||
-                          room.isOwner && device['id'] is String))
-                    PopupMenuButton<String>(
-                      tooltip: '管理设备',
-                      enabled: !_busy,
-                      onSelected: (action) => action == 'ip'
-                          ? _changeIp(room, device)
-                          : action == 'delete'
-                          ? _deleteDevice(room, device)
-                          : _controlDevice(room, device, access!, action),
-                      itemBuilder: (_) => [
-                        if (room.isOwner &&
-                            device['id'] is String &&
-                            (device['id'] as String).isNotEmpty)
-                          const PopupMenuItem(
-                            value: 'ip',
-                            child: Text('分配 IP'),
-                          ),
-                        if (access != null) ...[
-                          if (state == 'allowed')
-                            const PopupMenuItem(
-                              value: 'disconnect',
-                              child: Text('断开此设备'),
-                            ),
-                          if (state != 'blocked' &&
-                              (state != 'pending' || room.isOwner))
-                            const PopupMenuItem(
-                              value: 'block',
-                              child: Text('禁止此设备连接此房间'),
-                            ),
-                          if (state == 'blocked' &&
-                              (room.isOwner ||
-                                  access['blocked_by'] == _api.userId))
-                            const PopupMenuItem(
-                              value: 'unblock',
-                              child: Text('解除设备限制'),
-                            ),
-                          if (state == 'pending' && room.isOwner)
-                            const PopupMenuItem(
-                              value: 'approve',
-                              child: Text('批准此设备'),
-                            ),
-                        ] else if (room.isOwner)
-                          const PopupMenuItem(
-                            value: 'delete',
-                            child: Text('删除设备'),
-                          ),
-                      ],
-                    ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 24,
-                runSpacing: 12,
+                ),
+                if (!wide && management != null) management,
+                if (!wide && interactive)
+                  const Icon(Icons.chevron_right_rounded, size: 18),
+              ],
+            );
+            Widget metric(String label, Widget value) => withinList
+                ? value
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(label, style: Theme.of(context).textTheme.bodySmall),
+                      const SizedBox(height: 4),
+                      value,
+                    ],
+                  );
+            if (wide) {
+              return Row(
                 children: [
+                  Expanded(flex: 3, child: header),
+                  const SizedBox(width: 16),
+                  SizedBox(width: 180, child: metric('虚拟 IP', ipWidget)),
+                  SizedBox(width: 110, child: metric('连接', pathWidget)),
+                  Expanded(flex: 2, child: metric('房间数据', dataWidget)),
+                  SizedBox(width: 110, child: metric('端到端延迟', latencyWidget)),
                   SizedBox(
-                    width: 180,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('虚拟 IP', style: TextStyle(fontSize: 12)),
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Flexible(
-                              child: SelectableText(
-                                ip.isEmpty ? '待分配' : ip,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ),
-                            if (ip.isNotEmpty)
-                              IconButton(
-                                tooltip: '复制 IP',
-                                visualDensity: VisualDensity.compact,
-                                iconSize: 16,
-                                icon: const Icon(Icons.copy_rounded),
-                                onPressed: () async {
-                                  await Clipboard.setData(
-                                    ClipboardData(text: ip),
-                                  );
-                                  if (mounted) _notify('IP 已复制');
-                                },
-                              ),
-                          ],
-                        ),
-                      ],
+                    width: withinList ? 88 : null,
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: status,
                     ),
                   ),
-                  _deviceMetric('连接', path),
-                  _deviceMetric('房间数据', roomDeviceDataLabel(device, snapshot)),
-                  SizedBox(
-                    width: 110,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '端到端延迟',
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          latencyLabel,
-                          style: TextStyle(
-                            fontWeight: FontWeight.w600,
-                            color: latency == null
-                                ? colors.onSurfaceVariant
-                                : latency < 80
-                                ? green
-                                : latency < 150
-                                ? colors.onSurface
-                                : colors.error,
-                          ),
-                        ),
-                      ],
-                    ),
+                  if (withinList)
+                    SizedBox(width: 48, child: management)
+                  else
+                    ?management,
+                  if (interactive)
+                    const Icon(Icons.chevron_right_rounded, size: 18),
+                ],
+              );
+            }
+            if (constraints.maxWidth >= 480 &&
+                MediaQuery.textScalerOf(context).scale(14) < 20) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  header,
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 4,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      ipWidget,
+                      status,
+                      pathWidget,
+                      Tooltip(message: '端到端实测延迟', child: latencyWidget),
+                      dataWidget,
+                    ],
                   ),
                 ],
-              ),
-            ],
-          ),
+              );
+            }
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                header,
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Row(
+                    children: [
+                      Text(
+                        '虚拟 IP · ',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                      Flexible(child: ipWidget),
+                    ],
+                  ),
+                ),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 8,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    status,
+                    pathWidget,
+                    Tooltip(message: '端到端实测延迟', child: latencyWidget),
+                    dataWidget,
+                  ],
+                ),
+              ],
+            );
+          },
         ),
       ),
     );
+    return withinList
+        ? DecoratedBox(
+            decoration: BoxDecoration(
+              border: Border(
+                top: BorderSide(color: P2WlanColors.of(context).border),
+              ),
+            ),
+            child: content,
+          )
+        : _surfaceCard(child: content);
   }
 
-  Widget _deviceMetric(String label, String value) => SizedBox(
-    width: 96,
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(label, style: Theme.of(context).textTheme.bodySmall),
-        const SizedBox(height: 8),
-        Text(value, style: const TextStyle(fontWeight: FontWeight.w600)),
-      ],
-    ),
+  Widget _roomMetric(String label, String value) => Wrap(
+    spacing: 8,
+    runSpacing: 4,
+    crossAxisAlignment: WrapCrossAlignment.center,
+    children: [
+      Text(label, style: Theme.of(context).textTheme.bodySmall),
+      Text(
+        value,
+        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+          fontWeight: FontWeight.w600,
+          fontFeatures: AppTokens.tabularFontFeatures,
+        ),
+      ),
+    ],
+  );
+
+  Widget _autoConnectToggle(FriendRoom room) => SwitchListTile.adaptive(
+    title: const Text('启动时自动连接此房间'),
+    subtitle: const Text('仅对本机生效；手动或远程断开后，需重新手动连接'),
+    value: _autoConnect[room.id] ?? false,
+    onChanged: _busy
+        ? null
+        : (value) => _run((isCurrent) async {
+            await _parallel.setAutoConnect(room, value);
+            if (isCurrent()) _autoConnect[room.id] = value;
+          }),
   );
 
   Widget _roomDetails(RoomRoster roster) {
     final room = roster.room;
+    final compact = MediaQuery.sizeOf(context).width < 700;
     final connection = _parallel.session(room.id);
-    final primaryConnected = connection == null && _roomSnapshot(room) != null;
+    final snapshot = _roomSnapshot(room);
+    final primaryConnected = connection == null && snapshot != null;
     final active =
         connection != null ||
         widget.settingsStore.settings.networkId == room.id;
+    final palette = P2WlanColors.of(context);
+    final actions = Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        if (_canConnect) _connectionButton(room),
+        if (room.isOwner)
+          OutlinedButton.icon(
+            onPressed: _busy || room.locked ? null : () => _issueInvite(room),
+            icon: const Icon(Icons.person_add_alt_1_outlined, size: 18),
+            label: Text(compact ? '邀请' : '生成邀请'),
+          ),
+        if (!room.isOwner)
+          TextButton(
+            onPressed: _busy ? null : () => _leave(room),
+            child: const Text('退出房间'),
+          ),
+      ],
+    );
+    final identity = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Text(
+              room.name,
+              style: Theme.of(context).textTheme.headlineSmall
+                  ?.copyWith(fontSize: 22, fontWeight: FontWeight.w700),
+            ),
+            _connectionBadge(room),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 16,
+          runSpacing: 4,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(
+                  child: SelectableText(
+                    '房间号 ${room.code}',
+                    style: Theme.of(context).textTheme.bodySmall
+                        ?.copyWith(fontFeatures: AppTokens.tabularFontFeatures),
+                  ),
+                ),
+                IconButton(
+                  tooltip: '复制房间号',
+                  icon: const Icon(Icons.copy_rounded, size: 16),
+                  onPressed: _busy
+                      ? null
+                      : () async {
+                          await _copyText(room.code, success: '房间号已复制');
+                        },
+                ),
+              ],
+            ),
+            if (snapshot != null)
+              Text(
+                '本机 IP：${snapshot.virtualIp}',
+                style: Theme.of(context).textTheme.bodySmall
+                    ?.copyWith(fontFeatures: AppTokens.tabularFontFeatures),
+              ),
+            if (!compact)
+              Text(
+                room.cidr,
+                style: Theme.of(context).textTheme.bodySmall
+                    ?.copyWith(fontFeatures: AppTokens.tabularFontFeatures),
+              ),
+          ],
+        ),
+      ],
+    );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _surfaceCard(
           child: Padding(
-            padding: const EdgeInsets.all(20),
+            padding: const EdgeInsets.all(18),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        room.name,
-                        style: Theme.of(context).textTheme.headlineSmall,
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 5,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Theme.of(context).colorScheme.secondaryContainer,
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: Text(
-                        _connectionLabel(connection, _roomSnapshot(room)),
-                        style: Theme.of(context).textTheme.labelMedium,
-                      ),
-                    ),
-                  ],
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    if (constraints.maxWidth >= 900 &&
+                        MediaQuery.textScalerOf(context).scale(14) < 20) {
+                      return Row(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          Expanded(child: identity),
+                          const SizedBox(width: 24),
+                          actions,
+                        ],
+                      );
+                    }
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [identity, const SizedBox(height: 12), actions],
+                    );
+                  },
                 ),
-                const SizedBox(height: 8),
-                SelectableText('房间号 ${room.code}  ·  ${room.cidr}'),
-                if (_roomSnapshot(room) case final snapshot?) ...[
-                  const SizedBox(height: 8),
-                  Text('本机 IP：${snapshot.virtualIp}'),
-                  if (!snapshot.peerSnapshotStale)
-                    Text(
-                      RoomConnectivitySummary.fromSnapshot(snapshot).details,
-                    ),
-                ],
                 if (connection?.message case final message?) ...[
-                  const SizedBox(height: 8),
-                  Semantics(liveRegion: true, child: Text(message)),
-                ],
-                const SizedBox(height: 8),
-                Text(
-                  _parallel.supported
-                      ? '本机已连接 ${_parallel.activeConnections}/${_parallel.maxConnections} 个房间；各房间独立运行。'
-                      : '此平台使用单活动网络，连接本房间将断开当前网络。',
-                ),
-                const SizedBox(height: 16),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    if (_canConnect)
-                      FilledButton.icon(
-                        onPressed: _busy
-                            ? null
-                            : () => connection != null || primaryConnected
-                                  ? _disconnectRoom(room)
-                                  : _connect(room),
-                        icon: Icon(
-                          connection == null && !primaryConnected
-                              ? Icons.lan_outlined
-                              : Icons.link_off,
-                        ),
-                        label: Text(
-                          connection != null || primaryConnected
-                              ? '断开本机'
-                              : active
-                              ? '重新连接本机'
-                              : '连接本机',
-                        ),
-                      ),
-                    OutlinedButton.icon(
-                      onPressed: _busy
-                          ? null
-                          : () async {
-                              await Clipboard.setData(
-                                ClipboardData(text: room.code),
-                              );
-                              if (mounted) _notify('房间号已复制');
-                            },
-                      icon: const Icon(Icons.copy_rounded),
-                      label: const Text('复制房间号'),
+                  const SizedBox(height: 10),
+                  Semantics(
+                    liveRegion: true,
+                    child: Text(
+                      message,
+                      style: Theme.of(context).textTheme.bodySmall
+                          ?.copyWith(color: palette.warningText),
                     ),
-                    if (!room.isOwner)
-                      TextButton.icon(
-                        onPressed: _busy ? null : () => _leave(room),
-                        icon: const Icon(Icons.exit_to_app_rounded),
-                        label: const Text('退出房间'),
-                      ),
-                    if (room.isOwner)
-                      OutlinedButton.icon(
-                        onPressed: _busy || room.locked
-                            ? null
-                            : () => _issueInvite(room),
-                        icon: const Icon(Icons.link_rounded),
-                        label: const Text('生成邀请'),
-                      ),
-                  ],
-                ),
+                  ),
+                ],
                 if (connection == null && !primaryConnected) ...[
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 10),
                   Text(
                     active
                         ? (_parallel.supported ? '重新连接以启用多房间互联。' : '当前房间网络')
                         : '已加入，连接后即可访问房间内的设备。',
+                    style: Theme.of(context).textTheme.bodySmall,
                   ),
                 ],
-                if (connection?.message != null)
+                if (!_canConnect)
                   Padding(
-                    padding: const EdgeInsets.only(top: 8),
+                    padding: const EdgeInsets.only(top: 10),
                     child: Text(
-                      connection!.message!,
-                      style: TextStyle(
-                        color: Theme.of(context).colorScheme.error,
-                      ),
+                      '此平台仅支持房间管理，不能创建本地虚拟网卡。',
+                      style: Theme.of(context).textTheme.bodySmall,
                     ),
                   ),
-                if (!_canConnect) const Text('此平台仅支持房间管理，不能创建本地虚拟网卡。'),
               ],
             ),
           ),
         ),
-        if (_parallel.supported && _canConnect)
-          SwitchListTile.adaptive(
-            title: const Text('启动时自动连接此房间'),
-            subtitle: const Text('仅对本机生效；手动或远程断开后，需重新手动连接'),
-            value: _autoConnect[room.id] ?? false,
-            onChanged: _busy
-                ? null
-                : (value) => _run(() async {
-                    await _parallel.setAutoConnect(room, value);
-                    _autoConnect[room.id] = value;
-                  }),
-          ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 12),
         _deviceList(roster),
+        ExpansionTile(
+          title: const Text('连接与自动连接'),
+          children: [
+            ListTile(
+              title: const Text('房间网段'),
+              subtitle: SelectableText(room.cidr),
+            ),
+            if (_roomSnapshot(room) case final snapshot?)
+              ListTile(
+                title: const Text('连接概况'),
+                subtitle: Text(
+                  _snapshotStale(snapshot)
+                      ? '链路信息待更新'
+                      : RoomConnectivitySummary.fromSnapshot(snapshot).details,
+                ),
+              ),
+            ListTile(
+              title: Text(
+                _parallel.supported
+                    ? '本机已连接 ${_parallel.activeConnections}/${_parallel.maxConnections} 个房间；各房间独立运行。'
+                    : '此平台使用单活动网络，连接本房间将断开当前网络。',
+              ),
+            ),
+            if (_parallel.supported && _canConnect) _autoConnectToggle(room),
+          ],
+        ),
         if (roster.members.any((member) => !member.containsKey('username')))
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 8),
@@ -1717,7 +2054,7 @@ class _RoomsPageState extends State<RoomsPage> {
                     value: roster.deviceApprovalRequired,
                     onChanged: _busy
                         ? null
-                        : (value) => _run(() async {
+                        : (value) => _run((isCurrent) async {
                             await _api.request(
                               'PUT',
                               [room.id, 'device-policy'],
@@ -1732,7 +2069,7 @@ class _RoomsPageState extends State<RoomsPage> {
                   value: room.locked,
                   onChanged: _busy
                       ? null
-                      : (value) => _run(() async {
+                      : (value) => _run((isCurrent) async {
                           await _api.request(
                             'PATCH',
                             [room.id],
@@ -1765,6 +2102,15 @@ class _RoomsPageState extends State<RoomsPage> {
           ExpansionTile(
             title: const Text('邀请管理'),
             children: [
+              if (_invitesError != null)
+                ListTile(
+                  title: const Text('邀请信息更新失败'),
+                  subtitle: Text(_invitesError!),
+                  trailing: TextButton(
+                    onPressed: _busy || _refreshing ? null : () => _refresh(),
+                    child: const Text('重试'),
+                  ),
+                ),
               if (_invites.isEmpty)
                 const Padding(
                   padding: EdgeInsets.symmetric(vertical: 12),
@@ -1790,7 +2136,7 @@ class _RoomsPageState extends State<RoomsPage> {
                                     '链接将不能再用于加入，已加入成员不受影响。',
                                   ) &&
                                   mounted) {
-                                await _run(() async {
+                                await _run((isCurrent) async {
                                   await _api.request('DELETE', [
                                     room.id,
                                     'invites',
@@ -1818,7 +2164,7 @@ class _RoomsPageState extends State<RoomsPage> {
                                       '该账号仍需使用有效密码或邀请重新加入。',
                                     ) &&
                                     mounted) {
-                                  await _run(() async {
+                                  await _run((isCurrent) async {
                                     await _api.request('DELETE', [
                                       room.id,
                                       'bans',
@@ -1838,42 +2184,114 @@ class _RoomsPageState extends State<RoomsPage> {
     );
   }
 
+  Widget _rosterIssue(FriendRoom room) {
+    final cached = _rosters.containsKey(room.id);
+    final updated = _rosterUpdatedAt[room.id];
+    final time = updated == null
+        ? ''
+        : '（${TimeOfDay.fromDateTime(updated).format(context)} 更新）';
+    return _surfaceCard(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (!cached) ...[
+              Text(room.name, style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 8),
+              Text('房间号 ${room.code} · ${room.cidr}'),
+              const SizedBox(height: 12),
+            ],
+            Semantics(
+              liveRegion: true,
+              child: Text(cached ? '房间信息更新失败，当前显示上次数据$time。' : '暂时无法加载房间详情。'),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _rosterErrors[room.id]!,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              key: const ValueKey('retry-room-roster'),
+              onPressed: _busy || _refreshing
+                  ? null
+                  : () => _selectRoom(room.id),
+              icon: const Icon(Icons.refresh_rounded),
+              label: const Text('重试加载房间'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _overviewHeader() => LayoutBuilder(
     builder: (context, constraints) {
+      final owned = _rooms.where((room) => room.isOwner).firstOrNull;
       final actions = Wrap(
         spacing: 8,
         runSpacing: 8,
         children: [
           FilledButton.icon(
-            onPressed: _busy || _rooms.any((room) => room.isOwner)
-                ? null
-                : _create,
+            onPressed: _busy || _loading || owned != null ? null : _create,
             icon: const Icon(Icons.add_rounded),
             label: const Text('创建房间'),
           ),
           OutlinedButton.icon(
-            onPressed: _busy ? null : _join,
+            onPressed: _busy ? null : () => _join(),
             icon: const Icon(Icons.meeting_room_outlined),
             label: const Text('加入房间'),
           ),
-          OutlinedButton.icon(
-            onPressed: _busy ? null : () => _joinWithLink(),
-            icon: const Icon(Icons.link_rounded),
-            label: const Text('粘贴邀请'),
-          ),
         ],
       );
-      if (!widget.showHeader) return actions;
-      final title = Text('互联', style: Theme.of(context).textTheme.titleLarge);
-      if (constraints.maxWidth >= 520) {
-        return Row(children: [title, const Spacer(), actions]);
-      }
+      final title = Text(
+        '房间',
+        style: Theme.of(context).textTheme.titleLarge
+            ?.copyWith(fontSize: 24, fontWeight: FontWeight.w700),
+      );
       return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [title, const SizedBox(height: 8), actions],
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (!widget.showHeader || !widget.embedded)
+            actions
+          else if (constraints.maxWidth >= 600 &&
+              MediaQuery.textScalerOf(context).scale(14) < 20)
+            Row(children: [title, const Spacer(), actions])
+          else ...[
+            title,
+            const SizedBox(height: 8),
+            actions,
+          ],
+          if (owned != null) ...[
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                Text(
+                  '每个账号可创建一个房间，你已创建“${owned.name}”。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                TextButton(
+                  onPressed: _busy ? null : () => _selectRoom(owned.id),
+                  child: const Text('管理我的房间'),
+                ),
+              ],
+            ),
+          ],
+        ],
       );
     },
   );
+
+  bool _desktopLayout(BuildContext context) =>
+      switch (Theme.of(context).platform) {
+        TargetPlatform.macOS ||
+        TargetPlatform.windows ||
+        TargetPlatform.linux => true,
+        _ => MediaQuery.sizeOf(context).width >= 900,
+      };
 
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
@@ -1882,7 +2300,7 @@ class _RoomsPageState extends State<RoomsPage> {
       appBar: widget.embedded
           ? null
           : AppBar(
-              title: const Text('互联'),
+              title: const Text('房间'),
               actions: [
                 IconButton(
                   tooltip: '刷新房间',
@@ -1895,23 +2313,20 @@ class _RoomsPageState extends State<RoomsPage> {
         child: RefreshIndicator(
           onRefresh: _refresh,
           child: ListView(
-            padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+            padding: EdgeInsets.fromLTRB(
+              _desktopLayout(context) ? 28 : 20,
+              _desktopLayout(context) ? 24 : 16,
+              _desktopLayout(context) ? 28 : 20,
+              24,
+            ),
             children: [
               Center(
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 1800),
+                  constraints: const BoxConstraints(maxWidth: 1440),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       if (_selectedId == null) _overviewHeader(),
-                      if (_rooms.isEmpty) ...[
-                        const SizedBox(height: 8),
-                        Text(
-                          _parallel.supported
-                              ? '和好友加入同一房间，连接后即可互访。可同时连接多个房间。'
-                              : '和好友加入同一房间。此平台目前仍为单活动网络。',
-                        ),
-                      ],
                       const SizedBox(height: 12),
                       if (_selectedId != null)
                         Align(
@@ -1923,6 +2338,7 @@ class _RoomsPageState extends State<RoomsPage> {
                                     setState(() {
                                       _selectedId = null;
                                       _roster = null;
+                                      _loading = false;
                                     });
                                     _generation++;
                                     widget.onRoomSelected?.call(null);
@@ -1932,9 +2348,11 @@ class _RoomsPageState extends State<RoomsPage> {
                           ),
                         ),
                       if (_busy || _loading)
-                        const Padding(
-                          padding: EdgeInsets.symmetric(vertical: 16),
-                          child: LinearProgressIndicator(),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                          child: LinearProgressIndicator(
+                            semanticsLabel: _loading ? '正在加载房间' : '正在处理房间操作',
+                          ),
                         ),
                       if (_operationError != null || _error != null)
                         Padding(
@@ -1955,6 +2373,14 @@ class _RoomsPageState extends State<RoomsPage> {
                                     Expanded(
                                       child: Text(_operationError ?? _error!),
                                     ),
+                                    if (_error != null)
+                                      IconButton(
+                                        tooltip: '重试加载房间列表',
+                                        onPressed: _busy || _refreshing
+                                            ? null
+                                            : () => _refresh(),
+                                        icon: const Icon(Icons.refresh_rounded),
+                                      ),
                                     IconButton(
                                       tooltip: '关闭提示',
                                       onPressed: () => setState(() {
@@ -1974,6 +2400,12 @@ class _RoomsPageState extends State<RoomsPage> {
                         _roomList(),
                         const SizedBox(height: 16),
                       ],
+                      if (_selectedId != null)
+                        for (final room in _rooms.where(
+                          (room) => room.id == _selectedId,
+                        ))
+                          if (_rosterErrors.containsKey(room.id))
+                            _rosterIssue(room),
                       if (_roster != null) _roomDetails(_roster!),
                     ],
                   ),
@@ -1993,7 +2425,6 @@ class _RoomField {
     this.initial = '',
     this.hint,
     this.secret = false,
-    this.multiline = false,
     this.number = false,
     this.maxLength = 128,
     this.validate,
@@ -2002,7 +2433,6 @@ class _RoomField {
   final String initial;
   final String? hint;
   final bool secret;
-  final bool multiline;
   final bool number;
   final int maxLength;
   final String? Function(String?)? validate;
@@ -2061,7 +2491,7 @@ class _RoomInputDialogState extends State<_RoomInputDialog> {
                     autocorrect: false,
                     enableSuggestions: !widget.fields[i].secret,
                     maxLength: widget.fields[i].maxLength,
-                    maxLines: widget.fields[i].multiline ? 4 : 1,
+                    maxLines: 1,
                     keyboardType: widget.fields[i].number
                         ? TextInputType.number
                         : TextInputType.text,

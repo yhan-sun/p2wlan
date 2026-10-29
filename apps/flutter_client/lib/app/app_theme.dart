@@ -51,11 +51,11 @@ abstract final class AppTheme {
         ),
         labelStyle: TextStyle(
           color: AppTokens.colorTextSecondary,
-          fontSize: 13,
+          fontSize: 14,
         ),
         hintStyle: const TextStyle(
           color: AppTokens.colorTextMuted,
-          fontSize: 13,
+          fontSize: 14,
         ),
         helperStyle: const TextStyle(
           color: AppTokens.colorTextMuted,
@@ -104,7 +104,7 @@ abstract final class AppTheme {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(AppTokens.radiusSm),
           ),
-          textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+          textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
         ),
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
@@ -126,7 +126,7 @@ abstract final class AppTheme {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(AppTokens.radiusSm),
           ),
-          textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+          textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
         ),
       ),
       iconButtonTheme: IconButtonThemeData(
@@ -255,11 +255,11 @@ abstract final class AppTheme {
         ),
         labelStyle: TextStyle(
           color: AppTokens.colorDarkTextSecondary,
-          fontSize: 13,
+          fontSize: 14,
         ),
         hintStyle: const TextStyle(
           color: AppTokens.colorDarkTextMuted,
-          fontSize: 13,
+          fontSize: 14,
         ),
         helperStyle: const TextStyle(
           color: AppTokens.colorDarkTextMuted,
@@ -308,7 +308,7 @@ abstract final class AppTheme {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(AppTokens.radiusSm),
           ),
-          textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+          textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
         ),
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
@@ -330,7 +330,7 @@ abstract final class AppTheme {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(AppTokens.radiusSm),
           ),
-          textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+          textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
         ),
       ),
       iconButtonTheme: IconButtonThemeData(

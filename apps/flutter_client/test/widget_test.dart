@@ -10,6 +10,7 @@ import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
 import 'package:p2wlan_flutter_client/app/p2wlan_app.dart';
 import 'package:p2wlan_flutter_client/features/dashboard/dashboard_page.dart';
+import 'package:p2wlan_flutter_client/features/auth/login_page.dart';
 import 'package:p2wlan_flutter_client/features/diagnostics/diagnostics_page.dart';
 import 'package:p2wlan_flutter_client/features/nodes/nodes_page.dart';
 import 'package:p2wlan_flutter_client/features/settings/settings_page.dart';
@@ -120,7 +121,7 @@ void main() {
     );
     expect(find.text('首页'), findsWidgets);
     expect(find.text('设备'), findsWidgets);
-    expect(find.text('互联'), findsWidgets);
+    expect(find.text('房间'), findsWidgets);
     expect(find.text('设置'), findsOneWidget);
     // No permanent "More" destination.
     expect(find.text('更多'), findsNothing);
@@ -142,7 +143,7 @@ void main() {
     expect(find.byType(NavigationBar), findsNothing);
     expect(find.text('首页'), findsOneWidget);
     expect(find.text('设备'), findsOneWidget);
-    expect(find.text('互联'), findsOneWidget);
+    expect(find.text('房间'), findsOneWidget);
     expect(find.text('故障排查'), findsNothing);
     expect(find.text('设置'), findsOneWidget);
     expect(find.text('隧道'), findsNothing);
@@ -167,13 +168,13 @@ void main() {
     expect(find.text('P2WLAN'), findsWidgets);
     expect(find.text('首页'), findsOneWidget);
     expect(find.text('设备'), findsOneWidget);
-    expect(find.text('互联'), findsOneWidget);
+    expect(find.text('房间'), findsOneWidget);
     expect(find.text('故障排查'), findsNothing);
     expect(find.text('设置'), findsOneWidget);
     expect(find.text('隧道'), findsNothing);
     // Sidebar status footer renders (daemon is offline in this harness), and
     // the top bar no longer duplicates it: only the hero badge remains.
-    expect(find.text('无法连接本地服务'), findsOneWidget);
+    expect(find.text('本机网络尚未连接'), findsOneWidget);
     expect(find.byType(StatusBadge), findsOneWidget);
   });
 
@@ -373,7 +374,7 @@ void main() {
     await tester.pump();
     expect(find.byType(DesktopSidebar), findsOneWidget);
     expect(find.byType(DiagnosticsPage), findsOneWidget);
-    expect(find.text('无法连接本地服务'), findsOneWidget);
+    expect(find.text('本机网络尚未连接'), findsOneWidget);
 
     // Shrink back to Medium then Compact: section survives, bottom bar is
     // still exactly three destinations, and a primary destination can be
@@ -488,6 +489,37 @@ void main() {
     // Must be restored inside the test body: the framework asserts that
     // foundation debug variables are unset before it runs tear-downs.
     debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('reauthentication can cancel back to the same settings page', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await _pumpTestApp(tester);
+    await tester.tap(find.text('设置').last);
+    await tester.pumpAndSettle();
+    final settings = tester.widget<SettingsPage>(find.byType(SettingsPage));
+    final original = settings.settingsStore.settings;
+    settings.onReauthenticate!();
+    await tester.pumpAndSettle();
+    expect(find.byType(LoginPage), findsOneWidget);
+    expect(
+      tester.widget<LoginPage>(find.byType(LoginPage)).isReauthentication,
+      isTrue,
+    );
+    tester.widget<LoginPage>(find.byType(LoginPage)).onCancel!();
+    await tester.pumpAndSettle();
+    expect(find.byType(LoginPage), findsNothing);
+    expect(find.byType(SettingsPage), findsOneWidget);
+    expect(settings.settingsStore.settings.authToken, original.authToken);
+    expect(
+      settings.settingsStore.settings.controlServer,
+      original.controlServer,
+    );
+    expect(tester.takeException(), isNull);
   });
 }
 

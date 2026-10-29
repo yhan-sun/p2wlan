@@ -5,7 +5,8 @@ import '../../app/app_tokens.dart';
 import '../../app/navigation_model.dart';
 import '../../app/p2wlan_colors.dart';
 import '../../core/state/status_store.dart';
-import '../../core/rooms/parallel_rooms.dart';
+import '../../core/presentation/network_overview.dart';
+import '../network_overview_presentation.dart';
 import 'status_badge.dart';
 
 /// Expanded desktop side navigation: brand header, primary sections grouped
@@ -23,7 +24,7 @@ class DesktopSidebar extends StatelessWidget {
     required this.onFooterTap,
   });
 
-  static const width = 184.0;
+  static const width = 196.0;
 
   final P2WlanSection? selected;
   final AppStrings strings;
@@ -43,17 +44,16 @@ class DesktopSidebar extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             _SidebarBrandHeader(strings: strings),
-            const Divider(height: 1),
             Expanded(
               child: ListView(
-                padding: const EdgeInsets.symmetric(vertical: AppTokens.space6),
+                padding: const EdgeInsets.symmetric(vertical: AppTokens.space8),
                 children: [
                   for (final (index, group)
                       in P2WlanSection.sidebarGroups.indexed) ...[
                     if (index > 0)
                       const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 6),
-                        child: Divider(height: 1, indent: 16),
+                        padding: EdgeInsets.symmetric(vertical: 12),
+                        child: Divider(height: 1, indent: 20, endIndent: 20),
                       ),
                     for (final section in group)
                       _SidebarItem(
@@ -88,32 +88,36 @@ class _SidebarBrandHeader extends StatelessWidget {
     final theme = Theme.of(context);
     return SizedBox(
       key: const Key('desktop-sidebar-brand'),
-      height: 52,
+      height: 68,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: AppTokens.space14),
+        padding: const EdgeInsets.symmetric(horizontal: AppTokens.space20),
         child: Row(
           children: [
             Container(
-              width: 26,
-              height: 26,
+              width: 32,
+              height: 32,
               decoration: BoxDecoration(
                 color: theme.colorScheme.primary,
                 borderRadius: BorderRadius.circular(AppTokens.radiusSm + 1),
               ),
               child: Icon(
                 Icons.hub_outlined,
-                size: 16,
+                size: 20,
                 color: theme.colorScheme.onPrimary,
               ),
             ),
             const SizedBox(width: AppTokens.space10),
-            Text(
-              strings.appName,
-              style: TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 0,
-                color: theme.colorScheme.onSurface,
+            Flexible(
+              child: Text(
+                strings.appName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0,
+                  color: theme.colorScheme.onSurface,
+                ),
               ),
             ),
           ],
@@ -143,58 +147,69 @@ class _SidebarItem extends StatelessWidget {
     final foreground = selected
         ? theme.colorScheme.primary
         : theme.colorScheme.onSurfaceVariant;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: AppTokens.space8),
-      child: AnimatedContainer(
-        duration: AppTokens.durationMedium,
-        curve: AppTokens.curveEase,
-        decoration: BoxDecoration(
-          color: selected ? colors.selectedSurface : Colors.transparent,
-          borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        ),
-        child: Material(
-          type: MaterialType.transparency,
-          child: MouseRegion(
-            cursor: SystemMouseCursors.click,
-            child: InkWell(
-              onTap: onTap,
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: label,
+      child: Tooltip(
+        message: label,
+        excludeFromSemantics: true,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 2, 12, 2),
+          child: AnimatedContainer(
+            duration: AppTokens.durationMedium,
+            curve: AppTokens.curveEase,
+            decoration: BoxDecoration(
+              color: selected ? colors.selectedSurface : Colors.transparent,
               borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-              hoverColor: selected ? null : colors.hoverSurface,
-              child: SizedBox(
-                height: 36,
-                child: Row(
-                  children: [
-                    const SizedBox(width: AppTokens.space8),
-                    AnimatedContainer(
-                      duration: AppTokens.durationMedium,
-                      width: 2,
-                      height: selected ? 18 : 0,
-                      decoration: BoxDecoration(
-                        color: selected
-                            ? theme.colorScheme.primary
-                            : Colors.transparent,
-                        borderRadius: BorderRadius.circular(2),
+            ),
+            child: Material(
+              type: MaterialType.transparency,
+              child: MouseRegion(
+                cursor: SystemMouseCursors.click,
+                child: InkWell(
+                  onTap: onTap,
+                  borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+                  hoverColor: selected ? null : colors.hoverSurface,
+                  child: ExcludeSemantics(
+                    child: SizedBox(
+                      height: 44,
+                      child: Row(
+                        children: [
+                          const SizedBox(width: AppTokens.space8),
+                          AnimatedContainer(
+                            duration: AppTokens.durationMedium,
+                            width: 2,
+                            height: selected ? 18 : 0,
+                            decoration: BoxDecoration(
+                              color: selected
+                                  ? theme.colorScheme.primary
+                                  : Colors.transparent,
+                              borderRadius: BorderRadius.circular(2),
+                            ),
+                          ),
+                          const SizedBox(width: AppTokens.space8),
+                          Icon(icon, size: 20, color: foreground),
+                          const SizedBox(width: AppTokens.space10),
+                          Expanded(
+                            child: Text(
+                              label,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: selected
+                                    ? FontWeight.w600
+                                    : FontWeight.w500,
+                                color: foreground,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: AppTokens.space8),
+                        ],
                       ),
                     ),
-                    const SizedBox(width: AppTokens.space8),
-                    Icon(icon, size: 18, color: foreground),
-                    const SizedBox(width: AppTokens.space10),
-                    Expanded(
-                      child: Text(
-                        label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: selected
-                              ? FontWeight.w600
-                              : FontWeight.w500,
-                          color: foreground,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: AppTokens.space8),
-                  ],
+                  ),
                 ),
               ),
             ),
@@ -230,77 +245,102 @@ class _SidebarFooter extends StatelessWidget {
           StatusTone.bad => colors.dangerDot,
           StatusTone.neutral => colors.neutralDot,
         };
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const Divider(height: 1),
-            Container(
-              key: const Key('desktop-sidebar-status'),
-              child: Tooltip(
-                message: strings.openTroubleshooting,
-                child: Material(
-                  type: MaterialType.transparency,
-                  child: InkWell(
-                    onTap: onTap,
-                    hoverColor: colors.hoverSurface,
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(
-                        AppTokens.space14,
-                        AppTokens.space10,
-                        AppTokens.space10,
-                        AppTokens.space10,
-                      ),
-                      child: Row(
-                        children: [
-                          Container(
-                            width: 7,
-                            height: 7,
-                            decoration: BoxDecoration(
-                              color: dotColor,
-                              shape: BoxShape.circle,
+        final wrapStatus = MediaQuery.textScalerOf(context).scale(13) > 18;
+        final description = '$label, $detail';
+        return Semantics(
+          label: description,
+          hint: strings.openTroubleshooting,
+          button: true,
+          child: Padding(
+            padding: const EdgeInsets.all(AppTokens.space12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Container(
+                  key: const Key('desktop-sidebar-status'),
+                  decoration: BoxDecoration(
+                    color: colors.surfaceMuted,
+                    border: Border.all(color: colors.border),
+                    borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+                  ),
+                  child: Tooltip(
+                    message: '$label\n$detail\n${strings.openTroubleshooting}',
+                    excludeFromSemantics: true,
+                    child: Material(
+                      type: MaterialType.transparency,
+                      child: InkWell(
+                        onTap: onTap,
+                        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+                        hoverColor: colors.hoverSurface,
+                        child: ExcludeSemantics(
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(
+                              AppTokens.space14,
+                              AppTokens.space10,
+                              AppTokens.space10,
+                              AppTokens.space10,
                             ),
-                          ),
-                          const SizedBox(width: AppTokens.space8),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
+                            child: Row(
                               children: [
-                                Text(
-                                  label,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w600,
-                                    color: theme.colorScheme.onSurface,
+                                Container(
+                                  width: 7,
+                                  height: 7,
+                                  decoration: BoxDecoration(
+                                    color: dotColor,
+                                    shape: BoxShape.circle,
                                   ),
                                 ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  detail,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    color: theme.colorScheme.onSurfaceVariant,
+                                const SizedBox(width: AppTokens.space8),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        label,
+                                        maxLines: wrapStatus ? null : 1,
+                                        overflow: wrapStatus
+                                            ? TextOverflow.visible
+                                            : TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                          color: theme.colorScheme.onSurface,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        detail,
+                                        maxLines: wrapStatus ? null : 1,
+                                        overflow: wrapStatus
+                                            ? TextOverflow.visible
+                                            : TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: theme
+                                              .colorScheme
+                                              .onSurfaceVariant,
+                                        ),
+                                      ),
+                                    ],
                                   ),
+                                ),
+                                Icon(
+                                  Icons.chevron_right_rounded,
+                                  size: 16,
+                                  color: theme.colorScheme.onSurfaceVariant,
                                 ),
                               ],
                             ),
                           ),
-                          Icon(
-                            Icons.chevron_right_rounded,
-                            size: 16,
-                            color: theme.colorScheme.onSurfaceVariant,
-                          ),
-                        ],
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ),
+              ],
             ),
-          ],
+          ),
         );
       },
     );
@@ -312,43 +352,6 @@ class _SidebarFooter extends StatelessWidget {
     AppStrings strings,
     StatusStore store,
   ) {
-    final rooms = store.parallelRooms.sessions.values;
-    final connected = rooms
-        .where((room) => room.phase == RoomConnectionPhase.running)
-        .length;
-    if (connected > 0 && (!store.daemonReachable || store.snapshot == null)) {
-      final attention = rooms.any(
-        (room) => room.phase != RoomConnectionPhase.running,
-      );
-      return (
-        attention ? StatusTone.warn : StatusTone.good,
-        strings.isZh ? '房间已连接' : 'Rooms connected',
-        strings.isZh ? '$connected 个房间运行中' : '$connected active rooms',
-      );
-    }
-    if (!store.daemonReachable || store.snapshot == null) {
-      return (
-        StatusTone.neutral,
-        strings.shellStatusOffline,
-        strings.shellStatusOfflineDetail,
-      );
-    }
-    if (store.snapshotStale) {
-      return (StatusTone.warn, strings.stale, strings.shellStatusStaleDetail);
-    }
-    final health = store.snapshot!.health.status.toLowerCase();
-    if (health == 'healthy') {
-      final online = store.snapshot!.peers.where((p) => p.online).length;
-      return (
-        StatusTone.good,
-        strings.shellStatusHealthy,
-        strings.shellPeersOnline(online),
-      );
-    }
-    return (
-      StatusTone.warn,
-      strings.shellStatusAttention,
-      strings.needsAttention,
-    );
+    return networkOverviewStatus(strings, NetworkOverview.read(store));
   }
 }

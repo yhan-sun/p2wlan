@@ -326,6 +326,79 @@ void main() {
     });
 
     test(
+      'blank credential never transfers a saved token to another server',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp(
+          'p2wlan_server_token_',
+        );
+        addTearDown(() => tmp.delete(recursive: true));
+        final file = File('${tmp.path}/settings.json');
+        final secure = InMemorySecureTokenRepository();
+        final store = SettingsStore(
+          settingsFile: file,
+          tokenRepository: secure,
+        );
+        addTearDown(store.dispose);
+        await store.updateSettings(
+          const AppSettings(
+            controlServer: 'https://control.example.com',
+            authToken: 'original-server-token',
+            deviceName: 'test-client',
+          ),
+        );
+        final current = store.settings;
+        final persisted = await file.readAsString();
+        var published = 0;
+        store.addListener(() => published++);
+
+        Future<void> save(String server, String token) =>
+            store.updateConnectionSettings(
+              diagnosticsUrl: current.diagnosticsUrl,
+              controlServer: server,
+              authToken: token,
+              networkId: current.networkId,
+              virtualIp: current.virtualIp,
+              deviceName: current.deviceName,
+              overlayCidr: current.overlayCidr,
+              tunInterface: current.tunInterface,
+              mtu: current.mtu,
+              udpBind: current.udpBind,
+              udpAdvertise: current.udpAdvertise,
+              socketPool: current.socketPool,
+              relayServers: current.relayServers,
+              closeBehavior: current.closeBehavior,
+            );
+
+        for (final server in [
+          'https://other.example.com',
+          'http://control.example.com',
+          'https://control.example.com/other',
+        ]) {
+          await expectLater(
+            save(server, '  '),
+            throwsA(isA<FormatException>()),
+          );
+          expect(store.settings, same(current));
+          expect(await file.readAsString(), persisted);
+          expect(await secure.read(), 'original-server-token');
+          expect(published, 0);
+        }
+
+        // Equivalent trailing-slash normalization retains the same destination.
+        await save(' https://control.example.com/ ', '');
+        expect(store.settings.authToken, 'original-server-token');
+        expect(store.settings.controlServer, current.controlServer);
+
+        // Supplying the new server's credential is an explicit session change.
+        await save('https://other.example.com', 'new-server-token');
+        expect(store.settings.controlServer, 'https://other.example.com');
+        expect(store.settings.authToken, 'new-server-token');
+        expect(await secure.read(), 'new-server-token');
+        expect(await file.readAsString(), isNot(contains('new-server-token')));
+      },
+    );
+
+    test(
       'load repairs an offline flag left beside a secure credential',
       () async {
         final tmp = await Directory.systemTemp.createTemp(

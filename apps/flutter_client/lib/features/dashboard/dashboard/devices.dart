@@ -9,12 +9,16 @@ class _OnlineDevicesSection extends StatelessWidget {
     required this.peerTransferRates,
     required this.onOpenDevices,
     this.onOpenPeer,
+    this.onOpenRooms,
+    this.current = true,
   });
 
   final List<PeerSnapshot> peers;
   final Map<String, int> peerTransferRates;
   final VoidCallback? onOpenDevices;
   final ValueChanged<PeerSnapshot>? onOpenPeer;
+  final VoidCallback? onOpenRooms;
+  final bool current;
 
   @override
   Widget build(BuildContext context) {
@@ -23,36 +27,30 @@ class _OnlineDevicesSection extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
+        Wrap(
+          alignment: WrapAlignment.spaceBetween,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: AppTokens.space12,
+          runSpacing: AppTokens.space4,
           children: [
-            Expanded(
-              child: Text(
-                strings.devices,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: theme.colorScheme.onSurface,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 0,
-                ),
+            Text(
+              strings.devices,
+              style: TextStyle(
+                color: theme.colorScheme.onSurface,
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
               ),
             ),
-            TextButton(
+            TextButton.icon(
               key: const Key('home-view-all-devices'),
               onPressed: onOpenDevices,
               style: TextButton.styleFrom(
                 visualDensity: VisualDensity.compact,
                 padding: const EdgeInsets.symmetric(horizontal: 8),
               ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(strings.viewAllDevices),
-                  const SizedBox(width: 2),
-                  const Icon(Icons.chevron_right_rounded, size: 16),
-                ],
-              ),
+              iconAlignment: IconAlignment.end,
+              icon: const Icon(Icons.chevron_right_rounded, size: 16),
+              label: Text(strings.viewAllDevices),
             ),
           ],
         ),
@@ -74,13 +72,23 @@ class _OnlineDevicesSection extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  strings.noDevicesOnlineDetail,
+                  strings.isZh ? '邀请其他设备加入同一房间，连接后即可在这里查看。' : 'Invite another device to the same room to see it here.',
                   style: TextStyle(
                     color: theme.colorScheme.onSurfaceVariant,
                     fontSize: 12,
                     height: 1.3,
                   ),
                 ),
+                if (onOpenRooms != null) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: onOpenRooms,
+                    icon: const Icon(Icons.group_add_outlined, size: 18),
+                    label: Text(
+                      strings.isZh ? '查看房间与邀请' : 'Rooms and invitations',
+                    ),
+                  ),
+                ],
               ],
             ),
           )
@@ -93,6 +101,7 @@ class _OnlineDevicesSection extends StatelessWidget {
               ),
             _DeviceRow(
               peer: peers[index],
+              current: current,
               speedBytesPerSecond: peerTransferRates[peers[index].nodeId],
               onTap: onOpenPeer == null
                   ? onOpenDevices
@@ -109,8 +118,14 @@ class _DeviceRow extends StatelessWidget {
     required this.peer,
     required this.speedBytesPerSecond,
     this.onTap,
+    this.roomName,
+    this.scopeIdentity,
+    this.current = true,
   });
 
+  final String? roomName;
+  final String? scopeIdentity;
+  final bool current;
   final PeerSnapshot peer;
   final int? speedBytesPerSecond;
   final VoidCallback? onTap;
@@ -119,12 +134,16 @@ class _DeviceRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final theme = Theme.of(context);
-    final statusColor = _peerStatusColor(context, peer);
-    final statusLabel = _peerStatusLabel(strings, peer);
+    final statusColor = current
+        ? _peerStatusColor(context, peer)
+        : P2WlanColors.of(context).textMuted;
+    final statusLabel = current
+        ? _peerStatusLabel(strings, peer)
+        : strings.stale;
     return SizedBox(
       width: double.infinity,
       child: InkWell(
-        key: Key('home-device-row-${peer.nodeId}'),
+        key: Key('home-device-row-${scopeIdentity ?? peer.nodeId}'),
         onTap: onTap,
         borderRadius: BorderRadius.circular(AppTokens.radiusMd),
         child: ConstrainedBox(
@@ -182,19 +201,19 @@ class _DeviceRow extends StatelessWidget {
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         color: theme.colorScheme.onSurface,
-                        fontSize: constraints.maxWidth < 520 ? 11.5 : 13,
+                        fontSize: 14,
                         fontWeight: FontWeight.w600,
                         height: 1.2,
                       ),
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      dash(peer.virtualIp),
+                      [dash(peer.virtualIp), ?roomName].join(' · '),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         color: theme.colorScheme.onSurfaceVariant,
-                        fontSize: constraints.maxWidth < 520 ? 10.5 : 11.5,
+                        fontSize: 12,
                         height: 1.2,
                         fontFeatures: AppTokens.tabularFontFeatures,
                       ),
@@ -210,13 +229,15 @@ class _DeviceRow extends StatelessWidget {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     _HomeMetricText(
-                      value: formatTransferRate(speedBytesPerSecond),
+                      value: formatTransferRate(
+                        current ? speedBytesPerSecond : null,
+                      ),
                       width: constraints.maxWidth < 520 ? 38 : 58,
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
                     SizedBox(width: constraints.maxWidth < 520 ? 2 : 6),
                     _HomeMetricText(
-                      value: formatLatency(peer.latencyMs),
+                      value: formatLatency(current ? peer.latencyMs : null),
                       width: constraints.maxWidth < 520 ? 38 : 50,
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
@@ -228,6 +249,57 @@ class _DeviceRow extends StatelessWidget {
                     ),
                   ],
                 );
+
+                if (constraints.maxWidth < 520 ||
+                    MediaQuery.textScalerOf(context).scale(12) > 16) {
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          leading,
+                          const SizedBox(width: AppTokens.space10),
+                          Expanded(child: identity),
+                          chevron,
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      Padding(
+                        padding: const EdgeInsets.only(left: 42),
+                        child: Wrap(
+                          spacing: 12,
+                          runSpacing: 4,
+                          children: [
+                            Text(
+                              statusLabel,
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: statusColor,
+                              ),
+                            ),
+                            Text(
+                              formatLatency(current ? peer.latencyMs : null),
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                            Text(
+                              formatTransferRate(
+                                current ? speedBytesPerSecond : null,
+                              ),
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  );
+                }
 
                 return Row(
                   crossAxisAlignment: CrossAxisAlignment.center,
@@ -277,7 +349,7 @@ class _HomeMetricText extends StatelessWidget {
         textAlign: TextAlign.end,
         style: TextStyle(
           color: color,
-          fontSize: 11,
+          fontSize: 12,
           fontWeight: FontWeight.w600,
           height: 1.2,
           fontFeatures: AppTokens.tabularFontFeatures,

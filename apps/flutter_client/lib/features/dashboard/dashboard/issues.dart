@@ -7,11 +7,13 @@ class _HomeIssueBanner extends StatelessWidget {
     required this.message,
     required this.tone,
     this.onOpenTroubleshooting,
+    this.onReauthenticate,
   });
 
   final String message;
   final StatusTone tone;
   final VoidCallback? onOpenTroubleshooting;
+  final VoidCallback? onReauthenticate;
 
   @override
   Widget build(BuildContext context) {
@@ -63,11 +65,15 @@ class _HomeIssueBanner extends StatelessWidget {
                 ],
               ),
             ),
-            if (onOpenTroubleshooting != null) ...[
+            if (onOpenTroubleshooting != null || onReauthenticate != null) ...[
               const SizedBox(width: AppTokens.space8),
               TextButton(
-                key: const Key('home-check-issues'),
-                onPressed: onOpenTroubleshooting,
+                key: Key(
+                  onReauthenticate != null
+                      ? 'home-reauthenticate'
+                      : 'home-check-issues',
+                ),
+                onPressed: onReauthenticate ?? onOpenTroubleshooting,
                 style: TextButton.styleFrom(
                   visualDensity: VisualDensity.compact,
                   padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -75,7 +81,11 @@ class _HomeIssueBanner extends StatelessWidget {
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(strings.checkIssues),
+                    Text(
+                      onReauthenticate != null
+                          ? (strings.isZh ? '重新登录' : 'Sign in again')
+                          : strings.checkIssues,
+                    ),
                     const SizedBox(width: 2),
                     const Icon(Icons.chevron_right_rounded, size: 16),
                   ],

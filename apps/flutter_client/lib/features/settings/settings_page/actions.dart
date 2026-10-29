@@ -61,8 +61,11 @@ extension _SettingsPageActions on _SettingsPageState {
     final strings = AppStrings.fromCode(
       widget.settingsStore.settings.languageCode,
     );
+    if (!_validateCategory(category, strings)) return;
+    FocusManager.instance.primaryFocus?.unfocus();
     _updateState(() {
       _saving = true;
+      _savingCategory = category;
       // Only clear errors belonging to the category being saved. Other
       // categories' errors stay visible so the user can navigate back and
       // see what went wrong.
@@ -107,7 +110,9 @@ extension _SettingsPageActions on _SettingsPageState {
           authToken = '';
           overlayCidr = _overlayCidrController.text;
           tunInterface = _tunInterfaceController.text;
-          mtu = int.tryParse(_mtuController.text.trim()) ?? defaultMtu;
+          // _validateCategory already rejected invalid text; never replace an
+          // invalid draft with the default and report a successful save.
+          mtu = int.parse(_mtuController.text.trim());
           udpBind = _udpBindController.text;
           udpAdvertise = _udpAdvertiseController.text;
           socketPool = _socketPool;
@@ -192,7 +197,10 @@ extension _SettingsPageActions on _SettingsPageState {
       _showSnackBar(strings.failedToSaveLocalSettings);
     } finally {
       if (mounted) {
-        _updateState(() => _saving = false);
+        _updateState(() {
+          _saving = false;
+          _savingCategory = null;
+        });
         _notifyDirty();
       }
     }
@@ -202,14 +210,22 @@ extension _SettingsPageActions on _SettingsPageState {
     final strings = AppStrings.fromCode(
       widget.settingsStore.settings.languageCode,
     );
+    final sessionRevision = widget.statusStore.sessionRevision;
+    final diagnosticsUrl = widget.settingsStore.settings.diagnosticsUrl;
+    bool acceptsSession() =>
+        mounted &&
+        sessionRevision == widget.statusStore.sessionRevision &&
+        diagnosticsUrl == widget.settingsStore.settings.diagnosticsUrl;
     _updateState(() => _saving = true);
     try {
-      final stopped = await widget.statusStore.stopDaemon();
+      final stopped = await widget.statusStore.stopPrimaryDaemon();
+      if (!acceptsSession()) return;
       if (!stopped.ok) {
         _showSnackBar(strings.tunnelRestartFailed);
         return;
       }
       final started = await widget.statusStore.startDaemon();
+      if (!acceptsSession()) return;
       if (!started.ok) {
         _showSnackBar(strings.tunnelRestartFailed);
         return;
@@ -453,6 +469,9 @@ extension _SettingsPageActions on _SettingsPageState {
         _diagnosticsError = null;
     }
     _updateState(() {
+      for (final controller in _categoryControllers(category)) {
+        _fieldErrors.remove(controller);
+      }
       if (_formErrorCategory == category) {
         _formError = null;
         _formErrorCategory = null;

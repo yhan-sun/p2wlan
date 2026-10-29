@@ -73,6 +73,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
   bool _openingRoomLink = false;
   var _ready = false;
   var _authenticated = false;
+  var _reauthenticating = false;
   late final UpdateService _updateService;
   UpdateCheckResult? _automaticUpdateResult;
   var _automaticUpdateCheckStarted = false;
@@ -161,10 +162,8 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
       );
       unawaited(_desktopWindowStatusController!.initialize());
     }
-    // Mobile/web builds are remote-management clients. They do not ship a
-    // local diagnostics daemon, so polling the desktop default
-    // 127.0.0.1:39277 would manufacture a "local service unavailable" state
-    // on every Android/iOS launch.
+    // Remote-only platforms have no local diagnostics endpoint. Android uses
+    // its native VPN bridge and retains local-node polling.
     final canPollLocalDaemon = _capabilities.canActAsLocalVpnNode;
     if (widget.autoStartPolling && _authenticated) {
       await _statusStore.parallelRooms.credentialsChanged();
@@ -295,6 +294,39 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     }
   }
 
+  /// Reuse the authenticated login flow without clearing the current account
+  /// first. Its settings update performs the existing session transition;
+  /// cancelling the route leaves the user's account and navigation intact.
+  Future<void> _reauthenticate() async {
+    final navigator = _navigatorKey.currentState;
+    if (_reauthenticating || navigator == null || !_authenticated) return;
+    _reauthenticating = true;
+    try {
+      // Settings' compact category routes borrow their page state's drafts.
+      // Unwind them before an account transition can replace that state.
+      navigator.popUntil((route) => route.isFirst);
+      await navigator.push<void>(
+        MaterialPageRoute<void>(
+          settings: const RouteSettings(name: '/reauthenticate'),
+          fullscreenDialog: true,
+          builder: (routeContext) => AppStringsScope(
+            strings: AppStrings.fromCode(_settingsStore.settings.languageCode),
+            child: LoginPage(
+              settingsStore: _settingsStore,
+              statusStore: _statusStore,
+              capabilities: _capabilities,
+              isReauthentication: true,
+              onCancel: () => Navigator.of(routeContext).pop(),
+              onAuthenticated: () => Navigator.of(routeContext).pop(),
+            ),
+          ),
+        ),
+      );
+    } finally {
+      _reauthenticating = false;
+    }
+  }
+
   @override
   void dispose() {
     unawaited(_roomLinkSubscription?.cancel());
@@ -357,6 +389,8 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
                           settingsStore: _settingsStore,
                           statusStore: _statusStore,
                           capabilities: _capabilities,
+                          onOpenConnectionSettings: _reauthenticate,
+                          onReauthenticate: _reauthenticate,
                           onCompleted: () {
                             if (mounted) setState(() {});
                           },
@@ -368,6 +402,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
                           statusStore: _statusStore,
                           capabilities: _capabilities,
                           onLogout: _logout,
+                          onReauthenticate: _reauthenticate,
                           updateService: _updateService,
                           updateResult: _automaticUpdateResult,
                           onOpenUpdate: _openAutomaticUpdate,

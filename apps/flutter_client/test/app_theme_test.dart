@@ -62,7 +62,7 @@ void main() {
 
     test('light primary matches the approved UI reference', () {
       expect(AppTokens.colorAccent, const Color(0xFF2563EB));
-      expect(AppTokens.colorBg, const Color(0xFFF6F7F8));
+      expect(AppTokens.colorBg, const Color(0xFFF5F7FB));
       expect(AppTokens.colorSurface, const Color(0xFFFFFFFF));
     });
 

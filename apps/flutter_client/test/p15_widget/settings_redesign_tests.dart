@@ -1,6 +1,334 @@
 part of '../p15_widget_test.dart';
 
 void _registerSettingsRedesignTests() {
+  for (final failWrite in [false, true]) {
+    testWidgets(
+      'Settings keeps save feedback and leave protection until persistence ${failWrite ? 'fails' : 'completes'}',
+      (tester) async {
+        final repository = _PausedSettingsTokenRepository();
+        addTearDown(repository.release);
+        final dirtyStates = <bool>[];
+        final stores = await _pumpSettings(
+          tester,
+          api: _FakeDiagnosticsApi(health: false),
+          tokenRepository: repository,
+          onDirtyChanged: dirtyStates.add,
+          physicalSize: const Size(800, 800),
+        );
+        await _openCategory(tester, 'General');
+        final originalName = stores.settingsStore.settings.deviceName;
+        final device = _settingsTextField('Device name');
+        await tester.enterText(device, 'Demo updated device');
+        await tester.pump();
+        repository.pauseNextWrite();
+        await _tapSave(tester);
+        await _waitFor(tester, () => repository.waiting);
+        expect(stores.settingsStore.settings.deviceName, 'Demo updated device');
+        final save = find.byKey(const Key('settings-save-button'));
+        expect(save, findsOneWidget);
+        expect(tester.widget<FilledButton>(save).onPressed, isNull);
+        expect(dirtyStates.last, isTrue);
+        expect(tester.testTextInput.isVisible, isFalse);
+        repository.release(fail: failWrite);
+        if (failWrite) {
+          await _waitFor(
+            tester,
+            () => find
+                .text(AppStrings.fromCode('en').settingsSaveFailed)
+                .evaluate()
+                .isNotEmpty,
+          );
+          expect(stores.settingsStore.settings.deviceName, originalName);
+          expect(
+            tester.widget<TextField>(device).controller!.text,
+            'Demo updated device',
+          );
+          expect(dirtyStates.last, isTrue);
+          expect(tester.widget<FilledButton>(save).onPressed, isNotNull);
+        } else {
+          await _waitFor(tester, () => save.evaluate().isEmpty);
+          expect(dirtyStates.last, isFalse);
+          expect(
+            stores.settingsStore.settings.deviceName,
+            'Demo updated device',
+          );
+        }
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  testWidgets('username draft survives categories and uses the leave guard', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: false),
+        authToken: 'demo-token',
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(accountUsername: 'Original'),
+      ),
+    );
+    await tester.pumpWidget(
+      _TestApp(
+        child: P2WlanShell(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    Finder section(String label) => find.descendant(
+      of: find.byType(DesktopSidebar),
+      matching: find.text(label),
+    );
+    await tester.tap(section('Settings'));
+    await tester.pumpAndSettle();
+    await _openCategory(tester, 'Account & Connection');
+    await tester.enterText(_settingsTextField('Username'), 'Unsaved username');
+    await tester.pump();
+    // The profile has its own save action. Connection Save must not imply
+    // that it will submit the independent username draft.
+    expect(find.byKey(const Key('settings-save-button')), findsNothing);
+    await _openCategory(tester, 'General');
+    await _openCategory(tester, 'Account & Connection');
+    expect(
+      tester.widget<TextField>(_settingsTextField('Username')).controller!.text,
+      'Unsaved username',
+    );
+    await tester.tap(section('Home'));
+    await tester.pumpAndSettle();
+    expect(find.text('Discard unsaved changes?'), findsOneWidget);
+    await tester.tap(find.text('Continue editing'));
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<TextField>(_settingsTextField('Username')).controller!.text,
+      'Unsaved username',
+    );
+    await tester.tap(section('Home'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Discard changes'));
+    await tester.pumpAndSettle();
+    await tester.tap(section('Settings'));
+    await tester.pumpAndSettle();
+    await _openCategory(tester, 'Account & Connection');
+    expect(
+      tester.widget<TextField>(_settingsTextField('Username')).controller!.text,
+      'Original',
+    );
+    expect(tester.takeException(), isNull);
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  for (final spec in [
+    (const Size(800, 800), false, 1.0, 'settings-shell-800'),
+    (const Size(390, 844), true, 1.5, 'settings-shell-mobile-dark-large'),
+  ]) {
+    testWidgets('Settings layout shell ${spec.$4}', (tester) async {
+      debugDefaultTargetPlatformOverride = spec.$1.width < 600
+          ? TargetPlatform.android
+          : TargetPlatform.macOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: false),
+          deviceName: 'Demo workstation',
+        ),
+      ))!;
+      addTearDown(stores.dispose);
+      await tester.runAsync(
+        () => stores.settingsStore.updateLanguageCode('zh-Hans'),
+      );
+      tester.view.physicalSize = spec.$1;
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final theme = spec.$2 ? AppTheme.darkTheme : AppTheme.lightTheme;
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: theme,
+          builder: (context, child) => MediaQuery(
+            data: MediaQuery.of(context)
+                .copyWith(textScaler: TextScaler.linear(spec.$3)),
+            child: child!,
+          ),
+          home: AppStringsScope(
+            strings: AppStrings.fromCode('zh-Hans'),
+            child: P2WlanShell(
+              settingsStore: stores.settingsStore,
+              statusStore: stores.statusStore,
+              capabilities: PlatformCapabilities.fromPlatform(
+                spec.$1.width < 600 ? 'android' : 'macos',
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final tooltip = find.byTooltip('设置');
+      await tester.tap(
+        tooltip.evaluate().isNotEmpty ? tooltip : find.text('设置'),
+      );
+      await tester.pumpAndSettle();
+      debugDefaultTargetPlatformOverride = null;
+      expect(find.byType(SettingsPage), findsOneWidget);
+      final general = find.byKey(
+        const ValueKey('settings-category-card-general'),
+      );
+      final account = find.byKey(
+        const ValueKey('settings-category-card-accountNetwork'),
+      );
+      if (spec.$1.width == 800) {
+        expect(tester.getTopLeft(general).dy, tester.getTopLeft(account).dy);
+        expect(
+          tester.getTopLeft(account).dx,
+          greaterThan(tester.getTopLeft(general).dx),
+        );
+      } else {
+        expect(
+          tester.getTopLeft(account).dy,
+          greaterThan(tester.getTopLeft(general).dy),
+        );
+      }
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets(
+    'Settings shell keeps the selected section and refreshes account after sign in',
+    (tester) async {
+      var signIns = 0;
+      final stores = await _pumpSettingsShell(
+        tester,
+        const Size(1280, 900),
+        onReauthenticate: () => signIns++,
+      );
+      await _openCategory(tester, 'Account & Connection');
+      await tester.tap(find.byKey(const ValueKey('settings-reauthenticate')));
+      expect(signIns, 1);
+      await tester.runAsync(
+        () => stores.settingsStore.updateSettings(
+          stores.settingsStore.settings.copyWith(
+            controlServer: 'https://updated.example.com',
+            authToken: 'updated-session',
+            accountEmail: 'updated@example.com',
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byType(SettingsPage), findsOneWidget);
+      await _openCategory(tester, 'Account & Connection');
+      expect(
+        tester
+            .widget<TextField>(_settingsTextField('Control server'))
+            .controller!
+            .text,
+        'https://updated.example.com',
+      );
+      expect(find.byKey(const Key('settings-save-button')), findsNothing);
+      expect(find.textContaining('updated-session'), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'Settings sign in respects dirty guard and cancelled sign in keeps drafts',
+    (tester) async {
+      var signIns = 0;
+      await _pumpSettingsShell(
+        tester,
+        const Size(1280, 900),
+        onReauthenticate: () => signIns++,
+      );
+      await _openCategory(tester, 'Account & Connection');
+      await tester.enterText(
+        _settingsTextField('Control server'),
+        'https://draft.example.com',
+      );
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('settings-reauthenticate')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Continue editing'));
+      await tester.pumpAndSettle();
+      expect(signIns, 0);
+      await tester.tap(find.byKey(const ValueKey('settings-reauthenticate')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Discard changes'));
+      await tester.pumpAndSettle();
+      expect(signIns, 1);
+      // Returning without a session change represents cancelling the login page.
+      expect(
+        tester
+            .widget<TextField>(_settingsTextField('Control server'))
+            .controller!
+            .text,
+        'https://draft.example.com',
+      );
+      expect(find.byKey(const Key('settings-save-button')), findsOneWidget);
+    },
+  );
+
+  testWidgets('Settings rejects invalid MTU and keeps the saved value', (
+    tester,
+  ) async {
+    final stores = await _pumpSettings(
+      tester,
+      api: _FakeDiagnosticsApi(health: false),
+    );
+    final savedMtu = stores.settingsStore.settings.mtu;
+    await _openCategory(tester, 'Advanced Network');
+    for (final draft in ['abc', '', '575', '65536', '1420.5']) {
+      await tester.enterText(_settingsTextField('MTU'), draft);
+      await tester.pump();
+      await _tapSave(tester);
+      await tester.pumpAndSettle();
+      final field = tester.widget<TextField>(_settingsTextField('MTU'));
+      expect(
+        field.decoration!.errorText,
+        'Enter a whole number from 576 to 65535.',
+      );
+      expect(field.focusNode!.hasFocus, isTrue);
+      expect(field.controller!.text, draft);
+      expect(stores.settingsStore.settings.mtu, savedMtu);
+      expect(find.byKey(const Key('settings-save-button')), findsOneWidget);
+    }
+    await tester.tap(find.byKey(const ValueKey('settings-mtu-default')));
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<TextField>(_settingsTextField('MTU')).decoration!.errorText,
+      isNull,
+    );
+    expect(
+      tester.widget<TextField>(_settingsTextField('MTU')).controller!.text,
+      defaultMtu.toString(),
+    );
+  });
+
+  testWidgets('Settings offers direct sign in again in the account category', (
+    tester,
+  ) async {
+    var signIns = 0;
+    await _pumpSettings(
+      tester,
+      api: _FakeDiagnosticsApi(health: false),
+      onReauthenticate: () => signIns++,
+    );
+    await _openCategory(tester, 'Account & Connection');
+    await tester.tap(find.byKey(const ValueKey('settings-reauthenticate')));
+    expect(signIns, 1);
+  });
+
   testWidgets(
     'Settings redesign: undo is scoped and keeps immediate preferences',
     (tester) async {
@@ -116,88 +444,35 @@ void _registerSettingsRedesignTests() {
   for (final variant in [
     (const Size(1280, 900), false, 1.0, 'desktop-light'),
     (const Size(900, 800), true, 1.0, 'desktop-dark'),
+    (const Size(790, 900), false, 1.0, 'desktop-root'),
     (const Size(390, 844), false, 1.0, 'mobile'),
     (const Size(320, 740), true, 1.5, 'narrow-large-text'),
   ]) {
     testWidgets('Settings redesign: layout ${variant.$4}', (tester) async {
-      const capture = bool.fromEnvironment('SETTINGS_SCREENSHOTS');
       final stores = (await tester.runAsync(
         () => _makeStores(api: _FakeDiagnosticsApi(health: false)),
       ))!;
       addTearDown(stores.dispose);
       await tester.runAsync(
-        () => stores.settingsStore.updateLanguageCode('zh-Hans'),
+        () => stores.settingsStore.updateSettings(
+          stores.settingsStore.settings.copyWith(
+            languageCode: 'zh-Hans',
+            deviceName: '演示设备',
+          ),
+        ),
       );
       tester.view.physicalSize = variant.$1;
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
-      if (capture) {
-        await tester.runAsync(() async {
-          final bytes = await File(
-            const String.fromEnvironment('SETTINGS_PREVIEW_FONT'),
-          ).readAsBytes();
-          for (final family in [
-            'PreviewFont',
-            'Ahem',
-            'Roboto',
-            'SF Pro Text',
-            'PingFang SC',
-          ]) {
-            final loader = FontLoader(family)
-              ..addFont(Future.value(ByteData.sublistView(bytes)));
-            await loader.load();
-          }
-          final icons = await File(
-            'build/unit_test_assets/fonts/MaterialIcons-Regular.otf',
-          ).readAsBytes();
-          await (FontLoader(
-            'MaterialIcons',
-          )..addFont(Future.value(ByteData.sublistView(icons)))).load();
-        });
-      }
-      final boundary = GlobalKey();
       final theme = variant.$2 ? AppTheme.darkTheme : AppTheme.lightTheme;
       await tester.pumpWidget(
         MaterialApp(
-          theme: capture
-              ? theme.copyWith(
-                  textTheme: theme.textTheme.apply(fontFamily: 'PreviewFont'),
-                  primaryTextTheme: theme.primaryTextTheme.apply(
-                    fontFamily: 'PreviewFont',
-                  ),
-                  appBarTheme: theme.appBarTheme.copyWith(
-                    titleTextStyle: theme.appBarTheme.titleTextStyle?.copyWith(
-                      fontFamily: 'PreviewFont',
-                    ),
-                  ),
-                  outlinedButtonTheme: OutlinedButtonThemeData(
-                    style: theme.outlinedButtonTheme.style?.copyWith(
-                      textStyle: const WidgetStatePropertyAll(
-                        TextStyle(fontFamily: 'PreviewFont', fontSize: 13),
-                      ),
-                    ),
-                  ),
-                  textButtonTheme: TextButtonThemeData(
-                    style: theme.textButtonTheme.style?.copyWith(
-                      textStyle: const WidgetStatePropertyAll(
-                        TextStyle(fontFamily: 'PreviewFont', fontSize: 13),
-                      ),
-                    ),
-                  ),
-                  filledButtonTheme: FilledButtonThemeData(
-                    style: theme.filledButtonTheme.style?.copyWith(
-                      textStyle: const WidgetStatePropertyAll(
-                        TextStyle(fontFamily: 'PreviewFont', fontSize: 13),
-                      ),
-                    ),
-                  ),
-                )
-              : theme,
+          theme: theme,
           builder: (context, child) => MediaQuery(
             data: MediaQuery.of(context)
                 .copyWith(textScaler: TextScaler.linear(variant.$3)),
-            child: RepaintBoundary(key: boundary, child: child!),
+            child: child!,
           ),
           home: Scaffold(
             backgroundColor: theme.colorScheme.surfaceContainerLow,
@@ -212,6 +487,22 @@ void _registerSettingsRedesignTests() {
         ),
       );
       await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      if (variant.$4 == 'desktop-root') {
+        final general = find.byKey(
+          const ValueKey('settings-category-card-general'),
+        );
+        final account = find.byKey(
+          const ValueKey('settings-category-card-accountNetwork'),
+        );
+        expect(tester.getTopLeft(general).dy, tester.getTopLeft(account).dy);
+        expect(
+          tester.getTopLeft(account).dx,
+          greaterThan(tester.getTopLeft(general).dx),
+        );
+        expect(find.byType(TextField), findsNothing);
+        return;
+      }
       for (final category in ['通用', '账户与连接', '高级网络', '诊断与关于']) {
         // Mobile routes use the native back control.
         final back = find.byKey(const Key('settings-mobile-category-back'));
@@ -221,22 +512,6 @@ void _registerSettingsRedesignTests() {
         }
         await _openCategory(tester, category);
         expect(tester.takeException(), isNull);
-        if (capture) {
-          await tester.runAsync(() async {
-            final image =
-                await (boundary.currentContext!.findRenderObject()
-                        as RenderRepaintBoundary)
-                    .toImage(pixelRatio: 1);
-            final bytes = await image.toByteData(
-              format: ui.ImageByteFormat.png,
-            );
-            final dir = Directory('/tmp/p2wlan-settings-preview');
-            await dir.create(recursive: true);
-            await File('${dir.path}/${variant.$4}-$category.png')
-                .writeAsBytes(bytes!.buffer.asUint8List());
-            image.dispose();
-          });
-        }
         // Exercise long forms all the way down, including scaled text.
         final list = find.byType(ListView).last;
         await tester.drag(list, const Offset(0, -1400));
@@ -245,5 +520,43 @@ void _registerSettingsRedesignTests() {
         expect(find.byType(ListView), findsWidgets);
       }
     });
+  }
+}
+
+class _PausedSettingsTokenRepository implements SecureTokenRepository {
+  String? _token;
+  Completer<void>? _write;
+  bool waiting = false;
+
+  void pauseNextWrite() => _write = Completer<void>();
+  void release({bool fail = false}) {
+    final write = _write;
+    if (write == null || write.isCompleted) return;
+    if (fail) {
+      write.completeError(
+        const SecureTokenStorageException('test storage unavailable'),
+      );
+    } else {
+      write.complete();
+    }
+  }
+
+  @override
+  Future<String?> read() async => _token;
+  @override
+  Future<void> clear() async => _token = null;
+  @override
+  Future<void> write(String token) async {
+    final write = _write;
+    if (write != null) {
+      waiting = true;
+      try {
+        await write.future;
+      } finally {
+        _write = null;
+        waiting = false;
+      }
+    }
+    _token = token;
   }
 }

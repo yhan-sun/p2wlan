@@ -24,8 +24,13 @@ void _registerDashboardTests() {
       ),
     );
 
-    expect(find.text('P2WLAN is not running'), findsOneWidget);
-    expect(find.text('Start it to join the virtual network.'), findsOneWidget);
+    expect(find.text('Bring your devices together'), findsOneWidget);
+    expect(
+      find.text(
+        'Start the local network service to bring this device onto your virtual network.',
+      ),
+      findsOneWidget,
+    );
     expect(find.text('Not running'), findsOneWidget);
     expect(find.text('Check issues'), findsNothing);
     expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
@@ -89,7 +94,7 @@ void _registerDashboardTests() {
       expect(stores.statusStore.refreshing, isTrue);
       expect(stores.statusStore.refreshActivityVisible, isFalse);
       expect(find.text('Fetching network status…'), findsNothing);
-      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(find.text('Bring your devices together'), findsOneWidget);
       expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
       expect(find.byType(CircularProgressIndicator), findsNothing);
       expect(
@@ -104,7 +109,7 @@ void _registerDashboardTests() {
       initialHealth.complete(false);
       await initialRefresh;
       await tester.pump();
-      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(find.text('Bring your devices together'), findsOneWidget);
       expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
       expect(
         tester
@@ -123,7 +128,7 @@ void _registerDashboardTests() {
       expect(stores.statusStore.refreshing, isTrue);
       expect(stores.statusStore.refreshActivityVisible, isFalse);
       expect(find.text('Fetching network status…'), findsNothing);
-      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(find.text('Bring your devices together'), findsOneWidget);
       expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
       expect(find.text('Refreshing...'), findsNothing);
       expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
@@ -141,7 +146,7 @@ void _registerDashboardTests() {
       nextHealth.complete(false);
       await periodicRefresh;
       await tester.pump();
-      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(find.text('Bring your devices together'), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );
@@ -319,6 +324,58 @@ void _registerDashboardTests() {
     expect(find.text('offline-stale-direct'), findsNothing);
   });
 
+  testWidgets(
+    'Home does not confirm a selected path before validation commits',
+    (tester) async {
+      final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final selected =
+          _peerJson(
+              nodeId: 'selected-before-validation',
+              deviceName: 'Selected device',
+              virtualIp: '10.20.0.98',
+              online: true,
+              state: 'idle',
+              activePath: null,
+              relayConfirmedEndpoint: null,
+              direct: _emptyPathHealth(),
+              relay: _emptyPathHealth(),
+            )
+            ..['current_path_selection'] = {
+              'path': 'direct',
+              'direct_confirmed': true,
+            };
+      final snapshot = _snapshotWithPeers(base, [selected]);
+      // Selection can arrive before the daemon commits verified active state.
+      expect(snapshot.peers.single.path, 'direct');
+      expect(snapshot.peers.single.isDirectVerified, isFalse);
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+        ),
+      ))!;
+      addTearDown(stores.dispose);
+      await stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: DashboardPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
+        ),
+      );
+      expect(_heroCount(tester, 'dashboard-count-online'), '1');
+      expect(_heroCount(tester, 'dashboard-count-available'), '0');
+      expect(_heroCount(tester, 'dashboard-count-direct'), '0');
+      final row = find.byKey(
+        const Key('home-device-row-selected-before-validation'),
+      );
+      expect(
+        find.descendant(of: row, matching: find.text('probing')),
+        findsOneWidget,
+      );
+    },
+  );
+
   testWidgets('Home counts an online peer without a verified path as probing', (
     tester,
   ) async {
@@ -425,7 +482,15 @@ void _registerDashboardTests() {
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.text('Data may be out of date'), findsOneWidget);
     expect(find.byKey(const Key('home-stale-refresh')), findsNothing);
-    expect(find.text('Stale'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(StatusBadge),
+        matching: find.text('Stale'),
+      ),
+      findsOneWidget,
+    );
+    expect(find.byKey(const Key('dashboard-count-available')), findsNothing);
+    expect(find.text('Network components'), findsNothing);
     // Staleness is not an issue banner.
     expect(find.text('Check issues'), findsNothing);
   });
@@ -752,7 +817,7 @@ void _registerDashboardTests() {
 
     expect(find.text('No other devices online'), findsOneWidget);
     expect(
-      find.text('Devices appear here when they come online.'),
+      find.text('Invite another device to the same room to see it here.'),
       findsOneWidget,
     );
     expect(find.text('0 / 0'), findsOneWidget);

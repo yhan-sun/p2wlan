@@ -9,6 +9,9 @@ import '../../app/p2wlan_colors.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/daemon/daemon_controller.dart';
 import '../../core/models/diagnostics_models.dart';
+import '../../core/presentation/network_overview.dart';
+import '../../shared/network_overview_presentation.dart';
+import '../../shared/widgets/network_scope_picker.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
@@ -24,11 +27,12 @@ part 'dashboard/helpers.dart';
 part 'dashboard/hero.dart';
 part 'dashboard/issues.dart';
 part 'dashboard/surface.dart';
+part 'dashboard/room_overview.dart';
 
 /// Network Home: tells the user how the network is doing right now — status,
 /// Virtual IP, key metrics, a short device preview, and plain-language
 /// component state. Technical details live in Diagnostics / Troubleshooting.
-class DashboardPage extends StatelessWidget {
+class DashboardPage extends StatefulWidget {
   const DashboardPage({
     super.key,
     required this.settingsStore,
@@ -38,6 +42,9 @@ class DashboardPage extends StatelessWidget {
     this.onOpenDevices,
     this.onOpenPeer,
     this.onOpenTroubleshooting,
+    this.onOpenRooms,
+    this.onOpenRoom,
+    this.onReauthenticate,
   });
 
   final SettingsStore settingsStore;
@@ -58,86 +65,135 @@ class DashboardPage extends StatelessWidget {
   /// Opens Troubleshooting for a reported issue (supplied by the shell).
   final VoidCallback? onOpenTroubleshooting;
 
+  final VoidCallback? onOpenRooms;
+  final ValueChanged<String>? onOpenRoom;
+  final VoidCallback? onReauthenticate;
+
+  @override
+  State<DashboardPage> createState() => _DashboardPageState();
+}
+
+class _DashboardPageState extends State<DashboardPage> {
+  String? _selectedScopeId;
+
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final capabilities = this.capabilities ?? PlatformCapabilities.current();
+    final capabilities = widget.capabilities ?? PlatformCapabilities.current();
     return AnimatedBuilder(
-      animation: Listenable.merge([settingsStore, statusStore]),
+      animation: Listenable.merge([
+        widget.settingsStore,
+        widget.statusStore,
+        widget.statusStore.parallelRooms,
+      ]),
       builder: (context, _) {
-        final snapshot = statusStore.snapshot;
+        final overview = NetworkOverview.read(widget.statusStore);
+        final selectedId = overview.selected(_selectedScopeId).isEmpty
+            ? null
+            : _selectedScopeId;
+        final showRoomOverview =
+            overview.hasRooms && selectedId != NetworkOverview.primaryScopeId;
+        final snapshot = widget.statusStore.snapshot;
+        final primaryStale = overview.scopes.any(
+          (scope) =>
+              scope.isPrimary && scope.state == NetworkDisplayState.stale,
+        );
         final status = _networkStatus(
           snapshot,
-          snapshotStale: statusStore.snapshotStale,
-          healthReachable: statusStore.healthReachable,
+          snapshotStale: primaryStale,
+          healthReachable: widget.statusStore.healthReachable,
         );
         final daemonAvailable =
-            statusStore.daemonReachable || statusStore.statusReachable;
+            widget.statusStore.daemonReachable ||
+            widget.statusStore.statusReachable;
         final initialProbePending =
-            statusStore.daemonStarting ||
-            (snapshot == null && statusStore.startupCatalogSettling) ||
-            (statusStore.lastFetchedAt == null && statusStore.refreshing);
+            widget.statusStore.daemonStarting ||
+            (snapshot == null && widget.statusStore.startupCatalogSettling) ||
+            (widget.statusStore.lastFetchedAt == null &&
+                widget.statusStore.refreshing);
         final startupFailure =
-            !statusStore.daemonBusy && statusStore.lastDaemonFailureCode != null
+            !widget.statusStore.daemonBusy &&
+                widget.statusStore.lastDaemonFailureCode != null
             ? daemonStartupFailurePresentation(
                 strings,
                 DaemonCommandResult(
                   ok: false,
                   message: '',
-                  failureCode: statusStore.lastDaemonFailureCode,
+                  failureCode: widget.statusStore.lastDaemonFailureCode,
                 ),
               )
-            : !statusStore.daemonBusy &&
-                  statusStore.lastError == 'daemon_operation_failed'
+            : !widget.statusStore.daemonBusy &&
+                  widget.statusStore.lastError == 'daemon_operation_failed'
             ? strings.daemonOperationFailed
             : null;
         final peers = snapshot?.peers ?? const <PeerSnapshot>[];
         final counts = _countPeers(peers);
         final overviewPeers = _topOverviewPeers(
-          statusStore.stablePeerOrder(peers),
+          widget.statusStore.stablePeerOrder(peers),
         );
-        final peerTransferRates = statusStore.snapshotStale
+        final peerTransferRates = primaryStale
             ? const <String, int>{}
-            : statusStore.peerTransferRatesBytesPerSecond;
+            : widget.statusStore.peerTransferRatesBytesPerSecond;
         final issueMessage =
             startupFailure ??
             _dashboardIssueMessage(
               strings: strings,
               daemonAvailable: daemonAvailable,
-              snapshotStale: statusStore.snapshotStale,
-              statusReachable: statusStore.statusReachable,
-              statusError: statusStore.lastStatusError,
-              healthReachable: statusStore.healthReachable,
-              healthError: statusStore.lastHealthError,
-              error: statusStore.lastError,
+              snapshotStale: primaryStale,
+              statusReachable: widget.statusStore.statusReachable,
+              statusError: widget.statusStore.lastStatusError,
+              healthReachable: widget.statusStore.healthReachable,
+              healthError: widget.statusStore.lastHealthError,
+              error: widget.statusStore.lastError,
               snapshot: snapshot,
               startupCatalogSettling:
-                  statusStore.startupCatalogSettling ||
-                  statusStore.daemonStarting,
+                  widget.statusStore.startupCatalogSettling ||
+                  widget.statusStore.daemonStarting,
             );
-        final manualCommand = settingsStore.settings.authToken.trim().isEmpty
-            ? statusStore.lastDaemonManualCommand
+        final manualCommand =
+            widget.settingsStore.settings.authToken.trim().isEmpty
+            ? widget.statusStore.lastDaemonManualCommand
             : null;
         return PageScaffold(
-          title: strings.home,
+          title: strings.isZh ? '网络概览' : 'Network overview',
           subtitle: strings.homePageSubtitle,
-          showHeader: showHeader,
+          showHeader: widget.showHeader,
           maxWidth: dashboardPageMaxWidth,
           children: [
-            if (capabilities.canActAsLocalVpnNode)
+            if (capabilities.canActAsLocalVpnNode && overview.hasRooms) ...[
+              NetworkScopePicker(
+                overview: overview,
+                selectedId: selectedId,
+                onChanged: (id) => setState(() => _selectedScopeId = id),
+              ),
+              const SizedBox(height: AppTokens.space8),
+            ],
+            if (capabilities.canActAsLocalVpnNode && showRoomOverview)
+              _RoomHomeOverview(
+                overview: overview,
+                selectedId: selectedId,
+                onOpenDevices: widget.onOpenDevices,
+                onOpenRooms: widget.onOpenRooms,
+                onOpenRoom: widget.onOpenRoom,
+                onOpenPeer: widget.onOpenPeer,
+              )
+            else if (capabilities.canActAsLocalVpnNode)
               _NetworkHero(
                 snapshot: snapshot,
                 status: status,
                 counts: counts,
                 canControlLocalDaemon: capabilities.canControlLocalDaemon,
-                daemonBusy: statusStore.daemonBusy,
+                daemonBusy: widget.statusStore.daemonBusy,
                 initialProbePending: initialProbePending,
-                onStartDaemon: statusStore.startDaemon,
-                onStopDaemon: statusStore.stopDaemon,
+                onStartDaemon: widget.statusStore.startDaemon,
+                onStopDaemon: widget.statusStore.stopPrimaryDaemon,
               )
             else
-              _RemoteOnlyHero(onOpenDevices: onOpenDevices),
+              _RemoteOnlyHero(
+                onOpenDevices: widget.onOpenRooms ?? widget.onOpenDevices,
+              ),
             if (capabilities.canActAsLocalVpnNode &&
+                !showRoomOverview &&
                 issueMessage != null &&
                 (daemonAvailable || startupFailure != null)) ...[
               const SizedBox(height: AppTokens.space12),
@@ -145,25 +201,33 @@ class DashboardPage extends StatelessWidget {
                 message: issueMessage,
                 tone:
                     startupFailure != null ||
-                        (!statusStore.healthReachable &&
-                            statusStore.lastHealthError != null)
+                        (!widget.statusStore.healthReachable &&
+                            widget.statusStore.lastHealthError != null)
                     ? StatusTone.bad
                     : StatusTone.warn,
-                onOpenTroubleshooting: onOpenTroubleshooting,
+                onOpenTroubleshooting: widget.onOpenTroubleshooting,
+                onReauthenticate: snapshot?.health.reauthRequired == true
+                    ? widget.onReauthenticate
+                    : null,
               ),
             ],
-            if (capabilities.canActAsLocalVpnNode && snapshot != null) ...[
+            if (capabilities.canActAsLocalVpnNode &&
+                !showRoomOverview &&
+                snapshot != null) ...[
               const SizedBox(height: AppTokens.space16),
               LayoutBuilder(
                 builder: (context, constraints) {
                   final devices = _DashboardSectionSurface(
                     child: _OnlineDevicesSection(
                       peers: overviewPeers,
+                      current: !primaryStale,
                       peerTransferRates: peerTransferRates,
-                      onOpenDevices: onOpenDevices,
-                      onOpenPeer: onOpenPeer,
+                      onOpenDevices: widget.onOpenDevices,
+                      onOpenPeer: widget.onOpenPeer,
+                      onOpenRooms: widget.onOpenRooms,
                     ),
                   );
+                  if (primaryStale) return devices;
                   final components = _DashboardSectionSurface(
                     child: _NetworkComponentsSection(
                       snapshot: snapshot,
@@ -193,7 +257,16 @@ class DashboardPage extends StatelessWidget {
                 },
               ),
             ],
-            if (capabilities.canActAsLocalVpnNode && manualCommand != null) ...[
+            if (capabilities.canActAsLocalVpnNode &&
+                !showRoomOverview &&
+                snapshot == null &&
+                widget.onOpenRooms != null) ...[
+              const SizedBox(height: AppTokens.space12),
+              _RoomEntryAction(onOpenRooms: widget.onOpenRooms!),
+            ],
+            if (capabilities.canActAsLocalVpnNode &&
+                !showRoomOverview &&
+                manualCommand != null) ...[
               const SizedBox(height: AppTokens.space12),
               _ManualCommandCard(command: manualCommand),
             ],
