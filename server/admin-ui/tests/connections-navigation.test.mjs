@@ -31,7 +31,7 @@ async function compileSource(entry, plugins = []) {
 }
 
 const { ConnectionsPage } = await compileSource('src/features/connections/ConnectionsPage.tsx')
-const { ConnectionWorkspace } = await compileSource('src/features/connections/ConnectionWorkspace.tsx')
+const { ConnectionWorkspace, enterConnectionView } = await compileSource('src/features/connections/ConnectionWorkspace.tsx')
 const { ConnectionTopology } = await compileSource('src/features/connections/ConnectionTopology.tsx')
 const inlineTopology = {
   name: 'synchronous-topology-test',
@@ -237,6 +237,35 @@ test('workspace introduces the task before its labelled navigation and scoped li
   assert.ok(html.indexOf('查看设备之间的连接路径') < html.indexOf('aria-label="连接排障视图"'))
   assert.match(html, /aria-current="page"[^>]*class="active"[^>]*>.*?全部观测/)
   for (const label of ['搜索连接', '按网络过滤', '按路径过滤', '按观测新鲜度过滤']) assert.ok(html.includes(`aria-label="${label}"`))
+})
+
+test('tab entry preserves fixed positioning and cancels for reduced motion or cleanup', () => {
+  const listeners = new Set()
+  const preference = {
+    matches: false,
+    addEventListener(type, listener) { assert.equal(type, 'change'); listeners.add(listener) },
+    removeEventListener(type, listener) { assert.equal(type, 'change'); listeners.delete(listener) },
+  }
+  let cancelled = 0
+  let entered = 0
+  const surface = { animate(frames, options) {
+    entered += 1
+    assert.ok(frames.every((frame) => Object.keys(frame).every((key) => key === 'opacity')), 'A transformed ancestor breaks the fixed fullscreen graph')
+    assert.equal(options.duration, 200)
+    assert.equal(options.fill, undefined, 'Do not retain an opacity stacking context after entry')
+    return { cancel() { cancelled += 1 } }
+  } }
+  const cleanup = enterConnectionView(surface, preference)
+  assert.equal(entered, 1)
+  preference.matches = true
+  listeners.forEach((listener) => listener())
+  assert.equal(cancelled, 1)
+  cleanup()
+  assert.equal(cancelled, 2)
+  assert.equal(listeners.size, 0)
+  assert.equal(enterConnectionView(surface, preference), undefined)
+  assert.equal(entered, 1, 'Reduced motion must show the final view immediately')
+  assert.equal(enterConnectionView(null, preference), undefined)
 })
 
 test('direction rows group path and freshness without repeating internal network identifiers', (t) => {

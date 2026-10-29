@@ -1,17 +1,13 @@
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import {
-  Activity,
   AlertTriangle,
   ArrowDownRight,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
   CircleCheck,
-  Gauge,
   MonitorSmartphone,
   RadioTower,
-  RefreshCw,
-  Route,
   X,
 } from 'lucide-react'
 import { useEffect, useMemo, type ReactNode } from 'react'
@@ -74,18 +70,15 @@ function ErrorBlock({ error }: { error: unknown }) {
 }
 
 function HealthMetric({
-  icon,
   label,
   value,
   meta,
 }: {
-  icon: ReactNode
   label: string
   value: ReactNode
   meta: ReactNode
 }) {
   return <article className="connection-health-metric">
-    <span className="connection-health-metric-icon">{icon}</span>
     <div><span>{label}</span><strong>{value}</strong><small>{meta}</small></div>
   </article>
 }
@@ -186,12 +179,7 @@ export function ConnectionHealthPage() {
   }, [correctingPage, availablePage, setSearchParams])
 
   return <div className="page-stack connection-health-page">
-    <div className="connection-view-heading connection-health-intro">
-      <div>
-        <h3>{tr('待关注')}</h3>
-        <p>{tr('先查看异常信号，再打开对应方向的连接详情。')}</p>
-      </div>
-    </div>
+    <h3 className="sr-only">{tr('待关注')}</h3>
 
     <div className="connections-toolbar health-toolbar">
       <label className="connection-filter"><span>{tr('Network')}</span><select className="select-field" value={networkId} onChange={(event) => updateFilter('network_id', event.target.value, true)} aria-label={tr("按网络过滤健康信号")}>
@@ -226,7 +214,7 @@ export function ConnectionHealthPage() {
     </section> : <>
       <section className="panel-v2 health-attention-panel">
         <header className="panel-v2-header">
-          <div><h4>{tr('待处理信号')}</h4><p>{tr('选择一条信号，查看连接详情与切换历史。')}</p></div>
+          <h4>{tr('待处理信号')}</h4>
           <span className={`badge ${health.data.alerts_total ? 'warning' : 'success'}`}><span />{health.data.alerts_total} {tr("条")}</span>
         </header>
         {correctingPage ? <LoadingBlock label={tr('正在调整分页…')} /> : health.data.alerts.length === 0
@@ -244,13 +232,11 @@ export function ConnectionHealthPage() {
 
       <section className="connection-health-metrics">
         <HealthMetric
-          icon={<AlertTriangle size={17} />}
           label={tr("Needs attention")}
           value={health.data.alerts_unfiltered_total}
           meta={tr('当前范围内全部健康信号')}
         />
         <HealthMetric
-          icon={<Activity size={17} />}
           label={tr("Fresh observations")}
           value={<>{summary.fresh_observations}{tr("/")}{summary.total_observations}</>}
           meta={getLocale() === 'zh-CN'
@@ -258,19 +244,16 @@ export function ConnectionHealthPage() {
             : <>{summary.stale_observations} stale · {summary.reporter_offline_observations} reporter offline</>}
         />
         <HealthMetric
-          icon={<Route size={17} />}
           label={tr("Fresh paths")}
           value={<>{summary.fresh_direct} {tr("/ ")}{summary.fresh_relay}</>}
           meta={<>{tr("Direct / Relay · ")}{summary.fresh_online_no_path} {tr("在线但暂无路径")}</>}
         />
         <HealthMetric
-          icon={<RefreshCw size={17} />}
           label={tr("Recent transitions")}
           value={summary.recent_path_switches}
           meta={<>{summary.recent_direct_failures + summary.recent_relay_failures} {tr("explicit path failures")}</>}
         />
         <HealthMetric
-          icon={<Gauge size={17} />}
           label={tr("Validation RTT")}
           value={summary.average_validation_rtt_ms === undefined ? '—' : `${summary.average_validation_rtt_ms} ms`}
           meta={summary.validation_rtt_samples
@@ -288,7 +271,7 @@ export function ConnectionHealthPage() {
       </details>
     </> : <ErrorBlock error={new Error('控制面未返回连接健康数据。')} />}
 
-    <div className="connection-context-note"><span>{tr('趋势按网络汇总，保留当前排障上下文。')}</span><Link className="button secondary compact" to={`/connections?${connectionWorkspaceSearch(searchParams, 'trends')}`} state={resourceOrigin}>{tr('查看历史趋势')}</Link></div>
+    <div className="connection-context-note"><Link className="button secondary compact" to={`/connections?${connectionWorkspaceSearch(searchParams, 'trends')}`} state={resourceOrigin}>{tr('查看历史趋势')}</Link></div>
     {selectedAlert && connectionDetailIsOpen(searchParams) && <ConnectionDrawer key={`${selectedAlert.network_id}:${selectedAlert.reporting_device_id}:${selectedAlert.remote_device_id}`} connection={selectedAlert} onClose={() => setSearchParams(closeConnectionDetailSearch, { replace: true })} />}
   </div>
 }

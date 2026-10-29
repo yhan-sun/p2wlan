@@ -41,28 +41,30 @@ const account = { id: 'account-a', username: 'Alice', email: 'alice@example.test
 const device = { id: 'device-a', device_name: 'Workstation', owner_id: 'account-a', username: 'Alice', network_id: 'default', network_name: 'Personal', online: true, virtual_ip: '10.20.0.2', platform: 'linux', nat_type: 'unknown', last_seen: 1700000000 }
 const network = { id: 'network-a', name: 'Office', owner_id: 'account-a', owner_username: 'Alice', cidr: '10.20.0.0/16', member_count: 1, device_count: 1, online_devices: 1, is_room: false }
 
-test('resource headings stay separate from filters and each list has its own count and export action', (t) => {
-  for (const [kind, item, title, search] of [
-    ['accounts', account, '账号列表', '搜索用户名或邮箱'],
-    ['devices', device, '设备列表', '搜索设备、账号、IP 或网络'],
-    ['networks', network, '网络列表', '搜索名称、ID、网段或房间码'],
+test('resource headings stay separate from filters and result metadata retains the count and export action', (t) => {
+  for (const [kind, item, search] of [
+    ['accounts', account, '搜索用户名或邮箱'],
+    ['devices', device, '搜索设备、账号、IP 或网络'],
+    ['networks', network, '搜索名称、ID、网段或房间码'],
   ]) {
     const html = renderResource(t, kind, `/${kind}`, { items: [item], total: 7 })
     const header = html.match(/<header class="console-page-header">([\s\S]*?)<\/header>/)?.[1]
     assert.ok(header)
     assert.doesNotMatch(header, /<input|<select|role="search"/)
-    assert.match(html, new RegExp(`${title} · 7`))
+    assert.equal((html.match(/<h2>/g) || []).length, 1)
+    assert.match(html, /resource-result-count"><strong>7<\/strong>条记录/)
     assert.match(html, /class="resource-list-toolbar" role="search"/)
     assert.ok(html.includes(search))
     assert.match(html, /导出已加载记录/)
+    if (kind !== 'accounts') assert.match(html, /<summary aria-label="详情: [^"]+" title="技术信息">详情<\/summary>/)
   }
 })
 
 test('an empty deployment explains where resources originate and hides export and zero-result pagination', (t) => {
   for (const [kind, message, guidance] of [
-    ['accounts', '暂无账号', '账号注册后会显示在这里'],
-    ['devices', '尚无设备', '设备通过 P2WLAN 客户端注册后显示在这里'],
-    ['networks', '暂无网络', '已创建或加入的网络会显示在这里'],
+    ['accounts', '暂无账号', '用户注册后，账号会显示在这里'],
+    ['devices', '尚无设备', '在客户端注册设备后，即可在这里查看'],
+    ['networks', '暂无网络', '创建或加入网络后，即可在这里查看'],
   ]) {
     const html = renderResource(t, kind, `/${kind}`, { items: [], total: 0 })
     assert.ok(html.includes(message))
@@ -76,7 +78,7 @@ test('filtered empty lists offer clearing filters without pretending the deploym
   for (const kind of ['accounts', 'devices', 'networks']) {
     const html = renderResource(t, kind, `/${kind}?q=no-match`, { items: [], total: 0 })
     assert.match(html, /没有符合条件/)
-    assert.match(html, /请调整筛选条件/)
+    assert.match(html, /(?:换个关键词|调整筛选)，或清除筛选/)
     assert.match(html, /清除筛选/)
     assert.doesNotMatch(html, /class="pagination-v2"/)
   }
@@ -93,8 +95,8 @@ test('an empty cursor page retains first-page recovery instead of presenting a f
 
 test('room tab keeps its tabpanel identity and distinguishes missing rooms from missing networks', (t) => {
   const html = renderResource(t, 'networks', '/networks?tab=rooms', { items: [], total: 0 })
-  assert.match(html, /房间列表 · 0/)
+  assert.match(html, /resource-result-count"><strong>0<\/strong>条记录/)
   assert.match(html, /暂无房间/)
-  assert.match(html, /房间需在 P2WLAN 客户端中创建或加入/)
+  assert.match(html, /在客户端创建或加入房间后，即可在这里查看/)
   assert.match(html, /role="tabpanel" id="network-resources-panel" aria-labelledby="network-resources-rooms"/)
 })

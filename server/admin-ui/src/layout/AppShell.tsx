@@ -81,7 +81,7 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
   }
   const runtimeSnapshot = !refreshInterval || runtime.fetchStatus === 'paused' || Boolean(runtime.error)
   const runtimeTime = runtime.dataUpdatedAt ? new Intl.DateTimeFormat(getLocale(), { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(runtime.dataUpdatedAt) : ''
-  const runtimeLabel = tr(runtime.fetchStatus === 'paused' ? '控制面状态待更新' : runtime.isError ? '控制面检查失败' : runtime.isPending ? '正在检查控制面' : runtimeSnapshot ? '控制面快照' : '上次检查可达')
+  const runtimeLabel = tr(runtime.fetchStatus === 'paused' ? '控制面状态待更新' : runtime.isError ? '控制面检查失败' : runtime.isPending ? '正在检查控制面' : runtimeSnapshot ? '控制面快照' : '最近检查正常')
 
   return <div className={`app-layout ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${mobileOpen ? 'mobile-nav-open' : ''}`}>
     <a className="skip-link" href="#main-content" inert={mobileOpen}>{tr('跳至主内容')}</a>
@@ -94,7 +94,7 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
     }}>
       <div className="sidebar-brand-row">
-        <Link to="/" className="brand-lockup"><div className="brand-symbol"><Waypoints size={20} /></div><div><strong>P2WLAN</strong><span>Control</span></div></Link>
+        <Link to="/" className="brand-lockup" aria-label="P2WLAN Control"><div className="brand-symbol"><Waypoints size={20} /></div><div><strong>P2WLAN</strong><span>Control</span></div></Link>
         <IconButton className="sidebar-collapse" label={tr(sidebarCollapsed ? '展开导航' : '收起导航')} icon={sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed((value) => !value)} />
         <button ref={navClose} type="button" className="icon-button-v2 sidebar-mobile-close" aria-label={tr('关闭导航')} onClick={closeNavigation}><X size={18} /></button>
       </div>
@@ -109,14 +109,13 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
         {runtimeTime && <small>{tr('快照截至：')}<time dateTime={new Date(runtime.dataUpdatedAt).toISOString()}>{runtimeTime}</time></small>}
         {!refreshInterval && <small>{tr('自动刷新已关闭，可手动刷新。')}</small>}
         <div className="sidebar-account-row">
-          <span className="sidebar-admin-copy"><strong>admin</strong><small>{tr('只读管理模式')}</small></span>
-          <div className="sidebar-footer-actions"><ThemeSwitch /><ConsolePreferences onOpen={() => setSidebarCollapsed(false)} onLogout={() => { clearAdminToken(); queryClient.clear(); onLogout() }} /></div>
+          <div className="sidebar-footer-actions"><ConsolePreferences showLabel onOpen={() => setSidebarCollapsed(false)} onLogout={() => { clearAdminToken(); queryClient.clear(); onLogout() }} /><ThemeSwitch /></div>
         </div>
       </div>
     </aside>
     <div className="app-main" inert={mobileOpen}>
-      <header className="topbar-v2"><button ref={navTrigger} type="button" className="icon-button-v2 topbar-mobile-menu" aria-label={tr('打开导航')} aria-expanded={mobileOpen} aria-controls="primary-navigation" onClick={() => setMobileOpen(true)}><Menu size={18} /></button><div className="topbar-location"><span>P2WLAN Control</span><ChevronRight size={14} aria-hidden /><strong>{tr(meta.title)}</strong></div><div className="topbar-spacer" /><span className="topbar-readonly"><ShieldCheck size={15} aria-hidden />{tr('只读管理模式')}</span><IconButton label={tr('刷新数据')} disabled={refreshing} icon={<RefreshCw size={17} className={refreshing ? 'spin' : ''} />} onClick={refresh} /></header>
-      <main ref={main} id="main-content" className="page-content" aria-labelledby="console-page-title" tabIndex={-1}><h1 id="console-page-title" className="sr-only">{tr(meta.title)}</h1><AsyncView key={location.pathname}><Outlet /></AsyncView></main>
+      <header className="topbar-v2"><button ref={navTrigger} type="button" className="icon-button-v2 topbar-mobile-menu" aria-label={tr('打开导航')} aria-expanded={mobileOpen} aria-controls="primary-navigation" onClick={() => setMobileOpen(true)}><Menu size={18} /></button><div className="topbar-location"><span>P2WLAN Control</span><ChevronRight size={14} aria-hidden /><strong>{tr(meta.title)}</strong></div><div className="topbar-spacer" /><span className="topbar-readonly"><ShieldCheck size={15} aria-hidden />{tr('只读模式')}</span><IconButton label={tr('刷新数据')} disabled={refreshing} icon={<RefreshCw size={17} className={refreshing ? 'spin' : ''} />} onClick={refresh} /></header>
+      <main ref={main} id="main-content" className="page-content" aria-labelledby="console-page-title" tabIndex={-1}><h1 id="console-page-title" className="sr-only">{tr(meta.title)}</h1><div className="route-view" key={location.pathname}><AsyncView><Outlet /></AsyncView></div></main>
     </div>
   </div>
 }

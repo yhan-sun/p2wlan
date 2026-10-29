@@ -1,29 +1,101 @@
-/* Resource filters and recovery belong to the list they control. Shared
-   typography, colors and control sizing remain owned by the console foundation. */
+/* Resource lists: one tool area, then the records. Foundation tokens own color
+   and density; names, secondary facts and diagnostics have separate roles. */
 .resource-page .resource-results-panel { overflow: visible; }
-.resource-page .resource-list-toolbar { padding: 16px 20px; border-bottom: 1px solid var(--border); }
-.resource-page .resource-toolbar-fields { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
-.resource-page .resource-toolbar-fields > .search-field { flex: 1 1 280px; max-width: 440px; min-width: 220px; }
-.resource-page .resource-toolbar-fields > .select-field { flex: 0 1 160px; }
+.resource-page .resource-list-toolbar { padding: 18px 20px 8px; }
+.resource-page .resource-toolbar-fields { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.resource-page .resource-toolbar-fields > .search-field { flex: 1 1 260px; max-width: 380px; min-width: 200px; }
+.resource-page .resource-toolbar-fields > .select-field { flex: 0 1 140px; }
 .resource-page .resource-filter-clear { margin-left: auto; white-space: nowrap; }
-.resource-page .resource-list-status { padding: 0 20px; }
-.resource-page .resource-list-status .query-status { margin: 0; border: 0; }
+.resource-page .resource-list-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; min-height: 48px; padding: 0 20px 12px; border-bottom: 1px solid var(--border); }
+.resource-page .resource-result-count { display: inline-flex; align-items: baseline; flex: 0 0 auto; gap: 5px; color: var(--text-3); font-size: 12px; white-space: nowrap; }
+.resource-page .resource-result-count strong { color: var(--text-2); font-size: 13px; font-weight: 550; font-variant-numeric: tabular-nums; }
+.resource-page .resource-list-meta > .query-status { flex: 1 1 220px; min-width: 0; min-height: 32px; margin: 0; padding: 0; gap: 6px; }
+.resource-page .resource-list-meta > .snapshot-export { flex: 0 0 auto; }
+.resource-page .resource-list-meta .query-status .button { min-height: 32px; }
+.resource-page .resource-list-meta:has(.query-status.degraded) > .query-status { order: 3; flex-basis: 100%; padding: 10px 12px; }
 .resource-page .resource-list-tabs { padding: 0 20px; border-bottom: 1px solid var(--border); }
 .resource-page .resource-list-tabs .tabs-v2 { margin: 0; border-bottom: 0; }
-.resource-page .resource-empty-state { min-height: 244px; justify-content: center; gap: 12px; padding: 36px 24px; }
-.resource-page .resource-empty-state > strong { color: var(--text); font-size: 16px; font-weight: 600; }
-.resource-page .resource-empty-state > p { max-width: 440px; margin: 0 0 4px; color: var(--text-2); line-height: 1.7; }
+.resource-page .resource-empty-state { min-height: 244px; justify-content: center; gap: 10px; padding: 36px 24px; }
+.resource-page .resource-empty-state > strong { color: var(--text); font-size: 16px; font-weight: 550; }
+.resource-page .resource-empty-state > p { max-width: 440px; margin: 0 0 8px; color: var(--text-3); line-height: 1.7; }
 .resource-page .resource-results-panel > .pagination-v2,
 .resource-page .resource-results-panel > div > .pagination-v2 { border-radius: 0 0 var(--radius) var(--radius); }
 .resource-page .resource-query-recovery { padding: 12px 20px; }
-@media (max-width: 650px) {
-  .resource-page .resource-list-toolbar { padding: 16px; }
+
+.resource-account-identity { min-width: 0; gap: 12px; }
+.resource-account-identity > .account-mark { flex: 0 0 auto; margin: 0; }
+.resource-account-identity > div { min-width: 0; }
+.resource-account-identity .resource-name,
+.resource-account-identity .resource-secondary { display: block; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resource-account-identity .resource-secondary { margin-top: 4px; }
+.resource-device-count { display: grid; gap: 3px; line-height: 1.4; font-variant-numeric: tabular-nums; }
+.resource-device-count strong { color: var(--text); font-size: 14px; font-weight: 550; }
+.resource-device-count > span > span, .resource-device-count small { color: var(--text-3); font-size: 12px; }
+.resource-table .resource-identity { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 5px 16px; min-width: 0; max-width: 340px; }
+.resource-table .resource-name { grid-column: 1 / -1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-size: 14px; font-weight: 550; line-height: 1.5; }
+.resource-table .resource-name:hover, .resource-context-link:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.resource-table .resource-secondary { grid-column: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); font-size: 12px; line-height: 1.5; }
+.resource-table .resource-identity > .resource-technical-info { grid-column: 2; grid-row: 2; margin: 0; }
+.resource-table .resource-simple-identity > .resource-technical-info { grid-column: 1; justify-self: start; }
+.resource-table .resource-identity > .resource-technical-info > summary { min-height: 24px; color: var(--text-3); font-size: 12px; line-height: 24px; }
+.resource-table .resource-identity > .resource-technical-info > summary:hover { color: var(--accent); }
+.resource-table .resource-identity > .resource-technical-info[open] { grid-column: 1 / -1; grid-row: auto; width: 100%; }
+.resource-table .resource-technical-info dl { padding: 8px 0 2px; border-top: 1px solid var(--border); font-size: 12px; }
+.resource-table .resource-technical-info dl > div { display: grid; grid-template-columns: 52px minmax(0, 1fr); align-items: start; gap: 8px; }
+.resource-table tr:has(.resource-technical-info[open]) td { vertical-align: top; }
+.resource-table .resource-technical-info dd { min-width: 0; }
+.resource-table .resource-room-code { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; overflow: visible; }
+.resource-table .resource-primary-value { max-width: 100%; flex-wrap: wrap; }
+.resource-context-link { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Keep record identity in view while a narrow desktop scrolls its facts. */
+.resource-page .data-table-wrap { overscroll-behavior-inline: contain; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+.resource-page .data-table th:first-child, .resource-page .data-table td:first-child { position: sticky; left: 0; z-index: 1; box-shadow: 1px 0 0 var(--border); background: var(--surface); }
+.resource-page .data-table th:first-child { z-index: 2; background: var(--surface-subtle); }
+.resource-page .data-table tr:hover td:first-child { background: var(--surface-subtle); }
+.resource-accounts-panel .data-table, .resource-table .data-table { table-layout: fixed; }
+.resource-accounts-panel .data-table { min-width: 820px; }
+.resource-accounts-panel .data-table th:nth-child(1) { width: 30%; }
+.resource-accounts-panel .data-table th:nth-child(2) { width: 12%; }
+.resource-accounts-panel .data-table th:nth-child(3), .resource-accounts-panel .data-table th:nth-child(4) { width: 8%; }
+.resource-accounts-panel .data-table th:nth-child(5) { width: 20%; }
+.resource-accounts-panel .data-table th:nth-child(6) { width: 22%; }
+.resource-device-table .data-table { min-width: 900px; }
+.resource-device-table .data-table th:nth-child(1) { width: 28%; }
+.resource-device-table .data-table th:nth-child(2) { width: 10%; }
+.resource-device-table .data-table th:nth-child(3) { width: 16%; }
+.resource-device-table .data-table th:nth-child(4) { width: 16%; }
+.resource-device-table .data-table th:nth-child(5) { width: 18%; }
+.resource-device-table .data-table th:nth-child(6) { width: 12%; }
+.resource-network-table .data-table { min-width: 960px; }
+.resource-network-table .data-table th:nth-child(1) { width: 28%; }
+.resource-network-table .data-table th:nth-child(2) { width: 16%; }
+.resource-network-table .data-table th:nth-child(3) { width: 14%; }
+.resource-network-table .data-table th:nth-child(4) { width: 8%; }
+.resource-network-table .data-table th:nth-child(5), .resource-network-table .data-table th:nth-child(6) { width: 12%; }
+.resource-network-table .data-table th:nth-child(7) { width: 10%; }
+
+@media (max-width: 760px) {
+  .resource-page .resource-list-toolbar { padding: 16px 16px 8px; }
   .resource-page .resource-toolbar-fields { align-items: stretch; gap: 10px; }
   .resource-page .resource-toolbar-fields > .search-field { flex-basis: 100%; width: 100%; max-width: none; min-width: 0; }
   .resource-page .resource-toolbar-fields > .select-field { flex: 1 1 120px; min-width: 0; }
   .resource-page .resource-toolbar-fields > .account-scope-picker { width: auto; flex: 1 1 160px; min-width: 0; }
   .resource-page .resource-filter-clear { margin-left: 0; }
-  .resource-page .resource-list-status { padding: 0 16px; }
+  .resource-page .resource-list-meta { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; padding: 0 16px 10px; }
+  .resource-page .resource-list-meta > .resource-result-count { grid-column: 1; grid-row: 1; }
+  .resource-page .resource-list-meta > .snapshot-export { grid-column: 2; grid-row: 1; }
+  .resource-page .resource-list-meta > .query-status { grid-column: 1 / -1; grid-row: 2; }
   .resource-page .resource-list-tabs { padding: 0 16px; }
   .resource-page .resource-empty-state { min-height: 220px; padding: 30px 20px; }
+  .resource-account-identity .resource-name, .resource-account-identity .resource-secondary { max-width: 100%; }
+  .resource-table .resource-identity { max-width: none; }
+  .resource-table .data-mobile-card { gap: 20px; padding: 20px 16px; }
+  .resource-table .data-mobile-facts { gap: 16px 20px; }
+  .data-mobile-facts .resource-context-link { white-space: normal; overflow-wrap: anywhere; }
+}
+@media (pointer: fine) {
+  .resource-table .resource-room-code .copy-value-button { width: 24px; min-height: 24px; padding: 2px; }
+}
+@media (pointer: coarse) {
+  .resource-table .resource-identity > .resource-technical-info > summary { min-height: 44px; line-height: 28px; }
 }

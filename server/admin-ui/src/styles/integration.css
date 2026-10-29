@@ -5,7 +5,7 @@
   --text-2: var(--console-text-soft); --text-3: var(--console-text-muted);
   --border: var(--console-border); --border-strong: var(--console-border-strong);
   --sidebar: var(--console-sidebar); --sidebar-2: var(--console-sidebar-hover); --accent: var(--console-accent); --accent-soft: var(--console-accent-soft);
-  --action-primary: #465bd6; --action-primary-hover: #3548bd; --action-primary-text: #fff;
+  --action-primary: var(--console-text); --action-primary-hover: color-mix(in srgb, var(--console-text) 86%, var(--console-surface-solid)); --action-primary-text: var(--console-surface-solid);
   --success-text: var(--console-success); --success-soft: var(--console-success-soft);
   --warning-text: var(--console-warning); --warning-soft: var(--console-warning-soft);
   --danger-text: var(--console-danger); --danger-soft: var(--console-danger-soft);

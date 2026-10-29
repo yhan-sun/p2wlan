@@ -9,7 +9,7 @@ import {
   type Edge,
   type Node,
 } from '@xyflow/react'
-import { CircleAlert, Expand, Eye, EyeOff, Info, MonitorSmartphone, Shrink } from 'lucide-react'
+import { CircleAlert, Expand, Eye, EyeOff, Info, Shrink } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { getFlowAriaLabelConfig, tr, useLocale } from '../../i18n'
 import { TopologyViewport } from '../../shared/TopologyViewport'
@@ -119,7 +119,6 @@ function buildGraph(connections: AdminConnection[], locale: string, onSelect: (c
       },
       data: {
         label: <div className="connection-node">
-          <span className="connection-node-icon"><MonitorSmartphone size={17} /></span>
           <span className="connection-node-copy">
             <strong>{device.name}</strong>
             <small>{device.username} · {locale === 'zh-CN'
@@ -131,10 +130,10 @@ function buildGraph(connections: AdminConnection[], locale: string, onSelect: (c
       style: {
         width: NODE_WIDTH,
         height: NODE_HEIGHT,
-        borderRadius: 10,
+        borderRadius: 6,
         border: '1px solid var(--topology-neutral-border, #d7dde6)',
         background: 'var(--topology-node-surface, #fff)',
-        boxShadow: '0 4px 16px rgba(15, 23, 42, .06)',
+        boxShadow: 'none',
         padding: 0,
       },
       draggable: false,

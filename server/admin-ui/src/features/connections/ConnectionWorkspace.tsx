@@ -1,5 +1,5 @@
 import { useInfiniteQuery } from '@tanstack/react-query'
-import { AlertTriangle, ChartNoAxesCombined, Table2, Waypoints } from 'lucide-react'
+import { useEffect, useRef } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { adminApi } from '../../api'
 import { PageHeader } from '../../components/ui/console'
@@ -15,10 +15,10 @@ import { readHealthSearch } from './trends'
 import { useConnectionSearchParams } from './useConnectionSearch'
 
 const tabs = [
-  { id: 'health', label: '待关注', icon: AlertTriangle },
-  { id: 'all', label: '全部观测', icon: Table2 },
-  { id: 'topology', label: '连接拓扑', icon: Waypoints },
-  { id: 'trends', label: '历史趋势', icon: ChartNoAxesCombined },
+  { id: 'health', label: '待关注' },
+  { id: 'all', label: '全部观测' },
+  { id: 'topology', label: '连接拓扑' },
+  { id: 'trends', label: '历史趋势' },
 ] as const
 
 function NetworkTrends() {
@@ -44,7 +44,8 @@ function NetworkTrends() {
     return next
   })
   return <div className="page-stack connection-trends-page">
-    <div className="connection-view-heading"><div><h3>{tr('历史趋势')}</h3><p>{tr('按网络汇总观测；下方图表不应用账号或设备筛选。')}</p></div></div>
+    <h3 className="sr-only">{tr('历史趋势')}</h3>
+    <p className="connection-view-scope">{tr('按网络汇总观测；下方图表不应用账号或设备筛选。')}</p>
     <div className="connections-toolbar">
       <select className="select-field" aria-label={tr('按网络过滤')} value={networkId} onChange={(event) => update('network_id', event.target.value)}>
         <option value="">{tr('全部网络')}</option>
@@ -102,18 +103,37 @@ function RetainedFilters({ active }: { active: ConnectionWorkspaceTab }) {
   </details>
 }
 
+export function enterConnectionView(surface: HTMLElement | null, preference: MediaQueryList) {
+  if (!surface?.animate || preference.matches) return
+  // Do not transform this ancestor: it owns a position:fixed fullscreen graph.
+  const animation = surface.animate([{ opacity: 0.45 }, { opacity: 1 }], {
+    duration: 200, easing: 'cubic-bezier(.2,.65,.3,1)',
+  })
+  const reduce = () => { if (preference.matches) animation.cancel() }
+  preference.addEventListener('change', reduce)
+  return () => {
+    animation.cancel()
+    preference.removeEventListener('change', reduce)
+  }
+}
+
 export function ConnectionWorkspace() {
   const [params] = useConnectionSearchParams()
   const { pathname, state } = useLocation()
   const active = connectionWorkspaceTab(params, pathname)
+  const viewRef = useRef<HTMLDivElement>(null)
+  // Polling and filter changes retain this owner and never replay its entrance.
+  useEffect(() => enterConnectionView(viewRef.current, window.matchMedia('(prefers-reduced-motion: reduce)')), [active])
   const href = (tab: ConnectionWorkspaceTab) => `/connections?${connectionWorkspaceSearch(params, tab)}`
   return <div className="page-stack connection-workspace">
     <ResourceReturnLink />
     <PageHeader title={tr('连接排障')} description={tr('查看设备之间的连接路径、延迟与最近变化。')} />
     <nav className="connection-workspace-tabs" aria-label={tr('连接排障视图')}>
-      {tabs.map(({ id, label, icon: Icon }) => <Link key={id} to={href(id)} state={state} aria-current={active === id ? 'page' : undefined} className={active === id ? 'active' : ''}><Icon size={16} aria-hidden />{tr(label)}</Link>)}
+      {tabs.map(({ id, label }) => <Link key={id} to={href(id)} state={state} aria-current={active === id ? 'page' : undefined} className={active === id ? 'active' : ''}>{tr(label)}</Link>)}
     </nav>
     <RetainedFilters active={active} />
-    {active === 'health' ? <ConnectionHealthPage /> : active === 'trends' ? <NetworkTrends /> : <ConnectionsPage />}
+    <div ref={viewRef} className="connection-workspace-view">
+      {active === 'health' ? <ConnectionHealthPage /> : active === 'trends' ? <NetworkTrends /> : <ConnectionsPage />}
+    </div>
   </div>
 }

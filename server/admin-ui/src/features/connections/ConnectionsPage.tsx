@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { flexRender, getCoreRowModel, useReactTable, type ColumnDef } from '@tanstack/react-table'
-import { ChevronLeft, ChevronRight, CircleAlert, Network, Search, X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, CircleAlert, Info, Network, Search, X } from 'lucide-react'
 import { lazy, useEffect, useMemo, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { AsyncView } from '../../AsyncView'
@@ -137,17 +137,7 @@ export function ConnectionsPage() {
   })
 
   return <div className="page-stack connections-page">
-    <div className="connection-view-heading connections-intro">
-      <div>
-        <h3>{tr(view === 'topology' ? '连接拓扑' : '全部观测')}</h3>
-        <p>{tr(view === 'topology' ? '选择网络，沿连接方向查看路径。' : '每一行代表一个设备上报的单向连接。')}</p>
-      </div>
-      <details className="connection-observation-help">
-          <summary>{tr('观测说明')}</summary>
-          <p>{tr("路径只来自守护进程已提交的权威单向观测。“新鲜”表示观测仍在有效租约内，不代表目标应用一定可达。")}</p>
-      </details>
-    </div>
-
+    <h3 className="sr-only">{tr(view === 'topology' ? '连接拓扑' : '全部观测')}</h3>
     <div className="connections-toolbar">
       <label className="search-field connections-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={tr("搜索设备、账号或网络")} aria-label={tr("搜索连接")} /></label>
       <label className="connection-filter"><span>{tr('Network')}</span><select className="select-field" value={networkId} onChange={(event) => changeFilter({ network_id: event.target.value })} aria-label={tr("按网络过滤")}>
@@ -181,6 +171,10 @@ export function ConnectionsPage() {
     {(networks.error || networks.fetchStatus === 'paused') && <div className="connection-context-note"><span>{tr('网络目录')}</span><QueryStatus queries={[networks]} /></div>}
     {(view === 'table' || networkId) && <div className="connections-result-bar">
       <QueryStatus queries={[view === 'table' ? result : topology]} />
+      <details className="connection-observation-help">
+        <summary aria-label={tr('观测说明')}><Info size={14} aria-hidden /><span>{tr('观测说明')}</span></summary>
+        <p>{tr("路径只来自守护进程已提交的权威单向观测。“新鲜”表示观测仍在有效租约内，不代表目标应用一定可达。")}</p>
+      </details>
       {activeItems.length > 0 && <SnapshotExport items={query.trim() === committedQuery ? activeItems : []} filename="connections" total={view === 'table' ? result.data?.total : topology.data?.total} scope={{ network_id: networkId, account_id: accountId, device_id: deviceId, q: committedQuery, path, freshness, view, page: view === 'table' ? page : 1, ...(directionOnly ? { reporting_device_id: directionOnly.reporting_device_id, remote_device_id: directionOnly.remote_device_id } : {}) }} />}
     </div>}
 

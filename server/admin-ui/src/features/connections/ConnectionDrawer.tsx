@@ -166,10 +166,9 @@ export function ConnectionDrawer({
       </dl>
       {!current.fresh && <div className="connection-stale-note">
         {tr("这是守护进程最后一次权威上报的路径，不代表当前仍处于活动连接。")}</div>}
-      <h3 className="connection-detail-heading">{tr('双向观测对照')}</h3>
+      <h3 className="connection-detail-heading">{tr('反向观测')}</h3>
       <section className="connection-direction-comparison" aria-label={tr('双向观测对照')}>
-        <div><strong>{tr('当前方向')}</strong><span>{current.reporting_device_name} → {current.remote_device_name}</span><span><PathBadge connection={current} /> <FreshnessBadge connection={current} /></span><small>{tr('恢复状态')}：{current.recovery_state || tr('未上报')}</small><small>{tr('服务端接收于')} {formatDate(current.received_at)}</small></div>
-        <div><strong>{tr('反向观测')}</strong><span>{current.remote_device_name} → {current.reporting_device_name}</span>
+        <div><strong>{current.remote_device_name} → {current.reporting_device_name}</strong>
           {reverseConnection ? <><span><PathBadge connection={reverseConnection} /> <FreshnessBadge connection={reverseConnection} /></span><small>{tr('恢复状态')}：{reverseConnection.recovery_state || tr('未上报')}</small><small>{tr('服务端接收于')} {formatDate(reverseConnection.received_at)}</small><button type="button" className="button secondary compact" onClick={reverseDirection}>{tr('查看反向详情')}</button></>
             : <span>{tr(reverse.fetchStatus === 'paused' ? '反向观测更新已暂停' : reverse.isPending ? '正在读取反向观测…' : reverse.error ? '无法读取反向观测' : '没有反向观测；不等同于路径断开。')}</span>}
         </div>
