@@ -136,7 +136,12 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		for {
 			select {
 			case frame, ok := <-p.send:
-				if !ok || p.revoked.Load() {
+				if !ok {
+					return
+				}
+				if !p.authorizedAt(time.Now()) {
+					p.releaseFrame(frame.data)
+					_ = conn.Close()
 					return
 				}
 				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -284,10 +289,15 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 				return
 			}
 			s.recordAuthFailure(source)
-			setCloseCause("auth_revoked_at_register")
+			if claims.ExpiresAt != nil && !time.Now().Before(claims.ExpiresAt.Time) {
+				setCloseCause("ticket_expired_at_register")
+				_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+				_ = writeFull(conn, errorFrame(errTicketExpired, "ticket expired"))
+			} else {
+				setCloseCause("auth_revoked_at_register")
+			}
 			return
 		}
-		queue(p, makeFrame(msgRegistered, []byte(nodeID)))
 
 		// Store ticket expiry for connection lifecycle management
 		ticketExpiry := claims.ExpiresAt
@@ -304,6 +314,8 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 					log.Printf("relay ticket expiry: node=%q network=%q remaining=%s closing connection",
 						nodeID, claims.NetworkID, remaining.Round(time.Millisecond))
 					setCloseCause("ticket_expiry")
+					p.revoked.Store(true)
+					s.hub.unregister(p)
 					_ = conn.Close()
 				})
 			} else {
@@ -321,6 +333,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 			defer expiryTimer.Stop()
 		}
 
+		queue(p, makeFrame(msgRegistered, []byte(nodeID)))
 		atomic.AddUint64(&s.stats.authenticatedRegistrationsTotal, 1)
 		s.handlePostRegister(conn, p, nodeID, claims.NetworkID, setCloseCause)
 		return

@@ -226,13 +226,18 @@ export function ConnectionsPage() {
       {!networkId ? <div className="connection-topology-empty choose-network">
         <Network size={20} />
         <div><strong>{tr("选择一个网络查看实时拓扑")}</strong><span>{tr("拓扑不会跨网络拼接，也不会根据成员关系、信令或 RTT 推断连接。")}</span></div>
-      </div> : topology.data ? <>
-        {topology.data.total > topology.data.items.length && <div className="connection-partial-warning"><CircleAlert size={15} />{tr("当前网络共有 ")}{topology.data.total} {tr("条匹配观测，拓扑仅展示前 ")}{topology.data.items.length} {tr("条；请收紧搜索或路径过滤。")}</div>}
+      </div> : <>
+        {topology.data && topology.data.total > topology.data.items.length && <div className="connection-partial-warning"><CircleAlert size={15} />{tr("当前网络共有 ")}{topology.data.total} {tr("条匹配观测，拓扑仅展示前 ")}{topology.data.items.length} {tr("条；请收紧搜索或路径过滤。")}</div>}
         <AsyncView><ConnectionTopology
-          connections={topology.data.items}
+          connections={topology.data?.items ?? []}
           networkName={selectedNetwork?.name ?? networkId}
           showStale={showStaleTopology}
-          partial={topology.data.total > topology.data.items.length}
+          partial={Boolean(topology.data && topology.data.total > topology.data.items.length)}
+          loading={!topology.data && topology.isPending}
+          offline={!topology.data && topology.fetchStatus === 'paused'}
+          error={!topology.data ? topology.error : undefined}
+          onRetry={() => { void topology.refetch() }}
+          fullscreenStatus={<QueryStatus queries={[topology]} />}
           selected={selected}
           directionOnly={Boolean(directionOnly)}
           onClearSelection={() => selectConnection(null)}
@@ -240,7 +245,7 @@ export function ConnectionsPage() {
           onShowStaleChange={(value) => changeFilter({ freshness: value ? '' : 'fresh', tab: 'topology', view: null, show_stale: null })}
           onSelect={selectConnection}
         /></AsyncView>
-      </> : topology.fetchStatus === 'paused' ? null : topology.isPending ? <LoadingBlock label={tr("正在读取权威连接拓扑…")} /> : topology.error ? <ErrorBlock error={topology.error} /> : <ErrorBlock error={new Error('控制面未返回连接拓扑。')} />}
+      </>}
     </section>}
 
     {selected && connectionDetailIsOpen(searchParams) && <ConnectionDrawer key={`${selected.network_id}:${selected.reporting_device_id}:${selected.remote_device_id}`} connection={selected} onClose={() => setSearchParams(closeConnectionDetailSearch, { replace: true })} />}

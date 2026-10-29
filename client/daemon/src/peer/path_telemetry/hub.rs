@@ -18,6 +18,38 @@ use super::wire::{
 
 pub const MAX_DIRTY_PEERS: usize = 128;
 pub const DEFAULT_BATCH_OBSERVATIONS: usize = 32;
+/// A failed immutable sample gets at most three requeues. A new authoritative
+/// sample or successful delivery starts a new budget; workers own its lifetime.
+pub const MAX_TELEMETRY_RETRIES: u8 = 3;
+
+#[derive(Debug, Clone, Copy)]
+pub enum PathTelemetrySendFailure {
+    Transport,
+    Timeout,
+    HttpStatus,
+    Encoding,
+}
+
+#[derive(Debug)]
+struct LatestPathObservation {
+    observation: PathTelemetryObservation,
+    retries: u8,
+}
+
+fn same_sample(left: &PathTelemetryObservation, right: &PathTelemetryObservation) -> bool {
+    // Optional history may have been trimmed to fit a frame; it does not
+    // create a new authoritative sample or reset its retry budget.
+    left.remote_device_id == right.remote_device_id
+        && left.network_id == right.network_id
+        && left.observed_at == right.observed_at
+        && left.network_generation == right.network_generation
+        && left.peer_session_generation == right.peer_session_generation
+        && left.remote_candidate_epoch == right.remote_candidate_epoch
+        && left.observation_revision == right.observation_revision
+        && left.lifecycle == right.lifecycle
+        && left.current_path == right.current_path
+        && left.transition_reason == right.transition_reason
+}
 
 /// Telemetry operational and health metrics counters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -31,6 +63,12 @@ pub struct PathTelemetryMetrics {
     pub send_failures: u64,
     pub oversized_observations: u64,
     pub trimmed_transition_items: u64,
+    pub send_transport_failures: u64,
+    pub send_timeouts: u64,
+    pub send_http_failures: u64,
+    pub send_encoding_failures: u64,
+    pub requeued_observations: u64,
+    pub retry_exhausted_observations: u64,
 }
 
 /// The authoritative active-path telemetry hub.
@@ -39,7 +77,7 @@ pub struct PathTelemetryHub {
     device_id: Mutex<String>,
     network_id: Mutex<String>,
     registration_seq: AtomicU64,
-    latest_snapshots: Mutex<HashMap<String, PathTelemetryObservation>>,
+    latest_snapshots: Mutex<HashMap<String, LatestPathObservation>>,
     dirty_peers: Mutex<VecDeque<String>>,
     dirty_set: Mutex<HashSet<String>>,
     metrics: Mutex<PathTelemetryMetrics>,
@@ -93,7 +131,13 @@ impl PathTelemetryHub {
 
         // Update latest snapshot
         if let Ok(mut snapshots) = self.latest_snapshots.lock() {
-            snapshots.insert(remote_device_id.to_string(), obs);
+            snapshots.insert(
+                remote_device_id.to_string(),
+                LatestPathObservation {
+                    observation: obs,
+                    retries: 0,
+                },
+            );
         }
 
         // Bounded queueing and coalescing
@@ -146,7 +190,7 @@ impl PathTelemetryHub {
         if let Ok(snapshots) = self.latest_snapshots.lock() {
             for peer_id in peer_ids {
                 if let Some(obs) = snapshots.get(&peer_id) {
-                    results.push(obs.clone());
+                    results.push(obs.observation.clone());
                 }
             }
         }
@@ -175,7 +219,11 @@ impl PathTelemetryHub {
                     // The last observation belongs in a new frame. Never trim
                     // normal history just to fit an already populated batch.
                     if let Some(last) = frame.payload.observations.pop() {
-                        self.requeue_unsent(std::iter::once(last).chain(pending));
+                        self.requeue_dirty_ids(
+                            std::iter::once(last)
+                                .chain(pending)
+                                .map(|observation| observation.remote_device_id),
+                        );
                     }
                     return Some(frame);
                 }
@@ -211,14 +259,14 @@ impl PathTelemetryHub {
         (!frame.payload.observations.is_empty()).then_some(frame)
     }
 
-    fn requeue_unsent(&self, observations: impl Iterator<Item = PathTelemetryObservation>) {
+    fn requeue_dirty_ids(&self, peers_to_retry: impl Iterator<Item = String>) -> usize {
+        let mut requeued = 0;
         if let (Ok(mut peers), Ok(mut set), Ok(mut metrics)) = (
             self.dirty_peers.lock(),
             self.dirty_set.lock(),
             self.metrics.lock(),
         ) {
-            for observation in observations {
-                let peer = observation.remote_device_id;
+            for peer in peers_to_retry {
                 if set.contains(&peer) {
                     continue;
                 }
@@ -228,7 +276,50 @@ impl PathTelemetryHub {
                 }
                 set.insert(peer.clone());
                 peers.push_back(peer);
+                requeued += 1;
             }
+        }
+        requeued
+    }
+
+    /// Retry peer IDs, never old cloned data. A concurrent committed generation
+    /// is already in latest_snapshots and will be read by the next drain.
+    /// No notification is emitted: HTTP retries use the existing five-second
+    /// worker tick, and a failed WebSocket leaves its current connection.
+    pub fn retry_observations(&self, failed: &[PathTelemetryObservation]) {
+        let mut exhausted = 0u64;
+        let mut peers = Vec::with_capacity(failed.len());
+        if let Ok(mut snapshots) = self.latest_snapshots.lock() {
+            for observation in failed {
+                let Some(latest) = snapshots.get_mut(&observation.remote_device_id) else {
+                    continue;
+                };
+                if same_sample(&latest.observation, observation) {
+                    if latest.retries == MAX_TELEMETRY_RETRIES {
+                        exhausted = exhausted.saturating_add(1);
+                        continue;
+                    }
+                    latest.retries += 1;
+                }
+                peers.push(observation.remote_device_id.clone());
+            }
+        }
+        let requeued = self.requeue_dirty_ids(peers.into_iter());
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.requeued_observations = metrics
+                .requeued_observations
+                .saturating_add(requeued as u64);
+            metrics.retry_exhausted_observations = metrics
+                .retry_exhausted_observations
+                .saturating_add(exhausted);
+            metrics.dropped_events = metrics.dropped_events.saturating_add(exhausted);
+        }
+        if exhausted > 0 {
+            tracing::warn!(
+                reason_code = "path_telemetry_retry_exhausted",
+                observations = exhausted,
+                "Path telemetry delivery exhausted its retry budget"
+            );
         }
     }
 
@@ -242,12 +333,13 @@ impl PathTelemetryHub {
 
     /// Mark all known peers dirty to trigger full resync on reconnect.
     pub fn mark_all_dirty(&self) {
-        if let (Ok(snapshots), Ok(mut peers), Ok(mut set)) = (
+        if let (Ok(mut snapshots), Ok(mut peers), Ok(mut set)) = (
             self.latest_snapshots.lock(),
             self.dirty_peers.lock(),
             self.dirty_set.lock(),
         ) {
-            for peer_id in snapshots.keys() {
+            for (peer_id, latest) in snapshots.iter_mut() {
+                latest.retries = 0;
                 if !set.contains(peer_id) && peers.len() < MAX_DIRTY_PEERS {
                     peers.push_back(peer_id.clone());
                     set.insert(peer_id.clone());
@@ -261,7 +353,11 @@ impl PathTelemetryHub {
     pub fn snapshot_all(&self) -> Vec<PathTelemetryObservation> {
         self.latest_snapshots
             .lock()
-            .map(|m| m.values().cloned().collect())
+            .map(|m| {
+                m.values()
+                    .map(|latest| latest.observation.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -305,6 +401,21 @@ impl PathTelemetryHub {
         }
     }
 
+    /// Clear only the retry budget belonging to the exact delivered sample.
+    /// A newer generation remains untouched if it arrived during network I/O.
+    pub fn record_delivery_success(&self, observations: &[PathTelemetryObservation]) {
+        if let Ok(mut snapshots) = self.latest_snapshots.lock() {
+            for observation in observations {
+                if let Some(latest) = snapshots.get_mut(&observation.remote_device_id) {
+                    if same_sample(&latest.observation, observation) {
+                        latest.retries = 0;
+                    }
+                }
+            }
+        }
+        self.record_sent_batch(observations.len());
+    }
+
     /// Record that an ack frame was received from the Control server.
     pub fn record_ack(&self, _sent_at: i64) {
         if let Ok(mut metrics) = self.metrics.lock() {
@@ -314,8 +425,19 @@ impl PathTelemetryHub {
 
     /// Record a failed transmission.
     pub fn record_send_failure(&self) {
+        self.record_delivery_failure(PathTelemetrySendFailure::Transport);
+    }
+
+    pub fn record_delivery_failure(&self, reason: PathTelemetrySendFailure) {
         if let Ok(mut metrics) = self.metrics.lock() {
             metrics.send_failures = metrics.send_failures.saturating_add(1);
+            let counter = match reason {
+                PathTelemetrySendFailure::Transport => &mut metrics.send_transport_failures,
+                PathTelemetrySendFailure::Timeout => &mut metrics.send_timeouts,
+                PathTelemetrySendFailure::HttpStatus => &mut metrics.send_http_failures,
+                PathTelemetrySendFailure::Encoding => &mut metrics.send_encoding_failures,
+            };
+            *counter = counter.saturating_add(1);
         }
     }
 

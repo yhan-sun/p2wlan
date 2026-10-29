@@ -738,7 +738,16 @@
   z-index: 90;
   inset: 0;
   height: 100vh;
+  display: flex;
+  flex-direction: column;
 }
+
+.connection-topology.fullscreen > .connection-topology-head { position: static; flex: 0 0 auto; padding: 12px; }
+.connection-topology-status { flex: 0 0 auto; padding: 0 12px; background: var(--surface); }
+.connection-topology.fullscreen > .react-flow { flex: 1 1 0; min-height: 0; }
+.connection-topology.fullscreen > .connection-topology-empty,
+.connection-topology.fullscreen > .loading-block { flex: 1 1 0; min-height: 0; padding: 24px; }
+.connection-topology.fullscreen > .fullscreen-no-path { flex: 0 1 auto; max-height: 35%; overflow: auto; margin: 0; padding: 12px; background: var(--surface); }
 
 .connection-topology-head {
   position: absolute;

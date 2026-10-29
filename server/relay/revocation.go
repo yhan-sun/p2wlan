@@ -306,8 +306,14 @@ func (s *RelayServer) registerAuthenticated(p *peer, claims *relayTicketClaims) 
 		return false
 	}
 	p.deviceID, p.credentialID, p.ticketJTI = claims.DeviceID, claims.CredentialID, claims.ID
-	old := s.hub.registerSwap(p, claims.NetworkID, claims.NodeID)
+	if claims.ExpiresAt != nil {
+		p.ticketExpiresAt = claims.ExpiresAt.Time
+	}
+	old, accepted := s.hub.registerAuthenticatedSwap(p, claims.NetworkID, claims.NodeID)
 	s.revocationMu.RUnlock()
+	if !accepted {
+		return false
+	}
 	if old != nil {
 		_ = old.conn.Close()
 	}

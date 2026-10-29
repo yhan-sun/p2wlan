@@ -151,8 +151,19 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 	// keys have no prior daemon session to fence.
 	var previousRegistrationSequence int64
 	if existingDevice, err := s.db.GetDeviceByPublicKey(networkID, req.PublicKey); err == nil {
-		unlock := s.lockDeviceRegistrationSession(existingDevice.ID)
+		unlock, ok := s.lockDeviceRegistrationSession(w, r, existingDevice.ID)
+		if !ok {
+			return
+		}
 		defer unlock()
+		w = &registrationSessionResponseWriter{ResponseWriter: w, release: unlock}
+		if deviceCredentialAuth {
+			accepted := false
+			auth.RequireDeviceAuth(s.db)(func(http.ResponseWriter, *http.Request) { accepted = true })(w, r)
+			if !accepted {
+				return
+			}
+		}
 		// Refresh under the lock in case an earlier registration completed while
 		// this request was waiting for it.
 		if currentDevice, currentErr := s.db.GetDevice(existingDevice.ID); currentErr == nil {

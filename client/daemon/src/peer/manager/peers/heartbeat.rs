@@ -63,6 +63,15 @@ impl PeerManager {
         {
             return None;
         }
+        // A stable path still needs new daemon-owned samples. Control's
+        // last_seen is only the wake trigger; read the committed reducer here.
+        // The advisory fast path must not wait for an epoch owner or refresh
+        // old path evidence while a network handover is invalidating it.
+        if let Ok(_epoch_guard) = self.network_epoch_gate.try_lock() {
+            if self.current_network_generation_sync() == epoch.network_generation {
+                conn.sync_path_telemetry();
+            }
+        }
         Some(PeerUpdate {
             last_seen_only: true,
             previous_virtual_ip,

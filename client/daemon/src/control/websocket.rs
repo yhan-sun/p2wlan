@@ -356,27 +356,51 @@ async fn run_signal_websocket_with_lifecycle(
                         if send_telemetry {
                             if let Some(hub) = &telemetry_hub {
                                 if let Some(frame) = hub.drain_bounded_frame(32) {
-                                    if let Ok(text) = serde_json::to_string(&frame) {
-                                        let count = frame.payload.observations.len();
-                                        match time::timeout(
-                                            SIGNAL_WS_WRITE_TIMEOUT,
-                                            socket.send(WebSocketMessage::Text(text.into())),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {
-                                                hub.record_sent_batch(count);
-                                            }
-                                            Ok(Err(err)) => {
-                                                hub.record_send_failure();
-                                                warn!("Failed to send WebSocket path telemetry: {err}");
-                                                break;
-                                            }
-                                            Err(_) => {
-                                                hub.record_send_failure();
-                                                warn!("WebSocket path telemetry write timed out");
-                                                break;
-                                            }
+                                    use crate::peer::path_telemetry::PathTelemetrySendFailure;
+                                    let text = match serde_json::to_string(&frame) {
+                                        Ok(text) => text,
+                                        Err(error) => {
+                                            hub.record_delivery_failure(
+                                                PathTelemetrySendFailure::Encoding,
+                                            );
+                                            hub.retry_observations(&frame.payload.observations);
+                                            warn!(
+                                                reason_code = "path_telemetry_encoding_failed",
+                                                "Cannot encode WebSocket path telemetry: {error}"
+                                            );
+                                            break;
+                                        }
+                                    };
+                                    match time::timeout(
+                                        SIGNAL_WS_WRITE_TIMEOUT,
+                                        socket.send(WebSocketMessage::Text(text.into())),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(())) => {
+                                            hub.record_delivery_success(&frame.payload.observations)
+                                        }
+                                        Ok(Err(error)) => {
+                                            hub.record_delivery_failure(
+                                                PathTelemetrySendFailure::Transport,
+                                            );
+                                            hub.retry_observations(&frame.payload.observations);
+                                            warn!(
+                                                reason_code = "path_telemetry_transport_failed",
+                                                "Failed to send WebSocket path telemetry: {error}"
+                                            );
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            hub.record_delivery_failure(
+                                                PathTelemetrySendFailure::Timeout,
+                                            );
+                                            hub.retry_observations(&frame.payload.observations);
+                                            warn!(
+                                                reason_code = "path_telemetry_write_timeout",
+                                                "WebSocket path telemetry write timed out"
+                                            );
+                                            break;
                                         }
                                     }
                                 }
@@ -470,26 +494,6 @@ async fn run_signal_websocket_with_lifecycle(
                                             );
                                             if let Some(hub) = &telemetry_hub {
                                                 hub.mark_all_dirty();
-                                                let batch = hub.drain_dirty(32);
-                                                if !batch.is_empty() {
-                                                    let frame = hub.build_frame(batch);
-                                                    if let Ok(text) = serde_json::to_string(&frame)
-                                                    {
-                                                        let count =
-                                                            frame.payload.observations.len();
-                                                        if (time::timeout(
-                                                            SIGNAL_WS_WRITE_TIMEOUT,
-                                                            socket.send(WebSocketMessage::Text(
-                                                                text.into(),
-                                                            )),
-                                                        )
-                                                        .await)
-                                                            .is_ok()
-                                                        {
-                                                            hub.record_sent_batch(count);
-                                                        }
-                                                    }
-                                                }
                                             }
                                         }
                                         debug!(

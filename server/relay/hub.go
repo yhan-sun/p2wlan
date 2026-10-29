@@ -20,10 +20,12 @@ type peer struct {
 	deviceID     string
 	credentialID string
 	ticketJTI    string
-	revoked      atomic.Bool
-	conn         net.Conn
-	send         chan queuedFrame
-	done         chan struct{}
+	// Immutable after publication; expiry is checked even if its timer is late.
+	ticketExpiresAt time.Time
+	revoked         atomic.Bool
+	conn            net.Conn
+	send            chan queuedFrame
+	done            chan struct{}
 	// writeFailed is set when the per-peer writer goroutine fails to write a
 	// frame; handleConn's deferred close logging uses it as the disconnect
 	// cause when a write failure raced the read loop's classification.
@@ -62,6 +64,21 @@ func (h *hub) register(p *peer, networkID, nodeID string) {
 func (h *hub) registerSwap(p *peer, networkID, nodeID string) *peer {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.registerSwapLocked(p, networkID, nodeID)
+}
+
+func (h *hub) registerAuthenticatedSwap(p *peer, networkID, nodeID string) (*peer, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// A verified ticket can expire while waiting for publication. Never retire
+	// the healthy current owner on behalf of an already-expired replacement.
+	if !p.authorizedAt(time.Now()) {
+		return nil, false
+	}
+	return h.registerSwapLocked(p, networkID, nodeID), true
+}
+
+func (h *hub) registerSwapLocked(p *peer, networkID, nodeID string) *peer {
 	key := networkNodeKey{networkID: networkID, nodeID: nodeID}
 	old := h.peers[key]
 	p.id, p.networkID = nodeID, networkID
@@ -70,6 +87,10 @@ func (h *hub) registerSwap(p *peer, networkID, nodeID string) *peer {
 		return nil
 	}
 	return old
+}
+
+func (p *peer) authorizedAt(now time.Time) bool {
+	return !p.revoked.Load() && (p.ticketExpiresAt.IsZero() || now.Before(p.ticketExpiresAt))
 }
 
 func (h *hub) unregister(p *peer) {
@@ -147,7 +168,8 @@ func (h *hub) forward(src *peer, dstID string, data []byte, maxFramePayload int)
 func (h *hub) currentForward(src, dst *peer) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return src != nil && dst != nil && !src.revoked.Load() && !dst.revoked.Load() &&
+	now := time.Now()
+	return src != nil && dst != nil && src.authorizedAt(now) && dst.authorizedAt(now) &&
 		src.networkID == dst.networkID &&
 		h.peers[networkNodeKey{src.networkID, src.id}] == src &&
 		h.peers[networkNodeKey{dst.networkID, dst.id}] == dst

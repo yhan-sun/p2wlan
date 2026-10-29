@@ -10,7 +10,8 @@ pub mod sender;
 pub mod wire;
 
 pub use hub::{
-    PathTelemetryHub, PathTelemetryMetrics, DEFAULT_BATCH_OBSERVATIONS, MAX_DIRTY_PEERS,
+    PathTelemetryHub, PathTelemetryMetrics, PathTelemetrySendFailure, DEFAULT_BATCH_OBSERVATIONS,
+    MAX_DIRTY_PEERS,
 };
 pub use sender::PathTelemetrySender;
 pub use wire::{
@@ -20,3 +21,6 @@ pub use wire::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod delivery_tests;

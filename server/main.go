@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -266,37 +265,11 @@ func isAllowedOrigin(origin string, extra map[string]struct{}) bool {
 // rateLimit is a simple per-process token-bucket style limiter for auth endpoints.
 // maxEvents requests are allowed per window per remote IP.
 func rateLimit(next http.HandlerFunc, maxEvents int, window time.Duration) http.HandlerFunc {
-	type bucket struct {
-		count int
-		reset time.Time
-	}
-	var (
-		mu             sync.Mutex
-		buck           = map[string]*bucket{}
-		nextCleanup    = time.Now().Add(window)
-		trustedProxies = parseTrustedProxyCIDRs(getEnv("CONTROL_TRUSTED_PROXY_CIDRS", ""))
-	)
+	limiter := newAuthRequestLimiter(maxEvents, window)
+	trustedProxies := parseTrustedProxyCIDRs(getEnv("CONTROL_TRUSTED_PROXY_CIDRS", ""))
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := rateLimitClientIP(r, trustedProxies)
-		now := time.Now()
-		mu.Lock()
-		if !now.Before(nextCleanup) {
-			for key, candidate := range buck {
-				if !now.Before(candidate.reset) {
-					delete(buck, key)
-				}
-			}
-			nextCleanup = now.Add(window)
-		}
-		b, ok := buck[ip]
-		if !ok || now.After(b.reset) {
-			b = &bucket{count: 0, reset: now.Add(window)}
-			buck[ip] = b
-		}
-		b.count++
-		over := b.count > maxEvents
-		mu.Unlock()
-		if over {
+		if !limiter.allow(ip, time.Now()) {
 			http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
 			return
 		}

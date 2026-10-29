@@ -273,6 +273,8 @@ daemon 通过异步非阻塞 sidecar 向 Control 上报权威活动路径状态�
 
 WebSocket 使用 `{"type":"path_telemetry","payload":{"observations":[…]}}` 消息，HTTP 使用包含 `observations` 的请求体；Control 也兼容原有平铺 WebSocket 格式。`lifecycle` 来自 daemon 已提交的生命周期快照，`observed_at` 使用采样时的 Unix 秒。Control 在写入事务内核对设备当前 `registration_seq`，并对每个远端执行实际通信授权校验；旧会话、缺少注册代际证明、跨账号默认网络或已被房间撤权的观测不能写入。
 
+有效 peer heartbeat 可以从当前连接所有者重新采样稳定路径，无需制造路径切换；采样只尝试取得当前 epoch 许可，竞争或代际不符时跳过。同一注册与代际、同一 committed revision 的路径、生命周期和原因均一致，且 `observed_at` 严格增加时，Control 更新采样时间和接收租约，不增加迁移历史或趋势样本。原样重放不续租，同 revision 的矛盾路径被拒绝。客户端墙钟倒退期间，新鲜度可能暂时过期，直到新的采样时间超过已保存值；服务端不伪造客户端采样时间。
+
 ### 隐私硬约束
 
 遥测载荷严格遵循零泄露原则：
@@ -285,6 +287,7 @@ WebSocket 使用 `{"type":"path_telemetry","payload":{"observations":[…]}}` �
 - daemon 脏节点待发送队列容量硬上限为 128 个 peer；并发状态变迁对同一对端合并最新快照（coalesced）。
 - 每条对端观测最多附带最近 32 条本地迁移记录。
 - 每批最多 32 条观测，完整 WebSocket JSON 不超过 64 KiB；HTTP 请求体使用相同字节与条数上限。daemon 按实际序列化大小分批，剩余观测合并回有界待发送队列。单条观测超限时先裁掉最旧迁移记录并累计 `trimmed_transition_items`；保留最新快照后仍超限则累计 `oversized_observations` / `dropped_events` 并记录固定丢弃原因，不阻塞后续观测。
+- 首个 WebSocket ready 后的重同步和后续发送使用同一分批入口。传输失败、超时或 HTTP 非成功响应会按远端身份重新标记最新样本，不用失败请求中的旧副本覆盖并发更新；每份不变样本最多重新排队 3 次，新权威采样或成功送达重置预算。耗尽后保留 latest 快照，并累计 `retry_exhausted_observations`；传输、超时、HTTP 与编码失败分别计数。重排本身不立即唤醒重试循环，任务退出时随原 worker 取消。
 - Control 数据库持久化：`peer_path_observations` 表保留每个有向对 `(reporting_device, remote_device, network)` 的最新权威状态；`peer_path_transitions` 历史表对每个有向对保留上限 50 条最近记录，超出自动清理。
 
 

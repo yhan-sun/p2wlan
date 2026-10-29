@@ -219,6 +219,7 @@ type existingPathObservation struct {
 	Lifecycle             string
 	CurrentPath           sql.NullString
 	TransitionReason      string
+	ObservedAt            int64
 }
 
 // RecordPathObservations validates and persists path telemetry observations from an
@@ -292,7 +293,7 @@ func (db *DB) RecordPathObservations(
 		row := tx.QueryRow(
 			`SELECT registration_seq, observation_revision, network_generation,
 			        peer_session_generation, remote_candidate_epoch, lifecycle,
-			        current_path, transition_reason
+			        current_path, transition_reason, observed_at
 			 FROM peer_path_observations
 			 WHERE reporting_device_id = ? AND remote_device_id = ? AND network_id = ?`,
 			reportingDeviceID, remoteID, networkID,
@@ -306,6 +307,7 @@ func (db *DB) RecordPathObservations(
 			&existing.Lifecycle,
 			&existing.CurrentPath,
 			&existing.TransitionReason,
+			&existing.ObservedAt,
 		); scanErr == nil {
 			exists = true
 		} else if !errors.Is(scanErr, sql.ErrNoRows) {
@@ -344,6 +346,21 @@ func (db *DB) RecordPathObservations(
 								continue
 							}
 							if obs.ObservationRevision == existing.ObservationRevision {
+								samePath := currPath == nil && !existing.CurrentPath.Valid || currPath != nil && existing.CurrentPath.Valid && *currPath == existing.CurrentPath.String
+								if !samePath || lifecycle != existing.Lifecycle || obsReason != existing.TransitionReason {
+									summary.Rejected++
+									continue
+								}
+								// An unchanged committed path can be sampled again. Renew its
+								// lease only with a later sampling time, without manufacturing
+								// transitions or trend samples. Raw replays do not renew it.
+								if obs.ObservedAt > existing.ObservedAt {
+									_, err := tx.Exec(`UPDATE peer_path_observations SET received_at=?,observed_at=?,path_age_ms=?,last_handshake_age_ms=?,last_validation_rtt_ms=?
+ WHERE reporting_device_id=? AND remote_device_id=? AND network_id=?`, now, obs.ObservedAt, obs.PathAgeMS, obs.LastHandshakeAgeMS, validationRTT, reportingDeviceID, remoteID, networkID)
+									if err != nil {
+										return nil, fmt.Errorf("renew path observation lease: %w", err)
+									}
+								}
 								summary.Duplicate++
 								continue
 							}

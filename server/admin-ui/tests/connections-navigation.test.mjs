@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import test from 'node:test'
 import { build } from 'esbuild'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { CONNECTION_PAGE_SIZE, closeConnectionDetailSearch, connectionDetailIsOpen, connectionWorkspaceSearch, connectionWorkspaceTab, isolateConnectionSearch, lastAvailableConnectionPage, readConnectionSearch, readDirectionOnlySearch, selectConnectionSearch, updateConnectionSearch } from '../src/features/connections/connectionNavigation.ts'
@@ -11,7 +13,7 @@ const require = createRequire(import.meta.url)
 const { MemoryRouter } = require('react-router-dom')
 const { QueryClient, QueryClientProvider, QueryObserver, onlineManager } = require('@tanstack/react-query')
 
-async function compileSource(entry) {
+async function compileSource(entry, plugins = []) {
   const output = await build({
     absWorkingDir: new URL('..', import.meta.url).pathname,
     entryPoints: [entry],
@@ -21,6 +23,7 @@ async function compileSource(entry) {
     write: false,
     external: ['react', 'react-dom', 'react-router-dom', '@tanstack/react-query', '@xyflow/react'],
     loader: { '.css': 'empty' },
+    plugins,
   })
   const module = { exports: {} }
   new Function('module', 'exports', 'require', output.outputFiles[0].text)(module, module.exports, (name) => name.endsWith('.css') ? {} : require(name))
@@ -29,6 +32,27 @@ async function compileSource(entry) {
 
 const { ConnectionsPage } = await compileSource('src/features/connections/ConnectionsPage.tsx')
 const { ConnectionTopology } = await compileSource('src/features/connections/ConnectionTopology.tsx')
+const inlineTopology = {
+  name: 'synchronous-topology-test',
+  setup(builder) {
+    builder.onLoad({ filter: /ConnectionsPage\.tsx$/ }, ({ path: filename }) => ({
+      // Resolve the real lazy module synchronously only in SSR so the tests can
+      // inspect the surface's ownership during uncached requests and failures.
+      contents: readFileSync(filename, 'utf8').replace(/const ConnectionTopology = lazy\([^\n]+\)/, "import { ConnectionTopology } from './ConnectionTopology'"),
+      loader: 'tsx', resolveDir: path.dirname(filename),
+    }))
+  },
+}
+const { ConnectionsPage: InlineTopologyPage } = await compileSource('src/features/connections/ConnectionsPage.tsx', [inlineTopology])
+const { ConnectionTopology: FullscreenTopology } = await compileSource('src/features/connections/ConnectionTopology.tsx', [{
+  name: 'start-in-fullscreen',
+  setup(builder) {
+    builder.onLoad({ filter: /ConnectionTopology\.tsx$/ }, ({ path: filename }) => ({
+      contents: readFileSync(filename, 'utf8').replace('const [fullscreen, setFullscreen] = useState(false)', 'const [fullscreen, setFullscreen] = useState(true)'),
+      loader: 'tsx', resolveDir: path.dirname(filename),
+    }))
+  },
+}])
 
 test('connection scope, filters, view and page round-trip through a copied URL', () => {
   const search = updateConnectionSearch(new URLSearchParams(), {
@@ -149,10 +173,51 @@ const connection = {
   fresh: true, freshness: 'fresh', observation_revision: 1,
 }
 
-function renderPage(client, url = '/connections') {
+function renderPage(client, url = '/connections', PageComponent = ConnectionsPage) {
   return renderToStaticMarkup(createElement(QueryClientProvider, { client },
-    createElement(MemoryRouter, { initialEntries: [url] }, createElement(ConnectionsPage))))
+    createElement(MemoryRouter, { initialEntries: [url] }, createElement(PageComponent))))
 }
+
+test('uncached topology requests and failures retain the surface instead of replacing its state owner', async (t) => {
+  const { client } = pageClient(t)
+  const key = ['connections', 'topology', '', 'n', '', '', '', '']
+  const url = '/connections?tab=topology&network_id=n'
+  const pending = renderPage(client, url, InlineTopologyPage)
+  assert.match(pending, /connection-topology-workspace/)
+  assert.match(pending, /正在读取权威连接拓扑/)
+  assert.doesNotMatch(pending, /暂无可展示的路径观测/)
+  await assert.rejects(client.fetchQuery({ queryKey: key, queryFn: () => Promise.reject(new Error('Uncached topology unavailable')) }))
+  client.setQueryDefaults(key, { retryOnMount: false })
+  const failed = renderPage(client, url, InlineTopologyPage)
+  assert.match(failed, /connection-topology-workspace/)
+  assert.match(failed, /Uncached topology unavailable/)
+  assert.match(failed, /重试/)
+  client.setQueryData(key, { total: 0, limit: 100, offset: 0, items: [] })
+  const empty = renderPage(client, url, InlineTopologyPage)
+  assert.match(empty, /connection-topology-workspace/)
+  assert.match(empty, /暂无可展示的路径观测/)
+})
+
+test('fullscreen keeps an enabled exit for loading, offline, failed and empty filter results', () => {
+  for (const state of [{ loading: true }, { loading: true, offline: true }, { error: new Error('Filter failed') }, {}]) {
+    const html = renderToStaticMarkup(createElement(FullscreenTopology, {
+      ...state, connections: [], networkName: 'Test network', showStale: false, onShowStaleChange() {}, onSelect() {},
+    }))
+    assert.match(html, /role="dialog"/)
+    assert.match(html, /aria-label="退出全屏"/)
+    assert.doesNotMatch(html, /disabled=""[^>]*aria-label="退出全屏"/)
+    if (state.offline) assert.match(html, /浏览器当前离线/)
+  }
+})
+
+test('fullscreen no-path observations retain a way to open their directional details', () => {
+  const html = renderToStaticMarkup(createElement(FullscreenTopology, {
+    connections: [{ ...connection, current_path: null }], networkName: 'Test network', showStale: true,
+    onShowStaleChange() {}, onSelect() {},
+  }))
+  assert.match(html, /无路径观测/)
+  assert.match(html, /<button[^>]*><strong>Device A → Device B<\/strong>/)
+})
 
 function pageClient(t, offset = 0, total = 1, items = [connection]) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } })
