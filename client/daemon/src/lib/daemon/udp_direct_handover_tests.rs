@@ -397,3 +397,55 @@ async fn gateway_commit_is_bounded_and_does_not_refresh_retained_stun_age() {
     );
     daemon.udp_transport_publication.clear_current().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn network_hint_interrupts_bind_backoff_and_preserves_later_fault_delay() {
+    let daemon = Daemon::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (network_tx, network_rx) = broadcast::channel(8);
+    let mut context = test_context(&daemon, shutdown_rx);
+    context.android_network_change_rx = Some(Arc::new(Mutex::new(network_rx)));
+    let observed = context.android_network_change_observed.clone();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let bind_attempts = attempts.clone();
+    let mut worker = Box::pin(run_udp_direct_task_with_binder(context, move |_, _| {
+        bind_attempts.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(Err(DaemonError::Network("network unavailable".into())))
+    }));
+
+    assert!(futures_util::poll!(worker.as_mut()).is_pending());
+    for delay_ms in [10, 20, 40, 80] {
+        tokio::time::advance(Duration::from_millis(delay_ms)).await;
+        assert!(futures_util::poll!(worker.as_mut()).is_pending());
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 5);
+    let handover_at = tokio::time::Instant::now();
+    for generation in [40, 1] {
+        network_tx
+            .send(AndroidNetworkChangeHint {
+                kotlin_network_generation: generation,
+                network_identity_hash: format!("new-network-{generation}"),
+            })
+            .unwrap();
+    }
+    assert!(futures_util::poll!(worker.as_mut()).is_pending());
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        6,
+        "a physical network becoming available must wake the original bind backoff"
+    );
+    assert_eq!(tokio::time::Instant::now(), handover_at);
+    assert_eq!(observed.load(Ordering::Acquire), 1);
+    assert!(futures_util::poll!(worker.as_mut()).is_pending());
+    assert_eq!(attempts.load(Ordering::SeqCst), 6);
+    tokio::time::advance(udp_direct_retry_initial_delay()).await;
+    assert!(futures_util::poll!(worker.as_mut()).is_pending());
+    assert_eq!(attempts.load(Ordering::SeqCst), 7);
+    shutdown_tx.send(true).unwrap();
+    worker.await.unwrap();
+    assert!(daemon
+        .udp_transport_publication
+        .current_owner()
+        .await
+        .is_none());
+}

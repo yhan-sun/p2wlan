@@ -415,6 +415,7 @@ internal data class PhysicalNetworkIdentity(
     val validated: Boolean,
     val captive: Boolean,
     val interfaceIdentity: String?,
+    val linkConfigurationHash: String = "",
 ) {
     /** Stable, non-sensitive identity passed to the Rust lifecycle boundary. */
     fun identityHash(): String {
@@ -428,6 +429,8 @@ internal data class PhysicalNetworkIdentity(
             append(captive)
             append('|')
             append(interfaceIdentity.orEmpty())
+            append('|')
+            append(linkConfigurationHash)
         }
         val digest = MessageDigest.getInstance("SHA-256")
             .digest(canonical.toByteArray(Charsets.UTF_8))
@@ -435,6 +438,41 @@ internal data class PhysicalNetworkIdentity(
             digest.forEach { byte ->
                 append("%02x".format(Locale.ROOT, byte.toInt() and 0xff))
             }
+        }
+    }
+}
+
+internal data class PhysicalNetworkCapabilities(
+    val transports: Set<String>,
+    val validated: Boolean,
+    val captive: Boolean,
+)
+
+/** Retain one fixed-size digest, rather than addresses from previous Networks. */
+internal data class PhysicalNetworkLinkIdentity(
+    val interfaceIdentity: String?,
+    val configurationHash: String,
+) {
+    companion object {
+        fun fromProperties(
+            interfaceIdentity: String?,
+            addresses: Iterable<String>,
+            routes: Iterable<String>,
+            dnsServers: Iterable<String>,
+            mtu: Int,
+        ): PhysicalNetworkLinkIdentity {
+            val digest = MessageDigest.getInstance("SHA-256")
+            for (part in listOf(
+                listOf(interfaceIdentity.orEmpty()), addresses, routes, dnsServers, listOf(mtu.toString()),
+            )) {
+                part.toSortedSet().forEach {
+                    digest.update(it.toByteArray(Charsets.UTF_8))
+                    digest.update(0.toByte())
+                }
+                digest.update(0.toByte())
+            }
+            val hash = digest.digest().joinToString("") { "%02x".format(Locale.ROOT, it.toInt() and 0xff) }
+            return PhysicalNetworkLinkIdentity(interfaceIdentity, hash)
         }
     }
 }
@@ -528,12 +566,58 @@ internal class PhysicalNetworkCallbackForwarder(
     // One callback-scoped announcement survives temporarily unavailable
     // capabilities/link properties. No historical handle set is retained.
     private var announcedNetworkHandle: Long? = null
+    private var snapshotNetworkHandle: Long? = null
+    private var capabilities: PhysicalNetworkCapabilities? = null
+    private var linkIdentity: PhysicalNetworkLinkIdentity? = null
 
     /** Only the framework's actual onAvailable callback may call this. */
     fun announceAvailable(networkHandle: Long): Boolean {
         if (!ownerAccepted()) return false
         announcedNetworkHandle = networkHandle
+        snapshotNetworkHandle = networkHandle
+        capabilities = null
+        linkIdentity = null
         return true
+    }
+
+    fun onCapabilitiesChanged(
+        networkHandle: Long,
+        value: PhysicalNetworkCapabilities,
+    ): PhysicalNetworkCallbackResult? {
+        if (!acceptsProperties(networkHandle)) {
+            return result(MobileLifecycleOutcome.STALE_REJECTED, reducer.generation(), false)
+        }
+        capabilities = value
+        return forwardSnapshot(networkHandle)
+    }
+
+    fun onLinkPropertiesChanged(
+        networkHandle: Long,
+        value: PhysicalNetworkLinkIdentity,
+    ): PhysicalNetworkCallbackResult? {
+        if (!acceptsProperties(networkHandle)) {
+            return result(MobileLifecycleOutcome.STALE_REJECTED, reducer.generation(), false)
+        }
+        linkIdentity = value
+        return forwardSnapshot(networkHandle)
+    }
+
+    private fun acceptsProperties(networkHandle: Long): Boolean = ownerAccepted() &&
+        snapshotNetworkHandle == networkHandle
+
+    private fun forwardSnapshot(networkHandle: Long): PhysicalNetworkCallbackResult? {
+        // On API 26+, Android delivers both ordered snapshots after onAvailable.
+        // Do not rebuild sockets using incomplete or synchronously re-queried data.
+        val capabilities = capabilities ?: return null
+        val link = linkIdentity ?: return null
+        return onPropertiesChanged(PhysicalNetworkIdentity(
+            networkHandle,
+            capabilities.transports,
+            capabilities.validated,
+            capabilities.captive,
+            link.interfaceIdentity,
+            link.configurationHash,
+        ))
     }
 
     /** Complete-identity entry used by the JVM production-boundary fixtures. */
@@ -596,6 +680,11 @@ internal class PhysicalNetworkCallbackForwarder(
                 reducer.generation(),
                 forwardedToRust = false,
             )
+        }
+        if (acceptsProperties(networkHandle)) {
+            snapshotNetworkHandle = null
+            capabilities = null
+            linkIdentity = null
         }
         if (announcedNetworkHandle == networkHandle) announcedNetworkHandle = null
         val transition = reducer.onLost(networkHandle)

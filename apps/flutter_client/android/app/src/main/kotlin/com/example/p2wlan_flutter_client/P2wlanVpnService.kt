@@ -8,6 +8,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -728,8 +729,17 @@ class P2wlanVpnService : VpnService() {
             override fun onAvailable(network: Network) {
                 // Returning to a still-connected former default is a fresh
                 // selection edge, even when Android reuses its Network handle.
-                if (forwarder.announceAvailable(network.networkHandle)) {
-                    observePhysicalNetwork(network, forwarder)
+                if (!forwarder.announceAvailable(network.networkHandle)) return
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                    // API 24/25 do not guarantee initial property callbacks.
+                    // Seed only this legacy path; later callbacks use their
+                    // supplied snapshots rather than racing synchronous reads.
+                    manager.getNetworkCapabilities(network)?.let {
+                        onCapabilitiesChanged(network, it)
+                    }
+                    manager.getLinkProperties(network)?.let {
+                        onLinkPropertiesChanged(network, it)
+                    }
                 }
             }
 
@@ -737,14 +747,26 @@ class P2wlanVpnService : VpnService() {
                 network: Network,
                 networkCapabilities: NetworkCapabilities,
             ) {
-                observePhysicalNetwork(network, forwarder)
+                publishPhysicalNetworkChange(forwarder.onCapabilitiesChanged(
+                    network.networkHandle,
+                    physicalNetworkCapabilities(networkCapabilities),
+                ))
             }
 
             override fun onLinkPropertiesChanged(
                 network: Network,
                 linkProperties: android.net.LinkProperties,
             ) {
-                observePhysicalNetwork(network, forwarder)
+                publishPhysicalNetworkChange(forwarder.onLinkPropertiesChanged(
+                    network.networkHandle,
+                    PhysicalNetworkLinkIdentity.fromProperties(
+                        linkProperties.interfaceName,
+                        linkProperties.linkAddresses.map { "${it.address.hostAddress}/${it.prefixLength}" },
+                        linkProperties.routes.map { it.toString() },
+                        linkProperties.dnsServers.mapNotNull { it.hostAddress },
+                        linkProperties.mtu,
+                    ),
+                ))
             }
 
             override fun onLost(network: Network) {
@@ -755,7 +777,21 @@ class P2wlanVpnService : VpnService() {
             }
         }
         try {
-            manager.registerDefaultNetworkCallback(callback)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                // The app default may be our own split-tunnel VPN. Let Android
+                // rank physical Internet networks so its stable TUN handle
+                // cannot hide an underlying Wi-Fi/mobile handoff.
+                val request = NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                    .build()
+                manager.registerBestMatchingNetworkCallback(request, callback, mainHandler)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                // Best-match passive observation is unavailable before API 31.
+                manager.registerDefaultNetworkCallback(callback, mainHandler)
+            } else {
+                manager.registerDefaultNetworkCallback(callback)
+            }
             networkCallback = callback
         } catch (error: Throwable) {
             Log.w(TAG, "Unable to register physical network callback", error)
@@ -773,13 +809,7 @@ class P2wlanVpnService : VpnService() {
         }
     }
 
-    private fun observePhysicalNetwork(
-        network: Network,
-        forwarder: PhysicalNetworkCallbackForwarder,
-    ) {
-        if (!isCurrentServiceOwner()) return
-        val manager = getSystemService(ConnectivityManager::class.java) ?: return
-        val capabilities = manager.getNetworkCapabilities(network) ?: return
+    private fun physicalNetworkCapabilities(capabilities: NetworkCapabilities): PhysicalNetworkCapabilities {
         val transports = buildSet {
             if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) add("wifi")
             if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) add("cellular")
@@ -787,14 +817,15 @@ class P2wlanVpnService : VpnService() {
             if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) add("vpn")
             if (isEmpty()) add("other")
         }
-        val identity = PhysicalNetworkIdentity(
-            networkHandle = network.networkHandle,
+        return PhysicalNetworkCapabilities(
             transports = transports,
             validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
             captive = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL),
-            interfaceIdentity = manager.getLinkProperties(network)?.interfaceName,
         )
-        val transition = forwarder.onPropertiesChanged(identity)
+    }
+
+    private fun publishPhysicalNetworkChange(transition: PhysicalNetworkCallbackResult?) {
+        if (!isCurrentServiceOwner() || transition == null) return
         if (transition.outcome != MobileLifecycleOutcome.APPLIED) {
             Log.i(
                 TAG,
@@ -803,12 +834,13 @@ class P2wlanVpnService : VpnService() {
             )
             return
         }
+        val identity = transition.newIdentity ?: return
         val lifecycle = lifecycleCoordinator.physicalNetworkChanged(transition.generation)
         publishLifecycle(lifecycle)
         Log.i(
             TAG,
             "event=physical_network_changed generation=${transition.generation} " +
-                "transport=${transports.sorted().joinToString(",")} " +
+                "transport=${identity.transports.sorted().joinToString(",")} " +
                 "validated=${identity.validated} captive=${identity.captive} " +
                 "network_identity_hash=${identity.identityHash()}",
         )

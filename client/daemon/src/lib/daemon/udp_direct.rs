@@ -301,8 +301,24 @@ where
             ),
         }
 
-        if wait_for_udp_direct_retry_or_shutdown(ctx.shutdown_rx.clone(), retry_wait).await {
-            return Ok(());
+        match wait_for_udp_direct_retry_or_change(
+            ctx.shutdown_rx.clone(),
+            ctx.android_network_change_rx.clone(),
+            retry_wait,
+        )
+        .await
+        {
+            Some(UdpDirectLifecycleSignal::Stop) => return Ok(()),
+            Some(UdpDirectLifecycleSignal::NetworkChanged(hint)) => {
+                record_android_network_change(
+                    &ctx.peers,
+                    &ctx.android_network_change_observed,
+                    &hint,
+                );
+                retry_delay = udp_direct_retry_initial_delay();
+                continue;
+            }
+            None => {}
         }
         // An explicit handover bypasses only this wait. Never store zero in
         // the exponential backoff: 0 * 2 would busy-loop on every later fault.
@@ -1102,18 +1118,27 @@ async fn wait_for_udp_direct_shutdown(mut shutdown_rx: tokio::sync::watch::Recei
     }
 }
 
-async fn wait_for_udp_direct_retry_or_shutdown(
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+async fn wait_for_udp_direct_retry_or_change(
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    network_change_rx: Option<AndroidNetworkChangeReceiver>,
     retry_delay: Duration,
-) -> bool {
-    if *shutdown_rx.borrow_and_update() {
-        return true;
-    }
+) -> Option<UdpDirectLifecycleSignal> {
+    // A newly available Android network must wake a failed bind immediately,
+    // even when the previous unavailable network exhausted the retry backoff.
+    // Reuse the same receiver and bounded coalescing as the live UDP instance.
     tokio::select! {
-        _ = sleep(retry_delay) => false,
-        changed = shutdown_rx.changed() => {
-            changed.is_err() || *shutdown_rx.borrow_and_update()
-        }
+        biased;
+        _ = wait_for_udp_direct_shutdown(shutdown_rx) => Some(UdpDirectLifecycleSignal::Stop),
+        hint = async {
+            match network_change_rx {
+                Some(receiver) => crate::android_network_change::recv_latest(&receiver).await,
+                None => std::future::pending().await,
+            }
+        } => Some(match hint {
+            Some(hint) => UdpDirectLifecycleSignal::NetworkChanged(hint),
+            None => UdpDirectLifecycleSignal::Stop,
+        }),
+        _ = sleep(retry_delay) => None,
     }
 }
 

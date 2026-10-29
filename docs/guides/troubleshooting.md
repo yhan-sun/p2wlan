@@ -12,6 +12,7 @@
 | Direct 已建立但应用延迟忽高忽低 | 同一时间窗内的虚拟 IP 往返延迟、实际业务路径、出站发送失败和丢包计数、两端负载及应用服务端耗时 | Direct 只说明路径已确认，不能保证链路无抖动；应用卡顿也不能单独证明网络丢包 |
 | 只有 Relay | Relay TLS、audience/region、ticket、/readyz、撤权 feed | Relay 路径不说明 Direct 一定有缺陷 |
 | 虚拟 IP 可见但业务不通 | 本机路由、房间租约、数据面收发计数、目标应用监听和防火墙 | 加密 ACK 或在线人数不等于业务往返 |
+| IPv6 直连端点下无法访问 IPv4 虚拟 IP 的服务 | 实际业务路径、selected MTU、目标应用监听和 TUN 入站防火墙规则 | 外层 IPv6 可承载 IPv4 虚拟网流量；其他设备 ping 成功不能证明本端 TCP 端口可达 |
 | 重启后状态错误 | daemon process/revision、网络 generation、peer session、房间授权 | 旧快照不能当作实时状态 |
 
 建议命令：
