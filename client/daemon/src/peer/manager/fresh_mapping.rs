@@ -24,6 +24,26 @@ pub(crate) struct LocalFreshMapping {
     pub created_at: Instant,
 }
 
+/// Prepared local writer for a fresh mapping. The UDP owner takes its
+/// authoritative epoch/publication gates only after obtaining this writer.
+pub(crate) struct FreshMappingCommitGuard<'a> {
+    mappings: tokio::sync::RwLockWriteGuard<'a, HashMap<String, LocalFreshMapping>>,
+}
+
+impl FreshMappingCommitGuard<'_> {
+    pub(crate) fn commit(mut self, peer_id: &str, mapping: LocalFreshMapping) -> bool {
+        if self
+            .mappings
+            .get(peer_id)
+            .is_some_and(|existing| existing.punch_generation > mapping.punch_generation)
+        {
+            return false;
+        }
+        self.mappings.insert(peer_id.to_string(), mapping);
+        true
+    }
+}
+
 /// Outcome of comparing an actually learned peer-reflexive port with the
 /// model prediction.
 #[derive(Debug, Clone)]
@@ -272,9 +292,9 @@ impl PeerManager {
         .await;
     }
 
-    /// Record a fresh mapping together with the dynamic socket that owns it.
-    /// The compatibility wrapper above is retained for focused manager tests
-    /// and older callers that only model endpoint state.
+    /// Populate endpoint state for focused manager fixtures. Production
+    /// commits through the prepared writer under the UDP authority gates.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_fresh_mapping_with_socket(
         &self,
@@ -287,17 +307,8 @@ impl PeerManager {
         punch_generation: u64,
         network_generation: u64,
     ) {
-        let mut mappings = self.local_fresh_mappings.write().await;
-        // A stale generation that completed late must never overwrite the
-        // fresh state a newer generation already recorded.
-        if mappings
-            .get(peer_id)
-            .is_some_and(|existing| existing.punch_generation > punch_generation)
-        {
-            return;
-        }
-        mappings.insert(
-            peer_id.to_string(),
+        self.lock_fresh_mapping_for_commit().await.commit(
+            peer_id,
             LocalFreshMapping {
                 punch_generation,
                 network_generation,
@@ -309,6 +320,12 @@ impl PeerManager {
                 created_at: Instant::now(),
             },
         );
+    }
+
+    pub(crate) async fn lock_fresh_mapping_for_commit(&self) -> FreshMappingCommitGuard<'_> {
+        FreshMappingCommitGuard {
+            mappings: self.local_fresh_mappings.write().await,
+        }
     }
 
     /// Prepare the admission of a fresh-mapping prediction identity signaled
@@ -914,10 +931,21 @@ impl PeerManager {
     /// Record how close the actually used peer-reflexive port was to the
     /// model prediction.  This feeds the time-limited NAT fingerprint used to
     /// tune the next generation's window.
+    #[cfg(test)]
     pub(crate) async fn record_fresh_mapping_prediction_result(
         &self,
         peer_id: &str,
         actual_endpoint: SocketAddr,
+    ) {
+        self.record_fresh_mapping_prediction_result_fenced(peer_id, actual_endpoint, None)
+            .await;
+    }
+
+    pub(crate) async fn record_fresh_mapping_prediction_result_fenced(
+        &self,
+        peer_id: &str,
+        actual_endpoint: SocketAddr,
+        publication_fence: Option<&crate::control::CandidatePublicationFence>,
     ) {
         let Some(state) = self.fresh_mapping_for_peer(peer_id).await else {
             return;
@@ -974,6 +1002,25 @@ impl PeerManager {
                 .fresh_mapping_history
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Try-only after the history writer: never wait on epoch while
+            // holding local state. The existing epoch owner cannot advance
+            // or clear mappings in the middle of this synchronous commit.
+            let epoch_gate = self.network_epoch_gate();
+            let _epoch = if publication_fence.is_some() {
+                match epoch_gate.try_lock() {
+                    Ok(epoch) => Some(epoch),
+                    Err(_) => return,
+                }
+            } else {
+                None
+            };
+            // A fresh-state read can have waited across local handover. Its
+            // result must retain the publication's original generation.
+            if publication_fence.is_some_and(|fence| {
+                !fence.lifecycle_is_current() || fence.lifecycle().0 != state.network_generation
+            }) {
+                return;
+            }
             let entry = history.entry(peer_id.to_string()).or_default();
             if entry.iter().any(|recorded| {
                 recorded.punch_generation == result.punch_generation
@@ -1019,14 +1066,16 @@ impl PeerManager {
             hit_window,
             hit_rank
         );
-        self.record_direct_event(
+        self.record_direct_event_for_generation_with_socket(
                 peer_id,
+                state.network_generation,
                 if hit_window {
                     "fresh_mapping_prediction_hit"
                 } else {
                     "fresh_mapping_prediction_miss"
                 },
                 Some(actual_endpoint),
+                None,
                 Some(state.predicted_ports.len()),
                 None,
                 format!(

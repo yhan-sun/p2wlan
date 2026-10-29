@@ -54,6 +54,7 @@ impl Daemon {
 
     /// Whether a fresh snapshot lease exists (single-flight gate for live
     /// gathers).
+    #[cfg(test)]
     async fn candidate_snapshot_is_fresh(&self) -> bool {
         self.candidate_snapshot
             .read()
@@ -91,6 +92,7 @@ impl Daemon {
     }
 
     /// Store a freshly gathered/committed snapshot as the shared lease.
+    #[cfg(test)]
     async fn publish_candidate_snapshot(
         &self,
         candidates: Vec<String>,
@@ -158,7 +160,7 @@ async fn publish_candidate_snapshot_to_store(
     candidates: Vec<String>,
     candidate_sources: HashMap<String, String>,
     network_identity: Vec<String>,
-) {
+) -> u64 {
     publish_candidate_snapshot_to_store_with_readiness(
         store,
         candidates,
@@ -166,7 +168,7 @@ async fn publish_candidate_snapshot_to_store(
         network_identity,
         true,
     )
-    .await;
+    .await
 }
 
 /// Commit a candidate snapshot and explicitly record whether it represents
@@ -177,7 +179,7 @@ async fn publish_candidate_snapshot_to_store_with_readiness(
     candidate_sources: HashMap<String, String>,
     network_identity: Vec<String>,
     initial_gather_complete: bool,
-) {
+) -> u64 {
     let mut current = store.write().await;
     let version = current
         .as_ref()
@@ -192,6 +194,7 @@ async fn publish_candidate_snapshot_to_store_with_readiness(
         initial_gather_complete,
         gathered_at: Instant::now(),
     });
+    version
 }
 
 /// Wait briefly for the first full startup snapshot without requiring a

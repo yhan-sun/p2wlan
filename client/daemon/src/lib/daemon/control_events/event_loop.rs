@@ -1568,10 +1568,22 @@ impl Daemon {
                         {
                             self.control.refresh_peers_now();
                         }
+                        // Admission must not wait behind a transport writer;
+                        // a missing/contended publication retries this receipt.
+                        let endpoint_fence = self.udp_transport.try_read().ok().and_then(|udp| {
+                            udp.as_ref().map(|udp| EndpointPublicationFence::new(udp, &self.peers))
+                        });
+                        if !endpoint_fence.as_ref().is_some_and(EndpointPublicationFence::is_current) {
+                            if let Some(receipt) = delivery_receipt {
+                                receipt.complete(control::SignalApplyOutcome::Retry);
+                            }
+                            continue;
+                        }
                         let work = PendingPeerReflexive {
                             from_node_id: from_node_id.clone(),
                             observed_endpoint,
                             punch_at_ms,
+                            endpoint_fence,
                             peer_session_generation: self
                                 .peers
                                 .peer_session_generation_sync(&from_node_id),

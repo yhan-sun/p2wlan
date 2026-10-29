@@ -90,7 +90,8 @@ impl Daemon {
                 work.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
                 return;
             }
-            self.handle_peer_reflexive_work(&work, &mut reservation.cancellation)
+            let outcome = self
+                .handle_peer_reflexive_work(&work, &mut reservation.cancellation)
                 .await;
             work.complete_delivery(if *reservation.cancellation.borrow() {
                 control::SignalApplyOutcome::Retry
@@ -98,7 +99,7 @@ impl Daemon {
                 .peers
                 .peer_session_is_current_sync(&peer_id, peer_session_generation)
             {
-                control::SignalApplyOutcome::Applied
+                outcome
             } else {
                 control::SignalApplyOutcome::TerminalRejected
             });

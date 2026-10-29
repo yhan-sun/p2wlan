@@ -1,20 +1,43 @@
 use super::*;
 
 impl RelaySupervisor {
+    async fn absorb_network_change_before_attempt(
+        &self,
+        cooldowns: &mut HashMap<String, Instant>,
+    ) -> bool {
+        let Some(receiver) = &self.android_network_change_rx else {
+            return false;
+        };
+        if crate::android_network_change::take_latest(receiver)
+            .await
+            .is_none()
+        {
+            return false;
+        }
+        // Fresh sockets absorb the edge, but old-network candidate failures
+        // must be forgotten too. Any previous auth backoff has already elapsed.
+        cooldowns.clear();
+        true
+    }
+
     pub(crate) async fn run(self) {
         let mut retry_delay = Duration::from_millis(100);
         let max_retry_delay = Duration::from_secs(30);
         let mut cooldowns: HashMap<String, Instant> = HashMap::new();
+        let initial_routes =
+            tokio::task::spawn_blocking(|| crate::netenv::network_route_signature(&[]))
+                .await
+                .unwrap_or_default();
+        // Route confirmation must survive retries shorter than its sampling
+        // interval. A new attempt is not evidence that the old route recovered.
+        let mut retry_routes = connection::RelayRouteMonitor::new(initial_routes);
         loop {
-            // An edge accepted before this attempt is already reflected by
-            // its fresh sockets. Do not let a queued burst retire that new link.
-            if let Some(receiver) = &self.android_network_change_rx {
-                crate::android_network_change::take_latest(receiver).await;
+            if self
+                .absorb_network_change_before_attempt(&mut cooldowns)
+                .await
+            {
+                retry_delay = Duration::from_millis(100);
             }
-            let attempt_routes =
-                tokio::task::spawn_blocking(|| crate::netenv::network_route_signature(&[]))
-                    .await
-                    .unwrap_or_default();
             let now = Instant::now();
             cooldowns.retain(|_, until| *until > now);
 
@@ -53,6 +76,11 @@ impl RelaySupervisor {
             *self.relay_selection.write().await = diagnostics;
 
             if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
+                adopt_connected_relay_route(
+                    &mut retry_routes,
+                    &mut cooldowns,
+                    relay.route_signature(),
+                );
                 info!(
                     "Selected relay region {} at {} ({} ms connect latency)",
                     relay.region(),
@@ -121,7 +149,17 @@ impl RelaySupervisor {
                         },
                     )
                     .await;
-                *self.relay_transport.write().await = None;
+                let last_connected = self.relay_transport.write().await.take();
+                if let Some(connected) = last_connected {
+                    // Renewal may have published another successful socket
+                    // while the live supervisor owned the connection. Adopt
+                    // it before recording this connection's new failure.
+                    adopt_connected_relay_route(
+                        &mut retry_routes,
+                        &mut cooldowns,
+                        connected.route_signature(),
+                    );
+                }
                 let _ = self.relay_available_tx.send(false);
                 let (peer_failure_code, peer_failure_reason) = match &ended {
                     Ok(()) => (
@@ -151,15 +189,13 @@ impl RelaySupervisor {
                     .invalidate_relay_transport(&endpoint, peer_failure_code, peer_failure_reason)
                     .await;
 
-                let route_changed = matches!(&ended, Err(DaemonError::RelayRouteChanged { .. }));
-                let should_cooldown = self.relay_candidates.len() > 1 && !route_changed;
+                let should_cooldown = record_connection_cooldown(
+                    &mut cooldowns,
+                    &endpoint,
+                    self.relay_candidates.len(),
+                    &ended,
+                );
                 let cooldown_ms = duration_millis(RELAY_RUNTIME_FAILURE_COOLDOWN);
-                if should_cooldown {
-                    cooldowns.insert(
-                        endpoint.clone(),
-                        Instant::now() + RELAY_RUNTIME_FAILURE_COOLDOWN,
-                    );
-                }
 
                 let (reason, fallback_code) = match (ended, should_cooldown) {
                     (Err(DaemonError::RelayRouteChanged { .. }), _) => (
@@ -233,7 +269,7 @@ impl RelaySupervisor {
             if retry::wait_for_retry(
                 jittered,
                 self.android_network_change_rx.clone(),
-                attempt_routes,
+                &mut retry_routes,
                 !permanent_auth_failure,
             )
             .await
@@ -254,6 +290,40 @@ impl RelaySupervisor {
             }
         }
     }
+}
+
+fn adopt_connected_relay_route(
+    routes: &mut connection::RelayRouteMonitor,
+    cooldowns: &mut HashMap<String, Instant>,
+    signature: &[String],
+) {
+    if routes.adopt_connected_route(signature) {
+        // The successful replacement already absorbed this network change.
+        // Only failures attributed to the previous route become irrelevant.
+        cooldowns.clear();
+    }
+}
+
+fn record_connection_cooldown(
+    cooldowns: &mut HashMap<String, Instant>,
+    endpoint: &str,
+    candidate_count: usize,
+    ended: &Result<()>,
+) -> bool {
+    if matches!(ended, Err(DaemonError::RelayRouteChanged { .. })) {
+        // The live connection already consumed this network edge, so the
+        // retry waiter cannot rediscover it from the Android channel.
+        cooldowns.clear();
+        return false;
+    }
+    if candidate_count > 1 {
+        cooldowns.insert(
+            endpoint.to_string(),
+            Instant::now() + RELAY_RUNTIME_FAILURE_COOLDOWN,
+        );
+        return true;
+    }
+    false
 }
 
 /// Bounded exponential backoff with full jitter.
@@ -302,3 +372,7 @@ pub(super) fn relay_failure_summary(diagnostics: &RelaySelectionDiagnostics) -> 
 pub(super) fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
+
+#[cfg(test)]
+#[path = "tests/supervisor_network_change.rs"]
+mod network_change_tests;

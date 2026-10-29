@@ -12,10 +12,14 @@ fn physical_interface(name: &str, excluded: &[String]) -> bool {
         // does not change the separate physical socket-binding policy.
         && (!super::is_virtual_interface_name(&name) || name.starts_with("ppp"))
         && ![
-            "p2wlan", "p2pnet", "p2r", "wintun", "docker", "veth", "br-", "awdl", "llw",
+            "p2wlan", "p2pnet", "p2r", "wintun", "docker", "awdl", "llw",
         ]
         .iter()
         .any(|prefix| name.starts_with(prefix))
+        // A routed bridge can be the actual upstream (OpenWrt br-lan or
+        // Hyper-V vEthernet). Only Unix veth devices use this container
+        // naming convention; never apply it to Windows friendly aliases.
+        && (!cfg!(unix) || !name.starts_with("veth") || name.starts_with("vethernet"))
         && !excluded
             .iter()
             .any(|excluded| excluded.trim().eq_ignore_ascii_case(&name))
@@ -92,7 +96,7 @@ fn append_relevant_address(
     address: IpAddr,
     prefix: u8,
 ) {
-    if !relevant.iter().any(|candidate| *candidate == name) || !physical_interface(name, excluded) {
+    if !relevant.contains(&name) || !physical_interface(name, excluded) {
         return;
     }
     if let Some(entry) = address_entry(name, address, prefix) {

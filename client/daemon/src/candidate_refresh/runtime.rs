@@ -1,6 +1,10 @@
 pub(super) struct UdpCandidateRefreshContext {
     pub(super) udp: UdpTransport,
     pub(super) stun_servers: Vec<SocketAddr>,
+    pub(super) stun_server_specs: Vec<String>,
+    pub(super) udp_observer_specs: Vec<String>,
+    pub(super) runtime_stun_servers: Arc<RwLock<Vec<SocketAddr>>>,
+    pub(super) udp_transport_publication: UdpTransportPublication,
     pub(super) stun_timeout: Duration,
     pub(super) udp_advertise: Option<String>,
     pub(super) upnp_enabled: bool,
@@ -23,6 +27,8 @@ pub(super) struct UdpCandidateRefreshContext {
     pub(super) punch_attempts: u32,
     pub(super) boot_epoch_ms: u64,
 }
+
+include!("stun_recovery.rs");
 
 /// Gateway discovery is allowed to run concurrently with STUN.  Its result is
 /// usable only while the UDP socket and the network generation it started on
@@ -160,13 +166,18 @@ impl VolatilePublishCoalescer {
 struct VolatileCandidatePublish {
     candidates: Vec<String>,
     candidate_sources: HashMap<String, String>,
-    network_generation: u64,
+    snapshot_version: u64,
+    endpoint_fence: EndpointPublicationFence,
 }
 
 pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
     let UdpCandidateRefreshContext {
         udp,
-        stun_servers,
+        mut stun_servers,
+        stun_server_specs,
+        udp_observer_specs,
+        runtime_stun_servers,
+        udp_transport_publication,
         stun_timeout,
         udp_advertise,
         upnp_enabled,
@@ -259,9 +270,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 .take()
                 .expect("pending volatile publication verified above");
             let payload_hash = candidate_set_hash(&pending.candidates, &pending.candidate_sources);
-            if payload_hash == hash
-                && peers.current_network_generation_sync() == pending.network_generation
-            {
+            if payload_hash == hash && pending.endpoint_fence.is_current() {
                 publish_local_candidates_to_known_peers(
                     &control,
                     peers.clone(),
@@ -269,7 +278,8 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     punch_deduplicator.clone(),
                     &pending.candidates,
                     &pending.candidate_sources,
-                    pending.network_generation,
+                    pending.snapshot_version,
+                    pending.endpoint_fence.clone(),
                     probe_interval,
                     punch_attempts,
                     "UDP volatile candidate refresh",
@@ -282,7 +292,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     }),
                 )
                 .await;
-                if peers.current_network_generation_sync() == pending.network_generation {
+                if pending.endpoint_fence.is_current() {
                     volatile_coalescer.record_published(hash);
                 }
                 debug!(
@@ -315,6 +325,24 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             continue;
         }
 
+        // Initial DNS may have failed before the bind-time route became
+        // usable. Reuse this worker's existing bounded retry cadence so that
+        // recovery does not depend on another interface change or restart.
+        if stun_servers.is_empty() {
+            if let Some(recovered) = recover_empty_stun_sources(
+                &udp,
+                &peers,
+                &udp_transport_publication,
+                &stun_server_specs,
+                &udp_observer_specs,
+                stun_timeout,
+                &runtime_stun_servers,
+            )
+            .await
+            {
+                stun_servers = recovered;
+            }
+        }
         let gather_fence = {
             let refresh_guard = candidate_refresh_lock.lock().await;
             CandidateGatherFence::capture(&refresh_guard, &udp, &peers, &candidate_snapshot).await
@@ -410,9 +438,6 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 continue;
             }
         };
-        // Full discovery deliberately leaves this scheduling policy untouched
-        // until its originating snapshot has passed the commit fence.
-        udp.apply_candidate_report_socket_pool_policy(&report);
         let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
         debug!(
             target: "p2wlan_daemon::candidate_refresh",
@@ -425,20 +450,6 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             candidate_count = candidates.len(),
             "UDP candidate refresh gather completed"
         );
-        // A periodic gather is the only path that creates new `o=` NAT
-        // evidence. Its returned version must travel with this exact report;
-        // the endpoint heartbeat later reuses the committed label unchanged.
-        let nat_publication = peers.update_nat_profile(report.nat_profile.clone()).await;
-        let profile_changed = {
-            let mut current_profile = nat_profile.write().await;
-            if current_profile.as_ref() == Some(&report.nat_profile) {
-                false
-            } else {
-                *current_profile = Some(report.nat_profile.clone());
-                true
-            }
-        };
-
         let include_host_candidate = peers.gather_host_candidates().await;
         let advertised_endpoint = udp.local_addr().ok().and_then(|local_addr| {
             advertised_udp_endpoint(
@@ -566,46 +577,47 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 );
             }
         }
-        let previous_snapshot = candidate_snapshot.read().await.clone();
-        let previous_candidates = previous_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.candidates.clone())
-            .unwrap_or_default();
-        let previous_candidate_sources = previous_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.candidate_sources.clone())
-            .unwrap_or_default();
-        let next_network_identity = prepare_signal_candidates_and_network_identity(
-            &previous_candidates,
-            &previous_candidate_sources,
-            &mut candidates,
-            &mut candidate_sources,
-        );
-        let previous_network_identity = previous_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.network_identity.clone())
-            .unwrap_or_default();
-        let should_advance_generation =
-            network_identity_changed(&previous_network_identity, &next_network_identity);
-        let public_candidate_readiness_changed = public_candidate_readiness_changed(
-            &previous_candidates,
-            &previous_candidate_sources,
-            &candidates,
-            &candidate_sources,
-        );
-
-        let change_reason = candidate_set_change_reason(
-            &previous_candidates,
-            &candidates,
-            &previous_candidate_sources,
-            &candidate_sources,
-        );
-        let old_hash = candidate_set_hash(&previous_candidates, &previous_candidate_sources);
+        let Some(committed) = commit_candidate_report(
+            PreSignalCandidateCommitContext {
+                publication: &udp_transport_publication,
+                peers: &peers,
+                nat_profile: &nat_profile,
+                snapshot: &candidate_snapshot,
+                candidates: &local_candidates,
+                sources: &local_candidate_sources,
+                network_identity: &local_network_identity,
+            },
+            &refresh_guard,
+            &gather_fence,
+            &udp,
+            report.clone(),
+            candidates,
+            candidate_sources,
+            CandidateCommitMode::Periodic,
+        )
+        .await
+        else {
+            continue;
+        };
+        // The full local transition has completed. No STUN or control request
+        // is performed under the refresh/publication/epoch commit guards.
+        drop(refresh_guard);
+        let candidates = committed.publication.candidates;
+        let candidate_sources = committed.publication.sources;
+        let publication_version = committed.publication.snapshot_version;
+        let endpoint_fence = committed.publication.endpoint_fence;
+        let nat_type = committed.publication.nat_type;
+        let nat_publication = committed.nat_publication;
+        let profile_changed = committed.profile_changed;
+        let should_advance_generation = committed.generation_changed;
+        let public_candidate_readiness_changed = committed.public_readiness_changed;
+        let previous_candidates = committed.previous_candidates;
+        let change_reason = committed.change_reason;
+        let old_hash = committed.previous_hash;
         let new_hash = candidate_set_hash(&candidates, &candidate_sources);
         let old_candidate_count = previous_candidates.len();
         let new_candidate_count = candidates.len();
-        let real_change = change_reason != "no_change" && change_reason != "order_only";
-        if !candidate_refresh_requires_commit(real_change, should_advance_generation) {
+        if !committed.snapshot_changed {
             if profile_changed || nat_publication.observation_advanced {
                 debug!(
                     "Publishing refreshed UDP NAT evidence without advertised candidate endpoint changes: mapping={:?} public={:?} observation={:?}",
@@ -620,18 +632,14 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 )
                 .or(advertised_endpoint)
                 .unwrap_or_default();
-                let nat_type = report
-                    .nat_profile
-                    .control_label_with_generation_and_observation(
-                        nat_publication.generation,
-                        nat_publication.observation,
-                    );
                 let publish_result = if allow_loopback_stun_endpoint {
                     control
-                        .update_endpoint_for_handshake(&endpoint, &nat_type)
+                        .update_endpoint_for_handshake_fenced(&endpoint, &nat_type, endpoint_fence)
                         .await
                 } else {
-                    control.update_endpoint(&endpoint, &nat_type).await
+                    control
+                        .update_endpoint_fenced(&endpoint, &nat_type, endpoint_fence)
+                        .await
                 };
                 if let Err(err) = publish_result {
                     warn!("Failed to publish refreshed UDP NAT profile '{endpoint}': {err}");
@@ -645,20 +653,6 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             );
             continue;
         }
-
-        publish_candidate_snapshot_to_store(
-            &candidate_snapshot,
-            candidates.clone(),
-            candidate_sources.clone(),
-            next_network_identity.clone(),
-        )
-        .await;
-        // These mirrors remain for legacy diagnostics and readiness checks;
-        // all coherent candidate/source/identity reads use the committed
-        // snapshot above.
-        *local_candidates.write().await = candidates.clone();
-        *local_candidate_sources.write().await = candidate_sources.clone();
-        *local_network_identity.write().await = next_network_identity.clone();
 
         info!(
             "UDP candidates changed after network update; refreshed {} candidates (mapping={:?}, public={:?}, old_hash={old_hash}, new_hash={new_hash}, changed_reason={change_reason}, old_candidate_count={old_candidate_count}, new_candidate_count={new_candidate_count})",
@@ -676,20 +670,6 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         )
         .or(advertised_endpoint)
         .unwrap_or_default();
-        if should_advance_generation {
-            peers
-                // `network_identity_changed` only becomes true when an
-                // existing physical/public identity was replaced.  That is
-                // a real handover, not ordinary candidate churn: carrying a
-                // confirmed Direct pair into the new generation would make
-                // the fan-out below skip the offer/punch that must rebuild
-                // the path on the new network.
-                .advance_network_generation("UDP network identity changed")
-                .await;
-        }
-        let publication_generation = peers.current_network_generation_sync();
-        drop(refresh_guard);
-
         // A pending volatile publication belongs to the old candidate state.
         // Do not allow it to reappear after a generation or public-readiness
         // transition and reintroduce an obsolete endpoint.
@@ -709,18 +689,18 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             // good mapping expire while cached heartbeats keep replaying o-1.
             || nat_publication.observation_advanced;
         if should_update_endpoint {
-            let nat_type = report
-                .nat_profile
-                .control_label_with_generation_and_observation(
-                    nat_publication.generation,
-                    nat_publication.observation,
-                );
             let publish_result = if allow_loopback_stun_endpoint {
                 control
-                    .update_endpoint_for_handshake(&endpoint, &nat_type)
+                    .update_endpoint_for_handshake_fenced(
+                        &endpoint,
+                        &nat_type,
+                        endpoint_fence.clone(),
+                    )
                     .await
             } else {
-                control.update_endpoint(&endpoint, &nat_type).await
+                control
+                    .update_endpoint_fenced(&endpoint, &nat_type, endpoint_fence.clone())
+                    .await
             };
             if let Err(err) = publish_result {
                 warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
@@ -753,7 +733,8 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                         .expect("coalesced pending verified above");
                     pending.candidates = candidates.clone();
                     pending.candidate_sources = candidate_sources.clone();
-                    pending.network_generation = publication_generation;
+                    pending.snapshot_version = publication_version;
+                    pending.endpoint_fence = endpoint_fence.clone();
                     debug!(
                         "Volatile candidate churn coalesced newest-wins (hash={hash}); retaining the fixed {}-ms publication deadline without offer fan-out",
                         VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE.as_millis()
@@ -763,7 +744,8 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     pending_volatile = Some(VolatileCandidatePublish {
                         candidates: candidates.clone(),
                         candidate_sources: candidate_sources.clone(),
-                        network_generation: publication_generation,
+                        snapshot_version: publication_version,
+                        endpoint_fence: endpoint_fence.clone(),
                     });
                     debug!(
                         "Volatile candidate churn (hash={hash}) will be published once after the {}-ms fixed debounce window",
@@ -788,7 +770,8 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             punch_deduplicator.clone(),
             &candidates,
             &candidate_sources,
-            publication_generation,
+            publication_version,
+            endpoint_fence,
             probe_interval,
             punch_attempts,
             "UDP candidate refresh",
@@ -812,7 +795,8 @@ pub(super) async fn publish_local_candidates_to_known_peers(
     punch_deduplicator: PunchAttemptDeduplicator,
     candidates: &[String],
     candidate_sources: &HashMap<String, String>,
-    publication_generation: u64,
+    publication_version: u64,
+    endpoint_fence: EndpointPublicationFence,
     probe_interval: Duration,
     attempts: u32,
     reason: &str,
@@ -826,7 +810,8 @@ pub(super) async fn publish_local_candidates_to_known_peers(
     let attempts = peers.recommended_punch_attempts(attempts).await;
     let publication_hash = candidate_set_hash(candidates, candidate_sources);
 
-    if peers.current_network_generation().await != publication_generation {
+    let publication_generation = endpoint_fence.generation;
+    if !endpoint_fence.is_current() {
         debug!("Skipping {reason} candidate publication: source network generation was replaced");
         return;
     }
@@ -872,6 +857,17 @@ pub(super) async fn publish_local_candidates_to_known_peers(
             );
             continue;
         }
+        let publication_fence = crate::control::CandidatePublicationFence::new(
+            peers.clone(),
+            signal
+                .as_ref()
+                .map(|signal| signal.candidate_snapshot.clone()),
+            peer_id.clone(),
+            publication_generation,
+            publication_peer_session_generation,
+            publication_hash,
+        )
+        .with_endpoint(endpoint_fence.clone(), publication_version);
         if peers.hard_hard_experiment_only() {
             peers
                 .record_direct_event(
@@ -885,7 +881,7 @@ pub(super) async fn publish_local_candidates_to_known_peers(
                     ),
                 )
                 .await;
-            spawn_hole_punch_task(
+            spawn_hole_punch_task_with_lifecycle(
                 udp.clone(),
                 peers.clone(),
                 punch_deduplicator.clone(),
@@ -896,6 +892,8 @@ pub(super) async fn publish_local_candidates_to_known_peers(
                 signal.clone(),
                 None,
                 None,
+                None,
+                Some(publication_fence),
             )
             .await;
             continue;
@@ -913,16 +911,6 @@ pub(super) async fn publish_local_candidates_to_known_peers(
         let reason = reason.to_string();
         fanout_workers.spawn(async move {
             let _permit = permit;
-            let publication_fence = crate::control::CandidatePublicationFence::new(
-                peers.clone(),
-                signal
-                    .as_ref()
-                    .map(|signal| signal.candidate_snapshot.clone()),
-                peer_id.clone(),
-                publication_generation,
-                publication_peer_session_generation,
-                publication_hash,
-            );
             // The roster and Direct-health decisions above can age while a
             // worker waits for the bounded fan-out permit. The same fence is
             // checked again inside the per-peer control worker before HTTP.

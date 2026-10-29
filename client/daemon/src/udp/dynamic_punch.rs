@@ -1,4 +1,6 @@
 use super::*;
+#[path = "fresh_publication.rs"]
+mod fresh_publication;
 #[path = "measurement_batch.rs"]
 mod measurement_batch;
 pub(super) use measurement_batch::last_mapping_send_is_unobserved;
@@ -1369,18 +1371,26 @@ impl UdpTransport {
                 ),
             )
             .await;
-        self.peers
-            .record_fresh_mapping_with_socket(
+        if !self
+            .commit_fresh_mapping_for_publication(
                 peer_id,
-                p2pnet_nat::mapping::PortModel::clone(&model),
-                predicted_ports.clone(),
-                local_endpoint,
-                socket_index,
-                public_ip,
-                punch_generation,
-                network_generation,
+                crate::peer::LocalFreshMapping {
+                    punch_generation,
+                    network_generation,
+                    socket_local_endpoint: local_endpoint,
+                    socket_index,
+                    model: model.clone(),
+                    predicted_ports: predicted_ports.clone(),
+                    public_ip,
+                    created_at: Instant::now(),
+                },
+                cancellation,
             )
-            .await;
+            .await
+        {
+            // The provisional guard rolls this unadvertised socket back.
+            return FreshMappingOutcome::Rejected(FreshMappingRejection::Superseded);
+        }
 
         self.peers
             .record_direct_event(

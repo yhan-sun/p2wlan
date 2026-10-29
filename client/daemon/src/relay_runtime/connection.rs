@@ -36,6 +36,21 @@ impl RelayRouteMonitor {
         self.pending = None;
     }
 
+    /// A successfully published TCP connection supplies its own pre-connect
+    /// route. Retire pending retry samples even for same-network success; a
+    /// later fault must not confirm a handover absorbed by that connection.
+    pub(super) fn adopt_connected_route(&mut self, baseline: &[String]) -> bool {
+        self.pending = None;
+        if baseline.is_empty() {
+            // An unavailable route inspection cannot prove a handover or
+            // erase the last known network used to classify cooldowns.
+            return false;
+        }
+        let changed = self.baseline != baseline;
+        self.baseline = baseline.to_vec();
+        changed
+    }
+
     fn observe(&mut self, observed: Vec<String>) -> Option<Vec<String>> {
         if observed.is_empty() {
             self.pending = None;
@@ -50,6 +65,7 @@ impl RelayRouteMonitor {
                 *samples = samples.saturating_add(1);
                 if *samples >= RELAY_ROUTE_STABILITY_SAMPLES {
                     self.pending = None;
+                    self.baseline = observed.clone();
                     Some(observed)
                 } else {
                     None
@@ -63,12 +79,22 @@ impl RelayRouteMonitor {
     }
 
     pub(super) async fn wait_for_change(&mut self) -> Vec<String> {
+        self.wait_for_change_with(|| async {
+            tokio::task::spawn_blocking(|| crate::netenv::network_route_signature(&[]))
+                .await
+                .unwrap_or_default()
+        })
+        .await
+    }
+
+    pub(super) async fn wait_for_change_with<F, Fut>(&mut self, mut inspect: F) -> Vec<String>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Vec<String>>,
+    {
         loop {
             self.ticker.tick().await;
-            let observed =
-                tokio::task::spawn_blocking(|| crate::netenv::network_route_signature(&[]))
-                    .await
-                    .unwrap_or_default();
+            let observed = inspect().await;
             if let Some(changed) = self.observe(observed) {
                 return changed;
             }

@@ -1384,16 +1384,8 @@ impl UdpTransport {
             )
             .await
         } else {
-            self.send_probe_datagram(&socket, &bytes, peer_addr)
+            self.send_publication_scoped_probe_datagram(&socket, &bytes, peer_addr)
                 .await
-                .map_err(|error| {
-                    ProbeSendFailure::with_physical_send_error(
-                        DaemonError::Network(format!(
-                            "UDP probe send to {peer_addr} failed: {error}"
-                        )),
-                        bytes.len(),
-                    )
-                })
         };
         let (first_send_at_ms, primary_bytes_sent) = match send_result {
             Ok(accepted) => {
@@ -1469,6 +1461,7 @@ impl UdpTransport {
         let mut physical_bytes_sent = primary_bytes_sent;
         let mut physical_send_errors = 0u8;
         let mut physical_send_error_bytes = 0u64;
+        let mut publication_rejected = false;
         if let Some(legacy_probe) = compat_legacy_probe.clone() {
             #[cfg(not(test))]
             let compatibility_addr = peer_addr;
@@ -1490,7 +1483,7 @@ impl UdpTransport {
                 )
             });
             match self
-                .send_probe_datagram(&socket, &legacy_probe, compatibility_addr)
+                .send_publication_scoped_probe_datagram(&socket, &legacy_probe, compatibility_addr)
                 .await
             {
                 Ok(accepted) => {
@@ -1540,17 +1533,24 @@ impl UdpTransport {
                         );
                     }
                 }
-                Err(err) => {
-                    if let Some(operation) = ordinary_compatibility.as_mut() {
-                        operation.complete(None, monotonic_millis());
+                Err(failure) => {
+                    if failure.kind == ProbeSendFailureKind::PhysicalSend {
+                        if let Some(operation) = ordinary_compatibility.as_mut() {
+                            operation.complete(None, monotonic_millis());
+                        }
+                        physical_send_errors = physical_send_errors.saturating_add(1);
+                        physical_send_error_bytes =
+                            physical_send_error_bytes.saturating_add(legacy_probe.len() as u64);
+                        if let Some(recorder) = live_recorder.as_ref() {
+                            recorder.record_compatibility_error(legacy_probe.len());
+                        }
+                    } else {
+                        // The primary datagram is already committed. An old
+                        // publication cannot send its compatibility copy or
+                        // start another burst, and is not a physical IO error.
+                        publication_rejected = true;
                     }
                     drop(ordinary_compatibility);
-                    physical_send_errors = physical_send_errors.saturating_add(1);
-                    physical_send_error_bytes =
-                        physical_send_error_bytes.saturating_add(legacy_probe.len() as u64);
-                    if let Some(recorder) = live_recorder.as_ref() {
-                        recorder.record_compatibility_error(legacy_probe.len());
-                    }
                     #[cfg(test)]
                     if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
                         call.owner
@@ -1561,13 +1561,13 @@ impl UdpTransport {
                         "Failed to send compatibility legacy UDP punch probe to peer {} at {}: {}",
                         peer_id.unwrap_or("unknown"),
                         peer_addr,
-                        err
+                        failure.error
                     );
                 }
             }
         }
 
-        if should_retransmit {
+        if should_retransmit && !publication_rejected {
             self.retransmit_probe_burst(
                 socket,
                 socket_index,
@@ -1650,10 +1650,30 @@ impl UdpTransport {
             .probe_burst_capture_for_test
             .as_ref()
             .map(|capture| capture.reserve_before_spawn());
+        let transport = self.clone();
+        #[cfg(test)]
+        let transport = {
+            let mut transport = transport;
+            // The test capture owns the JoinHandle, never its own child.
+            transport.probe_burst_capture_for_test = None;
+            transport
+        };
         let handle = tokio::spawn(async move {
             for delay_ms in PUNCH_PROBE_RETRANSMIT_DELAYS_MS {
                 sleep(Duration::from_millis(delay_ms)).await;
-                match socket.send_to(&probe, peer_addr).await {
+                let result = if transport.probe_publication_fence.is_some() {
+                    transport
+                        .send_publication_scoped_probe_datagram(&socket, &probe, peer_addr)
+                        .await
+                        .map_err(|failure| failure.error)
+                } else {
+                    // Unscoped standalone retransmits keep their historical
+                    // direct socket path, including test-failure accounting.
+                    socket.send_to(&probe, peer_addr).await.map_err(|error| {
+                        DaemonError::Network(format!("UDP probe retransmit failed: {error}"))
+                    })
+                };
+                match result {
                     Ok(_) => {
                         if let Some(metrics) = diagnostics.lock().await.get_mut(socket_index) {
                             metrics.probe_retransmissions_sent += 1;

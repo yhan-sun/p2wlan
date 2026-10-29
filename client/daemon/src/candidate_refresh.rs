@@ -10,6 +10,7 @@ mod tests {
     use super::*;
 
     include!("candidate_refresh/gather_fence_tests.rs");
+    include!("candidate_refresh/periodic_commit_tests.rs");
 
     #[test]
     fn volatile_candidate_churn_is_coalesced_and_not_fanned_out() {

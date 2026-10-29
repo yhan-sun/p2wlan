@@ -77,6 +77,15 @@ async fn spawn_hole_punch_task_with_lifecycle(
     invocation_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     publication_fence: Option<Arc<crate::control::CandidatePublicationFence>>,
 ) {
+    // Carry the original publication through every UDP clone used by this
+    // invocation, including fresh-mapping children and delayed retransmits.
+    let udp = match publication_fence
+        .as_ref()
+        .and_then(|fence| fence.endpoint_publication_identity())
+    {
+        Some((owner, generation)) => udp.with_probe_publication_identity(owner, generation),
+        None => udp,
+    };
     if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
         return;
     }
@@ -245,7 +254,9 @@ async fn spawn_hole_punch_task_with_lifecycle(
     {
         return;
     }
-    let admission = peers.recovery_epoch_admit(&peer_id).await;
+    let admission = peers
+        .recovery_epoch_admit_for_publication(&peer_id, publication_fence.as_deref())
+        .await;
     if peers.current_network_generation_sync() != network_generation
         || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
     {
@@ -446,6 +457,9 @@ async fn spawn_hole_punch_task_with_lifecycle(
                 let peer_id = peer_id.clone();
                 let cancellation = session.cancellation_handle();
                 let child_cost = ordinary_cost.clone();
+                let fresh_publication_fence = publication_fence
+                    .as_ref()
+                    .map(|fence| fence.for_fresh_prediction());
                 async move {
                     let fresh_generation = if let Some(signal) = signal.as_ref() {
                         if signal.boot_epoch_ms == 0 {
@@ -479,9 +493,11 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                     .await;
                                 return;
                             };
-                            if cancellation.is_cancelled()
-                                || !peers
-                                    .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                            if !fresh_prediction_publication_is_current(
+                                &cancellation,
+                                fresh_publication_fence.as_deref(),
+                            ) || !peers
+                                .peer_session_is_current_sync(&peer_id, peer_session_generation)
                             {
                                 reservation.refund().await;
                                 return;
@@ -513,12 +529,13 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                     // generation measured: a stale prediction must not be
                                     // advertised (its HTTP-send-time generation would look
                                     // newer to the peer and cancel the fresher session).
-                                    if cancellation.is_cancelled()
-                                        || !peers.peer_session_is_current_sync(
-                                            &peer_id,
-                                            peer_session_generation,
-                                        )
-                                    {
+                                    if !fresh_prediction_publication_is_current(
+                                        &cancellation,
+                                        fresh_publication_fence.as_deref(),
+                                    ) || !peers.peer_session_is_current_sync(
+                                        &peer_id,
+                                        peer_session_generation,
+                                    ) {
                                         peers
                                 .record_direct_event(
                                     &peer_id,
@@ -554,8 +571,11 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                         // socket rollable, so the guard is dropped without
                                         // finalizing instead of leaving an un-advertised
                                         // socket as the peer's long-term path.
-                                        let advertised = if cancellation.is_cancelled()
-                                            || !peers.peer_session_is_current_sync(
+                                        let advertised = if !fresh_prediction_publication_is_current(
+                                            &cancellation,
+                                            fresh_publication_fence.as_deref(),
+                                        ) || !peers
+                                            .peer_session_is_current_sync(
                                                 &peer_id,
                                                 peer_session_generation,
                                             ) {
@@ -580,20 +600,22 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                     )
                                     .await;
                                             false
-                                        } else if cancellation.is_cancelled()
-                                            || !peers.peer_session_is_current_sync(
-                                                &peer_id,
-                                                peer_session_generation,
-                                            )
-                                        {
+                                        } else if !fresh_prediction_publication_is_current(
+                                            &cancellation,
+                                            fresh_publication_fence.as_deref(),
+                                        ) || !peers.peer_session_is_current_sync(
+                                            &peer_id,
+                                            peer_session_generation,
+                                        ) {
                                             false
                                         } else {
-                                            advertise_fresh_mapping_prediction(
+                                            advertise_fresh_mapping_prediction_fenced(
                                                 signal,
                                                 &peers,
                                                 &peer_id,
                                                 &*result,
                                                 &cancellation,
+                                                fresh_publication_fence.clone(),
                                             )
                                             .await
                                         };

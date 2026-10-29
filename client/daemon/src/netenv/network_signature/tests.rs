@@ -235,3 +235,63 @@ fn ppp_upstreams_are_observed_without_changing_socket_binding_policy() {
     );
     assert_eq!(signature, ["address:ppp0:192.0.2.2/32"]);
 }
+
+#[test]
+fn routed_linux_bridge_addresses_and_ipv6_default_are_observed() {
+    let sample = |address: &str| {
+        let mut signature = Vec::new();
+        let interface = append_ipv6_default(
+            &mut signature,
+            Some(("br-lan".into(), Some("fe80::1".into()))),
+            &[],
+        )
+        .expect("a routed bridge can be the only IPv6 upstream");
+        append_relevant_address(
+            &mut signature,
+            &[&interface],
+            &[],
+            &interface,
+            address.parse().unwrap(),
+            64,
+        );
+        signature
+    };
+    assert_ne!(sample("2001:db8::2"), sample("2001:db8::3"));
+    assert!(sample("2001:db8::2")
+        .iter()
+        .any(|entry| entry.starts_with("default6:br-lan:")));
+    let mut ignored = Vec::new();
+    append_relevant_address(
+        &mut ignored,
+        &["en0"],
+        &[],
+        "br-unrelated",
+        "192.0.2.2".parse().unwrap(),
+        24,
+    );
+    assert!(
+        ignored.is_empty(),
+        "an unrelated bridge still cannot cause a handover"
+    );
+    assert!(append_ipv6_default(
+        &mut ignored,
+        Some(("br-overlay".into(), None)),
+        &["br-overlay".into()]
+    )
+    .is_none());
+}
+
+#[test]
+fn windows_hyperv_default_route_remains_observable() {
+    let mut adapters = vec![adapter("vEthernet (External Switch)", 1, "192.0.2.2")];
+    let mut routes = vec![route(1, 4, "192.0.2.1")];
+    let baseline = windows_signature(&adapters, &routes, &[]);
+    assert!(!baseline.is_empty());
+    adapters[0].addresses[0].0 = "192.0.2.3".parse().unwrap();
+    assert_ne!(windows_signature(&adapters, &routes, &[]), baseline);
+    routes[0].next_hop = "192.0.2.254".parse().unwrap();
+    assert_ne!(windows_signature(&adapters, &routes, &[]), baseline);
+    assert!(windows_signature(&adapters, &routes, &[adapters[0].name.clone()]).is_empty());
+    adapters[0].tunnel = true;
+    assert!(windows_signature(&adapters, &routes, &[]).is_empty());
+}

@@ -82,6 +82,7 @@ struct PendingPeerReflexive {
     from_node_id: String,
     observed_endpoint: String,
     punch_at_ms: Option<u64>,
+    endpoint_fence: Option<EndpointPublicationFence>,
     peer_session_generation: Option<PeerSessionGeneration>,
     delivery_receipt: Option<control::SignalDeliveryReceipt>,
 }

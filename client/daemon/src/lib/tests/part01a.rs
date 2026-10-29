@@ -159,10 +159,34 @@ async fn peer_reflexive_candidate_refreshes_the_committed_snapshot() {
         )
         .await;
 
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: "observer".into(),
+            online: true,
+            public_key: hex::encode(p2pnet_crypto::NodeIdentity::generate().public_key()),
+            virtual_ip: "10.20.0.2".into(),
+            ..control::PeerInfo::default()
+        })
+        .await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
+        .await
+        .unwrap();
+    daemon.udp_transport_publication.publish(udp.clone()).await;
+    let work = PendingPeerReflexive {
+        from_node_id: "observer".into(),
+        observed_endpoint: "198.51.100.11:40001".into(),
+        punch_at_ms: None,
+        peer_session_generation: daemon.peers.peer_session_generation_sync("observer"),
+        endpoint_fence: Some(EndpointPublicationFence::new(&udp, &daemon.peers)),
+        delivery_receipt: None,
+    };
     assert!(
         daemon
-            .add_local_peer_reflexive_candidate("198.51.100.11:40001")
+            .add_local_peer_reflexive_candidate(&work)
             .await
+            .unwrap()
+            .0
     );
 
     let snapshot = daemon

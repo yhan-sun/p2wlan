@@ -480,6 +480,17 @@ async fn last_seen_only_peer_update_refreshes_diagnostics_without_handshake_rese
 async fn control_event_loop_processes_peer_answer_while_peer_reflexive_work_waits() {
     let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
     let daemon = Daemon::new(config);
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
+        .await
+        .unwrap();
+    daemon.udp_transport_publication.publish(udp).await;
+    daemon
+        .publish_candidate_snapshot(
+            vec!["198.51.100.1:41000".into()],
+            HashMap::new(),
+            Vec::new(),
+        )
+        .await;
     let peer_id = "peer-reflexive-blocked-answer";
     let peer_identity = NodeIdentity::generate();
     daemon
@@ -578,6 +589,17 @@ async fn control_event_loop_processes_peer_answer_while_peer_reflexive_work_wait
 async fn control_event_loop_processes_peer_offer_while_peer_reflexive_work_waits() {
     let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
     let daemon = Daemon::new(config);
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
+        .await
+        .unwrap();
+    daemon.udp_transport_publication.publish(udp).await;
+    daemon
+        .publish_candidate_snapshot(
+            vec!["198.51.100.1:41000".into()],
+            HashMap::new(),
+            Vec::new(),
+        )
+        .await;
     let peer_id = "peer-reflexive-blocked-offer";
     let peer_identity = NodeIdentity::generate();
     daemon

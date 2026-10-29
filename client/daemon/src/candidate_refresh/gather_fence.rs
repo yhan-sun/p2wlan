@@ -34,8 +34,9 @@ impl CandidateGatherFence {
     /// The caller keeps the existing refresh lock through the ensuing local
     /// profile/candidate commit, so a checked snapshot version cannot change
     /// between this comparison and that commit. Generation and publication
-    /// checks also reject changes during discovery; they do not claim to make
-    /// the existing later generation-advance/publication path one transaction.
+    /// checks reject changes during discovery. The shared local commit repeats
+    /// them under its snapshot writer and authoritative epoch/publication guards;
+    /// this discovery check alone never authorizes a later mutation.
     pub(super) async fn stale_reason(
         &self,
         _refresh_guard: &tokio::sync::MutexGuard<'_, ()>,

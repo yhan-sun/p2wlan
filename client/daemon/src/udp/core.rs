@@ -117,6 +117,7 @@ impl UdpTransport {
             peer_probe_rx_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             inbound_tx: None,
             inbound_publication_owner: Arc::new(AtomicU64::new(0)),
+            probe_publication_fence: None,
             peer_reflexive_ingress: None,
             validation_trigger: None,
             triggered_checks: Arc::new(Mutex::new(HashMap::new())),

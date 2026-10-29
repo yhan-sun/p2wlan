@@ -11,11 +11,25 @@ pub(crate) struct EndpointPublicationFence {
 
 impl EndpointPublicationFence {
     pub(crate) fn new(udp: &UdpTransport, peers: &Arc<PeerManager>) -> Self {
+        Self::from_identity(
+            udp,
+            peers,
+            udp.inbound_publication_owner(),
+            peers.current_network_generation_sync(),
+        )
+    }
+
+    pub(crate) fn from_identity(
+        udp: &UdpTransport,
+        peers: &Arc<PeerManager>,
+        owner: u64,
+        generation: u64,
+    ) -> Self {
         Self {
             publication_owner: udp.inbound_publication_owner_weak(),
             peers: Arc::downgrade(peers),
-            owner: udp.inbound_publication_owner(),
-            generation: peers.current_network_generation_sync(),
+            owner,
+            generation,
         }
     }
 
@@ -45,6 +59,48 @@ struct PreSignalCandidateCommit {
     sources: HashMap<String, String>,
     nat_type: String,
     endpoint_fence: EndpointPublicationFence,
+    snapshot_version: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CandidateCommitMode {
+    PreSignal,
+    Periodic,
+}
+
+struct CandidateReportCommit {
+    publication: PreSignalCandidateCommit,
+    nat_publication: crate::peer::NatProfilePublication,
+    profile_changed: bool,
+    snapshot_changed: bool,
+    generation_changed: bool,
+    public_readiness_changed: bool,
+    previous_candidates: Vec<String>,
+    previous_hash: u64,
+    change_reason: &'static str,
+}
+
+async fn commit_pre_signal_candidates(
+    context: PreSignalCandidateCommitContext<'_>,
+    refresh_guard: &tokio::sync::MutexGuard<'_, ()>,
+    gather_fence: &crate::candidate_refresh::CandidateGatherFence,
+    udp: &UdpTransport,
+    report: p2pnet_nat::CandidateGatherReport,
+    candidates: Vec<String>,
+    sources: HashMap<String, String>,
+) -> Option<PreSignalCandidateCommit> {
+    commit_candidate_report(
+        context,
+        refresh_guard,
+        gather_fence,
+        udp,
+        report,
+        candidates,
+        sources,
+        CandidateCommitMode::PreSignal,
+    )
+    .await
+    .map(|committed| committed.publication)
 }
 
 /// Existing refresh single-flight -> local writers -> epoch/publication try
@@ -55,7 +111,8 @@ struct PreSignalCandidateCommit {
 /// generation transition: timing it out after its atomic increment would leave
 /// peer state only partly invalidated. That existing transition performs local
 /// state cleanup, with no network I/O, task join, or candidate-lock acquisition.
-async fn commit_pre_signal_candidates(
+#[allow(clippy::too_many_arguments)]
+async fn commit_candidate_report(
     context: PreSignalCandidateCommitContext<'_>,
     _refresh_guard: &tokio::sync::MutexGuard<'_, ()>,
     gather_fence: &crate::candidate_refresh::CandidateGatherFence,
@@ -63,7 +120,8 @@ async fn commit_pre_signal_candidates(
     report: p2pnet_nat::CandidateGatherReport,
     mut candidates: Vec<String>,
     mut sources: HashMap<String, String>,
-) -> Option<PreSignalCandidateCommit> {
+    mode: CandidateCommitMode,
+) -> Option<CandidateReportCommit> {
     let prepared = timeout(Duration::from_millis(100), async {
         let profile = context.nat_profile.write().await;
         let peer_profile = context.peers.lock_local_nat_profile_for_commit().await;
@@ -147,34 +205,60 @@ async fn commit_pre_signal_candidates(
         .unwrap_or_default();
     let advance_generation = network_identity_changed(previous_identity, &next_identity);
 
+    let change_reason =
+        candidate_set_change_reason(previous_candidates, &candidates, previous_sources, &sources);
+    let previous_hash = candidate_set_hash(previous_candidates, previous_sources);
+    let public_readiness_changed = crate::candidate_refresh::public_candidate_readiness_changed(
+        previous_candidates,
+        previous_sources,
+        &candidates,
+        &sources,
+    );
+    let previous_candidates = previous_candidates.to_vec();
+    let snapshot_changed = mode == CandidateCommitMode::PreSignal
+        || snapshot.is_none()
+        || candidate_refresh_requires_commit(
+            !matches!(change_reason, "no_change" | "order_only"),
+            advance_generation,
+        );
+    let profile_changed = profile.as_ref() != Some(&report.nat_profile);
+
+    // All report side effects begin only after the original gather identity
+    // has passed the writers and both authoritative lifecycle guards.
+    if mode == CandidateCommitMode::Periodic {
+        udp.apply_candidate_report_socket_pool_policy(&report);
+    }
     let nat_publication = context
         .peers
         .update_nat_profile_with_guard(report.nat_profile.clone(), peer_profile)
         .await;
     *profile = Some(report.nat_profile.clone());
-    let version = snapshot
-        .as_ref()
-        .map_or(1, |snapshot| snapshot.version.saturating_add(1));
-    *snapshot = Some(CandidateSnapshotLease {
-        hash: candidate_set_hash(&candidates, &sources),
-        candidates: candidates.clone(),
-        candidate_sources: sources.clone(),
-        network_identity: next_identity.clone(),
-        version,
-        gathered_at: Instant::now(),
-        initial_gather_complete: true,
-    });
-    *candidates_mirror = candidates.clone();
-    *sources_mirror = sources.clone();
-    *identity_mirror = next_identity;
+    let mut version = snapshot.as_ref().map_or(0, |snapshot| snapshot.version);
+    if snapshot_changed {
+        version = version.saturating_add(1);
+        *snapshot = Some(CandidateSnapshotLease {
+            hash: candidate_set_hash(&candidates, &sources),
+            candidates: candidates.clone(),
+            candidate_sources: sources.clone(),
+            network_identity: next_identity.clone(),
+            version,
+            gathered_at: Instant::now(),
+            initial_gather_complete: true,
+        });
+        *candidates_mirror = candidates.clone();
+        *sources_mirror = sources.clone();
+        *identity_mirror = next_identity;
+    }
+    // A periodic measurement with unchanged candidates renews NAT evidence
+    // (g/o) without renewing the snapshot lease, version or startup readiness.
     if advance_generation {
         context
             .peers
-            .advance_network_generation_in_epoch(&epoch, "pre-signal UDP network identity changed")
+            .advance_network_generation_in_epoch(&epoch, "UDP network identity changed")
             .await;
     }
     let endpoint_fence = EndpointPublicationFence::new(udp, context.peers);
-    Some(PreSignalCandidateCommit {
+    let publication = PreSignalCandidateCommit {
         candidates,
         sources,
         nat_type: report
@@ -184,5 +268,17 @@ async fn commit_pre_signal_candidates(
                 nat_publication.observation,
             ),
         endpoint_fence,
+        snapshot_version: version,
+    };
+    Some(CandidateReportCommit {
+        publication,
+        nat_publication,
+        profile_changed,
+        snapshot_changed,
+        generation_changed: advance_generation,
+        public_readiness_changed,
+        previous_candidates,
+        previous_hash,
+        change_reason,
     })
 }

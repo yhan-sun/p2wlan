@@ -16,6 +16,51 @@ async fn spawn_peer_reflexive_micro_window(
     punch_at_ms: Option<u64>,
     origin: &'static str,
 ) {
+    spawn_peer_reflexive_micro_window_fenced(
+        udp,
+        peers,
+        punch_deduplicator,
+        peer_id,
+        candidates,
+        punch_at_ms,
+        origin,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_peer_reflexive_micro_window_fenced(
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    punch_deduplicator: PunchAttemptDeduplicator,
+    peer_id: String,
+    candidates: Vec<SocketAddr>,
+    punch_at_ms: Option<u64>,
+    origin: &'static str,
+    publication_fence: Option<Arc<crate::control::CandidatePublicationFence>>,
+) {
+    let udp = match publication_fence
+        .as_ref()
+        .and_then(|fence| fence.endpoint_publication_identity())
+    {
+        Some((owner, generation)) => udp.with_probe_publication_identity(owner, generation),
+        None => udp,
+    };
+    if let Some(fence) = publication_fence.as_ref() {
+        if !fence.is_current().await {
+            return;
+        }
+    }
+    let (generation, peer_session_generation) = if let Some(fence) = publication_fence.as_ref() {
+        fence.lifecycle()
+    } else {
+        let Some(session) = peers.peer_session_generation_sync(&peer_id) else {
+            return;
+        };
+        (peers.current_network_generation_sync(), session)
+    };
+
     let Some(punch_at_ms) = punch_at_ms else {
         peers
             .record_direct_event(
@@ -60,11 +105,10 @@ async fn spawn_peer_reflexive_micro_window(
     if peers.is_direct(&peer_id).await {
         return;
     }
-    let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
-        return;
-    };
-
-    let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
+    let RecoveryAdmission::Accepted { epoch } = peers
+        .recovery_epoch_admit_for_publication(&peer_id, publication_fence.as_deref())
+        .await
+    else {
         peers
             .record_direct_event(
                 &peer_id,
@@ -79,7 +123,12 @@ async fn spawn_peer_reflexive_micro_window(
             .await;
         return;
     };
-    let generation = peers.current_network_generation().await;
+    if publication_fence
+        .as_ref()
+        .is_some_and(|fence| !fence.lifecycle_is_current())
+    {
+        return;
+    }
     let Some(claim) = punch_deduplicator
         .claim_for_epoch_with_rendezvous_for_peer_session(
             &peers,
@@ -124,7 +173,11 @@ async fn spawn_peer_reflexive_micro_window(
     let delay = relay_assisted_punch_delay(Some(punch_at_ms));
     let session_id = session.session_id();
     tokio::spawn(async move {
-        if !peers.peer_session_is_current_sync(&peer_id, peer_session_generation) {
+        if !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            || publication_fence
+                .as_ref()
+                .is_some_and(|fence| !fence.lifecycle_is_current())
+        {
             return;
         }
         peers
@@ -168,6 +221,9 @@ async fn spawn_peer_reflexive_micro_window(
         if peers.is_direct(&peer_id).await
             || session.is_cancelled()
             || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            || publication_fence
+                .as_ref()
+                .is_some_and(|fence| !fence.lifecycle_is_current())
         {
             return;
         }
@@ -179,7 +235,12 @@ async fn spawn_peer_reflexive_micro_window(
             &session,
             PEER_REFLEXIVE_MICRO_WINDOW_DEADLINE,
             async {
-                let owner_gate = || !cancellation.is_cancelled();
+                let owner_gate = || {
+                    !cancellation.is_cancelled()
+                        && publication_fence
+                            .as_ref()
+                            .is_none_or(|fence| fence.lifecycle_is_current())
+                };
                 send_result = Some(
                     udp.punch_candidates_primary_socket_until_not_direct_gated_report(
                         &peer_id,

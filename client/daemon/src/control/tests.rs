@@ -299,3 +299,5 @@ include!("tests/candidate_lifecycle.rs");
 include!("tests/critical_capacity.rs");
 
 include!("tests/roster_wake.rs");
+
+include!("tests/candidate_publication_handover.rs");

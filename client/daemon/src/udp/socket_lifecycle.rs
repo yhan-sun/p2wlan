@@ -613,13 +613,35 @@ impl ProvisionalSocketGuard {
                     );
                     return false;
                 }
+            }
+            let mut finalize = || {
+                if let Some((owner, generation)) = self.transport.probe_publication_identity() {
+                    if owner == 0
+                        || self.transport.inbound_publication_owner() != owner
+                        || self.transport.peers.current_network_generation_sync() != generation
+                        || self.cancellation.is_cancelled()
+                    {
+                        return false;
+                    }
+                }
                 state
                     .dynamic
                     .get_mut(&self.socket_index)
                     .expect("finalize entry verified above")
                     .phase = DynamicSocketPhase::Finalized;
+                true
+            };
+            if self.transport.probe_publication_identity().is_some() {
+                // An owner-only withdrawal can cross either awaited lock
+                // above. Serialize its final check with the actual phase
+                // flip; never retain the synchronous gate across an await.
+                self.transport
+                    .dplpmtud
+                    .try_with_business_publication_gate(finalize)
+                    .unwrap_or(false)
+            } else {
+                finalize()
             }
-            true
         };
         if !flipped {
             return false;

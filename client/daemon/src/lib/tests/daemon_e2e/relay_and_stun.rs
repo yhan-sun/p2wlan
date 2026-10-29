@@ -597,7 +597,7 @@ async fn remote_incarnation_replay_republishes_unchanged_local_candidates() {
     let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
         .await
         .unwrap();
-    *daemon.udp_transport.write().await = Some(udp);
+    daemon.udp_transport_publication.publish(udp).await;
 
     let signals = StdArc::new(StdMutex::new(Vec::<TestControlSignal>::new()));
     let signals_for_forwarder = signals.clone();

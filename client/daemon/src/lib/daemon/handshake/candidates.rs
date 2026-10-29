@@ -84,8 +84,10 @@ impl Daemon {
                 .refresh_local_candidates_for_imminent_signal(&udp, reason)
                 .await
             {
-                return refreshed;
+                return (refreshed.candidates, refreshed.sources);
             }
+            // A failed owner-fenced refresh cannot revive the old lease.
+            return (Vec::new(), HashMap::new());
         }
         if let Some(stale) = stale {
             if !stale.0.is_empty() {
@@ -95,55 +97,6 @@ impl Daemon {
         self.wait_for_local_candidate_set().await
     }
 
-    async fn add_local_peer_reflexive_candidate(&self, observed_endpoint: &str) -> bool {
-        let _refresh_guard = self.candidate_refresh_lock.lock().await;
-        let current = self.cached_candidate_snapshot().await;
-        let mut candidates = current
-            .as_ref()
-            .map(|snapshot| snapshot.candidates.clone())
-            .unwrap_or_default();
-        let mut candidate_sources = current
-            .as_ref()
-            .map(|snapshot| snapshot.candidate_sources.clone())
-            .unwrap_or_default();
-        match add_peer_reflexive_candidate_to_set(
-            observed_endpoint,
-            &mut candidates,
-            &mut candidate_sources,
-        ) {
-            Ok(true) => {
-                let network_identity = current
-                    .as_ref()
-                    .map(|snapshot| snapshot.network_identity.clone())
-                    .unwrap_or_default();
-                publish_candidate_snapshot_to_store(
-                    &self.candidate_snapshot,
-                    candidates.clone(),
-                    candidate_sources.clone(),
-                    network_identity,
-                )
-                .await;
-                // Compatibility mirrors are written only after the coherent
-                // snapshot commit and are never used to assemble signal data.
-                *self.local_candidates.write().await = candidates;
-                *self.local_candidate_sources.write().await = candidate_sources;
-                info!(
-                    "Updated relay-assisted peer-reflexive local UDP candidate {}",
-                    observed_endpoint
-                );
-                true
-            }
-            Ok(false) => false,
-            Err(err) => {
-                warn!(
-                    "Ignoring invalid relay-assisted peer-reflexive endpoint '{}': {err}",
-                    observed_endpoint
-                );
-                false
-            }
-        }
-    }
-
     async fn publish_current_candidates_to_peer(&self, node_id: &str, reason: &str) {
         let Some(udp) = self.udp_transport.read().await.clone() else {
             debug!(
@@ -151,30 +104,21 @@ impl Daemon {
             );
             return;
         };
-        // Publication reuses the snapshot lease: a fresh lease means the
-        // current committed set is already live — no re-gather, no endpoint
-        // re-publish (the gather path already published it).
-        let (candidates, candidate_sources) = if self
-            .cached_candidate_snapshot()
-            .await
-            .is_some_and(|snapshot| !snapshot.initial_gather_complete)
-        {
-            debug!(
-                "Waiting for the full startup candidate snapshot before publishing {reason} candidates to {node_id}"
-            );
-            wait_for_initial_candidate_set_from_store(&self.candidate_snapshot).await
-        } else if let Some(leased) = self.fresh_candidate_set().await {
-            leased
-        } else if let Some(refreshed) = self
-            .refresh_local_candidates_for_imminent_signal(&udp, reason)
-            .await
-        {
-            refreshed
-        } else if let Some(stale) = self.leased_candidate_set().await {
-            stale
-        } else {
-            self.current_local_candidate_set().await
+        let Some(peer_session) = self.peers.peer_session_generation_sync(node_id) else {
+            return;
         };
+        let Some(selected) = self
+            .candidate_signal_set_for_publication(&udp, reason)
+            .await
+        else {
+            return;
+        };
+        let publication_fence = selected.publication_fence(self, node_id, peer_session);
+        let candidates = selected.candidates;
+        let candidate_sources = selected.sources;
+        if !publication_fence.is_current().await {
+            return;
+        }
         if candidates.is_empty() {
             debug!("Local UDP candidates are not ready; skipping {reason} candidate publication to {node_id}");
             return;
@@ -203,7 +147,7 @@ impl Daemon {
                 .recommended_punch_attempts(self.config.network.punch_attempts)
                 .await;
             let signal = self.hole_punch_signal_context().await;
-            spawn_hole_punch_task(
+            spawn_hole_punch_task_with_lifecycle(
                 udp,
                 self.peers.clone(),
                 self.punch_attempts.clone(),
@@ -214,6 +158,8 @@ impl Daemon {
                 signal,
                 None,
                 None,
+                None,
+                Some(publication_fence),
             )
             .await;
             return;
@@ -222,13 +168,14 @@ impl Daemon {
 
         if let Err(error) = self
             .control
-            .send_peer_offer_with_sources_and_punch_at(
+            .send_peer_offer_with_sources_and_punch_at_fenced(
                 node_id,
                 &candidates,
                 &candidate_sources,
                 &[],
                 punch_at_ms,
                 None,
+                Some(publication_fence.clone()),
             )
             .await
         {
@@ -251,7 +198,7 @@ impl Daemon {
             .recommended_punch_attempts(self.config.network.punch_attempts)
             .await;
         let signal = self.hole_punch_signal_context().await;
-        spawn_hole_punch_task(
+        spawn_hole_punch_task_with_lifecycle(
             udp,
             self.peers.clone(),
             self.punch_attempts.clone(),
@@ -262,6 +209,8 @@ impl Daemon {
             signal,
             None,
             None,
+            None,
+            Some(publication_fence),
         )
         .await;
     }
@@ -270,37 +219,19 @@ impl Daemon {
         &self,
         udp: &UdpTransport,
         reason: &str,
-    ) -> Option<(Vec<String>, HashMap<String, String>)> {
-        // Single-flight lease: cached candidates are never re-gathered inside
-        // the TTL, so multiple peers' offers cannot rewrite the local
-        // source/port mapping in a tight loop.  A non-empty committed
-        // snapshot remains usable after the lease expires; signal paths must
-        // not start an inline STUN gather and join a startup convoy.  The
-        // periodic candidate-refresh worker owns refreshes.  Only the
-        // no-snapshot bootstrap case gathers synchronously here.
-        if let Some(leased) = self.leased_candidate_set().await {
-            if !leased.0.is_empty() {
-                if self.candidate_snapshot_is_fresh().await {
-                    debug!(
-                        "Pre-signal UDP candidates reused from the fresh snapshot lease for {reason} ({} candidates); no live STUN gather",
-                        leased.0.len()
-                    );
-                } else {
-                    // A peer event must not join a convoy of live STUN
-                    // gathers after the short lease expires.  The UDP
-                    // candidate-refresh worker owns refreshes; the signal
-                    // path can use the bounded last snapshot immediately and
-                    // let that worker publish the newer set asynchronously.
-                    // This is especially important during startup when the
-                    // control roster can enqueue dozens of peer events while
-                    // the first gather still owns candidate_refresh_lock.
-                    debug!(
-                        "Pre-signal UDP candidates reused from the stale snapshot for {reason} ({} candidates); avoiding an inline STUN refresh convoy",
-                        leased.0.len()
-                    );
-                }
-                return Some(leased);
+    ) -> Option<CandidateSignalSet> {
+        // Even an expired lease is reusable, but its socket, generation and
+        // exact snapshot version must travel with the copied candidates.
+        let endpoint_fence = EndpointPublicationFence::new(udp, &self.peers);
+        if let Some(snapshot) = self.cached_candidate_snapshot().await {
+            if !snapshot.candidates.is_empty() {
+                return endpoint_fence
+                    .is_current()
+                    .then(|| CandidateSignalSet::from_snapshot(snapshot, endpoint_fence));
             }
+        }
+        if !endpoint_fence.is_current() {
+            return None;
         }
         let refreshed = self.refresh_local_candidates_core(udp, reason).await?;
         if let Some(endpoint) =
@@ -311,7 +242,7 @@ impl Daemon {
                 self.control.update_endpoint_for_handshake_fenced(
                     &endpoint,
                     &refreshed.nat_type,
-                    refreshed.endpoint_fence,
+                    refreshed.endpoint_fence.clone(),
                 ),
             )
             .await
@@ -325,7 +256,15 @@ impl Daemon {
                 }
             }
         }
-        Some((refreshed.candidates, refreshed.sources))
+        // An endpoint request may have waited behind authentication or HTTP.
+        // Cancellation never permits its old tuple to fall through to signal.
+        let selected = CandidateSignalSet {
+            candidates: refreshed.candidates,
+            sources: refreshed.sources,
+            snapshot_version: refreshed.snapshot_version,
+            endpoint_fence: refreshed.endpoint_fence,
+        };
+        selected.is_current(self).await.then_some(selected)
     }
 
     async fn refresh_local_candidates_core(
@@ -333,16 +272,20 @@ impl Daemon {
         udp: &UdpTransport,
         reason: &str,
     ) -> Option<PreSignalCandidateCommit> {
+        let entry_fence = EndpointPublicationFence::new(udp, &self.peers);
         let refresh_guard = self.candidate_refresh_lock.lock().await;
+        if !entry_fence.is_current() {
+            return None;
+        }
         // Another initiator may have completed the gather while this caller
         // waited for the single-flight lock. Re-check the lease after lock
         // acquisition or concurrent offers will serialize duplicate STUN
         // gathers and churn the public mapping again.
-        if let Some(leased) = self.fresh_candidate_set().await {
-            if !leased.0.is_empty() {
+        if let Some(leased) = self.cached_candidate_snapshot().await {
+            if leased.is_fresh() && !leased.candidates.is_empty() {
                 debug!(
                     "Pre-signal UDP candidates reused after refresh lock handoff for {reason} ({} candidates)",
-                    leased.0.len()
+                    leased.candidates.len()
                 );
                 let nat_type = self
                     .nat_profile
@@ -356,11 +299,15 @@ impl Daemon {
                         )
                     })
                     .unwrap_or_else(|| "unknown".into());
+                if !entry_fence.is_current() {
+                    return None;
+                }
                 return Some(PreSignalCandidateCommit {
-                    candidates: leased.0,
-                    sources: leased.1,
+                    candidates: leased.candidates,
+                    sources: leased.candidate_sources,
                     nat_type,
-                    endpoint_fence: EndpointPublicationFence::new(udp, &self.peers),
+                    endpoint_fence: entry_fence,
+                    snapshot_version: leased.version,
                 });
             }
         }
@@ -650,3 +597,5 @@ pub(crate) fn relay_first_candidate_shortcut(
         None
     }
 }
+
+include!("candidate_signal_lease.rs");

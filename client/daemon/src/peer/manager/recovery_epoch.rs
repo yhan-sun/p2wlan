@@ -501,11 +501,27 @@ impl PeerManager {
     /// plan or start a session, so the 1-second retry tick can never
     /// resurrect a 778/3072-candidate plan.
     pub(crate) async fn recovery_epoch_admit(&self, peer_id: &str) -> RecoveryAdmission {
+        self.recovery_epoch_admit_for_publication(peer_id, None)
+            .await
+    }
+
+    pub(crate) async fn recovery_epoch_admit_for_publication(
+        &self,
+        peer_id: &str,
+        publication_fence: Option<&crate::control::CandidatePublicationFence>,
+    ) -> RecoveryAdmission {
+        if publication_fence.is_some_and(|fence| !fence.lifecycle_is_current()) {
+            return RecoveryAdmission::Superseded;
+        }
         let now = Instant::now();
 
         if self.is_direct(peer_id).await || self.get_connection(peer_id).await.is_none() {
-            self.recovery_epoch_end(peer_id, "peer_direct_or_gone")
-                .await;
+            // A delayed publication must not clean up a replacement peer's
+            // recovery plan. The ordinary lifecycle owns that cleanup.
+            if publication_fence.is_none() {
+                self.recovery_epoch_end(peer_id, "peer_direct_or_gone")
+                    .await;
+            }
             return RecoveryAdmission::Superseded;
         }
 
@@ -518,9 +534,30 @@ impl PeerManager {
         self.apply_cached_liveness_block(peer_id).await;
 
         let mut epochs = self.recovery_epochs.write().await;
-        let generation = self.current_network_generation_sync();
-        let Some(peer_session) = self.peer_session_generation_sync(peer_id) else {
+        // The epoch gate is try-only after the existing writer: generation
+        // transition paths may hold epoch while waiting for local state, so
+        // never await that gate in this order. All work after acquisition is
+        // synchronous, and contention leaves the existing plan unchanged.
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch = if publication_fence.is_some() {
+            match epoch_gate.try_lock() {
+                Ok(epoch) => Some(epoch),
+                Err(_) => return RecoveryAdmission::Superseded,
+            }
+        } else {
+            None
+        };
+        if publication_fence.is_some_and(|fence| !fence.lifecycle_is_current()) {
             return RecoveryAdmission::Superseded;
+        }
+        let (generation, peer_session) = match publication_fence {
+            Some(fence) => fence.lifecycle(),
+            None => {
+                let Some(session) = self.peer_session_generation_sync(peer_id) else {
+                    return RecoveryAdmission::Superseded;
+                };
+                (self.current_network_generation_sync(), session)
+            }
         };
         let peer_session_generation = Some(peer_session);
         if !epochs.contains_key(peer_id) {

@@ -920,6 +920,8 @@ pub(crate) struct CandidatePublicationFence {
     network_generation: u64,
     peer_session_generation: crate::peer::PeerSessionGeneration,
     candidate_hash: u64,
+    candidate_version: Option<u64>,
+    endpoint: Option<crate::EndpointPublicationFence>,
 }
 
 impl CandidatePublicationFence {
@@ -942,14 +944,61 @@ impl CandidatePublicationFence {
             network_generation,
             peer_session_generation,
             candidate_hash,
+            candidate_version: None,
+            endpoint: None,
         })
     }
 
+    pub(crate) fn with_endpoint(
+        self: Arc<Self>,
+        endpoint: crate::EndpointPublicationFence,
+        candidate_version: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            peers: self.peers.clone(),
+            candidate_snapshot: self.candidate_snapshot.clone(),
+            peer_id: self.peer_id.clone(),
+            network_generation: self.network_generation,
+            peer_session_generation: self.peer_session_generation,
+            candidate_hash: self.candidate_hash,
+            candidate_version: Some(candidate_version),
+            endpoint: Some(endpoint),
+        })
+    }
+
+    /// Fresh prediction payloads come from a separate measurement. Preserve
+    /// the original invocation lifecycle without adopting a newer owner or
+    /// requiring that independent payload to match the ordinary candidate set.
+    pub(crate) fn for_fresh_prediction(&self) -> Arc<Self> {
+        Arc::new(Self {
+            peers: self.peers.clone(),
+            candidate_snapshot: None,
+            peer_id: self.peer_id.clone(),
+            network_generation: self.network_generation,
+            peer_session_generation: self.peer_session_generation,
+            candidate_hash: 0,
+            candidate_version: None,
+            endpoint: self.endpoint.clone(),
+        })
+    }
+
+    pub(crate) fn endpoint_publication_identity(&self) -> Option<(u64, u64)> {
+        self.endpoint
+            .as_ref()
+            .map(|endpoint| (endpoint.owner, endpoint.generation))
+    }
+
+    pub(crate) fn lifecycle_is_current(&self) -> bool {
+        self.endpoint
+            .as_ref()
+            .is_none_or(|fence| fence.is_current())
+            && self.peers.current_network_generation_sync() == self.network_generation
+            && self.peers.peer_session_generation_sync(&self.peer_id)
+                == Some(self.peer_session_generation)
+    }
+
     pub(crate) async fn is_current(&self) -> bool {
-        if self.peers.current_network_generation_sync() != self.network_generation
-            || self.peers.peer_session_generation_sync(&self.peer_id)
-                != Some(self.peer_session_generation)
-        {
+        if !self.lifecycle_is_current() {
             return false;
         }
         if !self.peers.peer_online(&self.peer_id).await
@@ -968,14 +1017,17 @@ impl CandidatePublicationFence {
                 .read()
                 .await
                 .as_ref()
-                .is_some_and(|lease| lease.hash == self.candidate_hash)
+                .is_some_and(|lease| {
+                    lease.hash == self.candidate_hash
+                        && self
+                            .candidate_version
+                            .is_none_or(|version| lease.version == version)
+                })
             {
                 return false;
             }
         }
-        self.peers.current_network_generation_sync() == self.network_generation
-            && self.peers.peer_session_generation_sync(&self.peer_id)
-                == Some(self.peer_session_generation)
+        self.lifecycle_is_current()
     }
 }
 

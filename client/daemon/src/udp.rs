@@ -88,8 +88,10 @@ pub(crate) use test_ingress::TestUdpIngressGate;
 mod consent_trace;
 mod direct_validation_preflight;
 mod legacy_probe_ack;
+mod probe_publication;
 #[cfg(test)]
 use consent_trace::{ConsentStage, ConsentTrace, ConsentTraceReport};
+use probe_publication::ProbePublicationFence;
 
 include!("udp/admission.rs");
 include!("udp/gather.rs");
@@ -266,6 +268,9 @@ pub struct UdpTransport {
     /// live watch value after decryption so a packet queued by a withdrawn
     /// transport cannot be attributed to a replacement socket.
     inbound_publication_owner: Arc<AtomicU64>,
+    /// Immutable candidate-attempt identity. This is a snapshot of the
+    /// existing publication and epoch authorities, never a second owner.
+    probe_publication_fence: Option<ProbePublicationFence>,
     /// Bounded per-peer newest-wins ingress for authenticated endpoint
     /// observations.  The daemon-side consumer owns the only receive loop;
     /// UDP readers submit synchronously and never wait on a worker queue.

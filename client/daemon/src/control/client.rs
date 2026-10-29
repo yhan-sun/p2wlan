@@ -612,6 +612,7 @@ impl ControlClient {
     /// never delay the answer's control signal.  The caller intentionally
     /// treats failure as best-effort: the answer is sent with its cached
     /// candidates regardless.
+    #[cfg(test)]
     pub(crate) async fn update_endpoint_for_handshake(
         &self,
         endpoint: &str,
@@ -752,6 +753,11 @@ impl ControlClient {
         fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
         publication_fence: Option<Arc<CandidatePublicationFence>>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
+        if let Some(fence) = publication_fence.as_ref() {
+            if !fence.is_current().await {
+                return Err(PeerOfferSendFailure::Cancelled);
+            }
+        }
         #[cfg(test)]
         if let Some(result) = self.maybe_forward_test_signal(
             to_node_id,
@@ -843,6 +849,31 @@ impl ControlClient {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_fresh_peer_offer_with_sources_and_punch_at_fenced(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        fresh_ownership: Arc<crate::PunchSessionCancellation>,
+        publication_fence: Option<Arc<CandidatePublicationFence>>,
+    ) -> std::result::Result<(), PeerOfferSendFailure> {
+        self.send_fresh_peer_offer_with_schedule_and_fence(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_init,
+            punch_at_ms,
+            None,
+            None,
+            fresh_ownership,
+            publication_fence,
+        )
+        .await
+    }
+
     /// Send a fresh-mapping prediction with an optional traversal session
     /// envelope.  `session_id` uses the existing signal field and remains
     /// opaque to older servers/clients, so Hard↔Hard coordination does not
@@ -889,6 +920,41 @@ impl ControlClient {
         session_id: Option<String>,
         fresh_ownership: Arc<crate::PunchSessionCancellation>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
+        self.send_fresh_peer_offer_with_schedule_and_fence(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_init,
+            punch_at_ms,
+            punch_at_server_ms,
+            session_id,
+            fresh_ownership,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_fresh_peer_offer_with_schedule_and_fence(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        punch_at_server_ms: Option<u64>,
+        session_id: Option<String>,
+        fresh_ownership: Arc<crate::PunchSessionCancellation>,
+        publication_fence: Option<Arc<CandidatePublicationFence>>,
+    ) -> std::result::Result<(), PeerOfferSendFailure> {
+        if fresh_ownership.is_cancelled() {
+            return Err(PeerOfferSendFailure::Cancelled);
+        }
+        if let Some(fence) = publication_fence.as_ref() {
+            if !fence.is_current().await {
+                return Err(PeerOfferSendFailure::Cancelled);
+            }
+        }
         #[cfg(test)]
         if let Some(result) = self.maybe_forward_test_signal(
             to_node_id,
@@ -917,7 +983,7 @@ impl ControlClient {
             punch_at_ms,
             punch_at_server_ms,
             fresh_ownership: Some(fresh_ownership),
-            publication_fence: None,
+            publication_fence,
             response_tx,
         });
         match enqueue_result {

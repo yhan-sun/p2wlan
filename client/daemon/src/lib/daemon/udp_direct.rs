@@ -55,6 +55,12 @@ struct UdpDirectTaskContext {
 enum UdpDirectLifecycleSignal {
     Stop,
     NetworkChanged(AndroidNetworkChangeHint),
+    RouteChanged,
+}
+
+enum UdpDirectInstanceExit {
+    Stopped,
+    RouteChanged,
 }
 
 /// The route used to select this socket's interface is its handover baseline.
@@ -87,60 +93,81 @@ fn direct_socket_interface_for_bind(
 
 async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
     let excluded_interfaces = ctx.excluded_interfaces.clone();
+    let sampled_interfaces = excluded_interfaces.clone();
     let fresh_mapping_harness_loopback = ctx.fresh_mapping_harness_loopback;
-    run_udp_direct_task_with_binder(ctx, move |udp_bind, peers| {
-        let excluded_interfaces = excluded_interfaces.clone();
-        async move {
-            let environment = tokio::task::spawn_blocking(move || {
-                crate::netenv::direct_route_snapshot(&excluded_interfaces)
-            })
-            .await
-            .map_err(|error| {
-                DaemonError::Network(format!("direct-route inspection task failed: {error}"))
-            })?;
-            // Pin every direct UDP socket whenever a physical route is known,
-            // not only when a *foreign* TUN was detected.  The daemon's own
-            // TUN is intentionally excluded from the diagnostic capture flag,
-            // but it must still never become the egress for its public control,
-            // STUN, or peer traffic.
-            let outbound_interface = direct_socket_interface_for_bind(
-                &environment,
-                udp_bind,
-                fresh_mapping_harness_loopback,
-            )
-            .map_err(DaemonError::Network)?;
-            if fresh_mapping_harness_loopback && udp_bind.ip().is_loopback() {
-                info!(
-                    bind = %udp_bind,
-                    "Using loopback routing for the explicit NAT simulator harness"
-                );
-            } else if let Some(interface) = outbound_interface.as_deref() {
-                info!(
-                    interface,
-                    capture_interface = ?environment.capture_iface,
-                    "Binding direct UDP sockets to the physical route interface"
-                );
+    run_udp_direct_task_with_binder_and_route_sampler(
+        ctx,
+        move |udp_bind, peers| {
+            let excluded_interfaces = excluded_interfaces.clone();
+            async move {
+                let environment = tokio::task::spawn_blocking(move || {
+                    crate::netenv::direct_route_snapshot(&excluded_interfaces)
+                })
+                .await
+                .map_err(|error| {
+                    DaemonError::Network(format!("direct-route inspection task failed: {error}"))
+                })?;
+                // Pin every direct UDP socket whenever a physical route is known,
+                // not only when a *foreign* TUN was detected.  The daemon's own
+                // TUN is intentionally excluded from the diagnostic capture flag,
+                // but it must still never become the egress for its public control,
+                // STUN, or peer traffic.
+                let outbound_interface = direct_socket_interface_for_bind(
+                    &environment,
+                    udp_bind,
+                    fresh_mapping_harness_loopback,
+                )
+                .map_err(DaemonError::Network)?;
+                if fresh_mapping_harness_loopback && udp_bind.ip().is_loopback() {
+                    info!(
+                        bind = %udp_bind,
+                        "Using loopback routing for the explicit NAT simulator harness"
+                    );
+                } else if let Some(interface) = outbound_interface.as_deref() {
+                    info!(
+                        interface,
+                        capture_interface = ?environment.capture_iface,
+                        "Binding direct UDP sockets to the physical route interface"
+                    );
+                }
+                let udp =
+                    UdpTransport::bind_to_interface(udp_bind, peers, outbound_interface).await?;
+                Ok(UdpDirectBinding {
+                    udp,
+                    route_signature: environment.signature,
+                })
             }
-            let udp = UdpTransport::bind_to_interface(udp_bind, peers, outbound_interface).await?;
-            Ok(UdpDirectBinding {
-                udp,
-                route_signature: environment.signature,
-            })
-        }
-    })
+        },
+        move || sample_udp_network_route(sampled_interfaces.clone()),
+    )
     .await
+}
+
+#[cfg(test)]
+async fn run_udp_direct_task_with_binder<F, Fut>(ctx: UdpDirectTaskContext, bind: F) -> Result<()>
+where
+    F: FnMut(SocketAddr, Arc<PeerManager>) -> Fut,
+    Fut: std::future::Future<Output = Result<UdpDirectBinding>>,
+{
+    // Existing socket/owner fixtures inject an empty route alongside their
+    // loopback binder. Route regressions inject their own controlled sampler.
+    run_udp_direct_task_with_binder_and_route_sampler(ctx, bind, || std::future::ready(Vec::new()))
+        .await
 }
 
 /// Supervise UDP binding for the daemon lifetime.  A socket bind or reader
 /// failure must unpublish its instance and retry; returning `Ok(())` would
 /// otherwise leave WireGuard inbound permanently disconnected from UDP.
-async fn run_udp_direct_task_with_binder<F, Fut>(
+async fn run_udp_direct_task_with_binder_and_route_sampler<F, Fut, S, Sample>(
     ctx: UdpDirectTaskContext,
     mut bind: F,
+    mut sample_route: S,
 ) -> Result<()>
 where
     F: FnMut(SocketAddr, Arc<PeerManager>) -> Fut,
     Fut: std::future::Future<Output = Result<UdpDirectBinding>>,
+    S: FnMut() -> Sample,
+    Sample: std::future::Future<Output = Vec<String>>,
 {
     // Each worker permit pool outlives individual UDP socket instances. A
     // rebind may begin while retired validation or peer-reflexive workers are
@@ -173,42 +200,59 @@ where
             }
         }
 
+        // A failed bind still needs its pre-attempt route baseline. Capturing
+        // it after failure could absorb the network that should wake retry.
+        let Some(retry_route_baseline) =
+            udp_direct_attempt_or_shutdown(ctx.shutdown_rx.clone(), sample_route()).await
+        else {
+            return Ok(());
+        };
         let mut instance_ctx = ctx.clone();
         let network_hint_before_instance = ctx
             .android_network_change_observed
             .load(std::sync::atomic::Ordering::Acquire);
-        if had_live_udp_instance {
-            let (resolved_stun, resolved_observers) = tokio::join!(
-                parse_stun_servers(&ctx.stun_server_specs, ctx.stun_timeout),
-                async {
-                    if ctx.udp_observer_specs.is_empty() {
-                        Ok(Vec::new())
-                    } else {
-                        parse_stun_servers(&ctx.udp_observer_specs, ctx.stun_timeout).await
-                    }
-                },
-            );
-            match (resolved_stun, resolved_observers) {
-                (Ok(mut stun), Ok(observers)) => {
-                    for observer in observers {
-                        if !stun.contains(&observer) {
-                            stun.push(observer);
+        // Discovery and bind belong to this same supervisor attempt. A stop
+        // must also retire an attempt still waiting on DNS, a mirror writer,
+        // or the platform binder before it publishes a socket.
+        let Some(binding) = udp_direct_attempt_or_shutdown(ctx.shutdown_rx.clone(), async {
+            if had_live_udp_instance {
+                let (resolved_stun, resolved_observers) = tokio::join!(
+                    parse_stun_servers(&ctx.stun_server_specs, ctx.stun_timeout),
+                    async {
+                        if ctx.udp_observer_specs.is_empty() {
+                            Ok(Vec::new())
+                        } else {
+                            parse_stun_servers(&ctx.udp_observer_specs, ctx.stun_timeout).await
                         }
+                    },
+                );
+                match (resolved_stun, resolved_observers) {
+                    (Ok(mut stun), Ok(observers)) => {
+                        for observer in observers {
+                            if !stun.contains(&observer) {
+                                stun.push(observer);
+                            }
+                        }
+                        instance_ctx.stun_servers = stun.clone();
+                        *ctx.runtime_stun_servers.write().await = stun;
+                        info!(
+                            count = instance_ctx.stun_servers.len(),
+                            "Re-resolved STUN/observer endpoints after UDP transport change"
+                        );
                     }
-                    instance_ctx.stun_servers = stun.clone();
-                    *ctx.runtime_stun_servers.write().await = stun;
-                    info!(
-                        count = instance_ctx.stun_servers.len(),
-                        "Re-resolved STUN/observer endpoints after UDP transport change"
-                    );
+                    (Err(error), _) | (_, Err(error)) => warn!(
+                        "Failed to re-resolve STUN/observer endpoints after network change; retaining the last resolved set: {error}"
+                    ),
                 }
-                (Err(error), _) | (_, Err(error)) => warn!(
-                    "Failed to re-resolve STUN/observer endpoints after network change; retaining the last resolved set: {error}"
-                ),
             }
-        }
+            bind(ctx.udp_bind, ctx.peers.clone()).await
+        })
+        .await
+        else {
+            return Ok(());
+        };
 
-        let (result, instance_runtime) = match bind(ctx.udp_bind, ctx.peers.clone()).await {
+        let (result, instance_runtime, route_changed) = match binding {
             Ok(mut binding) => {
                 if let Some(capture) = ctx.direct_validation_transport.resource_capture() {
                     if binding
@@ -245,29 +289,34 @@ where
                 }
                 had_live_udp_instance = true;
                 let instance_started_at = Instant::now();
+                let result = run_udp_direct_instance(
+                    instance_ctx,
+                    binding.udp,
+                    binding.route_signature,
+                    direct_validation_worker_permits.clone(),
+                    peer_reflexive_signal_worker_permits.clone(),
+                    &mut sample_route,
+                )
+                .await;
+                let route_changed = matches!(result, Ok(UdpDirectInstanceExit::RouteChanged));
                 (
-                    run_udp_direct_instance(
-                        instance_ctx,
-                        binding.udp,
-                        binding.route_signature,
-                        direct_validation_worker_permits.clone(),
-                        peer_reflexive_signal_worker_permits.clone(),
-                    )
-                    .await,
+                    result.map(|_| ()),
                     Some(instance_started_at.elapsed()),
+                    route_changed,
                 )
             }
-            Err(err) => (Err(err), None),
+            Err(err) => (Err(err), None, false),
         };
 
         if udp_direct_shutdown_requested(&ctx.shutdown_rx) {
             return Ok(());
         }
 
-        let network_hint_observed = ctx
-            .android_network_change_observed
-            .load(std::sync::atomic::Ordering::Acquire)
-            != network_hint_before_instance;
+        let network_hint_observed = route_changed
+            || ctx
+                .android_network_change_observed
+                .load(std::sync::atomic::Ordering::Acquire)
+                != network_hint_before_instance;
         if network_hint_observed {
             // A callback-authorized physical handoff already withdrew the
             // old publication. Rebind immediately; the normal exponential
@@ -305,6 +354,7 @@ where
             ctx.shutdown_rx.clone(),
             ctx.android_network_change_rx.clone(),
             retry_wait,
+            wait_for_network_route_change_with_sampler(retry_route_baseline, &mut sample_route),
         )
         .await
         {
@@ -315,6 +365,10 @@ where
                     &ctx.android_network_change_observed,
                     &hint,
                 );
+                retry_delay = udp_direct_retry_initial_delay();
+                continue;
+            }
+            Some(UdpDirectLifecycleSignal::RouteChanged) => {
                 retry_delay = udp_direct_retry_initial_delay();
                 continue;
             }
@@ -331,13 +385,18 @@ where
     }
 }
 
-async fn run_udp_direct_instance(
+async fn run_udp_direct_instance<S, Sample>(
     ctx: UdpDirectTaskContext,
     udp: UdpTransport,
     initial_route_signature: Vec<String>,
     direct_validation_worker_permits: Arc<tokio::sync::Semaphore>,
     peer_reflexive_signal_worker_permits: Arc<tokio::sync::Semaphore>,
-) -> Result<()> {
+    sample_route: &mut S,
+) -> Result<UdpDirectInstanceExit>
+where
+    S: FnMut() -> Sample,
+    Sample: std::future::Future<Output = Vec<String>>,
+{
     #[cfg(test)]
     let original_instance_for_test = ctx
         .original_owners_for_test
@@ -362,9 +421,9 @@ async fn run_udp_direct_instance(
         udp_inbound_tx,
         local_node_id,
         stun_servers,
-        stun_server_specs: _,
-        udp_observer_specs: _,
-        runtime_stun_servers: _,
+        stun_server_specs,
+        udp_observer_specs,
+        runtime_stun_servers,
         stun_timeout,
         udp_advertise,
         upnp_enabled,
@@ -376,7 +435,7 @@ async fn run_udp_direct_instance(
         udp_punch_attempts,
         boot_epoch_ms,
         proxy_env,
-        excluded_interfaces,
+        excluded_interfaces: _,
         shutdown_rx,
         android_network_change_rx,
         android_network_change_observed,
@@ -553,6 +612,7 @@ async fn run_udp_direct_instance(
             }
 
             let initial_refresh_guard = candidate_refresh_lock.lock().await;
+            let initial_endpoint_fence = EndpointPublicationFence::new(&udp, &peers);
             let mut advertised_nat_type = "unknown".to_string();
 
             let (mut candidate_endpoints, mut candidate_sources) = match udp
@@ -669,7 +729,7 @@ async fn run_udp_direct_instance(
                 "Prepared {} UDP candidate endpoints for signaling (initial_gather_complete=true)",
                 candidate_endpoints.len()
             );
-            publish_candidate_snapshot_to_store(
+            let initial_publication_version = publish_candidate_snapshot_to_store(
                 &candidate_snapshot,
                 candidate_endpoints.clone(),
                 candidate_sources.clone(),
@@ -748,7 +808,11 @@ async fn run_udp_direct_instance(
                 // transport startup.
                 match tokio::time::timeout(
                     Duration::from_millis(STARTUP_ENDPOINT_PUBLISH_BUDGET_MS),
-                    control.update_endpoint_for_handshake(endpoint, &advertised_nat_type),
+                    control.update_endpoint_for_handshake_fenced(
+                        endpoint,
+                        &advertised_nat_type,
+                        initial_endpoint_fence.clone(),
+                    ),
                 )
                 .await
                 {
@@ -761,7 +825,6 @@ async fn run_udp_direct_instance(
                     }
                 }
             }
-            let initial_publication_generation = peers.current_network_generation_sync();
             drop(initial_refresh_guard);
 
             // Candidate-only fan-out is background work.  Starting the UDP
@@ -775,7 +838,6 @@ async fn run_udp_direct_instance(
                 let punch_deduplicator = punch_deduplicator.clone();
                 let candidates = candidate_endpoints.clone();
                 let candidate_sources = candidate_sources.clone();
-                let publication_generation = initial_publication_generation;
                 let candidate_snapshot = candidate_snapshot.clone();
                 let stun_servers = stun_servers.clone();
                 let signal_control = control.clone();
@@ -787,7 +849,8 @@ async fn run_udp_direct_instance(
                         punch_deduplicator,
                         &candidates,
                         &candidate_sources,
-                        publication_generation,
+                        initial_publication_version,
+                        initial_endpoint_fence,
                         udp_punch_interval,
                         udp_punch_attempts,
                         "initial UDP candidates ready",
@@ -804,9 +867,6 @@ async fn run_udp_direct_instance(
             };
             initial_publication_worker = Some(tokio::spawn(initial_publication_task));
 
-            // Keep the route captured with the bind, even if it changed during
-            // STUN or candidate preparation. The first two changed samples must
-            // rebuild this socket rather than adopt that newer route as baseline.
             if keepalive_interval.is_zero() {
                 let refresh_udp = udp.clone();
                 tokio::select! {
@@ -819,6 +879,10 @@ async fn run_udp_direct_instance(
                     _ = run_udp_candidate_refresh(UdpCandidateRefreshContext {
                         udp: refresh_udp,
                         stun_servers,
+                        stun_server_specs,
+                        udp_observer_specs,
+                        runtime_stun_servers,
+                        udp_transport_publication: udp_transport_publication.clone(),
                         stun_timeout,
                         udp_advertise,
                         upnp_enabled,
@@ -839,9 +903,6 @@ async fn run_udp_direct_instance(
                         punch_attempts: udp_punch_attempts,
                         boot_epoch_ms,
                     }) => Ok(()),
-                    changed = wait_for_network_route_change(initial_route_signature, excluded_interfaces.clone()) => {
-                        Err(DaemonError::Network(format!("network route changed; rebuilding direct UDP transport: {changed:?}")))
-                    },
                 }
             } else {
                 let keepalive_udp = udp.clone();
@@ -857,6 +918,10 @@ async fn run_udp_direct_instance(
                     _ = run_udp_candidate_refresh(UdpCandidateRefreshContext {
                         udp: refresh_udp,
                         stun_servers,
+                        stun_server_specs,
+                        udp_observer_specs,
+                        runtime_stun_servers,
+                        udp_transport_publication: udp_transport_publication.clone(),
                         stun_timeout,
                         udp_advertise,
                         upnp_enabled,
@@ -877,9 +942,6 @@ async fn run_udp_direct_instance(
                         punch_attempts: udp_punch_attempts,
                         boot_epoch_ms,
                     }) => Ok(()),
-                    changed = wait_for_network_route_change(initial_route_signature, excluded_interfaces.clone()) => {
-                        Err(DaemonError::Network(format!("network route changed; rebuilding direct UDP transport: {changed:?}")))
-                    },
                 }
             }
         };
@@ -888,13 +950,20 @@ async fn run_udp_direct_instance(
             lifecycle = wait_for_udp_direct_lifecycle(
                 shutdown_rx.clone(), lease.shutdown_receiver(), android_network_change_rx.clone(),
             ) => match lifecycle {
-                UdpDirectLifecycleSignal::Stop => Ok(()),
+                UdpDirectLifecycleSignal::Stop => Ok(UdpDirectInstanceExit::Stopped),
                 UdpDirectLifecycleSignal::NetworkChanged(hint) => {
                     record_android_network_change(&peers, &android_network_change_observed, &hint);
                     Err(DaemonError::Network("Android physical network changed; rebuilding direct UDP transport".into()))
-                }
+                },
+                UdpDirectLifecycleSignal::RouteChanged => Ok(UdpDirectInstanceExit::RouteChanged),
             },
-            result = work => result,
+            // Start observing the bind-time route before STUN and candidate
+            // preparation. The same owner-scoped cleanup handles either input.
+            _ = wait_for_network_route_change_with_sampler(initial_route_signature, sample_route) => {
+                info!(event = "udp_network_route_changed", "Stable network route changed; rebuilding direct UDP transport");
+                Ok(UdpDirectInstanceExit::RouteChanged)
+            },
+            result = work => result.map(|()| UdpDirectInstanceExit::Stopped),
         }
     };
     if let Some(worker) = initial_publication_worker {
@@ -985,19 +1054,20 @@ async fn run_udp_direct_instance(
 /// Route commands can transiently return an empty/partial view during DHCP;
 /// the two-sample confirmation avoids tearing down a healthy transport for a
 /// single incomplete read while still rebuilding within a few seconds.
-async fn wait_for_network_route_change(
-    baseline: Vec<String>,
-    excluded_interfaces: Vec<String>,
-) -> Vec<String> {
-    wait_for_network_route_change_with_sampler(baseline, move || {
-        let excluded = excluded_interfaces.clone();
-        async move {
-            tokio::task::spawn_blocking(move || crate::netenv::network_route_signature(&excluded))
-                .await
-                .unwrap_or_default()
-        }
+async fn sample_udp_network_route(excluded_interfaces: Vec<String>) -> Vec<String> {
+    tokio::task::spawn_blocking(move || {
+        crate::netenv::network_route_signature(&excluded_interfaces)
     })
     .await
+    .unwrap_or_default()
+}
+
+fn udp_route_poll_interval() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_secs(1)
+    }
 }
 
 async fn wait_for_network_route_change_with_sampler<F, Fut>(
@@ -1008,7 +1078,8 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Vec<String>>,
 {
-    let mut ticker = interval(Duration::from_secs(1));
+    let mut ticker = interval(udp_route_poll_interval());
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await;
     let mut confirmation = RouteChangeConfirmation::new(baseline);
     loop {
@@ -1037,10 +1108,6 @@ impl RouteChangeConfirmation {
     fn observe(&mut self, current: Vec<String>) -> Option<Vec<String>> {
         if current.is_empty() {
             self.pending_change = None;
-            return None;
-        }
-        if self.baseline.is_empty() {
-            self.baseline = current;
             return None;
         }
         if current == self.baseline {
@@ -1118,10 +1185,22 @@ async fn wait_for_udp_direct_shutdown(mut shutdown_rx: tokio::sync::watch::Recei
     }
 }
 
+async fn udp_direct_attempt_or_shutdown<T>(
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    attempt: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = wait_for_udp_direct_shutdown(shutdown_rx) => None,
+        result = attempt => Some(result),
+    }
+}
+
 async fn wait_for_udp_direct_retry_or_change(
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     network_change_rx: Option<AndroidNetworkChangeReceiver>,
     retry_delay: Duration,
+    route_change: impl std::future::Future<Output = Vec<String>>,
 ) -> Option<UdpDirectLifecycleSignal> {
     // A newly available Android network must wake a failed bind immediately,
     // even when the previous unavailable network exhausted the retry backoff.
@@ -1138,6 +1217,7 @@ async fn wait_for_udp_direct_retry_or_change(
             Some(hint) => UdpDirectLifecycleSignal::NetworkChanged(hint),
             None => UdpDirectLifecycleSignal::Stop,
         }),
+        _ = route_change => Some(UdpDirectLifecycleSignal::RouteChanged),
         _ = sleep(retry_delay) => None,
     }
 }
@@ -1680,6 +1760,7 @@ mod udp_direct_tests {
     use super::*;
 
     include!("udp_direct_handover_tests.rs");
+    include!("udp_direct_route_tests.rs");
 
     #[test]
     fn nat_harness_loopback_does_not_pin_to_physical_interface() {

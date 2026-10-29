@@ -374,6 +374,7 @@ fn peer_reflexive_work_is_newest_wins_and_owner_scoped() {
         PendingPeerReflexive {
             from_node_id: peer_id.to_string(),
             observed_endpoint: endpoint.to_string(),
+            endpoint_fence: None,
             punch_at_ms: None,
             peer_session_generation: None,
             delivery_receipt: None,

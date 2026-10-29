@@ -30,7 +30,19 @@ async fn advertise_fresh_mapping_prediction(
     result: &FreshMappingResult,
     cancellation: &Arc<crate::PunchSessionCancellation>,
 ) -> bool {
-    if cancellation.is_cancelled() {
+    advertise_fresh_mapping_prediction_fenced(signal, peers, peer_id, result, cancellation, None)
+        .await
+}
+
+async fn advertise_fresh_mapping_prediction_fenced(
+    signal: &HolePunchSignalContext,
+    peers: &Arc<PeerManager>,
+    peer_id: &str,
+    result: &FreshMappingResult,
+    cancellation: &Arc<crate::PunchSessionCancellation>,
+    publication_fence: Option<Arc<crate::control::CandidatePublicationFence>>,
+) -> bool {
+    if !fresh_prediction_publication_is_current(cancellation, publication_fence.as_deref()) {
         peers
             .record_direct_event(
                 peer_id,
@@ -55,7 +67,7 @@ async fn advertise_fresh_mapping_prediction(
     );
 
     let punch_at_ms = Some(relay_assisted_punch_at_ms());
-    if cancellation.is_cancelled() {
+    if !fresh_prediction_publication_is_current(cancellation, publication_fence.as_deref()) {
         peers
             .record_direct_event(
                 peer_id,
@@ -89,18 +101,33 @@ async fn advertise_fresh_mapping_prediction(
     // means delivery is not authoritative: the server may already have
     // accepted a request whose local response future was dropped, so the
     // caller must roll back instead of finalizing the socket.
-    match signal
-        .control
-        .send_fresh_peer_offer_with_sources_and_punch_at(
-            peer_id,
-            &candidates,
-            &candidate_sources,
-            &[],
-            punch_at_ms,
-            cancellation.clone(),
-        )
-        .await
-    {
+    let sent = if publication_fence.is_some() {
+        signal
+            .control
+            .send_fresh_peer_offer_with_sources_and_punch_at_fenced(
+                peer_id,
+                &candidates,
+                &candidate_sources,
+                &[],
+                punch_at_ms,
+                cancellation.clone(),
+                publication_fence.clone(),
+            )
+            .await
+    } else {
+        signal
+            .control
+            .send_fresh_peer_offer_with_sources_and_punch_at(
+                peer_id,
+                &candidates,
+                &candidate_sources,
+                &[],
+                punch_at_ms,
+                cancellation.clone(),
+            )
+            .await
+    };
+    match sent {
         Ok(()) => {}
         Err(PeerOfferSendFailure::Cancelled) => {
             peers
@@ -127,7 +154,7 @@ async fn advertise_fresh_mapping_prediction(
     // ownership may have been revoked while the request was in flight: only a
     // still-valid ownership lets the caller finalize the socket, otherwise
     // the watcher restores the predecessor.
-    if cancellation.is_cancelled() {
+    if !fresh_prediction_publication_is_current(cancellation, publication_fence.as_deref()) {
         peers
             .record_direct_event(
                 peer_id,
@@ -204,7 +231,15 @@ async fn advertise_fresh_mapping_prediction(
             ),
         )
         .await;
-    true
+    fresh_prediction_publication_is_current(cancellation, publication_fence.as_deref())
+}
+
+fn fresh_prediction_publication_is_current(
+    cancellation: &crate::PunchSessionCancellation,
+    publication_fence: Option<&crate::control::CandidatePublicationFence>,
+) -> bool {
+    !cancellation.is_cancelled()
+        && publication_fence.is_none_or(|fence| fence.lifecycle_is_current())
 }
 
 /// Build the signal payload carrying the fresh-mapping prediction window.

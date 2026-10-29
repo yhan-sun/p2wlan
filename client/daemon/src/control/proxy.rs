@@ -133,8 +133,7 @@ struct ControlRouteBinding {
 }
 
 fn control_route_binding(mode: ControlProxyMode, server_url: Option<&str>) -> ControlRouteBinding {
-    let route_aware = mode == ControlProxyMode::Direct
-        && server_url.is_some_and(|url| !control_server_is_local(url));
+    let route_aware = server_url.is_some_and(|url| !control_server_is_local(url));
     if !route_aware {
         return ControlRouteBinding {
             signature: Vec::new(),
@@ -143,11 +142,22 @@ fn control_route_binding(mode: ControlProxyMode, server_url: Option<&str>) -> Co
         };
     }
 
-    let routes = crate::netenv::direct_route_snapshot(&[]);
+    control_route_binding_from_snapshot(mode, crate::netenv::direct_route_snapshot(&[]))
+}
+
+fn control_route_binding_from_snapshot(
+    mode: ControlProxyMode,
+    routes: crate::netenv::DirectRouteSnapshot,
+) -> ControlRouteBinding {
+    // Observation follows the physical network in both modes. Only Direct
+    // owns interface pinning; Environment must retain proxy/NO_PROXY routing.
+    let direct = mode == ControlProxyMode::Direct;
     ControlRouteBinding {
         signature: routes.signature,
-        outbound_interface: routes.physical_route_interface.clone(),
-        fail_closed: routes.tun_capture && routes.physical_route_interface.is_none(),
+        outbound_interface: direct
+            .then_some(routes.physical_route_interface.clone())
+            .flatten(),
+        fail_closed: direct && routes.tun_capture && routes.physical_route_interface.is_none(),
     }
 }
 
@@ -332,8 +342,36 @@ pub(super) fn route_aware_control_http_clients(
     timing: Option<Arc<ServerClockEstimate>>,
     route_changes: Option<super::network_change::ControlRouteChangeNotifier>,
 ) -> (RouteAwareControlHttpClient, RouteAwareControlHttpClient) {
-    let route_aware = mode == ControlProxyMode::Direct && !control_server_is_local(server_url);
     let initial_binding = control_route_binding(mode, Some(server_url));
+    let inspection_url = server_url.to_string();
+    route_aware_control_http_clients_with_inspector(
+        mode,
+        server_url,
+        timing,
+        route_changes,
+        initial_binding,
+        move || {
+            let inspection_url = inspection_url.clone();
+            tokio::task::spawn_blocking(move || control_route_binding(mode, Some(&inspection_url)))
+        },
+    )
+}
+
+fn route_aware_control_http_clients_with_inspector<F, Fut>(
+    mode: ControlProxyMode,
+    server_url: &str,
+    timing: Option<Arc<ServerClockEstimate>>,
+    route_changes: Option<super::network_change::ControlRouteChangeNotifier>,
+    initial_binding: ControlRouteBinding,
+    mut inspect: F,
+) -> (RouteAwareControlHttpClient, RouteAwareControlHttpClient)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<
+            Output = std::result::Result<ControlRouteBinding, tokio::task::JoinError>,
+        > + Send,
+{
+    let route_aware = !control_server_is_local(server_url);
     let initial_state = build_control_http_pools(mode, server_url, initial_binding.clone());
     if let Some(clock) = &timing {
         clock.activate_http_pool(initial_state.pool_id);
@@ -379,12 +417,7 @@ pub(super) fn route_aware_control_http_clients(
                 if state_tx.is_closed() {
                     return;
                 }
-                let inspection_url = server_url.clone();
-                let observed = match tokio::task::spawn_blocking(move || {
-                    control_route_binding(mode, Some(&inspection_url))
-                })
-                .await
-                {
+                let observed = match inspect().await {
                     Ok(binding) if forced || !binding.signature.is_empty() => binding,
                     Ok(_) => {
                         pending = None;
@@ -508,6 +541,8 @@ mod proxy_tests {
     /// never mutate HTTP_PROXY concurrently (their requests would observe each
     /// other's proxy address).
     static PROXY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    include!("tests/proxy_network_change.rs");
 
     #[test]
     fn behavior_labels_are_stable() {

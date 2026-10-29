@@ -1258,38 +1258,55 @@ impl Daemon {
         &self,
         work: &PendingPeerReflexive,
         cancellation: &mut watch::Receiver<bool>,
-    ) {
+    ) -> control::SignalApplyOutcome {
         if *cancellation.borrow() {
-            return;
+            return control::SignalApplyOutcome::Retry;
+        }
+        if work.observed_endpoint.parse::<SocketAddr>().is_err() {
+            // Invalid payloads cannot become valid after local contention or
+            // network recovery; release them permanently rather than retrying.
+            return control::SignalApplyOutcome::TerminalRejected;
         }
         let peer_id = &work.from_node_id;
         let already_direct_at_arrival = self.peers.should_defer_relay_assisted_punch(peer_id).await;
-        let local_candidate_changed = tokio::select! {
+        let committed = tokio::select! {
             changed = cancellation.changed() => {
                 if changed.is_err() || *cancellation.borrow() {
-                    return;
+                    return control::SignalApplyOutcome::Retry;
                 }
-                return;
+                return control::SignalApplyOutcome::Retry;
             }
-            changed = self.add_local_peer_reflexive_candidate(&work.observed_endpoint) => changed,
+            changed = self.add_local_peer_reflexive_candidate(work) => changed,
         };
+        let Some((local_candidate_changed, selected)) = committed else {
+            return if work
+                .endpoint_fence
+                .as_ref()
+                .is_some_and(EndpointPublicationFence::is_current)
+            {
+                control::SignalApplyOutcome::Retry
+            } else {
+                control::SignalApplyOutcome::TerminalRejected
+            };
+        };
+        let Some(peer_session) = work.peer_session_generation else {
+            return control::SignalApplyOutcome::TerminalRejected;
+        };
+        let publication_fence = selected.publication_fence(self, peer_id, peer_session);
         if let Ok(observed_addr) = work.observed_endpoint.parse::<SocketAddr>() {
             self.peers
-                .record_fresh_mapping_prediction_result(peer_id, observed_addr)
+                .record_fresh_mapping_prediction_result_fenced(
+                    peer_id,
+                    observed_addr,
+                    Some(&publication_fence),
+                )
                 .await;
         }
         let punch_at_ms = work
             .punch_at_ms
             .or_else(|| Some(relay_assisted_punch_at_ms()));
-        let (candidates, candidate_sources) = tokio::select! {
-            changed = cancellation.changed() => {
-                if changed.is_err() || *cancellation.borrow() {
-                    return;
-                }
-                return;
-            }
-            candidates = self.current_local_candidate_set() => candidates,
-        };
+        let candidates = selected.candidates;
+        let candidate_sources = selected.sources;
         let selected_remote_endpoint = self
             .peers
             .selected_direct_endpoint_for_consent(peer_id)
@@ -1315,8 +1332,8 @@ impl Daemon {
                 ),
             )
             .await;
-        if already_direct || *cancellation.borrow() {
-            return;
+        if already_direct || *cancellation.borrow() || !publication_fence.is_current().await {
+            return control::SignalApplyOutcome::Applied;
         }
         // The peer-reflexive signal carries the observer's relay-normalized
         // rendezvous deadline.  Join it with a tiny trusted remote-target
@@ -1329,7 +1346,7 @@ impl Daemon {
             let udp = self.udp_transport.read().await.clone();
             let targets = self.peers.direct_probe_target_set_for(peer_id).await;
             if let (Some(udp), Some(targets)) = (udp, targets) {
-                spawn_peer_reflexive_micro_window(
+                spawn_peer_reflexive_micro_window_fenced(
                     udp,
                     self.peers.clone(),
                     self.punch_attempts.clone(),
@@ -1337,6 +1354,7 @@ impl Daemon {
                     targets.candidates,
                     Some(shared_punch_at_ms),
                     "peer_reflexive_receiver",
+                    Some(publication_fence.clone()),
                 )
                 .await;
             } else {
@@ -1356,17 +1374,18 @@ impl Daemon {
             let send_result = tokio::select! {
                 changed = cancellation.changed() => {
                     if changed.is_err() || *cancellation.borrow() {
-                        return;
+                        return control::SignalApplyOutcome::Retry;
                     }
-                    return;
+                    return control::SignalApplyOutcome::Retry;
                 }
-                result = self.control.send_peer_offer_with_sources_and_punch_at(
+                result = self.control.send_peer_offer_with_sources_and_punch_at_fenced(
                     peer_id,
                     &candidates,
                     &candidate_sources,
                     &[],
                     punch_at_ms,
                     None,
+                    Some(publication_fence.clone()),
                 ) => result,
             };
             if let Err(err) = send_result {
@@ -1396,8 +1415,29 @@ impl Daemon {
                 .await;
         }
         if !*cancellation.borrow() && !self.peers.should_defer_relay_assisted_punch(peer_id).await {
-            self.start_hole_punch_at(peer_id, punch_at_ms, None, None)
+            if let Some(udp) = self.udp_transport.read().await.clone() {
+                let attempts = self
+                    .peers
+                    .recommended_punch_attempts(self.config.network.punch_attempts)
+                    .await;
+                let signal = self.hole_punch_signal_context().await;
+                spawn_hole_punch_task_with_lifecycle(
+                    udp,
+                    self.peers.clone(),
+                    self.punch_attempts.clone(),
+                    peer_id.to_string(),
+                    Duration::from_millis(self.config.network.punch_interval_ms),
+                    attempts,
+                    punch_at_ms,
+                    signal,
+                    None,
+                    None,
+                    Some(cancellation.clone()),
+                    Some(publication_fence),
+                )
                 .await;
+            }
         }
+        control::SignalApplyOutcome::Applied
     }
 }

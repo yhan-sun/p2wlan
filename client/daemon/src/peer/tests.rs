@@ -85,3 +85,5 @@ mod traffic_counters;
 
 #[path = "tests/relay_first_log_release.rs"]
 mod relay_first_log_release;
+
+include!("tests/publication_learning.rs");
