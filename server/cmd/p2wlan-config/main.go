@@ -34,6 +34,7 @@ type options struct {
 
 func main() {
 	var o options
+	printKeyring := flag.Bool("print-relay-keyring", false, "Print only the public keyring from existing RELAY_TICKET_SIGNER_* environment configuration; do not generate or change keys")
 	flag.StringVar(&o.output, "output", "", "New private configuration directory (must not exist)")
 	flag.StringVar(&o.mode, "mode", "native", "native or docker")
 	flag.StringVar(&o.endpoint, "relay-endpoint", "tls://localhost:18081", "Public TLS relay endpoint, not a container service name")
@@ -43,6 +44,23 @@ func main() {
 	flag.IntVar(&o.controlPort, "control-port", 18080, "Control port")
 	flag.IntVar(&o.metricsPort, "metrics-port", 18082, "Loopback relay readiness port")
 	flag.Parse()
+	if *printKeyring {
+		generationOption := false
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name != "print-relay-keyring" {
+				generationOption = true
+			}
+		})
+		if generationOption || flag.NArg() != 0 {
+			fmt.Fprintln(os.Stderr, "p2wlan-config: --print-relay-keyring cannot be combined with generation options or arguments")
+			os.Exit(1)
+		}
+		if err := printRelayKeyring(os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "p2wlan-config:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := generate(o); err != nil {
 		fmt.Fprintln(os.Stderr, "p2wlan-config:", err)
 		os.Exit(1)

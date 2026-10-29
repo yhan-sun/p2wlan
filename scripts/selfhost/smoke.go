@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -77,6 +78,68 @@ func loadEnv(path string) ([]string, error) {
 	}
 	return env, nil
 }
+
+func exportedRelayEnvironment(configBinary, cfg string) ([]string, error) {
+	controlEnv, err := loadEnv(filepath.Join(cfg, "control.env"))
+	if err != nil {
+		return nil, err
+	}
+	relayEnv, err := loadEnv(filepath.Join(cfg, "relay.env"))
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(configBinary, "--print-relay-keyring")
+	cmd.Env = controlEnv
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("public relay keyring export failed: %w", err)
+	}
+	var exported map[string]string
+	if err := json.Unmarshal(output, &exported); err != nil || len(exported) == 0 {
+		return nil, errors.New("public relay keyring export is not a nonempty JSON object")
+	}
+	keyringIndex := -1
+	for i, entry := range relayEnv {
+		name, value, _ := strings.Cut(entry, "=")
+		if name != "RELAY_TICKET_KEYRING_JSON" {
+			continue
+		}
+		var expected map[string]string
+		if err := json.Unmarshal([]byte(value), &expected); err != nil || !maps.Equal(exported, expected) {
+			return nil, errors.New("exported public keyring differs from generated relay verification keys")
+		}
+		keyringIndex = i
+	}
+	if keyringIndex < 0 {
+		return nil, errors.New("generated relay environment has no verification keyring")
+	}
+
+	// Exercise CLI dispatch as well as the helper: rejected export requests must
+	// neither write partial public output nor enter configuration generation.
+	rejectedDir := filepath.Join(cfg, "must-not-be-generated")
+	for _, probe := range []struct {
+		name string
+		args []string
+		env  []string
+	}{
+		{"missing signer", []string{"--print-relay-keyring"}, relayEnv},
+		{"mixed generation options", []string{"--print-relay-keyring", "--output", rejectedDir, "--dev-localhost"}, controlEnv},
+	} {
+		cmd := exec.Command(configBinary, probe.args...)
+		cmd.Env = probe.env
+		printed, err := cmd.Output()
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || len(printed) != 0 {
+			return nil, fmt.Errorf("keyring export did not safely reject %s", probe.name)
+		}
+	}
+	if _, err := os.Stat(rejectedDir); !os.IsNotExist(err) {
+		return nil, errors.New("rejected keyring export created configuration files")
+	}
+	relayEnv[keyringIndex] = "RELAY_TICKET_KEYRING_JSON=" + strings.TrimSpace(string(output))
+	return relayEnv, nil
+}
+
 func text(m map[string]any, key string) string { s, _ := m[key].(string); return s }
 func freePort(host string) (int, error) {
 	l, e := net.Listen("tcp", net.JoinHostPort(host, "0"))
@@ -194,10 +257,18 @@ func run(binDir, relayHost string) error {
 	if output, e := cmd.CombinedOutput(); e != nil {
 		return fmt.Errorf("configuration bootstrap failed: %s: %w", output, e)
 	}
+	relayEnv, err := exportedRelayEnvironment(binaryPath("config"), cfg)
+	if err != nil {
+		return err
+	}
+	fmt.Println("PASS: public keyring export matches Control signer and rejects unsafe CLI combinations")
 	for _, role := range []string{"control", "relay"} {
 		env, e := loadEnv(filepath.Join(cfg, role+".env"))
 		if e != nil {
 			return e
+		}
+		if role == "relay" {
+			env = relayEnv
 		}
 		log, e := os.Create(filepath.Join(dir, role+".log"))
 		if e != nil {

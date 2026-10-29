@@ -88,8 +88,10 @@ install -m 0755 "$manager_source" "$manager_path"
 P2WLAN_SERVER_ROOT="$INSTALL_ROOT" P2WLAN_SERVER_CONFIG="$CONFIG_DIR" P2WLAN_SERVER_DATA="$DATA_DIR" \
   "$manager_path" init --role "$ROLE"
 P2WLAN_SERVER_ROOT="$INSTALL_ROOT" P2WLAN_SERVER_CONFIG="$CONFIG_DIR" P2WLAN_SERVER_DATA="$DATA_DIR" \
-  "$manager_path" update --archive "$ARCHIVE"
-echo "P2WLAN server installed."
+  "$manager_path" update --archive "$ARCHIVE" --service "$ROLE"
+echo "P2WLAN server installed. New and stopped services remain stopped."
 echo "Admin console credential is stored in $CONFIG_DIR/control.env; do not print or share it."
-echo "Configure trusted HTTPS/WSS and Relay TLS before enabling public traffic."
+echo "Complete matching Control/Relay ticket keys, audience/region, advertised endpoint and trusted TLS before first start."
+echo "Configuration generator: $INSTALL_ROOT/current/p2wlan-config --help; see docs/guides/self-hosting.md."
+echo "Then run: sudo p2wlan-server start --service $ROLE"
 echo "Then run: sudo p2wlan-server doctor --service $ROLE"

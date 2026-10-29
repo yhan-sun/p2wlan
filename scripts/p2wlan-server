@@ -30,6 +30,8 @@ Usage:
 
 Updates preserve existing configuration and data. A missing log upload path
 is filled with the private managed data directory; custom paths are preserved.
+Updates restart active services only; initial installs remain stopped until
+their configuration is complete and an explicit start is requested.
 Set P2WLAN_SERVER_ROOT, P2WLAN_SERVER_CONFIG, or P2WLAN_SERVER_DATA to use
 an isolated staging installation.
 EOF
@@ -54,6 +56,19 @@ restart_services() {
   while IFS= read -r unit; do
     if systemctl cat "$unit" >/dev/null 2>&1; then
       systemctl restart "$unit"
+    fi
+  done < <(service_list "$selected")
+}
+
+restart_active_services() {
+  local selected=${1:-all}
+  if ! systemd_available; then return 0; fi
+  systemctl daemon-reload
+  while IFS= read -r unit; do
+    if systemctl cat "$unit" >/dev/null 2>&1; then
+      # systemd checks activity at the operation boundary. A new installation
+      # or a service deliberately stopped by its operator must remain stopped.
+      systemctl try-restart "$unit"
     fi
   done < <(service_list "$selected")
 }
@@ -97,6 +112,57 @@ env_value() {
   local key=$2
   [ -f "$file" ] || return 0
   awk -F= -v key="$key" '$1 == key { value=$0; sub(/^[^=]*=/, "", value); print value; exit }' "$file"
+}
+
+env_last_value() {
+  local file=$1 key=$2
+  [ -f "$file" ] || return 0
+  # EnvironmentFile keeps the last assignment. This presence-only reader does
+  # not evaluate shell syntax or attempt to validate the configured value.
+  awk -F= -v key="$key" '
+    { name=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", name) }
+    name == key { value=$0; sub(/^[^=]*=/, "", value); found=1 }
+    END { if (found) print value }
+  ' "$file"
+}
+
+relay_start_preflight() {
+  local selected=${1:-all}
+  case "$selected" in control) return 0 ;; relay|all) ;; *) die "service must be control, relay, or all" ;; esac
+  systemd_available || return 0
+  systemctl cat p2wlan-relay.service >/dev/null 2>&1 || return 0
+  local file="$CONFIG_DIR/relay.env" key value auth plaintext
+  local -a required=() missing=()
+  auth=$(env_last_value "$file" RELAY_REQUIRE_AUTH)
+  plaintext=$(env_last_value "$file" RELAY_ALLOW_INSECURE_PLAINTEXT)
+  # Only recognize simple scalar booleans here. The Relay binary remains the
+  # authority for parsing, authentication, matching keys, and TLS validation.
+  auth=${auth//[[:space:]\"\']/}
+  plaintext=${plaintext//[[:space:]\"\']/}
+  case "$auth" in
+    0|f|F|false|False|FALSE) ;;
+    *) required+=(RELAY_TICKET_KEYRING_JSON RELAY_AUDIENCE RELAY_REGION) ;;
+  esac
+  case "$plaintext" in
+    1|t|T|true|True|TRUE) ;;
+    *) required+=(RELAY_TLS_CERT RELAY_TLS_KEY) ;;
+  esac
+  value=$(env_last_value "$file" RELAY_REVOCATION_FEED_URL)
+  value=${value//[[:space:]]/}
+  case "$value" in
+    ''|'""'|"''") ;;
+    *) required+=(RELAY_REVOCATION_FEED_TOKEN) ;;
+  esac
+  if [ "${#required[@]}" -gt 0 ]; then
+    for key in "${required[@]}"; do
+      value=$(env_last_value "$file" "$key")
+      value=${value//[[:space:]]/}
+      case "$value" in ''|'""'|"''") missing+=("$key") ;; esac
+    done
+  fi
+  if [ "${#missing[@]}" -gt 0 ]; then
+    die "Relay configuration is incomplete in $file (missing: ${missing[*]}). Configure matching Control/Relay ticket keys, audience/region and TLS using p2wlan-config; see docs/guides/self-hosting.md. Existing credentials were not changed."
+  fi
 }
 
 # Keep this narrow filesystem transaction embedded in the released manager:
@@ -1034,6 +1100,7 @@ case "$cmd" in
       case "$1" in --service) selected=${2:?missing service}; shift 2 ;; *) die "unknown start option: $1" ;; esac
     done
     need_root
+    relay_start_preflight "$selected"
     start_services "$selected"
     echo "started service=$selected"
     ;;
@@ -1052,6 +1119,7 @@ case "$cmd" in
       case "$1" in --service) selected=${2:?missing service}; shift 2 ;; *) die "unknown restart option: $1" ;; esac
     done
     need_root
+    relay_start_preflight "$selected"
     restart_services "$selected"
     echo "restarted service=$selected"
     ;;
@@ -1092,7 +1160,7 @@ case "$cmd" in
     else
       die "update requires --archive FILE or --version server-vX.Y.Z"
     fi
-    restart_services "${selected:-all}"
+    restart_active_services "${selected:-all}"
     ;;
   backup) backup_server "$@" ;;
   restore) restore_server "$@" ;;

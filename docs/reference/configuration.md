@@ -10,7 +10,8 @@
 | CONTROL_ADMIN_TOKEN | 管理控制台凭据；`p2wlan-config` 默认生成独立 256-bit 随机值。为空时 `/admin` 与 `/admin/*` 返回 404；手工配置时至少 32 个字符，只用于 `/admin/api/v1/*` 的 Bearer 认证，不能复用 JWT_SECRET 或 Relay 凭据。 |
 | LOG_UPLOAD_DIR | 支持日志保存目录。托管部署显式配置为服务账户可写的绝对持久路径；默认受管理目录为数据目录下的 `log-uploads`，权限 `0700`。升级保留非空自定义值。 |
 | RELAY_CATALOG_JSON | 每项包含唯一 region、audience 和客户端可访问的 tls:// endpoint。 |
-| RELAY_TICKET_SIGNER_KEY_FILE / RELAY_TICKET_SIGNER_KID | 签票私钥和 key id，必须成对配置。 |
+| RELAY_TICKET_SIGNER_KEY_FILE / RELAY_TICKET_SIGNER_KID | Control 的 Ed25519 PKCS#8 PEM 签票私钥文件和 key id，必须成对配置；私钥不分发给 Relay。 |
+| RELAY_TICKET_SIGNER_JSON | 内联签名配置；生成器使用 `{"active":{"kid":"…","private_key":"…"}}`，其中私钥值为十六进制 seed。与文件方式选择一种；此值按私钥保护。 |
 | RELAY_TICKET_TTL | Relay ticket 的短期有效期，不是账号 token 的有效期。 |
 | RELAY_REVOCATION_FEED_TOKEN | Control 与 Relay 之间独立的撤权凭据。 |
 
@@ -26,7 +27,7 @@ Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemet
 | --- | --- |
 | RELAY_BIND | Relay TLS 数据入口。 |
 | RELAY_TLS_CERT / RELAY_TLS_KEY | 匹配的完整证书链和私钥。 |
-| RELAY_TICKET_KEYRING_JSON | key id 到 32 字节公钥的映射。 |
+| RELAY_TICKET_KEYRING_JSON | 非空 JSON 对象，形如 `{"key-id":"<64 位十六进制 Ed25519 公钥>"}`；key id 和公钥必须对应 Control 的签名配置，不填写私钥、JWT_SECRET 或 TLS 证书。 |
 | RELAY_AUDIENCE / RELAY_REGION | 必须与 Control catalog 的一项完全匹配。 |
 | RELAY_REVOCATION_FEED_URL | 分机部署使用 HTTPS；同机可用受保护的 loopback 路径。 |
 | RELAY_REVOCATION_FEED_TOKEN | 必须与 Control 完全相同，但不能复用 JWT_SECRET。 |
@@ -36,6 +37,8 @@ Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemet
 | RELAY_ALLOW_INSECURE_PLAINTEXT | 生产禁止。 |
 
 配置生成器会检查目录、证书、签票关系和随机秘密。正式启动还必须拒绝占位符、弱默认值和缺失证书。
+
+`p2wlan-config --print-relay-keyring` 读取现有 `RELAY_TICKET_SIGNER_*` 环境配置，输出对应的公钥 JSON，不生成或替换密钥。全新同机安装和已有配置恢复步骤见[自托管指南](../guides/self-hosting.md#relay-配置缺失时恢复)。Relay 配置缺失时须补齐配置，保持认证与 TLS 启用。
 
 ## 客户端资源观测
 

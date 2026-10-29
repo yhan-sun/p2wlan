@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from test_support_log_storage import SupportLogStorageTests
+from test_service_activation import ServiceActivationTests
 
 ROOT = Path(__file__).resolve().parents[2]
 

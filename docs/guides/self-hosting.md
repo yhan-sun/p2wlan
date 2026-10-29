@@ -29,15 +29,38 @@
 
 ## 安装
 
-下载同一 server-vX.Y.Z 下与主机架构匹配的归档和同名 checksum：
+下载同一 server-vX.Y.Z 下与主机架构匹配的归档和同名 checksum，在专用目录中校验并解包。以下使用 amd64：
 
     sha256sum -c p2wlan-server-linux-amd64.tar.gz.sha256
+    tar -xzf p2wlan-server-linux-amd64.tar.gz
+
+全新同机部署先用同归档中的生成器创建匹配的 Control/Relay 配置。`/etc/p2wlan` 必须尚不存在；已有安装按下面的恢复步骤处理。将示例 endpoint 和证书路径替换为实际值，证书须覆盖 Relay 域名并受客户端信任：
+
+```sh
+sudo ./p2wlan-config --mode native --output /etc/p2wlan \
+  --relay-endpoint tls://relay.example.com:18081 \
+  --tls-cert /absolute/path/fullchain.pem \
+  --tls-key /absolute/path/privkey.pem
+sudoedit /etc/p2wlan/control.env
+```
+
+生成器的 native 模式默认把数据放在输出目录的 `data/` 下。使用标准 systemd 安装路径时，在首次启动前将 `control.env` 中以下两项改为：
+
+```text
+DB_PATH=/var/lib/p2wlan/p2pnet.db
+LOG_UPLOAD_DIR=/var/lib/p2wlan/log-uploads
+```
+
+然后安装并验证发布包，完成 Control 的可信 HTTPS/WSS 入口后启动服务：
+
     sudo ./install-server.sh --archive p2wlan-server-linux-amd64.tar.gz --role all
     sudo p2wlan-server verify --service all
+    sudo p2wlan-server start --service all
+    sudo p2wlan-server check --service all
 
-也可以让新机器的安装脚本按明确版本下载并校验归档：
+完成上述配置准备后，也可用 `sudo ./install-server.sh --version server-vX.Y.Z --role all` 下载并安装；版本必须与用于生成配置的已校验归档一致，安装后仍需显式启动并检查服务。
 
-    sudo ./install-server.sh --version server-vX.Y.Z --role all
+安装器保留已有配置。首次安装留下的未运行服务不会因安装发布包而自动启动；更新只重启此前正在运行的服务。`init` 生成的最小模板不包含完整 Relay 认证和 TLS 配置，须先补齐再显式启动。远程部署的 `--start` 同样要求配置已经完成。
 
 安装器不会再从 main 或其他可变分支补取 manager；缺少同归档中的 manager 会直接失败。
 
@@ -58,7 +81,7 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 
 ## 配置
 
-先用 p2wlan-config 在新目录生成匹配的 Control/Relay 配置，再按[配置参考](../reference/configuration.md)填入域名、证书和密钥。配置文件和数据库应由专用 p2wlan 用户拥有，权限分别限制为服务需要的最小范围。
+`p2wlan-config` 在新目录生成匹配的 Control/Relay 配置，并复制提供的 TLS 证书和私钥；它不会覆盖已有目录。`--dev-localhost` 只生成隔离测试使用的本地证书，不能用于公网部署。其他字段见[配置参考](../reference/configuration.md)。配置文件和数据库应由专用 p2wlan 用户拥有，权限分别限制为服务需要的最小范围。
 
 `p2wlan-config` 会和 JWT、Relay 凭据一起生成独立的 256-bit `CONTROL_ADMIN_TOKEN` 并写入受保护的 `control.env`，因此使用 `p2wlan-config` 的部署不需要手工制造管理台凭据。生成器不会把这些秘密打印到 stdout，也不会覆盖已有部署。
 
@@ -75,6 +98,48 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 Docker Compose 适合隔离验证或已建立镜像发布流程的部署。默认 Control 只发布到 loopback；容器以非 root、只读根文件系统和无额外 capability 运行。生产镜像必须来自固定发布摘要，不能在业务服务器上临时 build 未验证源码。
 
 Compose 镜像也包含 `p2wlan-db`，可在挂载的数据卷上生成一致性 SQLite 快照；`p2wlan-server backup/restore` 只适用于服务端归档的 systemd 管理路径。容器恢复前先停止 Control，再用同一镜像的 `p2wlan-db --verify` 验证快照，最后启动并检查服务。
+
+### Relay 配置缺失时恢复
+
+`require-auth is enabled but no ticket keyring configured` 表示 Relay 没有可用的 `RELAY_TICKET_KEYRING_JSON`。保持 `RELAY_REQUIRE_AUTH=true`；补齐 keyring 后还需有匹配的 audience、region、撤权 feed 和 TLS。`setup` 只补齐缺失的管理台凭据，不会自动生成这些 Relay 配置。
+
+如果安装仅有 `init` 模板，尚无 Relay 签名密钥、keyring 和 TLS，先备份现有配置，再从已校验的发布包向新的私有目录生成一对配置：
+
+```sh
+sudo /opt/p2wlan-server/current/p2wlan-config --mode native \
+  --output /etc/p2wlan-relay-setup \
+  --relay-endpoint tls://relay.example.com:18081 \
+  --tls-cert /absolute/path/fullchain.pem \
+  --tls-key /absolute/path/privkey.pem
+sudo install -o p2wlan -g p2wlan -m 0600 /etc/p2wlan-relay-setup/tls.crt /etc/p2wlan/tls.crt
+sudo install -o p2wlan -g p2wlan -m 0600 /etc/p2wlan-relay-setup/tls.key /etc/p2wlan/tls.key
+sudoedit /etc/p2wlan-relay-setup/control.env /etc/p2wlan-relay-setup/relay.env \
+  /etc/p2wlan/control.env /etc/p2wlan/relay.env
+```
+
+通过受保护的编辑器，从新 `control.env` 仅合入 `RELAY_CATALOG_JSON`、`RELAY_TICKET_SIGNER_JSON`、`RELAY_TICKET_TTL` 和 `RELAY_REVOCATION_FEED_TOKEN`；保留原 `JWT_SECRET`、`CONTROL_ADMIN_TOKEN`、`DB_PATH`、`LOG_UPLOAD_DIR` 与其他设置。从同一次生成的 `relay.env` 合入 Relay 设置，将其中 TLS 路径改为 `/etc/p2wlan/tls.crt` 和 `/etc/p2wlan/tls.key`。两份环境文件保持 `0600` 并归 `p2wlan` 所有。不要用新生成的整份 `control.env` 覆盖已有配置，也不要通过 shell `source` 加载包含 JSON 的环境文件。
+
+如果 Control 已有签名密钥，应恢复对应的公钥 keyring，不重新生成签名密钥。使用包含 `--print-relay-keyring` 的同版本生成器，可从现有 PKCS#8 PEM 配置导出公钥；替换下面的文件名与 key id 为现有值：
+
+```sh
+sudo env RELAY_TICKET_SIGNER_KEY_FILE=/etc/p2wlan/relay-signing.pem \
+  RELAY_TICKET_SIGNER_KID=existing-key-id \
+  /opt/p2wlan-server/current/p2wlan-config --print-relay-keyring
+```
+
+输出仅为公钥 JSON，将完整结果写入 Relay 的 `RELAY_TICKET_KEYRING_JSON`。轮换期间还须提供现有的 `RELAY_TICKET_SIGNER_PREV_KEY_FILE` 与 `RELAY_TICKET_SIGNER_PREV_KID`。使用 `RELAY_TICKET_SIGNER_JSON` 的生成器部署，应优先恢复同次生成的 `relay.env`；不要把私钥 JSON 粘贴到命令参数或公开日志中。旧发布包缺少导出选项时，先按固定版本升级工具。
+
+配置完成后重新加载两端，并验证 Relay 就绪：
+
+    sudo p2wlan-server restart --service all
+    sudo p2wlan-server check --service all
+    sudo p2wlan-server doctor --service all
+
+### Control 与 Relay 分机
+
+从同一对配置分发：Control 保存 Ed25519 签名私钥，Relay 只需要其 key id 对应的 32 字节公钥。两台机器共享的是独立的 `RELAY_REVOCATION_FEED_TOKEN`，不分发 Control 的 JWT、管理台令牌或签名私钥到 Relay。
+
+将 Relay 的 `RELAY_REVOCATION_FEED_URL` 改为 Control 的可信 HTTPS 地址加 `/api/v1/relay/revocations`，并保证 Relay 可访问它；生成器的 loopback feed 地址只适合同机。Control catalog 中的 `region`、`audience` 必须与该 Relay 一致，`endpoint` 必须是客户端可访问且与 TLS 证书匹配的地址。票据中的设备与网络范围由 Control 签发，不能通过填写 keyring 扩大。已配置的撤权 feed 尚未同步或已过期时，Relay 不会通过 readiness 检查或接受新的票据认证。
 
 ## 验证
 
