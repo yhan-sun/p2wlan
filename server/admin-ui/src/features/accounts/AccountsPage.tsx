@@ -36,14 +36,31 @@ export function AccountsPage() {
     { id: 'created_at', header: '注册时间', cell: ({ row }) => formatDate(row.original.created_at) },
   ], [location])
 
-  return <div className="page-stack">
-    <PageHeader title={tr("所有账号")} description={<> {tr('查看账号的设备、网络和最近活动。')} </>} actions={<><div className="search-field"><Search size={16} /><input value={query} onChange={(event) => update({ q: event.target.value, cursor: '', page: '' }, true)} placeholder={tr("搜索用户名或邮箱")} aria-label={tr("搜索用户名或邮箱")} /></div></>} />
-    <QueryStatus queries={[result]} />
-    <Panel action={result.data && debounced === query && <SnapshotExport items={result.data.items} filename="accounts" total={result.data.total} scope={{ q: query, cursor: paging.cursor }} />}>
-      {debounced === query && paging.cursor && result.error instanceof ApiError && result.error.status === 400 && <div className="resource-query-recovery"><button type="button" className="button secondary compact" onClick={() => update({ cursor: '', page: '' }, true)}>{tr('重新从首页加载')}</button></div>}
+  const hasFilters = Boolean(query.trim())
+  const clearFilters = () => update({ q: '', cursor: '', page: '' })
+  const resetPage = () => update({ cursor: '', page: '' }, true)
+  const resultTitle = `${tr('账号列表')}${result.data && debounced === query ? ` · ${result.data.total}` : ''}`
+
+  return <div className="page-stack resource-page">
+    <PageHeader title={tr('所有账号')} description={tr('查看账号的设备、网络和最近活动。')} />
+    <Panel className="resource-results-panel" title={resultTitle} action={result.data?.items.length && debounced === query ? <SnapshotExport items={result.data.items} filename="accounts" total={result.data.total} scope={{ q: query, cursor: paging.cursor }} /> : undefined}>
+      <div className="resource-list-toolbar" role="search" aria-label={tr('账号筛选')}>
+        <div className="resource-toolbar-fields">
+          <label className="search-field"><Search size={16} aria-hidden /><input value={query} onChange={(event) => update({ q: event.target.value, cursor: '', page: '' }, true)} placeholder={tr('搜索用户名或邮箱')} aria-label={tr('搜索用户名或邮箱')} /></label>
+          {hasFilters && <button type="button" className="button secondary resource-filter-clear" onClick={clearFilters}>{tr('清除筛选')}</button>}
+        </div>
+      </div>
+      <div className="resource-list-status"><QueryStatus queries={[result]} /></div>
+      {debounced === query && paging.cursor && result.error instanceof ApiError && result.error.status === 400 && <div className="resource-query-recovery"><button type="button" className="button secondary" onClick={resetPage}>{tr('重新从首页加载')}</button></div>}
       {result.isPending || debounced !== query ? <PendingBlock queries={[result]} /> : result.error && !result.data ? <ErrorBlock error={result.error} onRetry={() => { void result.refetch() }} /> : result.data ? <>
-        {result.data.items.length ? <DataTable<AdminAccount> columns={columns} data={result.data.items} /> : <ResourceEmptyState message="没有符合条件的账号" onClear={query ? () => update({ q: '', cursor: '', page: '' }) : undefined} />}
-        <CursorPagination
+        {result.data.items.length ? <DataTable<AdminAccount> columns={columns} data={result.data.items} /> : <ResourceEmptyState
+          message={paging.cursor ? '当前页没有记录' : hasFilters ? '没有符合条件的账号' : '暂无账号'}
+          description={paging.cursor ? '列表可能已更新，请返回首页重新读取。' : hasFilters ? '请调整筛选条件，或清除筛选查看全部记录。' : '账号注册后会显示在这里，此页面仅提供只读查看。'}
+          onReset={paging.cursor ? resetPage : undefined}
+          onClear={hasFilters ? clearFilters : undefined}
+          action={{ to: '/system', label: '查看运行状态' }}
+        />}
+        {result.data.total > 0 && <CursorPagination
           total={result.data.total}
           pageIndex={paging.pageIndex}
           canPrev={paging.canPrev}
@@ -53,7 +70,7 @@ export function AccountsPage() {
           canNext={Boolean(result.data.next_cursor)}
           onPrev={paging.prev}
           onNext={() => paging.next(result.data?.next_cursor || '')}
-        />
+        />}
       </> : <ErrorBlock error={new Error('控制面未返回账号列表。')} />}
     </Panel>
   </div>

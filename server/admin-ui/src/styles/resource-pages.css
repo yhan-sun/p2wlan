@@ -1,0 +1,29 @@
+/* Resource filters and recovery belong to the list they control. Shared
+   typography, colors and control sizing remain owned by the console foundation. */
+.resource-page .resource-results-panel { overflow: visible; }
+.resource-page .resource-list-toolbar { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+.resource-page .resource-toolbar-fields { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.resource-page .resource-toolbar-fields > .search-field { flex: 1 1 280px; max-width: 440px; min-width: 220px; }
+.resource-page .resource-toolbar-fields > .select-field { flex: 0 1 160px; }
+.resource-page .resource-filter-clear { margin-left: auto; white-space: nowrap; }
+.resource-page .resource-list-status { padding: 0 20px; }
+.resource-page .resource-list-status .query-status { margin: 0; border: 0; }
+.resource-page .resource-list-tabs { padding: 0 20px; border-bottom: 1px solid var(--border); }
+.resource-page .resource-list-tabs .tabs-v2 { margin: 0; border-bottom: 0; }
+.resource-page .resource-empty-state { min-height: 244px; justify-content: center; gap: 12px; padding: 36px 24px; }
+.resource-page .resource-empty-state > strong { color: var(--text); font-size: 16px; font-weight: 600; }
+.resource-page .resource-empty-state > p { max-width: 440px; margin: 0 0 4px; color: var(--text-2); line-height: 1.7; }
+.resource-page .resource-results-panel > .pagination-v2,
+.resource-page .resource-results-panel > div > .pagination-v2 { border-radius: 0 0 var(--radius) var(--radius); }
+.resource-page .resource-query-recovery { padding: 12px 20px; }
+@media (max-width: 650px) {
+  .resource-page .resource-list-toolbar { padding: 16px; }
+  .resource-page .resource-toolbar-fields { align-items: stretch; gap: 10px; }
+  .resource-page .resource-toolbar-fields > .search-field { flex-basis: 100%; width: 100%; max-width: none; min-width: 0; }
+  .resource-page .resource-toolbar-fields > .select-field { flex: 1 1 120px; min-width: 0; }
+  .resource-page .resource-toolbar-fields > .account-scope-picker { width: auto; flex: 1 1 160px; min-width: 0; }
+  .resource-page .resource-filter-clear { margin-left: 0; }
+  .resource-page .resource-list-status { padding: 0 16px; }
+  .resource-page .resource-list-tabs { padding: 0 16px; }
+  .resource-page .resource-empty-state { min-height: 220px; padding: 30px 20px; }
+}

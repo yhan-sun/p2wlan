@@ -1,56 +1,21 @@
-/* Shared aliases keep current resource/diagnostic states on the console palette. */
+/* Legacy feature tokens resolve to the same foundation in both themes. */
 :root, :root[data-theme='dark'] {
   --bg: var(--console-bg); --surface: var(--console-surface-solid);
   --surface-subtle: var(--console-surface-subtle); --text: var(--console-text);
   --text-2: var(--console-text-soft); --text-3: var(--console-text-muted);
   --border: var(--console-border); --border-strong: var(--console-border-strong);
-  --sidebar: var(--console-sidebar); --accent: var(--console-accent); --accent-soft: var(--console-accent-soft);
-  --action-primary: var(--console-text); --action-primary-hover: var(--console-text-soft); --action-primary-text: var(--console-surface-solid);
+  --sidebar: var(--console-sidebar); --sidebar-2: var(--console-sidebar-hover); --accent: var(--console-accent); --accent-soft: var(--console-accent-soft);
+  --action-primary: #465bd6; --action-primary-hover: #3548bd; --action-primary-text: #fff;
   --success-text: var(--console-success); --success-soft: var(--console-success-soft);
   --warning-text: var(--console-warning); --warning-soft: var(--console-warning-soft);
   --danger-text: var(--console-danger); --danger-soft: var(--console-danger-soft);
+  --nav-active: var(--console-sidebar-active); --minimap-mask: rgb(226 232 240 / 60%);
 }
-.sidebar-mobile-close { display: none; }
-.sidebar-runtime { overflow: visible; }
-.sidebar-runtime > small { display: block; margin: 6px 0; font-size: 10px; color: var(--console-text-muted); }
-.sidebar-footer-actions .theme-switch, .sidebar-footer-actions .icon-button-v2 { width: 28px; height: 28px; border: 0; color: inherit; }
-.mobile-page-title { font-size: 13px; color: var(--text-2); }
-:root[data-theme='dark'] .sidebar-v2 { background: var(--console-sidebar); }
-:root[data-theme='dark'] .sidebar-v2 .runtime-line strong { color: var(--console-text-soft); }
-@media (max-width: 900px) {
-  .sidebar-mobile-close { display: grid; }
-  .sidebar-collapse { display: none; }
-  .sidebar-footer-actions .theme-switch, .sidebar-footer-actions .icon-button-v2 { min-width: 36px; height: 36px; }
-}
-
-/* Keep the preferences inside the scrollable navigation surface. Opening them
-   expands the desktop rail so every control remains reachable. */
-.sidebar-runtime, .sidebar-footer-actions, .sidebar-footer-actions .console-preferences { position: static; }
-.sidebar-footer-actions .console-preferences-panel {
-  top: auto; bottom: 64px; left: 8px; right: 8px; width: auto;
-  max-height: calc(100dvh - 120px); padding: 12px; text-align: left;
-}
-.theme-select { min-width: 0; width: 100px; max-width: 100px; }
-.data-table td { font-size: 12px; }
-.data-table th, .identity-cell span, .primary-secondary span, .ratio-cell span { font-size: 11px; }
-
-:root { --minimap-mask: rgba(240, 240, 240, .6); --nav-active: var(--console-sidebar-active); }
-:root[data-theme='dark'] { --minimap-mask: rgba(148, 163, 184, .2); --nav-active: var(--console-sidebar-active); }
-/* Keep the resource name readable beside its independent account identifier. */
+:root[data-theme='dark'] { --minimap-mask: rgb(148 163 184 / 20%); }
+/* Resource graph nodes have a fixed geometry shared with their layout engine. */
 .topology-node-title-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; row-gap: 4px; }
 .topology-node-title-row strong { grid-column: 1 / -1; font-size: 12px; }
-.topology-node-title-row .account-identity-code { justify-self: start; font-size: 9px; height: 14px; }
+.topology-node-title-row .account-identity-code { justify-self: start; font-size: 10px; height: 16px; }
 .topology-node-content { gap: 8px; padding: 8px 10px; }
 .topology-node-icon { width: 28px; height: 28px; flex-basis: 28px; }
-.topology-node-copy > span { font-size: 10px; }
-@media (max-width: 900px) {
-  .app-layout .sidebar-v2 { width: min(280px, calc(100vw - 48px)); height: 100dvh; display: flex; flex-direction: column; }
-  .sidebar-v2 .sidebar-nav { display: flex; flex-direction: column; grid-template-columns: none; gap: 20px; }
-  .sidebar-v2 .nav-group { display: flex; flex-direction: column; gap: 4px; }
-  .sidebar-v2 .nav-group-label { display: block; }
-  .sidebar-v2 .nav-link { display: flex; flex-direction: row; justify-content: flex-start; align-items: center; min-height: 42px; padding: 10px 12px; white-space: nowrap; }
-  .sidebar-v2 .sidebar-runtime { display: block; margin-top: auto; }
-  .app-layout.sidebar-collapsed .sidebar-footer-actions { flex-direction: row; }
-  .app-layout.sidebar-collapsed .sidebar-admin-copy { display: flex; }
-  .app-layout.sidebar-collapsed .sidebar-account-row { justify-content: space-between; }
-}
+.topology-node-copy > span { font-size: 11px; }

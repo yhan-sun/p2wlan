@@ -1,15 +1,17 @@
-/* The only application stylesheet entry; shared tokens follow feature rules. */
 @import '@xyflow/react/dist/style.css';
 @import './styles.css';
 @import './polish.css';
-@import './connections.css';
-@import './connection-health.css';
 @import './theme.css';
 @import './dashboard-shell.css';
 @import './account-scope-picker.css';
 @import './data-actions.css';
 @import './refresh.css';
 @import './resource-workflow.css';
-@import './trends.css';
 @import './design-system.css';
 @import './integration.css';
+@import './connections.css';
+@import './connection-health.css';
+@import './trends.css';
+@import './overview.css';
+@import './resource-pages.css';
+@import './relationship-workspace.css';

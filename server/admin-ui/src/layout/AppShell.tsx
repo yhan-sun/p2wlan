@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Activity, LayoutDashboard, Menu, MonitorSmartphone, Network, PanelLeftClose, PanelLeftOpen, RadioTower, RefreshCw, Users, Waypoints, X } from 'lucide-react'
+import { Activity, ChevronRight, LayoutDashboard, Menu, MonitorSmartphone, Network, PanelLeftClose, PanelLeftOpen, RadioTower, RefreshCw, ShieldCheck, Users, Waypoints, X } from 'lucide-react'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom'
 import { AsyncView } from '../AsyncView'
@@ -110,12 +110,12 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
         {!refreshInterval && <small>{tr('自动刷新已关闭，可手动刷新。')}</small>}
         <div className="sidebar-account-row">
           <span className="sidebar-admin-copy"><strong>admin</strong><small>{tr('只读管理模式')}</small></span>
-          <div className="sidebar-footer-actions"><ThemeSwitch /><IconButton label={tr('刷新数据')} disabled={refreshing} icon={<RefreshCw size={16} className={refreshing ? 'spin' : ''} />} onClick={refresh} /><ConsolePreferences onOpen={() => setSidebarCollapsed(false)} onLogout={() => { clearAdminToken(); queryClient.clear(); onLogout() }} /></div>
+          <div className="sidebar-footer-actions"><ThemeSwitch /><ConsolePreferences onOpen={() => setSidebarCollapsed(false)} onLogout={() => { clearAdminToken(); queryClient.clear(); onLogout() }} /></div>
         </div>
       </div>
     </aside>
     <div className="app-main" inert={mobileOpen}>
-      <header className="topbar-v2"><button ref={navTrigger} type="button" className="icon-button-v2 topbar-mobile-menu" aria-label={tr('打开导航')} aria-expanded={mobileOpen} aria-controls="primary-navigation" onClick={() => setMobileOpen(true)}><Menu size={18} /></button><span className="mobile-page-title">{tr(meta.title)}</span><div className="topbar-spacer" /><IconButton label={tr('刷新数据')} disabled={refreshing} icon={<RefreshCw size={17} className={refreshing ? 'spin' : ''} />} onClick={refresh} /></header>
+      <header className="topbar-v2"><button ref={navTrigger} type="button" className="icon-button-v2 topbar-mobile-menu" aria-label={tr('打开导航')} aria-expanded={mobileOpen} aria-controls="primary-navigation" onClick={() => setMobileOpen(true)}><Menu size={18} /></button><div className="topbar-location"><span>P2WLAN Control</span><ChevronRight size={14} aria-hidden /><strong>{tr(meta.title)}</strong></div><div className="topbar-spacer" /><span className="topbar-readonly"><ShieldCheck size={15} aria-hidden />{tr('只读管理模式')}</span><IconButton label={tr('刷新数据')} disabled={refreshing} icon={<RefreshCw size={17} className={refreshing ? 'spin' : ''} />} onClick={refresh} /></header>
       <main ref={main} id="main-content" className="page-content" aria-labelledby="console-page-title" tabIndex={-1}><h1 id="console-page-title" className="sr-only">{tr(meta.title)}</h1><AsyncView key={location.pathname}><Outlet /></AsyncView></main>
     </div>
   </div>

@@ -214,7 +214,7 @@ export function ConnectionTopology({
 }: ConnectionTopologyProps) {
   const [fullscreen, setFullscreen] = useState(false)
   const surfaceRef = useRef<HTMLDivElement>(null)
-  const [legendOpen, setLegendOpen] = useState(false)
+  const [legendOpen, setLegendOpen] = useState(true)
   const locale = useLocale()
   const [narrow, setNarrow] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 650px)').matches)
   const [showCanvas, setShowCanvas] = useState(false)
@@ -265,7 +265,7 @@ export function ConnectionTopology({
       <div><strong>{networkName}</strong><span>{loading || offline || error ? '—' : activeConnectionCount} {tr("条单向路径观测")}{partial ? ` · ${tr('当前视图已截断')}` : ''}</span></div>
       <div>
         <button className={`topology-filter-button ${showStale ? 'active' : ''}`} onClick={() => onShowStaleChange(!showStale)} aria-pressed={showStale} aria-label={tr('显示过期观测')}>
-          {showStale ? <Eye size={15} /> : <EyeOff size={15} />}{tr("Stale")}</button>
+          {showStale ? <Eye size={15} /> : <EyeOff size={15} />}{tr('过期观测')}</button>
         <button className={`topology-filter-button connection-legend-toggle ${legendOpen ? 'active' : ''}`} onClick={() => setLegendOpen((value) => !value)} aria-expanded={legendOpen} aria-controls="connection-topology-legend"><Info size={15} />{tr('图例')}</button>
         <button data-fullscreen-toggle className="icon-button connection-topology-fullscreen-button" disabled={!fullscreen && graph.nodes.length === 0} onClick={() => setFullscreen((value) => !value)} aria-label={tr(fullscreen ? '退出全屏' : '全屏')}>
           {fullscreen ? <Shrink size={16} /> : <Expand size={16} />}
@@ -278,7 +278,7 @@ export function ConnectionTopology({
       : error ? <div className="connection-topology-empty"><ErrorBlock error={error} />{onRetry && <button type="button" className="button secondary compact" onClick={onRetry}>{tr('重试')}</button>}</div>
       : connections.length === 0 ? <div className="connection-topology-empty">
       <CircleAlert size={18} />
-      <div><strong>{tr("暂无可展示的路径观测")}</strong><span>{tr("只有守护进程权威上报且 current_path 非空的观测才会生成连接边；无路径观测仍保留在列表中用于诊断。")}</span></div>
+      <div><strong>{tr("暂无可展示的路径观测")}</strong><span>{tr('调整筛选，或等待设备上报连接路径。')}</span></div>
     </div> : listMode ? <div className="connection-neighbor-list">{visibleConnections.map((connection) => <button key={connectionKey(connection)} onClick={() => onSelect(connection)} className={selected && connectionKey(selected) === connectionKey(connection) ? 'active' : ''}>
       <strong>{connection.reporting_device_name} → {connection.remote_device_name}</strong>
       <span>{pathLabel(connection.current_path)} · {tr(connection.freshness)}</span>

@@ -43,8 +43,8 @@ function NetworkTrends() {
     }
     return next
   })
-  return <div className="page-stack">
-    <PageHeader title={tr('历史趋势')} description={<> {tr('按网络汇总观测；下方图表不应用账号或设备筛选。')} </>} />
+  return <div className="page-stack connection-trends-page">
+    <div className="connection-view-heading"><div><h3>{tr('历史趋势')}</h3><p>{tr('按网络汇总观测；下方图表不应用账号或设备筛选。')}</p></div></div>
     <div className="connections-toolbar">
       <select className="select-field" aria-label={tr('按网络过滤')} value={networkId} onChange={(event) => update('network_id', event.target.value)}>
         <option value="">{tr('全部网络')}</option>
@@ -109,6 +109,7 @@ export function ConnectionWorkspace() {
   const href = (tab: ConnectionWorkspaceTab) => `/connections?${connectionWorkspaceSearch(params, tab)}`
   return <div className="page-stack connection-workspace">
     <ResourceReturnLink />
+    <PageHeader title={tr('连接排障')} description={tr('查看设备之间的连接路径、延迟与最近变化。')} />
     <nav className="connection-workspace-tabs" aria-label={tr('连接排障视图')}>
       {tabs.map(({ id, label, icon: Icon }) => <Link key={id} to={href(id)} state={state} aria-current={active === id ? 'page' : undefined} className={active === id ? 'active' : ''}><Icon size={16} aria-hidden />{tr(label)}</Link>)}
     </nav>

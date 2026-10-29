@@ -31,6 +31,7 @@ async function compileSource(entry, plugins = []) {
 }
 
 const { ConnectionsPage } = await compileSource('src/features/connections/ConnectionsPage.tsx')
+const { ConnectionWorkspace } = await compileSource('src/features/connections/ConnectionWorkspace.tsx')
 const { ConnectionTopology } = await compileSource('src/features/connections/ConnectionTopology.tsx')
 const inlineTopology = {
   name: 'synchronous-topology-test',
@@ -227,6 +228,28 @@ function pageClient(t, offset = 0, total = 1, items = [connection]) {
   client.setQueryData(['connections', 'networks'], { pages: [{ total: 1, offset: 0, limit: 100, items: [{ id: 'n', name: 'Test network' }] }], pageParams: [0] })
   return { client, key }
 }
+
+test('workspace introduces the task before its labelled navigation and scoped list', (t) => {
+  const { client } = pageClient(t)
+  const html = renderPage(client, '/connections?tab=all', ConnectionWorkspace)
+  assert.match(html, /<h2[^>]*>连接排障<\/h2>/)
+  assert.match(html, /<nav[^>]*aria-label="连接排障视图"/)
+  assert.ok(html.indexOf('查看设备之间的连接路径') < html.indexOf('aria-label="连接排障视图"'))
+  assert.match(html, /aria-current="page"[^>]*class="active"[^>]*>.*?全部观测/)
+  for (const label of ['搜索连接', '按网络过滤', '按路径过滤', '按观测新鲜度过滤']) assert.ok(html.includes(`aria-label="${label}"`))
+})
+
+test('direction rows group path and freshness without repeating internal network identifiers', (t) => {
+  const { client } = pageClient(t, 0, 1, [{ ...connection, network_id: 'internal-network-uuid' }])
+  const html = renderPage(client)
+  const row = html.match(/<tbody>(.*?)<\/tbody>/s)?.[1]
+  assert.ok(row)
+  assert.match(row, /aria-label="连接详情: Device A → Device B"/)
+  assert.match(row, /Test network/)
+  assert.doesNotMatch(row, /internal-network-uuid/)
+  assert.match(row, /connection-path-cell.*?直连.*?新鲜/s)
+  assert.equal((html.match(/<th>/g) ?? []).length, 7)
+})
 
 test('background errors keep the last list visible while explicitly labelling the cache', async (t) => {
   const { client, key } = pageClient(t)

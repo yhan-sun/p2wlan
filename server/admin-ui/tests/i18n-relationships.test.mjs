@@ -31,3 +31,23 @@ test('all literal relationship-page labels and state messages have English trans
   assert.deepEqual([...keys].filter((key) => /\p{Script=Han}/u.test(tr(key))), [], 'Missing English translations')
   setLocale('zh-CN')
 })
+
+test('connection task flow and diagnostic disclosures have English translations', () => {
+  setLocale('en-US')
+  const keys = new Set()
+  for (const filename of ['ConnectionWorkspace', 'ConnectionsPage', 'ConnectionTopology', 'ConnectionDrawer']) {
+    const source = ts.createSourceFile(filename, readFileSync(`src/features/connections/${filename}.tsx`, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+    const collect = (node) => {
+      if (ts.isStringLiteral(node) && /\p{Script=Han}/u.test(node.text)) keys.add(node.text)
+      ts.forEachChild(node, collect)
+    }
+    const visit = (node) => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'tr') node.arguments.forEach(collect)
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+  }
+  assert.ok(keys.size > 70)
+  assert.deepEqual([...keys].filter((key) => /\p{Script=Han}/u.test(tr(key))), [], 'Missing English connection labels')
+  setLocale('zh-CN')
+})

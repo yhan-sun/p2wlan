@@ -109,3 +109,15 @@ test('a manual snapshot page does not promise polling when global auto refresh i
   const automatic = renderToStaticMarkup(createElement(exported.exports.QueryStatus, { queries }))
   assert.match(automatic, /自动刷新已开启/)
 })
+
+
+test('old and degraded query snapshots include a visible calendar date', () => {
+  const timestamp = new Date(2025, 0, 2, 8, 10).getTime()
+  const query = { dataUpdatedAt: timestamp, fetchStatus: 'idle', refetch() {} }
+  const expectedDate = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(timestamp)
+  const old = renderToStaticMarkup(createElement(exported.exports.QueryStatus, { queries: [query] }))
+  assert.ok(old.includes(expectedDate))
+  const failed = renderToStaticMarkup(createElement(exported.exports.QueryStatus, { queries: [{ ...query, error: new Error('unavailable') }] }))
+  assert.ok(failed.includes(expectedDate))
+  assert.match(failed, /缓存快照/)
+})
