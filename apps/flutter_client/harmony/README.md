@@ -61,6 +61,10 @@ Bearer 令牌，原子写入应用私有目录中的 `p2wlan-daemon.diag-auth`�
 Flutter 经 `p2wlan/platform` 读取当前令牌后查询引擎状态；令牌不进入设置快照或日志。
 停止和启动失败会清理本次令牌；读取失败或格式错误时诊断认证保持失败。
 
+运行时提供 `generateVpnId()` 时使用系统 VPN ID；缺少该方法时生成本地随机 UUID，
+仅用于 Native 生命周期的实例隔离，并省略系统配置的 `vpnId`。两种路径都必须实际完成
+进程网络保护、系统 VPN 创建和路由确认，才允许引擎进入就绪状态。
+
 ArkTS 通过 `ets/native/build_info.ets` 动态加载
 `libp2wlan_harmony_native.so`，查询真实 Rust 构建版本、target、架构和 ABI
 版本；缺库、ABI 不匹配与 native 调用失败有固定错误码。VPN 生命周期桥接只通过 MethodChannel

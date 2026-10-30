@@ -1,4 +1,5 @@
 import { Want } from '@kit.AbilityKit';
+import { util } from '@kit.ArkTS';
 import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
 import {
   createVpnConfig,
@@ -163,7 +164,11 @@ export default class P2wlanVpnExtensionAbility extends VpnExtensionAbility {
 
       const connection = vpnExtension.createVpnConnection(this.context);
       this.connection = connection;
-      const instanceId = await connection.generateVpnId();
+      const supportsSystemVpnId: boolean = typeof connection.generateVpnId == 'function';
+      // Older runtimes lack system VPN IDs. A local UUID still fences native
+      // lifecycle operations; it is never presented as a system VPN identifier.
+      const instanceId = supportsSystemVpnId
+        ? await connection.generateVpnId() : util.generateRandomUUID();
       if (typeof instanceId != 'string' || instanceId.length == 0) {
         throw new NativeVpnAdapterError('VPN_ID_INVALID');
       }
@@ -218,7 +223,9 @@ export default class P2wlanVpnExtensionAbility extends VpnExtensionAbility {
         cidr: networkResult.cidr
       };
       const vpnConfig = createVpnConfig(settingsSnapshot.settings, network);
-      vpnConfig.vpnId = instanceId;
+      if (supportsSystemVpnId) {
+        vpnConfig.vpnId = instanceId;
+      }
       const routeSnapshot = getConfiguredRouteSnapshot(vpnConfig);
 
       this.state = 'creating';
