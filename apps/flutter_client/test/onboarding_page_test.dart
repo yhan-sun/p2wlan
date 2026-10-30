@@ -204,7 +204,7 @@ class _FakeDaemonController extends DaemonController {
   _FakeDaemonController() : super(diagnosticsApi: DiagnosticsApi());
 
   @override
-  Future<DaemonCommandResult> start(AppSettings settings) async {
+  Future<DaemonCommandResult> start(AppSettings settings, {int? vpnSettingsRevision}) async {
     return const DaemonCommandResult(ok: true, message: 'started');
   }
 
@@ -259,6 +259,7 @@ Future<SettingsStore> _makeSettings(WidgetTester tester, bool completed) {
             authToken: 'test-account-token',
             languageCode: 'zh-Hans',
             onboardingCompleted: completed,
+            deviceName: 'Onboarding test device',
           ),
         );
         return store;

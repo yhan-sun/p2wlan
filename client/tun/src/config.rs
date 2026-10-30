@@ -42,8 +42,10 @@ impl InterfaceConfig {
             return Err(Error::InvalidInterfaceName("name is empty".into()));
         }
 
-        // Linux limits interface names to 15 characters (IFNAMSIZ - 1)
-        #[cfg(target_os = "linux")]
+        // Linux kernel interface names are limited to IFNAMSIZ - 1. OHOS
+        // descriptors already refer to a platform-created VPN interface and
+        // this field is only its daemon-side logical name.
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if name.len() > 15 {
             return Err(Error::InvalidInterfaceName(format!(
                 "name '{name}' exceeds 15 characters (Linux IFNAMSIZ limit)"

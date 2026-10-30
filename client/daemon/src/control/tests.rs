@@ -205,6 +205,37 @@ async fn registration_rejects_partial_lifecycle_response() {
         .contains("omitted a valid registration_seq"));
 }
 
+#[tokio::test]
+async fn authoritative_vpn_registration_rejects_a_missing_cidr() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).await.unwrap();
+        let body = r#"{"success":true,"node_id":"node-a","virtual_ip":"10.20.0.2"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    let config = test_config();
+    let result = register_device_with_authoritative_cidr(
+        &test_no_proxy_client(),
+        &format!("http://{address}"),
+        "test-token",
+        &config,
+    )
+    .await
+    .map(|_| ());
+    server.await.unwrap();
+
+    let error = result.expect_err("VPN setup must require the server's CIDR");
+    assert!(error.to_string().contains("missing authoritative cidr"));
+}
+
 #[test]
 fn endpoint_control_label_replaces_untrusted_lifecycle_and_stays_bounded() {
     let base = "p2v2:m=endpoint_independent;a=stable;d=0;c=100;f=endpoint_independent;h=supported;g=18446744073709551615;o=18446744073709551615;l=1";

@@ -4,7 +4,6 @@ import 'package:flutter/foundation.dart'
     show debugDefaultTargetPlatformOverride;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
@@ -504,10 +503,11 @@ Future<void> _pumpTestApp(WidgetTester tester) async {
     // Complete onboarding so these shell tests reach the main UI (the
     // onboarding flow is covered by onboarding_page_test.dart).
     await settingsStore.updateSettings(
-      const AppSettings(
+      settingsStore.settings.copyWith(
         controlServer: 'https://control.example.com',
         authToken: 'test-account-token',
         onboardingCompleted: true,
+        deviceName: 'Widget test device',
       ),
     );
   });

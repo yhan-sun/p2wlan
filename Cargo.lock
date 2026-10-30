@@ -2650,6 +2650,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2wlan-harmony-native"
+version = "0.1.170"
+dependencies = [
+ "hex",
+ "libc",
+ "p2pnet-crypto",
+ "p2wlan-daemon",
+ "tokio",
+]
+
+[[package]]
 name = "p2wlan-tray"
 version = "0.1.170"
 dependencies = [

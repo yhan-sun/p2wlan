@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../build_info.dart';
+import '../capabilities/platform_capabilities.dart';
 import 'update_models.dart';
 
 typedef UpdateUrlLauncher = Future<bool> Function(Uri uri);
@@ -13,9 +14,13 @@ class UpdateService {
   UpdateService({
     UpdateHttpTransport? transport,
     UpdateUrlLauncher? launcher,
+    bool? canOpenExternalUrls,
     String? currentAppVersion,
   }) : _transport = transport ?? IoUpdateHttpTransport(),
        _launcher = launcher ?? _launchExternalUrl,
+       _canOpenExternalUrls =
+           canOpenExternalUrls ??
+           PlatformCapabilities.current().canOpenExternalUrls,
        _currentAppVersionOverride = currentAppVersion;
 
   static const repositoryOwner = 'yhan-sun';
@@ -28,6 +33,7 @@ class UpdateService {
 
   final UpdateHttpTransport _transport;
   final UpdateUrlLauncher _launcher;
+  final bool _canOpenExternalUrls;
   final String? _currentAppVersionOverride;
 
   Future<UpdateCheckResult> check({String? appVersion}) async {
@@ -146,7 +152,10 @@ class UpdateService {
   }
 
   Future<bool> openRelease(UpdateInfo update) async {
-    if (!isAllowedReleaseUrl(update.releaseUrl, update.version)) return false;
+    if (!_canOpenExternalUrls ||
+        !isAllowedReleaseUrl(update.releaseUrl, update.version)) {
+      return false;
+    }
     try {
       return await _launcher(update.releaseUrl);
     } on Object {

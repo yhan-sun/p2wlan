@@ -943,7 +943,20 @@ class StatusStore extends ChangeNotifier {
       );
     }
     return _runDaemonCommand(() async {
-      final result = await daemonController.start(settingsStore.settings);
+      int? vpnSettingsRevision;
+      try {
+        vpnSettingsRevision =
+            await settingsStore.ensureVpnEngineSettingsSnapshot();
+      } catch (_) {
+        return const DaemonCommandResult(
+          ok: false,
+          message: '无法发布 Harmony VPN 配置，已拒绝启动。',
+        );
+      }
+      final result = await daemonController.start(
+        settingsStore.settings,
+        vpnSettingsRevision: vpnSettingsRevision,
+      );
       if (result.ok) _accountRequiresRestart = false;
       return result;
     }, settlePeerCatalog: true);

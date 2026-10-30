@@ -1,0 +1,19 @@
+[package]
+name = "p2wlan-harmony-native"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+name = "p2wlan_harmony_core"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+hex = { workspace = true }
+libc = { workspace = true }
+p2pnet-crypto = { path = "../crypto", version = "0.1.168" }
+p2pnet-daemon = { package = "p2wlan-daemon", path = "../daemon", version = "0.1.168" }
+tokio = { workspace = true }

@@ -117,6 +117,15 @@ impl SystemTun {
         Ok(Self::wrap(inner, false))
     }
 
+    #[cfg(target_env = "ohos")]
+    pub(crate) fn from_owned_fd(
+        fd: std::os::fd::OwnedFd,
+        config: &InterfaceConfig,
+    ) -> p2pnet_tun::Result<Self> {
+        let inner = TunDevice::from_owned_fd(fd, config)?;
+        Ok(Self::wrap(inner, false))
+    }
+
     fn wrap(inner: TunDevice, created_system_device: bool) -> Self {
         Self {
             inner,

@@ -6,8 +6,17 @@ impl Daemon {
         mtu: u32,
     ) -> Result<Option<crate::os_request_capture::SystemTun>> {
         if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
-            warn!("TUN creation disabled via P2WLAN_DISABLE_TUN=1");
-            return Ok(None);
+            #[cfg(target_env = "ohos")]
+            return Err(DaemonError::Network(
+                "HarmonyOS VPN engine requires its extension-owned TUN fd reason_code=ohos_vpn_tun_disabled"
+                    .to_string(),
+            ));
+
+            #[cfg(not(target_env = "ohos"))]
+            {
+                warn!("TUN creation disabled via P2WLAN_DISABLE_TUN=1");
+                return Ok(None);
+            }
         }
 
         let config = InterfaceConfig::new(&self.config.network.interface, vip, netmask, mtu)
@@ -36,7 +45,24 @@ impl Daemon {
             Ok(Some(tun))
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_env = "ohos")]
+        {
+            let fd = self.ohos_tun_fd.take().ok_or_else(|| {
+                DaemonError::Network("HarmonyOS VPN Extension TUN fd was not supplied".to_string())
+            })?;
+            let tun = crate::os_request_capture::SystemTun::from_owned_fd(fd, &config).map_err(|e| {
+                DaemonError::Network(format!("failed to attach HarmonyOS VPN TUN: {e}"))
+            })?;
+            info!(
+                "HarmonyOS VPN TUN {} is attached at logical address {} MTU {}",
+                tun.name(),
+                tun.address(),
+                tun.mtu(),
+            );
+            Ok(Some(tun))
+        }
+
+        #[cfg(all(not(target_os = "android"), not(target_env = "ohos")))]
         {
             let tun = crate::os_request_capture::SystemTun::create(&config).map_err(|e| {
                 error!("[tun] startup failed: {e}");

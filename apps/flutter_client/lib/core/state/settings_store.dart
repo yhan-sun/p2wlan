@@ -6,18 +6,24 @@ import 'package:flutter/foundation.dart';
 
 import '../api/diagnostics_api.dart';
 import '../models/diagnostics_models.dart';
-import '../platform/android_platform.dart';
+import '../platform/native_platform.dart';
 import '../rooms/room_profiles.dart';
 import '../security/local_config_secret.dart';
 import '../security/secure_token_repository.dart';
+import 'vpn_engine_settings_snapshot.dart';
 
 class SettingsStore extends ChangeNotifier {
-  SettingsStore({File? settingsFile, SecureTokenRepository? tokenRepository})
-    : _settingsFileOverride = settingsFile {
+  SettingsStore({
+    File? settingsFile,
+    SecureTokenRepository? tokenRepository,
+    VpnEngineSettingsSnapshotWriter? vpnEngineSnapshotWriter,
+  }) : _settingsFileOverride = settingsFile,
+       _vpnEngineSnapshotWriterOverride = vpnEngineSnapshotWriter {
     _tokenRepository = tokenRepository ?? LocalTokenRepository();
   }
 
   final File? _settingsFileOverride;
+  final VpnEngineSettingsSnapshotWriter? _vpnEngineSnapshotWriterOverride;
   late final SecureTokenRepository _tokenRepository;
 
   Future<void> Function(
@@ -41,7 +47,7 @@ class SettingsStore extends ChangeNotifier {
   Future<void> load() async {
     AppSettings? parsedSettings;
     try {
-      final file = Platform.isAndroid
+      final file = usesNativeApplicationSupportDirectory
           ? await _settingsFile()
           : _settingsFileSync();
       _configPath = file.path;
@@ -103,6 +109,14 @@ class SettingsStore extends ChangeNotifier {
             .copyWith(authToken: (await _tokenRepository.read()) ?? '');
       }
       _lastError = null;
+      try {
+        await _publishVpnEngineSettingsSnapshot();
+      } catch (error) {
+        // Keep the Flutter shell usable for login and recovery. The extension
+        // cannot start from defaults: a missing, malformed, or stale snapshot
+        // remains a fail-closed condition for its reader.
+        _lastError = 'Failed to synchronize local engine settings: $error';
+      }
     } catch (error) {
       _lastError = 'Failed to load local settings: $error';
       // Keep the parsed legacy value in memory when secure migration fails so
@@ -117,7 +131,7 @@ class SettingsStore extends ChangeNotifier {
   Future<void> updateDiagnosticsUrl(String diagnosticsUrl) async {
     final normalized = normalizeDiagnosticsUrl(diagnosticsUrl);
     _settings = _settings.copyWith(diagnosticsUrl: normalized);
-    await _save();
+    await _save(publishVpnEngineSnapshot: false);
     notifyListeners();
   }
 
@@ -275,9 +289,24 @@ class SettingsStore extends ChangeNotifier {
     Future<void> commit() async {
       _settings = normalizedSettings;
       try {
-        await _save();
-      } catch (_) {
+        await _save(
+          publishVpnEngineSnapshot: !vpnEngineSettingsEqual(
+            previous,
+            normalizedSettings,
+          ),
+        );
+      } catch (error) {
         _settings = previous;
+        final originalFailure = _lastError ?? error.toString();
+        try {
+          // If snapshot publication fails after the ordinary settings/token
+          // files committed, restore them so they remain aligned with the
+          // previous atomic engine snapshot.
+          await _save(publishVpnEngineSnapshot: false);
+          _lastError = originalFailure;
+        } catch (_) {
+          _lastError = 'Failed to save local settings and restore the previous revision.';
+        }
         rethrow;
       }
       notifyListeners();
@@ -299,7 +328,7 @@ class SettingsStore extends ChangeNotifier {
     }
     final previous = _settings;
     try {
-      final file = Platform.isAndroid
+      final file = usesNativeApplicationSupportDirectory
           ? await _settingsFile()
           : _settingsFileSync();
       final ciphertext = await LocalConfigSecret.encrypt(
@@ -310,7 +339,7 @@ class SettingsStore extends ChangeNotifier {
         macosAdminPassword: password,
         macosAdminPasswordCiphertext: ciphertext,
       );
-      await _save();
+      await _save(publishVpnEngineSnapshot: false);
     } catch (_) {
       _settings = previous;
       rethrow;
@@ -327,7 +356,7 @@ class SettingsStore extends ChangeNotifier {
       macosAdminPasswordCiphertext: '',
     );
     try {
-      await _save();
+      await _save(publishVpnEngineSnapshot: false);
     } catch (_) {
       _settings = previous;
       rethrow;
@@ -338,13 +367,13 @@ class SettingsStore extends ChangeNotifier {
   Future<void> updateLanguageCode(String languageCode) async {
     _settings = _settings.copyWith(languageCode: languageCode);
     notifyListeners();
-    await _save();
+    await _save(publishVpnEngineSnapshot: false);
     notifyListeners();
   }
 
   Future<void> updateThemeMode(String themeMode) async {
     _settings = _settings.copyWith(themeMode: themeMode);
-    await _save();
+    await _save(publishVpnEngineSnapshot: false);
     notifyListeners();
   }
 
@@ -354,7 +383,7 @@ class SettingsStore extends ChangeNotifier {
     final previous = _settings;
     _settings = previous.copyWith(onboardingCompleted: true);
     try {
-      await _save();
+      await _save(publishVpnEngineSnapshot: false);
     } catch (_) {
       // Do not leave the in-memory state ahead of disk. Otherwise a failed
       // completion can appear to succeed on the next tap but will reappear
@@ -367,13 +396,13 @@ class SettingsStore extends ChangeNotifier {
 
   Future<void> resetDiagnosticsUrl() async {
     _settings = _settings.copyWith(diagnosticsUrl: defaultDiagnosticsUrl);
-    await _save();
+    await _save(publishVpnEngineSnapshot: false);
     notifyListeners();
   }
 
-  Future<void> _save() async {
+  Future<void> _save({bool publishVpnEngineSnapshot = true}) async {
     try {
-      final file = Platform.isAndroid
+      final file = usesNativeApplicationSupportDirectory
           ? await _settingsFile()
           : _settingsFileSync();
       _configPath = file.path;
@@ -381,11 +410,41 @@ class SettingsStore extends ChangeNotifier {
       // in-memory value. A blank token clears the local token file.
       await _tokenRepository.write(_settings.authToken);
       await _writeSettingsFile(file);
+      if (publishVpnEngineSnapshot) {
+        await _publishVpnEngineSettingsSnapshot(settingsFile: file);
+      }
       _lastError = null;
     } catch (error) {
       _lastError = 'Failed to save local settings: $error';
       rethrow;
     }
+  }
+
+  /// Ensures the exact current Harmony settings revision is published before
+  /// an Extension start request is issued.
+  Future<int?> ensureVpnEngineSettingsSnapshot() async {
+    if (Platform.operatingSystem != 'ohos') return null;
+    return _publishVpnEngineSettingsSnapshot();
+  }
+
+  Future<int?> _publishVpnEngineSettingsSnapshot({File? settingsFile}) async {
+    final injected = _vpnEngineSnapshotWriterOverride;
+    if (injected == null && Platform.operatingSystem != 'ohos') return null;
+
+    final settings =
+        settingsFile ??
+        (usesNativeApplicationSupportDirectory
+            ? await _settingsFile()
+            : _settingsFileSync());
+    final writer =
+        injected ??
+        FileVpnEngineSettingsSnapshotWriter(
+          file: File(
+            '${settings.parent.path}${Platform.pathSeparator}'
+            'vpn-engine-settings-v1.json',
+          ),
+        );
+    return writer.publish(_settings);
   }
 
   File _settingsFileSync() {
@@ -402,7 +461,7 @@ class SettingsStore extends ChangeNotifier {
     if (override != null) return override;
     final applicationSupport = await resolveApplicationSupportDirectory();
     if (applicationSupport == null) {
-      throw StateError('Android application support directory is unavailable.');
+      throw StateError('Native application support directory is unavailable.');
     }
     return File(
       '${applicationSupport.path}${Platform.pathSeparator}flutter-client-settings.json',
@@ -520,6 +579,9 @@ class SettingsStore extends ChangeNotifier {
   }
 
   Directory _configDirectorySync() {
+    if (Platform.operatingSystem == 'ohos') {
+      throw StateError('HarmonyOS application storage bridge is unavailable.');
+    }
     if (Platform.isMacOS) {
       final home = Platform.environment['HOME'];
       if (home != null && home.isNotEmpty) {

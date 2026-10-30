@@ -267,7 +267,10 @@ impl UdpSocketRaw for UdpSocket {}
 
 #[cfg(unix)]
 fn configure_ipv4_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "android"
+    ))]
     {
         return set_and_verify_unix_option(
             socket.as_raw_fd(),
@@ -318,7 +321,10 @@ fn configure_ipv4_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
 
 #[cfg(unix)]
 fn read_ipv4_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "android"
+    ))]
     {
         return read_unix_option(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_MTU_DISCOVER)
             == Some(libc::IP_PMTUDISC_PROBE);
@@ -357,7 +363,10 @@ fn read_ipv4_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
 
 #[cfg(unix)]
 fn configure_ipv6_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "android"
+    ))]
     {
         let pmtudisc = set_and_verify_unix_option(
             socket.as_raw_fd(),
@@ -415,7 +424,10 @@ fn configure_ipv6_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
 
 #[cfg(unix)]
 fn read_ipv6_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "android"
+    ))]
     {
         let pmtudisc = read_unix_option(
             socket.as_raw_fd(),
@@ -613,7 +625,10 @@ fn normalized_interface(interface: Option<&str>) -> Option<&str> {
     interface.map(str::trim).filter(|name| !name.is_empty())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    target_os = "android"
+))]
 fn bind_socket_to_interface(socket: &Socket, _ipv4: bool, interface: &str) -> io::Result<()> {
     socket.bind_device(Some(interface.as_bytes()))
 }
@@ -697,7 +712,7 @@ fn bind_socket_to_interface(socket: &Socket, ipv4: bool, interface: &str) -> io:
 }
 
 #[cfg(not(any(
-    target_os = "linux",
+    all(target_os = "linux", not(target_env = "ohos")),
     target_os = "android",
     target_os = "macos",
     target_os = "ios",
@@ -752,7 +767,7 @@ mod tests {
         assert_eq!(ipv4_profile, udp_no_fragment_capabilities(&ipv4));
 
         #[cfg(any(
-            target_os = "linux",
+            all(target_os = "linux", not(target_env = "ohos")),
             target_os = "android",
             target_os = "macos",
             target_os = "ios",
@@ -771,7 +786,7 @@ mod tests {
         assert_eq!(ipv6_profile, udp_no_fragment_capabilities(&ipv6));
 
         #[cfg(any(
-            target_os = "linux",
+            all(target_os = "linux", not(target_env = "ohos")),
             target_os = "android",
             target_os = "macos",
             target_os = "ios",

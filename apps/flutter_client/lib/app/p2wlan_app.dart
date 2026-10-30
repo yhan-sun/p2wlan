@@ -202,7 +202,9 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
       // failure must never escape the startup task or affect the shell.
       return;
     }
-    if (!mounted || !result.hasUpdate) return;
+    if (!mounted || !_capabilities.canOpenExternalUrls || !result.hasUpdate) {
+      return;
+    }
     final latestTag = result.update!.version.tag;
     if (_automaticUpdateResult?.update?.version.tag == latestTag) return;
     setState(() => _automaticUpdateResult = result);

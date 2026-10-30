@@ -320,6 +320,24 @@ where
 
     /// Run the packet pump until the TUN device closes or an unrecoverable error occurs.
     pub async fn run(&mut self) -> Result<()> {
+        self.run_inner(None).await
+    }
+
+    /// Run the packet pump and report when its first TUN read is registered
+    /// with the async runtime or completes with data. This is startup
+    /// readiness for the supplied TUN worker, not proof of peer connectivity
+    /// or successful business traffic.
+    pub async fn run_with_tun_worker_ready(
+        &mut self,
+        ready: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<()> {
+        self.run_inner(Some(ready)).await
+    }
+
+    async fn run_inner(
+        &mut self,
+        mut tun_worker_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
         let mut buf = crate::dataplane_resources::FixedReadBuffer::tun(self.resource_capture());
         let resource_capture = self.resource_capture().cloned();
         let mut local_feedback_rx = self
@@ -331,7 +349,7 @@ where
         if let Some(mut inbound_rx) = self.inbound_rx.take() {
             loop {
                 tokio::select! {
-                    result = self.read_packet(&mut buf) => {
+                    result = self.read_packet(&mut buf, &mut tun_worker_ready) => {
                         let (packet, tun_read_started, tun_read_completed, binding) = result?;
                         if !packet.is_empty() {
                             // The TUN read has completed.  Route outside the
@@ -407,7 +425,7 @@ where
 
         loop {
             tokio::select! {
-                result = self.read_packet(&mut buf) => {
+                result = self.read_packet(&mut buf, &mut tun_worker_ready) => {
                     let (packet, tun_read_started, tun_read_completed, binding) = result?;
                     if !packet.is_empty() {
                         // Match the bidirectional loop: once read consumed a
@@ -463,7 +481,9 @@ where
 
     #[cfg(test)]
     pub(crate) async fn read_and_route_once(&mut self, buf: &mut [u8]) -> Result<()> {
-        let (packet, tun_read_started, tun_read_completed, binding) = self.read_packet(buf).await?;
+        let mut tun_worker_ready = None;
+        let (packet, tun_read_started, tun_read_completed, binding) =
+            self.read_packet(buf, &mut tun_worker_ready).await?;
         if packet.is_empty() {
             return Ok(());
         }
@@ -483,18 +503,35 @@ where
     async fn read_packet(
         &mut self,
         buf: &mut [u8],
+        tun_worker_ready: &mut Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(
         Vec<u8>,
         std::time::Instant,
         std::time::Instant,
         Option<RequestBinding>,
     )> {
+        use std::future::Future;
+
         let started = std::time::Instant::now();
-        let n = self
-            .tun
-            .read(buf)
-            .await
-            .map_err(|e| DaemonError::Network(format!("TUN read failed: {e}")))?;
+        let mut read = Box::pin(self.tun.read(buf));
+        let n = std::future::poll_fn(|context| {
+            let polled = read.as_mut().poll(context);
+            let worker_entered = match &polled {
+                std::task::Poll::Pending => true,
+                std::task::Poll::Ready(Ok(bytes_read)) => *bytes_read > 0,
+                std::task::Poll::Ready(Err(_)) => false,
+            };
+            if worker_entered {
+                if let Some(ready) = tun_worker_ready.take() {
+                    let _ = ready.send(());
+                }
+            }
+            polled
+        })
+        .await
+        .map_err(|e| DaemonError::Network(format!("TUN read failed: {e}")))?;
+        drop(read);
+
         // Take this exact completed read before any resolve/ACL/route await.
         let context = if n == 0 {
             None

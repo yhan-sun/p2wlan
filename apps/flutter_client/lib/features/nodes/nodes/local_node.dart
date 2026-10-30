@@ -76,7 +76,7 @@ class _LocalNodePanel extends StatelessWidget {
                       borderRadius: BorderRadius.circular(AppTokens.radiusSm),
                     ),
                     child: Icon(
-                      localDeviceIcon(),
+                      localDeviceIcon(context),
                       size: 17,
                       color: theme.colorScheme.primary,
                     ),

@@ -18,7 +18,10 @@ fn default_ipv4_gateway_blocking() -> Option<Ipv4Addr> {
         return parse_first_ipv4(&String::from_utf8_lossy(&output.stdout));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "android"
+    ))]
     {
         let output = Command::new("ip")
             .args(["route", "show", "default"])

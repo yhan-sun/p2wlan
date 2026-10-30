@@ -83,7 +83,7 @@ class _Daemon extends DaemonController {
   }
 
   @override
-  Future<DaemonCommandResult> start(AppSettings settings) async {
+  Future<DaemonCommandResult> start(AppSettings settings, {int? vpnSettingsRevision}) async {
     api.current = _snapshot(settings.authToken == _token('a') ? 'a' : 'b');
     return const DaemonCommandResult(ok: true, message: 'start');
   }

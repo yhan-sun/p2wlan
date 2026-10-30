@@ -173,7 +173,8 @@ class AppSelect<T> extends StatelessWidget {
     final isMobilePlatform = switch (defaultTargetPlatform) {
       TargetPlatform.android ||
       TargetPlatform.iOS ||
-      TargetPlatform.fuchsia => true,
+      TargetPlatform.fuchsia ||
+      TargetPlatform.ohos => true,
       _ => false,
     };
     if (!isMobilePlatform) return false;

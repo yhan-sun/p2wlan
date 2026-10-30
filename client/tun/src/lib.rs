@@ -44,3 +44,5 @@ pub use mock::MockTunDevice;
 pub use packet::{IpPacket, Ipv4Packet, Ipv6Packet, Protocol};
 #[cfg(target_os = "android")]
 pub use platform::android::AndroidTunMode;
+#[cfg(target_env = "ohos")]
+pub use platform::ohos::OhosTun;

@@ -1,8 +1,17 @@
-use std::net::Ipv4Addr;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    target_os = "macos",
+    target_os = "windows"
+))]
 use std::process::Command;
 use std::sync::Mutex;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    target_os = "macos",
+    target_os = "windows"
+))]
 use tracing::info;
 #[cfg(target_os = "windows")]
 use tracing::warn;
