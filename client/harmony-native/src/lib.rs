@@ -8,7 +8,9 @@ mod diagnostics;
 mod lifecycle;
 #[cfg(any(target_env = "ohos", test))]
 mod shutdown;
+#[cfg(any(target_env = "ohos", test))]
 mod snapshot;
+#[cfg(any(target_env = "ohos", test))]
 pub use snapshot::{
     P2wlanStringListV1, P2wlanStringViewV1, P2wlanVpnIdentityV1, P2wlanVpnNetworkRequestV1,
     P2wlanVpnSettingsSnapshotV1, P2wlanVpnSettingsV1, P2wlanVpnStartRequestV1,

@@ -586,6 +586,21 @@ mod tests {
         assert_eq!(copied.settings_snapshot.settings.auth_token, auth_token);
         assert!(copied.settings_snapshot.settings.virtual_ip.is_empty());
         assert_eq!(copied.settings_snapshot.settings.socket_pool, "4");
+
+        let mut network_request = P2wlanVpnNetworkRequestV1 {
+            identity_store_path: request.identity_store_path,
+            settings_snapshot: request.settings_snapshot,
+        };
+        // SAFETY: the same live views are copied synchronously for preflight.
+        let network = unsafe { VpnNetworkRequestV1::copy_from_ffi(&network_request) }.unwrap();
+        assert_eq!(network.identity_store_path, identity_store_path);
+        assert_eq!(network.settings_snapshot.revision, 9);
+        network_request.settings_snapshot.schema_version = 2;
+        // SAFETY: invalid schema is data; the backing pointers remain valid.
+        assert_eq!(
+            unsafe { VpnNetworkRequestV1::copy_from_ffi(&network_request) }.err(),
+            Some("invalid_request")
+        );
     }
 
     #[test]
