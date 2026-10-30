@@ -103,6 +103,13 @@ pub enum DaemonError {
     #[error("control plane error: {0}")]
     ControlPlane(String),
 
+    /// A bounded local diagnostic/cache resource cannot admit another key.
+    #[error("resource capacity exceeded: {resource} limit={limit}")]
+    ResourceLimit {
+        resource: &'static str,
+        limit: usize,
+    },
+
     /// Relay error.
     #[error("relay error: {0}")]
     Relay(String),

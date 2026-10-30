@@ -472,7 +472,7 @@ pub struct PeerManager {
     /// both endpoints believe they are the Hard↔Hard initiator.
     local_node_id_for_traversal: std::sync::RwLock<String>,
     /// Active peer connections, indexed by node ID.
-    connections: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    connections: Arc<ConnectionsTable>,
     /// No-await mirror of connection-map membership and peer lifecycle.
     ///
     /// The serial control-signal consumer must be able to decide whether an

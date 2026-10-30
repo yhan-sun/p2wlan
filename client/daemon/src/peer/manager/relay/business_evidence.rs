@@ -181,6 +181,23 @@ impl PeerManager {
         relay_endpoint: Option<&str>,
         relay_connection_id: Option<u64>,
     ) -> bool {
+        // A negative/no-change result may linearize at this real reader.
+        // It creates no health/owner/send fact. Busy or not-yet-recorded cases
+        // keep the original epoch/writer transaction and all identity checks.
+        if self
+            .connections
+            .try_read()
+            .ok()
+            .and_then(|connections| {
+                connections.get(node_id).map(|connection| {
+                    connection.relay_first.business_sent_generation == Some(generation)
+                })
+            })
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let mut path_log = DeferredPathTransitionLog::new(node_id);
         let (changed, exchange_confirmed, relay_endpoint) = {
             let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
             if generation != self.current_network_generation_sync() {
@@ -219,7 +236,7 @@ impl PeerManager {
                 conn.relay_confirmed_connection_id,
             );
             let mut exchange_confirmed = false;
-            let outcome = conn.commit_path_transition(
+            let outcome = conn.commit_path_transition_deferred(
                 PathEvent::RelayBusinessUsable {
                     relay: relay_identity,
                     observation: RelayBusinessObservation::Sent,
@@ -234,6 +251,7 @@ impl PeerManager {
                         conn.relay_first.business_gate_completed_generation = Some(generation);
                     }
                 },
+                &mut path_log,
             );
             if !outcome.accepted() {
                 return false;
@@ -244,6 +262,8 @@ impl PeerManager {
                 conn.relay_confirmed_endpoint.clone(),
             )
         };
+        // Flush only after both actual grants have left the inner scope.
+        drop(path_log);
         if changed {
             self.emit_timeline(
                 "relay_first_business_sent",

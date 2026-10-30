@@ -164,37 +164,45 @@ pub(crate) async fn run_relay_peer_probe_loop(
             sends.push(async move {
                 let deadline_permit = RelayWriteBoundaryPermit::new();
                 let boundary_permit = deadline_permit.clone();
-                let result = tokio::time::timeout(
-                    RELAY_CONTROL_SEND_TIMEOUT,
-                    send_transport.encrypt_and_emit_outbound(
-                        OutboundPacket {
-                            room_authorization: None,
-                            peer_id: send_peer_id.clone(),
-                            dst_ip: send_peer_virtual_ip,
-                            packet,
-                            trace: None,
-                        },
-                        move |encrypted| async move {
+                let result = tokio::time::timeout(RELAY_CONTROL_SEND_TIMEOUT, async {
+                    let __control_packet = OutboundPacket {
+                        room_authorization: None,
+                        peer_id: send_peer_id.clone(),
+                        dst_ip: send_peer_virtual_ip,
+                        packet,
+                        trace: None,
+                    };
+                    let mut __relay_post =
+                        send_relay.prepare_deferred_send(&__control_packet.peer_id);
+                    let __relay_post_ref = &mut __relay_post;
+                    let __outcome = send_transport
+                        .encrypt_and_emit_outbound(__control_packet, move |encrypted| async move {
                             send_relay
-                                .send_packet_with_write_boundary(&encrypted, move |sent_at| {
-                                    boundary_permit.commit(|| {
-                                        send_peers
-                                            .register_relay_probe_expectation_at_write_boundary(
-                                                &expectation_peer_id,
-                                                send_generation,
-                                                request_id,
-                                                send_owner_token,
-                                                &expectation_endpoint,
-                                                send_relay_connection_id,
-                                                send_peer_session_generation,
-                                                sent_at,
-                                            )
-                                    })
-                                })
+                                .send_packet_deferred(
+                                    &encrypted,
+                                    Some(Box::new(move |sent_at| {
+                                        boundary_permit.commit(|| {
+                                            send_peers
+                                                .register_relay_probe_expectation_at_write_boundary(
+                                                    &expectation_peer_id,
+                                                    send_generation,
+                                                    request_id,
+                                                    send_owner_token,
+                                                    &expectation_endpoint,
+                                                    send_relay_connection_id,
+                                                    send_peer_session_generation,
+                                                    sent_at,
+                                                )
+                                        })
+                                    })),
+                                    __relay_post_ref,
+                                )
                                 .await
-                        },
-                    ),
-                )
+                        })
+                        .await;
+                    __relay_post.finish().await;
+                    __outcome
+                })
                 .await;
                 (
                     send_peer_id,
@@ -416,21 +424,27 @@ pub(crate) async fn run_relay_peer_probe_loop(
                 path_sends.push(async move {
                     let deadline_permit = RelayWriteBoundaryPermit::new();
                     let boundary_permit = deadline_permit.clone();
-                    let result = tokio::time::timeout(
-                        RELAY_CONTROL_SEND_TIMEOUT,
-                        send_transport.encrypt_and_emit_outbound(
-                            OutboundPacket {
-                                room_authorization: None,
-                                peer_id: send_peer_id.clone(),
-                                dst_ip: send_peer_virtual_ip,
-                                packet,
-                                trace: None,
-                            },
-                            move |encrypted| async move {
-                                send_relay
-                                    .send_packet_with_write_boundary(&encrypted, move |sent_at| {
-                                        boundary_permit.commit(|| {
-                                            send_peers
+                    let result = tokio::time::timeout(RELAY_CONTROL_SEND_TIMEOUT, async {
+                        let __control_packet = OutboundPacket {
+                            room_authorization: None,
+                            peer_id: send_peer_id.clone(),
+                            dst_ip: send_peer_virtual_ip,
+                            packet,
+                            trace: None,
+                        };
+                        let mut __relay_post =
+                            send_relay.prepare_deferred_send(&__control_packet.peer_id);
+                        let __relay_post_ref = &mut __relay_post;
+                        let __outcome = send_transport
+                            .encrypt_and_emit_outbound(
+                                __control_packet,
+                                move |encrypted| async move {
+                                    send_relay
+                                        .send_packet_deferred(
+                                            &encrypted,
+                                            Some(Box::new(move |sent_at| {
+                                                boundary_permit.commit(|| {
+                                                    send_peers
                                                 .register_path_commit_expectation_at_write_boundary(
                                                     &expectation_peer_id,
                                                     send_generation,
@@ -441,12 +455,17 @@ pub(crate) async fn run_relay_peer_probe_loop(
                                                     send_peer_session_generation,
                                                     sent_at,
                                                 )
-                                        })
-                                    })
-                                    .await
-                            },
-                        ),
-                    )
+                                                })
+                                            })),
+                                            __relay_post_ref,
+                                        )
+                                        .await
+                                },
+                            )
+                            .await;
+                        __relay_post.finish().await;
+                        __outcome
+                    })
                     .await;
                     (
                         send_peer_id,

@@ -17,6 +17,7 @@ use crate::transport::{EncryptedPeerPacket, OriginalEncryptionSource};
 mod channel;
 mod crypto;
 mod physical;
+mod queue_observation;
 mod residency_metadata;
 #[cfg(test)]
 mod residency_overhead_tests;

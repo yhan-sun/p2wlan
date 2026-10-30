@@ -33,6 +33,7 @@ sys.path.insert(0, str(DUAL))
 import udp_business_probe as udp
 import udp_business_summary as udp_summary
 import tcp_business_probe as tcp
+import application_layer_export
 
 spec = importlib.util.spec_from_file_location("original_linux_netns", Path(__file__).with_name("linux-netns.py"))
 original = importlib.util.module_from_spec(spec)
@@ -174,16 +175,22 @@ def wait_child(child: subprocess.Popen, deadline: float, *, capture=None) -> int
             capture.drain()
             if time.monotonic() >= deadline:
                 break
-        result = child.poll()
+        # Keep the original child unreaped until its owned pipe reaches EOF.
+        # One read can leave a tail (the eight-write stream exceeds 4096 bytes);
+        # polling first could retire the owner before live delivery sees it.
+        # Every iteration keeps the same read cap, sleep and absolute deadline.
+        stream_open = capture is not None and capture.reader is not None and capture.gap is None
+        result = None if stream_open else child.poll()
         if result is not None:
             return result
         time.sleep(.02)
     raise TimeoutError("original application child deadline")
 
 
-def prepare_write_capture(groups, entry, protocol, bind, target, stem, namespace):
+def prepare_write_capture(groups, entry, protocol, bind, target, stem, namespace, *, defer_pipe=False):
     captures = getattr(groups, "write_captures", None)
-    return captures.prepare(groups, entry, protocol, bind, target, stem, namespace) if captures else None
+    return captures.prepare(groups, entry, protocol, bind, target, stem, namespace,
+                            defer_pipe=defer_pipe) if captures else None
 
 
 def prepare_kernel_capture(lab, groups, entry, capture, source, target, snapshots, *, deadline=None):
@@ -218,6 +225,8 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
     echo_argv = tool_argv(tool, "echo", destination, bind, entry, echo_report)
     if protocol == "tcp" and getattr(lab.args, "kernel_read_facts", False):
         echo_argv.extend(["--completion-barrier", str(out / (stem + "-window-handoff.json"))])
+    if protocol == "tcp" and getattr(lab.args, "layered_measurements", False):
+        echo_argv.append("--observe-tcp")
     echo = groups.spawn(stem + "-echo", ["ip", "netns", "exec", lab.ns(lab.daemons[target]["namespace"]),
                                        *echo_argv],
                         echo_log, env=clean, socket_tool=True)
@@ -238,6 +247,8 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
     if revocation is not None:
         revocation.prepare(capture, kernel)
     probe_argv = tool_argv(tool, "probe", bind, destination, entry, probe_report)
+    if protocol == "tcp" and getattr(lab.args, "layered_measurements", False):
+        probe_argv.append("--observe-tcp")
     if capture is not None:
         probe_argv.extend(capture.arguments())
     probe = groups.spawn(stem + "-probe", ["ip", "netns", "exec", namespace, *probe_argv],
@@ -383,6 +394,8 @@ def main() -> int:
                         help="independent fixed32 application DROP/clear/fresh scope; original baseline unchanged")
     mode.add_argument("--server-stall", action="store_true",
                       help="independent UDP fixed16 original echo STOP/CONT; explicit keepalive interval1")
+    parser.add_argument("--layered-measurements", action="store_true",
+                        help="export original TCP RTT, service, socket and two channel observations")
     mode.add_argument("--relay-application", choices=["udp", "tcp"],
                       help="independent bidirectional Relay16; original normal32/fault32/stall16 unchanged")
     mode.add_argument("--room-revocation", action="store_true",
@@ -428,7 +441,8 @@ def main() -> int:
                                  Path(__file__).with_name("linux_tun_revoke_contract.py"),
                                  Path(__file__).with_name("linux_tun_room_revoke.py"),
                                  Path(__file__).with_name("udp_stall_echo.py"),
-                                 DUAL / "udp_business_probe.py", DUAL / "udp_business_summary.py", DUAL / "tcp_business_probe.py",
+                                 DUAL / "udp_business_probe.py", DUAL / "udp_business_summary.py", DUAL / "tcp_business_probe.py", DUAL / "tcp_socket_observation.py",
+                                 DUAL / "application_layer_report.py", DUAL / "application_layer_export.py",
                                  DUAL / "probe_completion_barrier.py",
                                  ROOT / ".github/workflows/parallel-rooms.yml")},
               "binary_sha256": {"daemon": None, "control": None}}
@@ -554,6 +568,15 @@ def main() -> int:
         if args.relay_application:
             report["relay_native_path_comparisons"] = relay_fixture.path_summary(report["manifest"])
             report["passed"] = report["passed"] and report["relay_native_path_comparisons"]["complete"]
+        if args.layered_measurements:
+            try:
+                report["layered_application_observations"] = application_layer_export.export(
+                    args.output_dir, report["manifest"], kernel_captures)
+            except (OSError, ValueError, KeyError, TypeError) as layer_error:
+                report["layered_application_observations"] = {
+                    "scope": "original_TCP_request_layer_observations_only",
+                    "error": type(layer_error).__name__, "reports": [],
+                    "business_outcomes_reclassified": False}
         udp.write_report(args.report, report)
         # Preserve 0600 files while making only this non-secret output readable
         # by the invoking CI runner for upload; private Lab credentials were removed.

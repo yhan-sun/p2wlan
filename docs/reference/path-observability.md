@@ -265,7 +265,7 @@ python3 scripts/nat-sim/benchmark_campaign.py summarize \
 
 配置身份范围为 `argv_and_allowlisted_environment`：对实际参数、明确列出的环境变量以及启动时存在的指定配置文件计算摘要，不保存原始参数或环境值，不读取授权 stdin。配置文件尚不存在时记录 `absent_at_launch`，后续自动生成的文件不能替代启动时事实。`configuration_identity_scope` 明示这份输入范围，`resolved_runtime_configuration_sha256` 保持未知；生成后的运行配置、未列出的宿主环境和 stdin 授权不由该摘要覆盖。
 
-当前范围为 `synthetic_ipv4_udp_normal_join`：mock TUN、同主机进程和人工网络条件。成功可经 Direct 或 Relay；`direct_at_10s`、`first_business_ms`、`application_p99_ms` 保持 `null` 并给出未知原因。启动身份不能据此证明发布产物性能、真实运营商成功率或 Minecraft 交互延迟。不同种子也不构成独立真实网络样本。
+当前范围为 `synthetic_ipv4_udp_normal_join`：mock TUN、同主机进程和人工网络条件。成功可经 Direct 或 Relay；`direct_at_10s`、`first_business_ms`、`application_p99_ms` 保持 `null` 并给出未知原因。启动身份不能据此证明发布产物性能、真实运营商成功率或真实应用交互延迟。不同种子也不构成独立真实网络样本。
 
 ## 活动路径遥测契约（path_telemetry_v1）
 
@@ -331,3 +331,26 @@ daemon 内部 `FreshMappingRejection::NoProbesSent(summary)` 保留固定大小�
 零成功分支的 UDP owner 在原 `fresh_mapping_skipped` 事件追加一次 first failure、调用数、primary 成功数、physical 成本、outer stop 和 saturation 展示，并明确 `sent_probes=0`。ordinary caller 保留原 label/fallback，不重复展示或累加该成本。诊断事件环、时间线和日志均为 best effort；事件可能因竞争、替换或输出丢失而不可见，不能用事件条数反推累计成本。
 
 该 producer 事件在 cleanup 前记录。完整 detach 的最后 await 返回后再次检查显式 cancellation，并保持 unit `Superseded` 终态优先；cleanup 期间才到达的 cancellation 不会回填先前事件的 outer stop，也不会返回 NoProbesSent payload。Superseded 的事件不是 durable 成本账本。future 被 drop/abort/panic 而未返回时，这份局部摘要的最终覆盖未知，不能补成零成本或已成功。此改动不新增发送 owner/预算/队列，不收紧 ordinary retained-Arc 或 HH2 授权规则，诊断字段不参与路径选择。
+
+## TCP 应用分层观察
+
+`tcp_business_probe.py` 的 `--observe-tcp` 在原连接成功后和关闭前各读取一次系统 TCP 信息，不额外连接、发送或重试，也不延长请求截止时间。Linux 使用 TCP_INFO，macOS 使用 TCP_CONNECTION_INFO，Windows 使用 SIO_TCP_INFO v0。不可用、布局不符、连接身份变化和计数下降会保留不可用原因；计数差属于整条 TCP 连接，不能归因到某一个应用请求。默认不启用该观察。
+
+同一选项使 echo 保留每个完整请求的本机读完、开始响应写入和写入返回时间。这是解码、校验、调度和写入背压的局部区间，不是 CPU 使用时间。应用 RTT 继续使用原请求、原超时与固定分母；不从 RTT 减去服务端区间推导网络 RTT，不跨主机相减时钟。
+
+已有原报告可在采样结束后组合，输出须位于 Git 仓库之外：
+
+```bash
+python3 scripts/dual-end/application_layer_report.py \
+  --probe ../observations/probe.json \
+  --echo ../observations/echo.json \
+  --daemon-capture ../observations/daemon-a.json \
+  --daemon-capture ../observations/daemon-b.json \
+  --out ../observations/layers.json
+```
+
+`--daemon-capture` 最多两份，可省略；输入是原描述符返回的 schema 2 JSON 快照。每份快照保留在原有最多 1000 请求、1024 包、每包最多 8 个 frame span 的边界内。工具按原 producer scope、run/round、完整请求 nonce、序号和 flow/read ordinal 关联，同一包覆盖多个 TCP frame 时分别列出，绝不叠加为请求耗时或端到端时延。
+
+队列字段只导出同一包已有的 dataplane channel 和 network-outbound channel 两段首次入队到出队区间，包含入队背压；缺边界或时序错误保留 unavailable。pending、锁、加密和内核队列未观测。这些字段不产生 KernelRead、Full、SystemTun、当前 owner 或 once 信用。
+
+Linux 真实 TUN 采证的 `--layered-measurements` 可组合原 TCP 报告和已经保留的 daemon 快照，写出各方向的 `tcp-*-layers.json`。它不追加快照请求，不重跑测量，也不重分类业务成功、超时、取消或失败。观察导出错误单列，原业务结果仍保留；CI 使用 `scripts/parallel-rooms/verify_application_layers.py` 单独核验基础双向 16 个 TCP 请求的区间字段。工具和 CI 的同机验证不代表真实设备、公网或性能收益已验收。

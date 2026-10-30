@@ -285,6 +285,7 @@ pub use write_origin::OriginalRelayWriteFact;
 
 mod commands;
 mod connect;
+mod data_completion;
 mod legacy_tcp;
 
 #[cfg(test)]

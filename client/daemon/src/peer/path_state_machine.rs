@@ -2617,18 +2617,18 @@ mod tests {
         assert!(connection
             .commit_path_transition(PathEvent::PeerOnline { epoch: current }, |_| {})
             .accepted());
-        connection.bytes_sent = 7;
+        connection.bytes_sent = crate::peer::TrafficBytes::new(7);
 
         let rejected = connection
             .commit_path_transition(PathEvent::DirectPathFailed { epoch: stale }, |conn| {
-                conn.bytes_sent = 99
+                conn.bytes_sent = crate::peer::TrafficBytes::new(99)
             });
 
         assert_eq!(
             rejected.decision,
             PathTransitionDecision::RejectedNetworkGeneration
         );
-        assert_eq!(connection.bytes_sent, 7);
+        assert_eq!(connection.bytes_sent.get(), 7);
         assert_eq!(connection.state, ConnectionState::Idle);
         assert_eq!(connection.active_path(), None);
         assert_eq!(connection.path_state_snapshot().rejected_transitions, 1);

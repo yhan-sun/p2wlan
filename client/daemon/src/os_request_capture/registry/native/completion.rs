@@ -150,7 +150,7 @@ struct PreparedCompletion {
 pub(in crate::os_request_capture::registry) struct NativeCompletionBatch {
     flows: Vec<(usize, Arc<FrozenFlowSources>)>,
     requests: Vec<PreparedCompletion>,
-    version: Option<u64>,
+    version: Option<(u64, u64, u64)>,
     unstable: bool,
 }
 
@@ -210,7 +210,7 @@ impl NativeCompletionBatch {
         if self.unstable {
             return false;
         }
-        match scope.state.try_metadata_version() {
+        match scope.try_source_metadata_versions() {
             Ok(version) if self.version.is_none_or(|old| old == version) => {
                 self.version = Some(version);
                 true
@@ -233,7 +233,7 @@ impl NativeCompletionBatch {
                 prepared.claim.not_ready();
             }
             if matches!(
-                scope.state.try_metadata_version(),
+                scope.try_source_metadata_versions(),
                 Err(std::sync::TryLockError::Poisoned(_))
             ) {
                 scope.pending_full.clear();
@@ -242,7 +242,7 @@ impl NativeCompletionBatch {
             scope.pending_full.defer_window_until_unlock();
             // Subscribe first, then check: an unlock that already happened
             // must not strand the one existing metadata actor's pending work.
-            if scope.state.try_metadata_version().is_ok() {
+            if scope.try_source_metadata_versions().is_ok() {
                 scope.pending_full.request_window();
             }
             return;

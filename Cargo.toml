@@ -16,7 +16,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.170"
+version = "0.1.171"
 edition = "2021"
 authors = ["P2PNet Team"]
 license = "MIT"
@@ -24,7 +24,7 @@ repository = "https://github.com/yhan-sun/p2wlan"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 clap = { version = "4.4", features = ["derive"] }
 
 # Serialization

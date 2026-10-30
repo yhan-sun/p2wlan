@@ -386,8 +386,8 @@ async fn native_workflow(
     timeout_at(arrival_deadline(deadline), async {
         loop {
             let connection = peers.get_connection(PEER).await.unwrap();
-            if connection.bytes_sent == tx_len as u64 {
-                assert_eq!(connection.bytes_received, 0);
+            if connection.bytes_sent.get() == tx_len as u64 {
+                assert_eq!(connection.bytes_received.get(), 0);
                 assert!(connection.endpoint == Some(remote_endpoint));
                 break;
             }
@@ -445,8 +445,8 @@ async fn native_workflow(
         timeout_at(arrival_deadline(deadline), async {
             loop {
                 let connection = peers.get_connection(PEER).await.unwrap();
-                if connection.bytes_received == rx_len as u64 {
-                    assert_eq!(connection.bytes_sent, tx_len as u64);
+                if connection.bytes_received.get() == rx_len as u64 {
+                    assert_eq!(connection.bytes_sent.get(), tx_len as u64);
                     assert!(connection.endpoint == Some(remote_endpoint));
                     break;
                 }

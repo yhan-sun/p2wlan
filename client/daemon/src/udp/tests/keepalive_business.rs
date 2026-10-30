@@ -369,7 +369,8 @@ async fn c02_delivered_ordinary_udp_without_application_reply_preserves_healthy_
                 .get_connection("peer-a")
                 .await
                 .ok_or("missing actual receiver peer")?
-                .bytes_received;
+                .bytes_received
+                .get();
             if received >= packet.len() as u64 {
                 break received;
             }
@@ -379,7 +380,8 @@ async fn c02_delivered_ordinary_udp_without_application_reply_preserves_healthy_
             .get_connection("peer-b")
             .await
             .ok_or("missing actual sender peer")?
-            .bytes_sent;
+            .bytes_sent
+            .get();
         let after_business = health(&peers, endpoint, source_endpoint).await?;
 
         udp.run_keepalive_round(Duration::from_millis(500)).await;

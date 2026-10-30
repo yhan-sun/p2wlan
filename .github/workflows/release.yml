@@ -236,7 +236,7 @@ jobs:
   flutter-ios:
     needs: quality-gate
     name: Flutter iOS arm64 IPA
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
@@ -294,7 +294,7 @@ jobs:
   flutter-macos:
     needs: quality-gate
     name: Flutter macOS ${{ matrix.arch }} DMG
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:

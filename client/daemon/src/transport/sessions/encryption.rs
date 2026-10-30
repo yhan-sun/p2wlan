@@ -70,6 +70,10 @@ impl WireGuardTransport {
         E: From<DaemonError>,
     {
         let peer_id = packet.peer_id.clone();
+        // All subscriber callbacks, including crypto diagnostics, belong to
+        // the outer attempt and drain only after the original emit guard.
+        let mut control_log =
+            diagnostics::DeferredControlLog::new(peer_id.clone(), packet.packet.len());
         let emit_lock = self.outbound_emit_lock(&peer_id).await;
         let lock_wait_started = Instant::now();
         let _emit_guard = match tokio::time::timeout(lock_timeout, emit_lock.lock()).await {
@@ -86,42 +90,28 @@ impl WireGuardTransport {
                 return Ok(BoundedEmitOutcome::LockTimeout);
             }
         };
-        debug!(
-            event = "control_emit_lock_acquired",
-            peer_id = %peer_id,
-            lock_wait_ms = lock_wait_started.elapsed().as_millis() as u64,
-            bytes = packet.packet.len(),
-            "control/probe packet acquired the same per-peer counter-ordering lock as business traffic"
-        );
-        let packet_bytes = packet.packet.len();
-        let Some(encrypted) = self.encrypt_outbound_inner(packet, false, false).await? else {
+        control_log.acquired(lock_wait_started.elapsed().as_millis() as u64);
+        let Some(encrypted) = self
+            .encrypt_outbound_inner_with_capture(
+                packet,
+                false,
+                false,
+                false,
+                None,
+                Some(control_log.crypto()),
+            )
+            .await?
+            .map(EncryptedOutboundWithSource::into_packet)
+        else {
             return Ok(BoundedEmitOutcome::SessionUnavailable);
         };
-        let counter = wire_counter(&encrypted.wire_bytes);
-        let wire_fp = wire_fingerprint(&encrypted.wire_bytes);
-        let encrypted_bytes = encrypted.wire_bytes.len();
-        debug!(
-            event = "control_transport_handoff_started",
-            peer_id = %peer_id,
-            counter = ?counter,
-            bytes = encrypted_bytes,
-            plaintext_bytes = packet_bytes,
-            wire_fp = format_args!("{wire_fp:016x}"),
-            "encrypted control packet entered its caller-provided transport handoff"
-        );
+        control_log.started(&encrypted.wire_bytes);
         let emitted = emit(encrypted).await;
         // Counter order requires the fence through the real handoff. The
         // completed diagnostic is not part of that transaction and may block.
         drop(_emit_guard);
+        control_log.completed(emitted.is_ok());
         emitted?;
-        debug!(
-            event = "control_transport_handoff_completed",
-            peer_id = %peer_id,
-            counter = ?counter,
-            bytes = encrypted_bytes,
-            wire_fp = format_args!("{wire_fp:016x}"),
-            "control packet handoff completed locally; peer delivery still requires its matching ACK"
-        );
         Ok(BoundedEmitOutcome::Sent)
     }
 

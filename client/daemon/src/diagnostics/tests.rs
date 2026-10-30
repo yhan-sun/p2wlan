@@ -389,8 +389,47 @@ mod tests {
             snapshot.peer_snapshot_shape
         );
 
+        // A queued writer makes both an existing and an unknown peer
+        // temporarily unreadable. Neither response may manufacture a 404.
+        for peer_id in ["node-b", "absent-peer"] {
+            let mut peer_stream = TcpStream::connect(addr).await.unwrap();
+            peer_stream
+                .write_all(
+                    format!(
+                        "GET /status/peer/{peer_id} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer diag-test-token\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                peer_stream.read_to_string(&mut response),
+            )
+            .await
+            .expect("peer contention must remain bounded")
+            .unwrap();
+            assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+            assert!(response.contains("peer_snapshot_busy"));
+        }
+
+        // Poll one actual capture while contended, then release the original
+        // reader/writer. The same future must recover a fresh peer snapshot.
+        let mut recovering_peer =
+            Box::pin(build_peer_scoped_snapshot(context_probe.clone(), "node-b"));
+        assert!(
+            tokio::time::timeout(Duration::ZERO, recovering_peer.as_mut())
+                .await
+                .is_err()
+        );
         drop(connection_reader);
         queued_writer.await.unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(2), recovering_peer)
+            .await
+            .unwrap()
+            .expect("the original capture should recover after contention clears");
+        assert_eq!(recovered.peer.unwrap().node_id, "node-b");
         assert_eq!(
             snapshot.protocol.handshake,
             "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
@@ -476,6 +515,24 @@ mod tests {
         assert_eq!(scoped.network_peer_count, 0);
         assert!(scoped.captured_at_ms > 0);
         assert_eq!(scoped.peer.unwrap().node_id, "node-b");
+
+        let absent = build_peer_scoped_snapshot(context_probe.clone(), "absent-peer")
+            .await
+            .expect("a readable map can confirm absence");
+        assert!(absent.peer.is_none());
+        let mut missing_stream = TcpStream::connect(addr).await.unwrap();
+        missing_stream
+            .write_all(
+                b"GET /status/peer/absent-peer HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer diag-test-token\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut missing_response = String::new();
+        missing_stream
+            .read_to_string(&mut missing_response)
+            .await
+            .unwrap();
+        assert!(missing_response.starts_with("HTTP/1.1 404 Not Found"));
 
         let mut runtime_stream = TcpStream::connect(addr).await.unwrap();
         runtime_stream

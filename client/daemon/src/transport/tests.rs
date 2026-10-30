@@ -34,6 +34,11 @@ mod tests {
 
     include!("tests/control_log_release.rs");
 
+    mod relay_post_write {
+        use super::*;
+        include!("tests/relay_post_write.rs");
+    }
+
     mod ingress_business_log_release {
         use super::*;
         include!("tests/ingress_business_log_release.rs");

@@ -22,6 +22,10 @@
 
 准确参数以 p2wlan help 和当前 Release 内的 CLI 为准。登录、配置和查询不要使用 sudo；创建 TUN、路由和 systemd 服务可能需要权限。
 
+## 本地节点诊断
+
+认证后的 `GET /status/peer/<node_id>` 返回当前节点快照。连接表短暂争用时执行有界读取；持续争用返回 HTTP 503 与 `peer_snapshot_busy`，不使用旧缓存代替当前快照。只有实际读取连接表并确认节点不存在时才返回 HTTP 404。完整快照仍受原请求超时限制，连接取消会结束对应读取。
+
 ## OS UDP/TCP 请求计划
 
 `python3 scripts/dual-end/probe_request_plan.py prepare --help` 提供请求计划生成入口。`--transport udp` 或 `tcp` 选择工具，地址、端口、run/round nonce 及时间配置须与后续 probe 一致；`--capture-id` 与 `--producer-scope` 均为 32 位小写十六进制关联 ID。`--output` 必须是 Git 检出外的新绝对路径，POSIX 文件权限为 0600。准备计划只生成输入文件，不打开 socket。

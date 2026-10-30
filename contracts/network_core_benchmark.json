@@ -16,5 +16,5 @@
   "required_run_identity": ["client_commit", "client_patch_sha256", "client_binary_sha256", "server_commit", "server_binary_sha256", "config_sha256", "platform", "scenario", "seed", "cold_or_warm", "probe_budget", "maximum_duration"],
   "planned_metrics": ["ipv4_udp_direct_at_10s", "first_business_available_ms", "tx_local_dataplane_latency_us", "rx_local_dataplane_latency_us", "application_interaction_ms", "business_outage_duration_ms", "probe_cost", "resource_peak"],
   "synthetic_runner_scope": "synthetic_ipv4_udp_normal_join",
-  "synthetic_runner_limits": ["mock_tun", "not_public_nat_success_rate", "not_minecraft_latency", "not_direct_at_10s", "not_independent_network_samples"]
+  "synthetic_runner_limits": ["mock_tun", "not_public_nat_success_rate", "not_real_application_latency", "not_direct_at_10s", "not_independent_network_samples"]
 }

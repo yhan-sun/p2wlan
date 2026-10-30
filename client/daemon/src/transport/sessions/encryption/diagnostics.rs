@@ -1,6 +1,9 @@
 //! One attempt's frozen crypto log fields. No packet, guard or worker is kept.
 use crate::transport::{wire_counter, wire_fingerprint};
 
+mod control;
+pub(super) use control::DeferredControlLog;
+
 const TARGET: &str = "p2pnet_daemon::transport::sessions::encryption";
 
 pub(super) enum Unavailable {
@@ -61,9 +64,10 @@ impl DeferredEncryptionLog {
     }
 }
 
-impl Drop for DeferredEncryptionLog {
-    fn drop(&mut self) {
-        match self.event.as_ref() {
+impl DeferredEncryptionLog {
+    pub(super) fn emit(&mut self) {
+        let event = self.event.take();
+        match event.as_ref() {
             Some(Event::Counter {
                 session_instance,
                 counter,
@@ -118,5 +122,11 @@ impl Drop for DeferredEncryptionLog {
             ),
             None => {}
         }
+    }
+}
+
+impl Drop for DeferredEncryptionLog {
+    fn drop(&mut self) {
+        self.emit();
     }
 }

@@ -302,12 +302,12 @@ async fn duplicate_path_events_preserve_revision_counters_timestamps_and_markers
     let mut connections = manager.connections.write().await;
     let connection = connections.get_mut(peer_id).unwrap();
     let revision = connection.path_state_snapshot().revision;
-    let bytes_sent = connection.bytes_sent;
+    let bytes_sent = connection.bytes_sent.get();
     let direct_success_count = connection.direct_health.success_count;
     let direct_event_count = connection.direct_events.len();
     let peer_online_duplicate =
         connection.commit_path_transition(PathEvent::PeerOnline { epoch }, |connection| {
-            connection.bytes_sent = connection.bytes_sent.saturating_add(1);
+            connection.record_sent(1);
             connection.direct_health.record_success();
             connection.record_direct_event(
                 generation,
@@ -323,7 +323,7 @@ async fn duplicate_path_events_preserve_revision_counters_timestamps_and_markers
         PathTransitionDecision::Duplicate
     );
     assert_eq!(connection.path_state_snapshot().revision, revision);
-    assert_eq!(connection.bytes_sent, bytes_sent);
+    assert_eq!(connection.bytes_sent.get(), bytes_sent);
     assert_eq!(connection.direct_health.success_count, direct_success_count);
     assert_eq!(connection.direct_events.len(), direct_event_count);
 
@@ -345,7 +345,7 @@ async fn duplicate_path_events_preserve_revision_counters_timestamps_and_markers
             retained: PathRetention::DirectAndRelay,
         },
         |connection| {
-            connection.bytes_sent = connection.bytes_sent.saturating_add(1);
+            connection.record_sent(1);
             connection.direct_health.record_success();
         },
     );
@@ -357,7 +357,7 @@ async fn duplicate_path_events_preserve_revision_counters_timestamps_and_markers
         connection.path_state_snapshot().revision,
         generation_revision
     );
-    assert_eq!(connection.bytes_sent, bytes_sent);
+    assert_eq!(connection.bytes_sent.get(), bytes_sent);
     assert_eq!(connection.direct_health.success_count, direct_success_count);
 }
 

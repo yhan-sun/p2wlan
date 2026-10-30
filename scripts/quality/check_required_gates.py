@@ -17,13 +17,17 @@ Rules this module enforces:
   ``missing``, ``api_error`` or ``pending``. Only ``pass`` authorizes a merge.
 * A failed request, an unreadable response, a response missing required fields
   or an unfinished pagination walk produces ``api_error`` -- never success.
+  Temporary transport failures can await a complete fresh query within the
+  original polling deadline; authentication and malformed responses fail closed.
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -79,6 +83,22 @@ GATE_WORKFLOWS: Mapping[str, str] = {
 
 class GateRequestError(RuntimeError):
     """The query could not be completed; the caller must not read this as success."""
+
+
+class GateTransientRequestError(GateRequestError):
+    """Temporary metadata transport failure; no result may authorize a merge."""
+
+
+def _transient_transport(error: Exception) -> bool:
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in {500, 502, 503, 504}
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    return isinstance(reason, TimeoutError) or (
+        isinstance(reason, OSError)
+        and reason.errno in {errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED,
+                             errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH,
+                             socket.EAI_AGAIN}
+    )
 
 
 class GateVisibilityError(GateRequestError):
@@ -262,6 +282,7 @@ class GitHubClient:
                 },
             )
             last_error: Exception | None = None
+            transient_only = True
             for attempt in range(self.retries):
                 try:
                     with urllib.request.urlopen(request, timeout=30) as response:
@@ -269,10 +290,12 @@ class GitHubClient:
                     break
                 except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as error:
                     last_error = error
+                    transient_only = transient_only and _transient_transport(error)
                     if attempt + 1 < self.retries:
                         time.sleep(2 * (attempt + 1))
             else:
-                raise GateRequestError(f"GET {path} page {page} failed after {self.retries} attempts: {last_error}")
+                kind = GateTransientRequestError if transient_only and last_error is not None else GateRequestError
+                raise kind(f"GET {path} page {page} failed after {self.retries} attempts: {last_error}")
 
             if not isinstance(payload, dict):
                 raise GateRequestError(f"GET {path} page {page} returned a non-object body")
@@ -371,40 +394,44 @@ class GitHubClient:
     def runs_for(
         self, head_sha: str, *, required_workflows: Iterable[str] | None = None
     ) -> list[WorkflowRun]:
-        wanted = None if required_workflows is None else frozenset(required_workflows)
-        scope = (head_sha, wanted)
-        if scope != self._visibility_scope:
-            self._visibility_scope = scope
-            self._observed_run_keys = frozenset()
-        for attempt in range(self.retries):
-            runs = self._run_metadata_for(head_sha)
-            current = frozenset(
-                (run.run_id, run.workflow_name, run.event)
-                for run in runs
-                if run.authoritative and (wanted is None or run.workflow_name in wanted)
-            )
-            missing = self._observed_run_keys - current
-            if not missing:
-                # Only identities are retained, never a prior pass/pending result.
-                # Pagination already bounds this set to MAX_PAGES * 100 entries.
-                self._observed_run_keys = current
-                break
-            if attempt + 1 == self.retries:
-                raise GateVisibilityError(
-                    f"run visibility regressed after {self.retries} metadata reads: "
-                    f"{len(missing)} previously observed authoritative runs disappeared"
+        try:
+            wanted = None if required_workflows is None else frozenset(required_workflows)
+            scope = (head_sha, wanted)
+            if scope != self._visibility_scope:
+                self._visibility_scope = scope
+                self._observed_run_keys = frozenset()
+            for attempt in range(self.retries):
+                runs = self._run_metadata_for(head_sha)
+                current = frozenset(
+                    (run.run_id, run.workflow_name, run.event)
+                    for run in runs
+                    if run.authoritative and (wanted is None or run.workflow_name in wanted)
                 )
-        else:
-            raise GateRequestError("no run metadata read was attempted")
-        # Validate every head-filtered metadata page before omitting unrelated
-        # jobs. Compatibility callers without a scope still read all jobs.
-        return [
-            replace(run, jobs=self.jobs(
-                run.run_id, final=run.status == "completed", run_attempt=run.run_attempt
-            ))
-            if wanted is None or run.workflow_name in wanted else run
-            for run in runs
-        ]
+                missing = self._observed_run_keys - current
+                if not missing:
+                    # Only identities are retained, never a prior pass/pending result.
+                    # Pagination already bounds this set to MAX_PAGES * 100 entries.
+                    self._observed_run_keys = current
+                    break
+                if attempt + 1 == self.retries:
+                    raise GateVisibilityError(
+                        f"run visibility regressed after {self.retries} metadata reads: "
+                        f"{len(missing)} previously observed authoritative runs disappeared"
+                    )
+            else:
+                raise GateRequestError("no run metadata read was attempted")
+            # Validate every head-filtered metadata page before omitting unrelated
+            # jobs. Compatibility callers without a scope still read all jobs.
+            return [
+                replace(run, jobs=self.jobs(
+                    run.run_id, final=run.status == "completed", run_attempt=run.run_attempt
+                ))
+                if wanted is None or run.workflow_name in wanted else run
+                for run in runs
+            ]
+        except GateTransientRequestError:
+            self._job_cache.clear()
+            raise
 
 
 def _client() -> GitHubClient:
@@ -452,9 +479,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             runs = client.runs_for(args.sha, required_workflows=required_workflows)
             findings = evaluate(args.require, runs, head_sha=args.sha)
-        except GateVisibilityError as error:
+        except (GateVisibilityError, GateTransientRequestError) as error:
             # No previous finding is reused. Await a complete fresh snapshot
-            # within the same deadline; generic API errors still fail below.
+            # within the same deadline. Authentication, malformed data and
+            # permanent query errors still fail below; no producer is rerun.
             print(f"required gate metadata pending for {args.sha}: {error}")
             if time.monotonic() >= deadline:
                 print(f"FAIL required gates for {args.sha}: api_error: {error}", file=sys.stderr)

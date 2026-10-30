@@ -13,6 +13,8 @@ const PEER: &str = "peer-b";
 const LOCAL: &str = "10.21.1.2";
 const REMOTE: &str = "10.21.1.3";
 
+mod system_write_partition;
+
 #[tokio::test]
 async fn actual_reader_ingress_peer_metadata_cannot_borrow_new_network_identity() {
     let mut harness = Harness::new(false, true).await;

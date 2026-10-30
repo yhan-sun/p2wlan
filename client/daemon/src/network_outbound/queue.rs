@@ -466,6 +466,7 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
                             "tx_network_outbound_queue_wait_us", now.duration_since(enqueued));
                     }
                 }
+                packet.observe_initial_queue_intervals();
                 let peer_id = packet.peer_id.clone();
                 let can_try_fast = ctx.prefer_direct && ctx.peers.is_direct_sync(&peer_id)
                     && !pending.contains_key(&peer_id) && !flushing_peers.contains_key(&peer_id);

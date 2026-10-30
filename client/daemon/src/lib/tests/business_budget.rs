@@ -512,7 +512,7 @@ async fn direct_business_budget_production_path_e2e() {
             if peers_a
                 .get_connection("peer-b")
                 .await
-                .is_some_and(|connection| connection.bytes_sent >= 256)
+                .is_some_and(|connection| connection.bytes_sent.get() >= 256)
             {
                 break;
             }

@@ -727,7 +727,7 @@ async fn udp_inbound_decrypts_and_writes_packet_to_tun() {
     assert_eq!(written, ip_packet);
 
     let conn = peers.get_connection("peer-a").await.unwrap();
-    assert_eq!(conn.bytes_received, written.len() as u64);
+    assert_eq!(conn.bytes_received.get(), written.len() as u64);
     assert_ne!(
         conn.state.to_string(),
         "direct",

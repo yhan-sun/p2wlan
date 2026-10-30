@@ -158,10 +158,16 @@ impl CaptureSession {
                 .filter(|read| read.full_observed_ns().is_some())
                 .map(|read| (read.flow, read.spans.clone())),
         );
+        // Freeze one immutable Full-write prefix after copying native rows.
+        // A published entry already contains its original write; later
+        // appends cannot change either coverage or the serialized history.
+        let inbound_prefix = state.inbound_history.published_len();
         Ok(CapturedSnapshot {
             plans,
             full: SnapshotCoverage::from_rows(full_coverage),
-            inbound: state.inbound_history.snapshot_coverage(inbound_coverage),
+            inbound: state
+                .inbound_history
+                .snapshot_coverage(inbound_prefix, inbound_coverage),
             value: ReadSnapshot {
                 schema_version: 2,
                 scope: "registered_native_frame_capture",
@@ -177,7 +183,9 @@ impl CaptureSession {
                 gaps: self.gaps.load(Ordering::Relaxed),
                 requests,
                 historical_full_packets: full::snapshot(&state.read_history, full_packets),
-                system_tun_full_writes: state.inbound_history.snapshot(system_writes),
+                system_tun_full_writes: state
+                    .inbound_history
+                    .snapshot(inbound_prefix, system_writes),
                 // Registration alone leaves these false. Only the sole native
                 // current-owner/once transaction can make every frame verified;
                 // original application OS-write qualification stays separate.
@@ -196,11 +204,15 @@ impl CaptureSession {
                 original_authenticated_input_registry_refusal: self
                     .state
                     .authenticated_refusal_snapshot(),
-                original_system_write_registry_refusal: self.state.system_write_refusal_snapshot(),
+                original_system_write_registry_refusal: self
+                    .system_write_state
+                    .system_write_refusal_snapshot(),
                 #[cfg(any(target_os = "linux", all(unix, test)))]
                 original_kernel_epoch_refusal: self.epoch_trace.snapshot(),
                 #[cfg(any(target_os = "linux", all(unix, test)))]
                 original_read_peer_epoch_refusal: self.epoch_trace.read_peer_snapshot(),
+                #[cfg(any(target_os = "linux", all(unix, test)))]
+                original_read_peer_connections_refusal: self.connections_trace.snapshot(),
                 #[cfg(any(target_os = "linux", all(unix, test)))]
                 original_kernel_emit_refusal: self.emit_trace.snapshot(),
             },

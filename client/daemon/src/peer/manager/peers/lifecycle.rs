@@ -60,7 +60,7 @@ async fn pause_after_peer_membership_publish_for_test(peer_id: &str) {
 
 struct PeerUpdateResources<'a> {
     epoch_guard: crate::peer::NetworkEpochGuard<'a>,
-    conns: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
+    conns: ConnectionsWriteGuard<'a>,
     ip_map: tokio::sync::RwLockWriteGuard<'a, HashMap<String, String>>,
     generation: u64,
 }
@@ -190,6 +190,9 @@ impl PeerManager {
     ) -> PeerUpdate {
         #[cfg(test)]
         self.notify_peer_add_wait_started_for_test();
+        if let Some(update) = self.try_refresh_peer_last_seen(info) {
+            return update;
+        }
         let mut lock_trace = PeerUpdateLockTrace::new(
             self,
             &info.node_id,
@@ -253,7 +256,7 @@ impl PeerManager {
         let old_capabilities = conn.capabilities;
         let old_registration_seq = conn.registration_seq;
         let old_nat_type = conn.nat_type.clone();
-        let old_last_seen = conn.last_seen;
+        let old_last_seen = conn.last_seen.get();
         let old_remote_relay_rtt_ms = conn.remote_relay_rtt_ms;
         let virtual_ip_changed = !is_new && old_virtual_ip != info.virtual_ip;
         let public_key_changed = !is_new && old_public_key != info.public_key;
@@ -405,7 +408,7 @@ impl PeerManager {
             revoke_relay_after_lock = true;
         }
         conn.online = info.online;
-        conn.last_seen = info.last_seen;
+        conn.last_seen.set(info.last_seen);
         conn.remote_relay_rtt_ms = info.relay_rtt_ms;
 
         let signaled_endpoint = if info.endpoint.trim().is_empty() {

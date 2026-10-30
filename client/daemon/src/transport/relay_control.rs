@@ -179,20 +179,29 @@ impl WireGuardTransport {
                     &ack_payload,
                 );
                 let relay_send = relay.clone();
-                match self
-                    .encrypt_and_emit_outbound(
-                        OutboundPacket {
-                            room_authorization: None,
-                            peer_id: peer_id.to_string(),
-                            dst_ip: ip.src_addr().to_string(),
-                            packet: ack_packet,
-                            trace: None,
-                        },
-                        move |encrypted| async move {
-                            relay_send.send_packet(&encrypted).await.map(|_| ())
-                        },
-                    )
-                    .await
+                match async {
+                    let __control_packet = OutboundPacket {
+                        room_authorization: None,
+                        peer_id: peer_id.to_string(),
+                        dst_ip: ip.src_addr().to_string(),
+                        packet: ack_packet,
+                        trace: None,
+                    };
+                    let mut __relay_post =
+                        relay_send.prepare_deferred_send(&__control_packet.peer_id);
+                    let __relay_post_ref = &mut __relay_post;
+                    let __outcome = self
+                        .encrypt_and_emit_outbound(__control_packet, move |encrypted| async move {
+                            relay_send
+                                .send_packet_deferred(&encrypted, None, __relay_post_ref)
+                                .await
+                                .map(|_| ())
+                        })
+                        .await;
+                    __relay_post.finish().await;
+                    __outcome
+                }
+                .await
                 {
                     Ok(true) => {
                         debug!(
@@ -346,20 +355,29 @@ impl WireGuardTransport {
                     &ack_payload,
                 );
                 let relay_send = relay.clone();
-                match self
-                    .encrypt_and_emit_outbound(
-                        OutboundPacket {
-                            room_authorization: None,
-                            peer_id: peer_id.to_string(),
-                            dst_ip: ip.src_addr().to_string(),
-                            packet: ack_packet,
-                            trace: None,
-                        },
-                        move |encrypted| async move {
-                            relay_send.send_packet(&encrypted).await.map(|_| ())
-                        },
-                    )
-                    .await
+                match async {
+                    let __control_packet = OutboundPacket {
+                        room_authorization: None,
+                        peer_id: peer_id.to_string(),
+                        dst_ip: ip.src_addr().to_string(),
+                        packet: ack_packet,
+                        trace: None,
+                    };
+                    let mut __relay_post =
+                        relay_send.prepare_deferred_send(&__control_packet.peer_id);
+                    let __relay_post_ref = &mut __relay_post;
+                    let __outcome = self
+                        .encrypt_and_emit_outbound(__control_packet, move |encrypted| async move {
+                            relay_send
+                                .send_packet_deferred(&encrypted, None, __relay_post_ref)
+                                .await
+                                .map(|_| ())
+                        })
+                        .await;
+                    __relay_post.finish().await;
+                    __outcome
+                }
+                .await
                 {
                     Ok(true) => {
                         info!(

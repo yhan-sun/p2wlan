@@ -186,7 +186,7 @@ pub struct PeerConnection {
     /// Whether the control plane currently reports this peer online.
     pub online: bool,
     /// Last seen timestamp reported by the control plane.
-    pub last_seen: u64,
+    pub last_seen: LastSeen,
     /// Peer-reported RTT to its selected relay server, in milliseconds.
     pub remote_relay_rtt_ms: Option<u64>,
     /// Current connection state.
@@ -199,9 +199,9 @@ pub struct PeerConnection {
     /// When the connection was established.
     pub connected_at: Option<Instant>,
     /// Bytes sent to this peer.
-    pub bytes_sent: u64,
+    pub bytes_sent: TrafficBytes,
     /// Bytes received from this peer.
-    pub bytes_received: u64,
+    pub bytes_received: TrafficBytes,
     /// Which relay server is being used (if connected via relay).
     pub relay_server: Option<String>,
     /// ICE candidates for this peer.
@@ -629,14 +629,14 @@ impl PeerConnection {
             remote_nat_profile: None,
             remote_nat_profile_candidate_epoch: None,
             online: true,
-            last_seen: 0,
+            last_seen: LastSeen::new(0),
             remote_relay_rtt_ms: None,
             state: ConnectionState::Idle,
             path_state_machine: PathStateMachine::new(ConnectionState::Idle),
             path_observability: PathObservabilityState::default(),
             connected_at: None,
-            bytes_sent: 0,
-            bytes_received: 0,
+            bytes_sent: TrafficBytes::new(0),
+            bytes_received: TrafficBytes::new(0),
             relay_server: None,
             candidates: Vec::new(),
             signaled_candidates: HashSet::new(),
@@ -779,6 +779,16 @@ impl PeerConnection {
         event: PathEvent,
         apply_side_effects: impl FnOnce(&mut Self),
     ) -> PathTransitionOutcome {
+        let mut log = DeferredPathTransitionLog::new(&self.node_id);
+        self.commit_path_transition_deferred(event, apply_side_effects, &mut log)
+    }
+
+    pub(crate) fn commit_path_transition_deferred(
+        &mut self,
+        event: PathEvent,
+        apply_side_effects: impl FnOnce(&mut Self),
+        log: &mut DeferredPathTransitionLog,
+    ) -> PathTransitionOutcome {
         let event_epoch = event.epoch();
         let observability_event = event.clone();
         let previous_active = self.path_state_machine.active_path();
@@ -788,26 +798,20 @@ impl PeerConnection {
         self.path_observability
             .record(&observability_event, &outcome, Instant::now());
         if !outcome.accepted() {
-            debug!(
-                target: "p2pnet_daemon::peer::path_state_machine",
-                event = "path_transition_rejected",
-                peer_id = %self.node_id,
-                epoch = ?event_epoch,
-                decision = ?outcome.decision,
-                revision = outcome.snapshot.revision,
-                "rejected stale or illegal path event"
+            log.refused(
+                event_epoch,
+                outcome.decision,
+                outcome.snapshot.revision,
+                false,
             );
             return outcome;
         }
         if !outcome.applies_side_effects() {
-            debug!(
-                target: "p2pnet_daemon::peer::path_state_machine",
-                event = "path_transition_duplicate",
-                peer_id = %self.node_id,
-                epoch = ?event_epoch,
-                decision = ?outcome.decision,
-                revision = outcome.snapshot.revision,
-                "ignored duplicate path event without executing side effects"
+            log.refused(
+                event_epoch,
+                outcome.decision,
+                outcome.snapshot.revision,
+                true,
             );
             return outcome;
         }
@@ -834,28 +838,10 @@ impl PeerConnection {
         self.sync_path_telemetry();
 
         if previous_state != new_state || previous_active != current_active {
-            info!(target: "p2pnet_daemon::peer::connection",
-                event = "peer_connection_state_changed",
-                peer_id = %self.node_id,
-                previous_state = ?previous_state,
-                new_state = ?new_state,
-                previous_active_path = ?previous_active,
-                active_path = ?current_active,
-                path_revision = outcome.snapshot.revision,
-                direct_generation = self.direct_generation,
-                relay_ready_generation = ?self.relay_ready_generation,
-                relay_confirmed_generation = ?self.relay_confirmed_generation,
-                relay_confirmed_connection_id = ?self.relay_confirmed_connection_id,
-                relay_server = ?self.relay_server,
-                direct_endpoint = ?self.endpoint,
-                "peer connection state changed peer_id={} previous={:?} new={:?}",
-                self.node_id,
-                previous_state,
-                new_state,
-            );
-            info!(
-                "Peer {} state: {} → {}",
-                self.node_id, previous_state, new_state
+            log.changed(
+                self,
+                (previous_state, new_state, previous_active, current_active),
+                outcome.snapshot.revision,
             );
         }
         outcome
@@ -993,13 +979,13 @@ impl PeerConnection {
     }
 
     /// Record bytes sent.
-    pub fn record_sent(&mut self, n: u64) {
-        self.bytes_sent += n;
+    pub fn record_sent(&self, n: u64) {
+        self.bytes_sent.add(n);
     }
 
     /// Record bytes received.
-    pub fn record_received(&mut self, n: u64) {
-        self.bytes_received += n;
+    pub fn record_received(&self, n: u64) {
+        self.bytes_received.add(n);
     }
 
     /// Record the first usable production ingress for this peer + generation.

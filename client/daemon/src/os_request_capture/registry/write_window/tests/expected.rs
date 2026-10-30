@@ -1,10 +1,10 @@
 //! Published expected inputs stay metadata; the actual command must still
-//! acquire the real registry within its original deadline and fence the Arc.
+//! acquire the sole window metadata owner within its deadline and fence the Arc.
 use super::super::{expected, selection};
 use super::*;
 
 #[cfg(target_os = "linux")]
-fn current_wire(scope: &CaptureSession, duration: u64) -> WireWriteWindow {
+pub(super) fn current_wire(scope: &CaptureSession, duration: u64) -> WireWriteWindow {
     let now = monotonic_ns().unwrap();
     let clock = serde_json::to_value(scope.clock_scope.as_ref().unwrap()).unwrap();
     let mut wire = labels();
@@ -76,14 +76,22 @@ async fn published_window_expectation_keeps_actual_producer_shape_and_exact_arc_
 async fn actual_window_command_uses_one_real_guard_and_rejects_duplicate_without_io_credit() {
     let (setup, _parent) = digest_scope().await;
     let wire = current_wire(&setup.session, 1_000_000_000);
-    let version = setup.session.state.try_metadata_version().unwrap();
+    let version = setup
+        .session
+        .window_commands
+        .try_metadata_version()
+        .unwrap();
     setup
         .session
         .observe_original_write_window(wire)
         .await
         .unwrap();
     assert_eq!(
-        setup.session.state.try_metadata_version().unwrap(),
+        setup
+            .session
+            .window_commands
+            .try_metadata_version()
+            .unwrap(),
         version + 2
     );
     {
@@ -120,7 +128,7 @@ async fn actual_window_command_busy_registry_keeps_original_deadline_and_empty_w
     let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(0);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
     let owner = std::thread::spawn(move || {
-        let _guard = session.state.lock().unwrap();
+        let _guard = session.window_commands.lock().unwrap();
         acquired_tx.send(()).unwrap();
         release_rx
             .recv_timeout(std::time::Duration::from_secs(3))

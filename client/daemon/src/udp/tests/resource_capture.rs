@@ -221,7 +221,7 @@ async fn actual_udp_wg_full_mock_write_requires_executed_vec_observations() {
             async {
                 loop {
                     let connection = peers.get_connection("peer-a").await.unwrap();
-                    if connection.bytes_received == raw.len() as u64 {
+                    if connection.bytes_received.get() == raw.len() as u64 {
                         assert_eq!(connection.endpoint, Some(source));
                         break;
                     }

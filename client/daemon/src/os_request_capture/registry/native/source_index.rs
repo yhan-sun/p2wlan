@@ -12,7 +12,7 @@ pub(in crate::os_request_capture::registry) struct RequestSources {
 pub(in crate::os_request_capture::registry) struct FlowSources {
     pub(in crate::os_request_capture::registry) producer_scope: [u8; 16],
     pub(in crate::os_request_capture::registry) plan: Arc<RegisteredFlowPlan>,
-    pub(super) invalid: Arc<AtomicBool>,
+    pub(in crate::os_request_capture::registry) invalid: Arc<AtomicBool>,
     pub(super) inbound_invalid: Arc<AtomicBool>,
     pub(in crate::os_request_capture::registry) requests: Vec<RequestSources>,
 }

@@ -154,3 +154,24 @@ fn metadata_source_version_exhaustion_never_wraps_or_reopens_sampling() {
     ));
     assert_eq!(state.metadata_version.load(Ordering::Acquire), u64::MAX);
 }
+
+#[tokio::test]
+async fn sibling_partitions_share_one_waiter_and_cancellation_releases_that_same_slot() {
+    let input = ControlState::new(());
+    let window = input.sibling(());
+    let input_held = input.try_lock().unwrap();
+    let window_held = window.try_lock().unwrap();
+    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut first = Box::pin(input.lock_until(end));
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    assert!(matches!(
+        window.lock_until(end).await,
+        Err(CaptureFailure::Contended)
+    ));
+    drop(first);
+    let mut second = Box::pin(window.lock_until(end));
+    assert!(futures_util::poll!(second.as_mut()).is_pending());
+    drop(window_held);
+    let _window = second.await.unwrap();
+    drop(input_held);
+}
