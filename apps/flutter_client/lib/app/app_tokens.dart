@@ -6,11 +6,11 @@ import 'package:flutter/material.dart';
 abstract final class AppTokens {
   // --- Color Palette ---
   // Reference-aligned light neutral background & surfaces.
-  static const colorBg = Color(0xFFF6F7F8);
+  static const colorBg = Color(0xFFF5F7FB);
   static const colorSurface = Color(0xFFFFFFFF);
   static const colorSurfaceSubtle = Color(0xFFF8FAFC);
-  static const colorBorder = Color(0xFFE6E9EB);
-  static const colorBorderSubtle = Color(0xFFF0F2F4);
+  static const colorBorder = Color(0xFFE2E7EF);
+  static const colorBorderSubtle = Color(0xFFEDF0F5);
 
   // Dark theme neutral background & surfaces
   static const colorDarkBg = Color(0xFF0B1220);
@@ -20,9 +20,9 @@ abstract final class AppTokens {
   static const colorDarkBorderSubtle = Color(0xFF202A3A);
 
   // Text hierarchy
-  static const colorTextPrimary = Color(0xFF171A1F);
-  static const colorTextSecondary = Color(0xFF667078);
-  static const colorTextMuted = Color(0xFF8A949E);
+  static const colorTextPrimary = Color(0xFF1B2940);
+  static const colorTextSecondary = Color(0xFF657188);
+  static const colorTextMuted = Color(0xFF8390A3);
 
   // Dark text hierarchy
   static const colorDarkTextPrimary = Color(0xFFF7F9FC);
@@ -75,10 +75,10 @@ abstract final class AppTokens {
   static const colorDarkBadText = Color(0xFFFFA39A);
   static const colorDarkBadDot = Color(0xFFEF5D54);
 
-  static const colorDarkNeutralBg = Color(0xFF1D2927);
-  static const colorDarkNeutralBorder = Color(0xFF3A4A47);
-  static const colorDarkNeutralText = Color(0xFFB8C7C4);
-  static const colorDarkNeutralDot = Color(0xFF81918E);
+  static const colorDarkNeutralBg = Color(0xFF1D293B);
+  static const colorDarkNeutralBorder = Color(0xFF3A4860);
+  static const colorDarkNeutralText = Color(0xFFB5C0D0);
+  static const colorDarkNeutralDot = Color(0xFF7F8BA0);
 
   // Debug Console / Raw JSON
   static const colorConsoleBg = Color(0xFF111817);
@@ -86,19 +86,13 @@ abstract final class AppTokens {
   static const colorConsoleText = Color(0xFFE5ECE8);
 
   static const shadowBorder = [
-    BoxShadow(color: Color(0x0D0F172A), blurRadius: 0, spreadRadius: 1),
-    BoxShadow(
-      color: Color(0x0F0F172A),
-      offset: Offset(0, 6),
-      blurRadius: 20,
-      spreadRadius: -8,
-    ),
+    BoxShadow(color: Color(0x060F172A), offset: Offset(0, 2), blurRadius: 6),
   ];
 
   // --- Radius & Spacing ---
   static const radiusSm = 8.0;
   static const radiusMd = 10.0;
-  static const radiusLg = 14.0;
+  static const radiusLg = 12.0;
 
   // --- Spacing scale (visual rhythm) ---
   // page/section/card rhythm uses these; per-row or painter-specific offsets
@@ -113,6 +107,7 @@ abstract final class AppTokens {
   static const space16 = 16.0;
   static const space20 = 20.0;
   static const space24 = 24.0;
+  static const space28 = 28.0;
   static const space32 = 32.0;
   static const space40 = 40.0;
 

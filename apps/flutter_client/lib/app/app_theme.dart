@@ -51,11 +51,11 @@ abstract final class AppTheme {
         ),
         labelStyle: TextStyle(
           color: AppTokens.colorTextSecondary,
-          fontSize: 13,
+          fontSize: 14,
         ),
         hintStyle: const TextStyle(
           color: AppTokens.colorTextMuted,
-          fontSize: 13,
+          fontSize: 14,
         ),
         helperStyle: const TextStyle(
           color: AppTokens.colorTextMuted,
@@ -86,62 +86,87 @@ abstract final class AppTheme {
         ),
       ),
       filledButtonTheme: FilledButtonThemeData(
-        style: FilledButton.styleFrom(
-          backgroundColor: AppTokens.colorAccent,
-          foregroundColor: AppTokens.colorSurface,
-          disabledBackgroundColor: AppTokens.colorBorder,
-          disabledForegroundColor: AppTokens.colorTextMuted,
-          enabledMouseCursor: SystemMouseCursors.click,
-          disabledMouseCursor: SystemMouseCursors.basic,
-          minimumSize: const Size(
-            AppTokens.minTouchTarget,
-            AppTokens.minTouchTarget,
-          ),
-          padding: const EdgeInsets.symmetric(
-            horizontal: AppTokens.space16,
-            vertical: AppTokens.space10,
-          ),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          ),
-          textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-        ),
+        style:
+            FilledButton.styleFrom(
+              backgroundColor: AppTokens.colorAccent,
+              foregroundColor: AppTokens.colorSurface,
+              disabledBackgroundColor: AppTokens.colorBorder,
+              disabledForegroundColor: AppTokens.colorTextMuted,
+              enabledMouseCursor: SystemMouseCursors.click,
+              disabledMouseCursor: SystemMouseCursors.basic,
+              minimumSize: const Size(
+                AppTokens.minTouchTarget,
+                AppTokens.minTouchTarget,
+              ),
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppTokens.space16,
+                vertical: AppTokens.space10,
+              ),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+              ),
+              textStyle: const TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ).copyWith(
+              side: _buttonFocusSide(AppTokens.colorDarkBg),
+              overlayColor: _buttonOverlay(AppTokens.colorSurface),
+            ),
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
-        style: OutlinedButton.styleFrom(
-          foregroundColor: AppTokens.colorTextPrimary,
-          disabledForegroundColor: AppTokens.colorTextMuted,
-          disabledBackgroundColor: Colors.transparent,
-          enabledMouseCursor: SystemMouseCursors.click,
-          disabledMouseCursor: SystemMouseCursors.basic,
-          minimumSize: const Size(
-            AppTokens.minTouchTarget,
-            AppTokens.minTouchTarget,
-          ),
-          padding: const EdgeInsets.symmetric(
-            horizontal: AppTokens.space14,
-            vertical: AppTokens.space10,
-          ),
-          side: const BorderSide(color: AppTokens.colorBorder),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          ),
-          textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-        ),
+        style:
+            OutlinedButton.styleFrom(
+              foregroundColor: AppTokens.colorTextPrimary,
+              disabledForegroundColor: AppTokens.colorTextMuted,
+              disabledBackgroundColor: Colors.transparent,
+              enabledMouseCursor: SystemMouseCursors.click,
+              disabledMouseCursor: SystemMouseCursors.basic,
+              minimumSize: const Size(
+                AppTokens.minTouchTarget,
+                AppTokens.minTouchTarget,
+              ),
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppTokens.space14,
+                vertical: AppTokens.space10,
+              ),
+              side: const BorderSide(color: AppTokens.colorBorder),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+              ),
+              textStyle: const TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ).copyWith(
+              side: _buttonFocusSide(
+                AppTokens.colorAccent,
+                resting: BorderSide(color: AppTokens.colorBorder),
+              ),
+              overlayColor: _buttonOverlay(AppTokens.colorAccent),
+            ),
+      ),
+      textButtonTheme: _textButtonTheme(
+        AppTokens.colorAccent,
+        AppTokens.colorTextMuted,
       ),
       iconButtonTheme: IconButtonThemeData(
-        style: IconButton.styleFrom(
-          enabledMouseCursor: SystemMouseCursors.click,
-          disabledMouseCursor: SystemMouseCursors.basic,
-          minimumSize: const Size(
-            AppTokens.minTouchTarget,
-            AppTokens.minTouchTarget,
-          ),
-          foregroundColor: AppTokens.colorTextSecondary,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          ),
-        ),
+        style:
+            IconButton.styleFrom(
+              enabledMouseCursor: SystemMouseCursors.click,
+              disabledMouseCursor: SystemMouseCursors.basic,
+              minimumSize: const Size(
+                AppTokens.minTouchTarget,
+                AppTokens.minTouchTarget,
+              ),
+              foregroundColor: AppTokens.colorTextSecondary,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+              ),
+            ).copyWith(
+              side: _buttonFocusSide(AppTokens.colorAccent),
+              overlayColor: _buttonOverlay(AppTokens.colorAccent),
+            ),
       ),
       chipTheme: _lightChipTheme,
       dialogTheme: DialogThemeData(
@@ -255,11 +280,11 @@ abstract final class AppTheme {
         ),
         labelStyle: TextStyle(
           color: AppTokens.colorDarkTextSecondary,
-          fontSize: 13,
+          fontSize: 14,
         ),
         hintStyle: const TextStyle(
           color: AppTokens.colorDarkTextMuted,
-          fontSize: 13,
+          fontSize: 14,
         ),
         helperStyle: const TextStyle(
           color: AppTokens.colorDarkTextMuted,
@@ -290,62 +315,87 @@ abstract final class AppTheme {
         ),
       ),
       filledButtonTheme: FilledButtonThemeData(
-        style: FilledButton.styleFrom(
-          backgroundColor: AppTokens.colorDarkAccent,
-          foregroundColor: AppTokens.colorDarkBg,
-          disabledBackgroundColor: AppTokens.colorDarkBorder,
-          disabledForegroundColor: AppTokens.colorDarkTextMuted,
-          enabledMouseCursor: SystemMouseCursors.click,
-          disabledMouseCursor: SystemMouseCursors.basic,
-          minimumSize: const Size(
-            AppTokens.minTouchTarget,
-            AppTokens.minTouchTarget,
-          ),
-          padding: const EdgeInsets.symmetric(
-            horizontal: AppTokens.space16,
-            vertical: AppTokens.space10,
-          ),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          ),
-          textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-        ),
+        style:
+            FilledButton.styleFrom(
+              backgroundColor: AppTokens.colorDarkAccent,
+              foregroundColor: AppTokens.colorDarkBg,
+              disabledBackgroundColor: AppTokens.colorDarkBorder,
+              disabledForegroundColor: AppTokens.colorDarkTextMuted,
+              enabledMouseCursor: SystemMouseCursors.click,
+              disabledMouseCursor: SystemMouseCursors.basic,
+              minimumSize: const Size(
+                AppTokens.minTouchTarget,
+                AppTokens.minTouchTarget,
+              ),
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppTokens.space16,
+                vertical: AppTokens.space10,
+              ),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+              ),
+              textStyle: const TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ).copyWith(
+              side: _buttonFocusSide(AppTokens.colorDarkBg),
+              overlayColor: _buttonOverlay(AppTokens.colorDarkBg),
+            ),
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
-        style: OutlinedButton.styleFrom(
-          foregroundColor: AppTokens.colorDarkTextPrimary,
-          disabledForegroundColor: AppTokens.colorDarkTextMuted,
-          disabledBackgroundColor: Colors.transparent,
-          enabledMouseCursor: SystemMouseCursors.click,
-          disabledMouseCursor: SystemMouseCursors.basic,
-          minimumSize: const Size(
-            AppTokens.minTouchTarget,
-            AppTokens.minTouchTarget,
-          ),
-          padding: const EdgeInsets.symmetric(
-            horizontal: AppTokens.space14,
-            vertical: AppTokens.space10,
-          ),
-          side: const BorderSide(color: AppTokens.colorDarkBorder),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          ),
-          textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-        ),
+        style:
+            OutlinedButton.styleFrom(
+              foregroundColor: AppTokens.colorDarkTextPrimary,
+              disabledForegroundColor: AppTokens.colorDarkTextMuted,
+              disabledBackgroundColor: Colors.transparent,
+              enabledMouseCursor: SystemMouseCursors.click,
+              disabledMouseCursor: SystemMouseCursors.basic,
+              minimumSize: const Size(
+                AppTokens.minTouchTarget,
+                AppTokens.minTouchTarget,
+              ),
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppTokens.space14,
+                vertical: AppTokens.space10,
+              ),
+              side: const BorderSide(color: AppTokens.colorDarkBorder),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+              ),
+              textStyle: const TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ).copyWith(
+              side: _buttonFocusSide(
+                AppTokens.colorDarkAccent,
+                resting: BorderSide(color: AppTokens.colorDarkBorder),
+              ),
+              overlayColor: _buttonOverlay(AppTokens.colorDarkAccent),
+            ),
+      ),
+      textButtonTheme: _textButtonTheme(
+        AppTokens.colorDarkAccent,
+        AppTokens.colorDarkTextMuted,
       ),
       iconButtonTheme: IconButtonThemeData(
-        style: IconButton.styleFrom(
-          enabledMouseCursor: SystemMouseCursors.click,
-          disabledMouseCursor: SystemMouseCursors.basic,
-          minimumSize: const Size(
-            AppTokens.minTouchTarget,
-            AppTokens.minTouchTarget,
-          ),
-          foregroundColor: AppTokens.colorDarkTextSecondary,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          ),
-        ),
+        style:
+            IconButton.styleFrom(
+              enabledMouseCursor: SystemMouseCursors.click,
+              disabledMouseCursor: SystemMouseCursors.basic,
+              minimumSize: const Size(
+                AppTokens.minTouchTarget,
+                AppTokens.minTouchTarget,
+              ),
+              foregroundColor: AppTokens.colorDarkTextSecondary,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+              ),
+            ).copyWith(
+              side: _buttonFocusSide(AppTokens.colorDarkAccent),
+              overlayColor: _buttonOverlay(AppTokens.colorDarkAccent),
+            ),
       ),
       chipTheme: _darkChipTheme,
       dialogTheme: DialogThemeData(
@@ -414,6 +464,56 @@ abstract final class AppTheme {
       ),
     );
   }
+
+  static TextButtonThemeData _textButtonTheme(Color accent, Color disabled) =>
+      TextButtonThemeData(
+        style:
+            TextButton.styleFrom(
+              foregroundColor: accent,
+              disabledForegroundColor: disabled,
+              enabledMouseCursor: SystemMouseCursors.click,
+              disabledMouseCursor: SystemMouseCursors.basic,
+              minimumSize: const Size(
+                AppTokens.minTouchTarget,
+                AppTokens.minTouchTarget,
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+              ),
+              textStyle: const TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ).copyWith(
+              side: _buttonFocusSide(accent),
+              overlayColor: _buttonOverlay(accent),
+            ),
+      );
+
+  static WidgetStateProperty<BorderSide?> _buttonFocusSide(
+    Color color, {
+    BorderSide resting = BorderSide.none,
+  }) => WidgetStateProperty.resolveWith((states) {
+    if (!states.contains(WidgetState.disabled) &&
+        states.contains(WidgetState.focused)) {
+      return BorderSide(color: color, width: 2);
+    }
+    return resting;
+  });
+
+  static WidgetStateProperty<Color?> _buttonOverlay(Color color) =>
+      WidgetStateProperty.resolveWith((states) {
+        if (states.contains(WidgetState.disabled)) return Colors.transparent;
+        if (states.contains(WidgetState.pressed)) {
+          return color.withValues(alpha: .12);
+        }
+        if (states.contains(WidgetState.hovered) ||
+            states.contains(WidgetState.focused)) {
+          return color.withValues(alpha: .07);
+        }
+        return Colors.transparent;
+      });
 }
 
 final _lightChipTheme = ChipThemeData(

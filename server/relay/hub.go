@@ -20,10 +20,12 @@ type peer struct {
 	deviceID     string
 	credentialID string
 	ticketJTI    string
-	revoked      atomic.Bool
-	conn         net.Conn
-	send         chan []byte
-	done         chan struct{}
+	// Immutable after publication; expiry is checked even if its timer is late.
+	ticketExpiresAt time.Time
+	revoked         atomic.Bool
+	conn            net.Conn
+	send            chan queuedFrame
+	done            chan struct{}
 	// writeFailed is set when the per-peer writer goroutine fails to write a
 	// frame; handleConn's deferred close logging uses it as the disconnect
 	// cause when a write failure raced the read loop's classification.
@@ -31,6 +33,13 @@ type peer struct {
 	queueMu        sync.Mutex
 	queuedBytes    int
 	queuedBySource map[string]int
+}
+
+// queuedFrame preserves the exact source connection across delay and queue
+// boundaries. A node ID alone could accidentally borrow its replacement's auth.
+type queuedFrame struct {
+	data   []byte
+	source *peer // nil only for relay-generated control frames
 }
 
 type hub struct {
@@ -55,6 +64,21 @@ func (h *hub) register(p *peer, networkID, nodeID string) {
 func (h *hub) registerSwap(p *peer, networkID, nodeID string) *peer {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.registerSwapLocked(p, networkID, nodeID)
+}
+
+func (h *hub) registerAuthenticatedSwap(p *peer, networkID, nodeID string) (*peer, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// A verified ticket can expire while waiting for publication. Never retire
+	// the healthy current owner on behalf of an already-expired replacement.
+	if !p.authorizedAt(time.Now()) {
+		return nil, false
+	}
+	return h.registerSwapLocked(p, networkID, nodeID), true
+}
+
+func (h *hub) registerSwapLocked(p *peer, networkID, nodeID string) *peer {
 	key := networkNodeKey{networkID: networkID, nodeID: nodeID}
 	old := h.peers[key]
 	p.id, p.networkID = nodeID, networkID
@@ -63,6 +87,10 @@ func (h *hub) registerSwap(p *peer, networkID, nodeID string) *peer {
 		return nil
 	}
 	return old
+}
+
+func (p *peer) authorizedAt(now time.Time) bool {
+	return !p.revoked.Load() && (p.ticketExpiresAt.IsZero() || now.Before(p.ticketExpiresAt))
 }
 
 func (h *hub) unregister(p *peer) {
@@ -95,47 +123,56 @@ func (h *hub) count() int {
 
 // forward forwards payload and returns error code (0 for success) and a diagnostic message.
 // Uses network-scoped lookup: source and destination must be in the same network.
-func (h *hub) forward(srcNetwork, srcID, dstID string, data []byte, maxFramePayload int) (uint16, string) {
-	dst := h.lookup(srcNetwork, dstID)
+func (h *hub) forward(src *peer, dstID string, data []byte, maxFramePayload int) (uint16, string) {
+	dst := h.lookup(src.networkID, dstID)
 	if dst == nil || dst.revoked.Load() {
-		// Return 404 even if peer exists in a different network — do not leak
-		// that information to the sender.
+		// Do not reveal peers in another network.
 		return 404, "peer not found: " + dstID
 	}
-
-	// Enforce max_frame_payload limit on outbound frames
-	totalLen := 1 + len(srcID) + len(data)
-	if totalLen > maxFramePayload {
-		return 4006, "forwarded frame too large" // ERR_FRAME_TOO_LARGE
+	if !h.currentForward(src, dst) {
+		return errIdentityMismatch, "source session is no longer current"
 	}
-
-	frame, err := receivedFrame(srcID, data)
+	if 1+len(src.id)+len(data) > maxFramePayload {
+		return 4006, "forwarded frame too large"
+	}
+	frame, err := receivedFrame(src.id, data)
 	if err != nil {
 		return 4000, "malformed received frame"
 	}
-	// Slow-relay diagnostics: apply the artificial per-frame delay BEFORE
-	// handing the frame to the destination queue, so the sender observes the
-	// full one-way latency (and the relay keeps servicing other peers during
-	// the delay).
 	if h.forwardDelay > 0 {
+		timer := time.NewTimer(h.forwardDelay)
+		defer timer.Stop()
 		select {
-		case <-time.After(h.forwardDelay):
+		case <-timer.C:
+		case <-src.done:
+			return errIdentityMismatch, "source session is no longer current"
 		case <-dst.done:
 			return 404, "peer disconnected: " + dstID
 		}
 	}
-	select {
-	case <-dst.done:
-		return 404, "peer disconnected: " + dstID
-	default:
+	// Delay can cross revocation, disconnect or replacement of either peer.
+	if !h.currentForward(src, dst) {
+		return errIdentityMismatch, "forward session is no longer current"
 	}
-	if !dst.enqueue(frame) {
+	if !dst.enqueueFrame(queuedFrame{data: frame, source: src}) {
 		return 4008, "peer backpressure: " + dstID
 	}
 	if h.debugFrames {
-		log.Printf("event=relay_forward_enqueued src=%s dst=%s bytes=%d wire_fp=%s", srcID, dstID, len(data), opaqueFrameFingerprint(data))
+		log.Printf("event=relay_forward_enqueued src=%s dst=%s bytes=%d wire_fp=%s", src.id, dstID, len(data), opaqueFrameFingerprint(data))
 	}
 	return 0, ""
+}
+
+// currentForward checks the one authoritative peer registry. Its lock is never
+// held during a delay or network I/O. The writer calls it again at write start.
+func (h *hub) currentForward(src, dst *peer) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	now := time.Now()
+	return src != nil && dst != nil && src.authorizedAt(now) && dst.authorizedAt(now) &&
+		src.networkID == dst.networkID &&
+		h.peers[networkNodeKey{src.networkID, src.id}] == src &&
+		h.peers[networkNodeKey{dst.networkID, dst.id}] == dst
 }
 
 // opaqueFrameFingerprint correlates an encrypted frame across local relay

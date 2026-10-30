@@ -16,6 +16,8 @@ async fn advanced_timestamp_does_not_wait_for_epoch_or_ip_writer_or_publish_path
     let before = manager.get_connection(&peer.node_id).await.unwrap();
     let lifecycle = manager.peer_session_generation_sync(&peer.node_id);
     let routes = manager.ip_to_node_snapshot.borrow().clone();
+    let telemetry = manager.telemetry_hub();
+    telemetry.drain_dirty(128);
     let epoch = manager.network_epoch_gate.lock().await;
     let ip_writer = manager.ip_to_node.write().await;
     peer.last_seen = 11;
@@ -35,6 +37,10 @@ async fn advanced_timestamp_does_not_wait_for_epoch_or_ip_writer_or_publish_path
     let after = after.get(&peer.node_id).unwrap();
     assert_eq!(after.last_seen.get(), 11);
     assert_eq!(after.path_state_snapshot(), before.path_state_snapshot());
+    assert!(
+        !telemetry.has_dirty(),
+        "epoch contention must not refresh old path evidence"
+    );
     assert_eq!(after.remote_nat_profile, before.remote_nat_profile);
     assert_eq!(
         manager.peer_session_generation_sync(&peer.node_id),
@@ -102,7 +108,7 @@ async fn changed_correctness_or_other_metadata_fields_keep_original_epoch_fence(
 async fn busy_original_metadata_owners_never_partially_refresh_timestamp() {
     let (manager, mut peer) = setup().await;
     peer.last_seen = 11;
-    let membership = manager.peer_membership.lock().unwrap();
+    let membership = manager.peer_membership.write().unwrap();
     assert!(manager.try_refresh_peer_last_seen(&peer).is_none());
     drop(membership);
     let ledger = manager.remote_identity_ledger.lock().unwrap();
@@ -121,7 +127,7 @@ async fn retired_membership_generation_and_missing_profile_cannot_use_heartbeat_
     peer.last_seen = 11;
     manager
         .peer_membership
-        .lock()
+        .write()
         .unwrap()
         .publish(&peer.node_id, false, true);
     assert!(manager.try_refresh_peer_last_seen(&peer).is_none());
@@ -230,4 +236,52 @@ async fn heartbeat_refresh_shares_original_peer_read_lock_and_freezes_snapshot_t
         Err(OverlayCreditOutcome::Contended(CreditLock::Connections))
     );
     drop(writer);
+}
+
+#[tokio::test]
+async fn path_telemetry_heartbeat_samples_current_committed_state_without_a_transition() {
+    let (manager, mut peer) = setup().await;
+    let telemetry = manager.telemetry_hub();
+    telemetry.drain_dirty(128);
+    let before = manager
+        .get_connection(&peer.node_id)
+        .await
+        .unwrap()
+        .path_state_snapshot();
+    peer.last_seen += 5;
+    assert!(
+        manager
+            .try_refresh_peer_last_seen(&peer)
+            .unwrap()
+            .last_seen_only
+    );
+    let samples = telemetry.drain_dirty(128);
+    assert_eq!(
+        samples.len(),
+        1,
+        "stable heartbeat lost the only fresh sample"
+    );
+    let current = manager.get_connection(&peer.node_id).await.unwrap();
+    assert_eq!(
+        current.path_state_snapshot(),
+        before,
+        "sampling created a path transition"
+    );
+    assert_eq!(samples[0].observation_revision, before.revision);
+    assert_eq!(
+        samples[0].network_generation,
+        manager.current_network_generation_sync()
+    );
+    assert_eq!(samples[0].remote_device_id, peer.node_id);
+    assert!(samples[0].observed_at > 0);
+
+    // A stale membership cannot refresh the cached path's freshness.
+    manager
+        .peer_membership
+        .write()
+        .unwrap()
+        .publish(&peer.node_id, false, true);
+    peer.last_seen += 5;
+    assert!(manager.try_refresh_peer_last_seen(&peer).is_none());
+    assert!(!telemetry.has_dirty());
 }

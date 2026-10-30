@@ -1,0 +1,48 @@
+/* Resource selection stays separate from graph rendering and snapshot ownership. */
+.relationship-workspace { gap: 20px; }
+.relationship-workspace .console-page-header { align-items: flex-start; }
+.relationship-workspace .console-page-heading { max-width: 860px; }
+.relationship-workspace-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.relationship-workspace-toolbar .search-field { flex: 1 1 260px; min-width: 200px; max-width: none; width: auto; }
+.relationship-workspace-toolbar .select-field { flex: 0 1 200px; min-width: 160px; }
+.relationship-workspace-toolbar .account-scope-picker { flex: 0 1 240px; min-width: 180px; }
+.relationship-workspace-toolbar .account-scope-control .account-scope-trigger { max-width: none; }
+.relationship-workspace > .query-status { margin: -8px 0 0; }
+.relationship-workspace .topology-truth { margin: 0; padding: 14px 20px; border-bottom: 1px solid var(--border); border-radius: 0; font-size: 13px; }
+.relationship-workspace .network-overview { padding: 24px 20px; }
+.relationship-workspace .network-overview-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 20px; }
+.relationship-workspace .network-overview-heading h3 { margin: 0 0 6px; font-size: 16px; font-weight: 650; line-height: 1.4; letter-spacing: -.01em; }
+.relationship-workspace .network-overview-heading p { margin: 0; color: var(--text-3); font-size: 13px; line-height: 1.6; }
+.relationship-workspace .network-total { min-height: 24px; font-size: 12px; line-height: 1.5; }
+.relationship-workspace .network-overview-grid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 16px; }
+.relationship-workspace .topology-main-panel > .network-overview-grid { padding: 20px; }
+.relationship-workspace .network-overview-card { display: flex; flex-direction: column; align-items: stretch; gap: 14px; min-width: 0; min-height: 186px; padding: 18px; border-radius: 8px; color: var(--text-2); }
+.relationship-workspace .network-overview-card-heading { display: grid; grid-template-columns: 34px minmax(0, 1fr); align-items: start; gap: 12px; width: 100%; }
+.relationship-workspace .network-overview-icon { width: 34px; height: 34px; border-radius: 7px; color: var(--accent); border: 1px solid var(--border); background: var(--surface-subtle); }
+.relationship-workspace .network-overview-icon.room { color: var(--accent); border-color: var(--border); background: var(--accent-soft); }
+.relationship-workspace .network-overview-copy { display: grid; min-width: 0; gap: 6px; }
+.relationship-workspace .network-overview-copy strong { overflow: visible; font-size: 14px; font-weight: 600; line-height: 1.5; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+.relationship-workspace .network-cidr { overflow: visible; color: var(--text-3); font-family: inherit; font-size: 12px; line-height: 1.5; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+.relationship-workspace .network-overview-card-meta { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px 12px; min-width: 0; padding-left: 46px; font-size: 12px; line-height: 1.5; }
+.relationship-workspace .network-kind-label { color: var(--text-2); font-size: 12px; font-weight: 500; }
+.relationship-workspace .network-overview-owner { min-width: 0; color: var(--text-3); overflow-wrap: anywhere; }
+.relationship-workspace .network-overview-footer { display: flex; justify-content: space-between; align-items: center; gap: 14px; min-width: 0; margin-top: auto; padding-top: 14px; border-top: 1px solid var(--border); font-size: 12px; line-height: 1.5; }
+.relationship-workspace .network-overview-stats { display: grid; justify-items: start; align-content: start; min-width: 0; gap: 5px; padding: 0; font-size: 12px; line-height: 1.5; }
+.relationship-workspace .network-overview-stats > span { color: var(--text-3); white-space: normal; overflow-wrap: anywhere; }
+.relationship-workspace .network-overview-stats strong { color: var(--text); font-size: 14px; font-weight: 600; line-height: 1.4; font-variant-numeric: tabular-nums; }
+.relationship-workspace .network-overview-stats i { color: var(--text-3); font-style: normal; font-weight: 450; }
+.relationship-workspace .network-open-label { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; color: var(--accent); font-size: 12px; font-weight: 550; white-space: nowrap; }
+.relationship-workspace .network-overview-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media (max-width: 767px) {
+  .relationship-workspace-toolbar { gap: 10px; padding: 14px; }
+  .relationship-workspace-toolbar .search-field { flex-basis: 100%; }
+  .relationship-workspace-toolbar .select-field, .relationship-workspace-toolbar .account-scope-picker { flex: 1 1 160px; }
+  .relationship-workspace .network-overview-heading { flex-wrap: wrap; gap: 10px; }
+  .relationship-workspace .network-overview { padding: 20px 16px; }
+  .relationship-workspace .topology-main-panel > .network-overview-grid { padding: 16px; }
+  .relationship-workspace .topology-truth { padding: 14px 16px; }
+}
+@media (max-width: 480px) {
+  .relationship-workspace-toolbar .select-field, .relationship-workspace-toolbar .account-scope-picker { flex-basis: 100%; width: 100%; min-width: 0; }
+  .relationship-workspace .network-overview-card { padding: 16px; }
+}

@@ -205,6 +205,27 @@ def _secret_interpolation_is_env_assignment(line: str) -> bool:
     )
 
 
+def _is_asset_recovery_timestamp_storage(line: str) -> bool:
+    # The admin upgrade bridge persists only a reload timestamp. Match the
+    # whole numeric read or direct clock write, never a path, key alone, or
+    # an arbitrary value: credentials under this same key must still fail.
+    key = r'"p2wlan-admin-asset-recovery"'
+    return bool(
+        re.fullmatch(
+            r"\s*const\s+previous\s*=\s*Number\(\s*sessionStorage\.getItem\("
+            + key
+            + r"\)\s*\|\|\s*0\s*\)\s*;\s*",
+            line,
+        )
+        or re.fullmatch(
+            r"\s*sessionStorage\.setItem\("
+            + key
+            + r"\s*,\s*String\(\s*Date\.now\(\)\s*\)\s*\)\s*;\s*",
+            line,
+        )
+    )
+
+
 def scan_file(path: Path, root: Path, text: str) -> list[Finding]:
     relative = path.relative_to(root).as_posix()
     findings: list[Finding] = []
@@ -269,6 +290,7 @@ def scan_file(path: Path, root: Path, text: str) -> list[Finding]:
             behavioral_scan
             and not is_pattern_definition
             and ("localstorage" in lower or "sessionstorage" in lower)
+            and not _is_asset_recovery_timestamp_storage(line)
         ):
             findings.append(
                 Finding(

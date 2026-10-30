@@ -1,12 +1,259 @@
 part of '../p15_widget_test.dart';
 
 void _registerDashboardTests() {
-  test('formats peer throughput in K/S, M/S, and G/S', () {
+  testWidgets(
+    'Home manual command keeps selection and copy focus across reduced motion',
+    (tester) async {
+      tester.view.physicalSize = const Size(800, 1200);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(
+        tester.platformDispatcher.clearAccessibilityFeaturesTestValue,
+      );
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures(disableAnimations: true);
+      final api = _FakeDiagnosticsApi(health: false);
+      final stores = (await tester.runAsync(
+        () => _makeStores(api: api, daemonController: _ManualLaunchDaemon(api)),
+      ))!;
+      addTearDown(stores.dispose);
+      await stores.statusStore.startDaemon();
+      String? copied;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+            if (call.method == 'Clipboard.setData') {
+              copied = (call.arguments as Map)['text'] as String;
+            }
+            return null;
+          });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(SystemChannels.platform, null),
+      );
+      await tester.pumpWidget(
+        _TestApp(
+          child: DashboardPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+            capabilities: PlatformCapabilities.fromPlatform('linux'),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final toggle = find.byKey(const Key('home-manual-command-toggle'));
+      final copy = find.byKey(const Key('home-manual-command-copy'));
+      final command = find.byWidgetPredicate(
+        (widget) =>
+            widget is SelectableText &&
+            widget.data == _ManualLaunchDaemon.command,
+      );
+      await tester.ensureVisible(toggle);
+      await tester.pump();
+      await tester.tap(toggle);
+      await tester.pump();
+      expect(command, findsOneWidget);
+      expect(copy.hitTestable(), findsOneWidget);
+      await tester.tap(toggle);
+      await tester.pump();
+      expect(command, findsNothing);
+      expect(copy, findsNothing);
+      expect(tester.takeException(), isNull);
+
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures();
+      await tester.pump();
+      await tester.tap(toggle);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 40));
+      final editable = find.descendant(
+        of: command,
+        matching: find.byType(EditableText),
+      );
+      final editableState = tester.state(editable);
+      final editor = tester.widget<EditableText>(editable);
+      const selection = TextSelection(baseOffset: 0, extentOffset: 6);
+      editor.focusNode.requestFocus();
+      editor.controller.selection = selection;
+      await tester.pump();
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures(disableAnimations: true);
+      await tester.pump();
+      expect(tester.state(editable), same(editableState));
+      expect(editor.focusNode.hasPrimaryFocus, isTrue);
+      expect(editor.controller.selection, selection);
+      final copyState = tester.state(copy);
+      final copyFocus = Focus.of(
+        tester.element(
+          find
+              .descendant(of: copy, matching: find.byType(GestureDetector))
+              .first,
+        ),
+      );
+      copyFocus.requestFocus();
+      await tester.pump();
+      for (final reduced in [false, true]) {
+        tester.platformDispatcher.accessibilityFeaturesTestValue =
+            FakeAccessibilityFeatures(disableAnimations: reduced);
+        await tester.pump();
+        expect(copyFocus.hasPrimaryFocus, isTrue);
+        expect(tester.state(copy), same(copyState));
+        expect(tester.state(editable), same(editableState));
+        expect(editor.controller.selection, selection);
+        expect(tester.takeException(), isNull);
+      }
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pumpAndSettle();
+      expect(copied, _ManualLaunchDaemon.command);
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures();
+      await tester.pump();
+      await tester.tap(toggle);
+      await tester.pump();
+      expect(command, findsNothing);
+      expect(copy, findsNothing);
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures(disableAnimations: true);
+      await tester.pump();
+      expect(command, findsNothing);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  test('formats peer throughput in KB/s, MB/s, and GB/s', () {
     expect(formatTransferRate(null), '—');
-    expect(formatTransferRate(1024), '1 K/S');
-    expect(formatTransferRate(1024 * 1024), '1 M/S');
-    expect(formatTransferRate(1024 * 1024 * 1024), '1 G/S');
+    expect(formatTransferRate(1024), '1 KB/s');
+    expect(formatTransferRate(1024 * 1024), '1 MB/s');
+    expect(formatTransferRate(1024 * 1024 * 1024), '1 GB/s');
   });
+
+  for (final probing in [false, true]) {
+    testWidgets(
+      'Home only warns for unconfirmed online paths (probing: $probing)',
+      (tester) async {
+        final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+        final peers = _fourPeerFixtures();
+        final snapshot = _snapshotWithPeers(base, [
+          peers[0],
+          if (probing) peers[2],
+          peers[3],
+        ]);
+        final stores = (await tester.runAsync(
+          () => _makeStores(
+            api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+          ),
+        ))!;
+        addTearDown(stores.dispose);
+        await stores.statusStore.refresh();
+        await tester.pumpWidget(
+          _TestApp(
+            child: DashboardPage(
+              settingsStore: stores.settingsStore,
+              statusStore: stores.statusStore,
+            ),
+          ),
+        );
+        final summary = tester.widget<Text>(
+          find.byKey(const Key('home-connection-details-summary')),
+        );
+        expect(
+          summary.data,
+          probing ? 'Device connectivity: 1 / 2' : 'Control server · Normal',
+        );
+        await _expandHomeConnectionDetails(tester);
+        expect(find.text(probing ? '1 / 2' : '1 / 1'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  for (final outcome in ['success', 'changed address', 'disposed', 'failure']) {
+    testWidgets(
+      'Home copy feedback handles $outcome without stale confirmation',
+      (tester) async {
+        final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+        final api = _FakeDiagnosticsApi(health: true, snapshot: base);
+        final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+        addTearDown(stores.dispose);
+        final completion = Completer<Object?>();
+        String? copied;
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+              if (call.method == 'Clipboard.setData') {
+                copied = (call.arguments as Map)['text'] as String;
+                return completion.future;
+              }
+              return null;
+            });
+        addTearDown(
+          () => TestDefaultBinaryMessengerBinding
+              .instance
+              .defaultBinaryMessenger
+              .setMockMethodCallHandler(SystemChannels.platform, null),
+        );
+        await stores.statusStore.refresh();
+        await tester.pumpWidget(
+          _TestApp(
+            child: DashboardPage(
+              settingsStore: stores.settingsStore,
+              statusStore: stores.statusStore,
+            ),
+          ),
+        );
+        final copy = find.byKey(const Key('home-virtual-ip'));
+        final confirmation = find.descendant(
+          of: copy,
+          matching: find.byIcon(Icons.check_rounded),
+        );
+        expect(tester.getSize(copy).height, greaterThanOrEqualTo(44));
+        await tester.tap(copy);
+        await tester.pump();
+        expect(copied, base.virtualIp);
+        expect(confirmation, findsNothing);
+        if (outcome == 'changed address') {
+          final raw = jsonDecode(jsonEncode(base.raw)) as Map<String, dynamic>;
+          raw['virtual_ip'] = '10.20.0.50';
+          api.snapshot = DiagnosticsSnapshot.fromJson(raw);
+          await stores.statusStore.refresh();
+          await tester.pump();
+        } else if (outcome == 'disposed') {
+          await tester.pumpWidget(const SizedBox.shrink());
+        }
+        if (outcome == 'failure') {
+          completion.completeError(
+            PlatformException(code: 'clipboard_unavailable'),
+          );
+        } else {
+          completion.complete(null);
+        }
+        await tester.pumpAndSettle();
+        if (outcome == 'success') {
+          expect(confirmation, findsOneWidget);
+          final semantics = tester.ensureSemantics();
+          final node = tester.getSemantics(
+            find.byKey(const Key('home-virtual-ip-feedback')),
+          );
+          expect(node.value, 'Copied');
+          expect(node.label, contains('Copy virtual IP'));
+          semantics.dispose();
+          await tester.pump(const Duration(milliseconds: 1600));
+          await tester.pumpAndSettle();
+          expect(confirmation, findsNothing);
+        } else {
+          expect(confirmation, findsNothing);
+          if (outcome == 'changed address') {
+            expect(find.text('10.20.0.50'), findsOneWidget);
+          }
+          if (outcome == 'failure') {
+            expect(find.text('Copy failed. Try again.'), findsOneWidget);
+          }
+        }
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
 
   testWidgets('Home renders stopped state with start action', (tester) async {
     final stores = (await tester.runAsync(
@@ -24,8 +271,13 @@ void _registerDashboardTests() {
       ),
     );
 
-    expect(find.text('P2WLAN is not running'), findsOneWidget);
-    expect(find.text('Start it to join the virtual network.'), findsOneWidget);
+    expect(find.text('Bring your devices together'), findsOneWidget);
+    expect(
+      find.text(
+        'Start the local network service to bring this device onto your virtual network.',
+      ),
+      findsOneWidget,
+    );
     expect(find.text('Not running'), findsOneWidget);
     expect(find.text('Check issues'), findsNothing);
     expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
@@ -89,7 +341,7 @@ void _registerDashboardTests() {
       expect(stores.statusStore.refreshing, isTrue);
       expect(stores.statusStore.refreshActivityVisible, isFalse);
       expect(find.text('Fetching network status…'), findsNothing);
-      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(find.text('Bring your devices together'), findsOneWidget);
       expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
       expect(find.byType(CircularProgressIndicator), findsNothing);
       expect(
@@ -104,7 +356,7 @@ void _registerDashboardTests() {
       initialHealth.complete(false);
       await initialRefresh;
       await tester.pump();
-      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(find.text('Bring your devices together'), findsOneWidget);
       expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
       expect(
         tester
@@ -123,7 +375,7 @@ void _registerDashboardTests() {
       expect(stores.statusStore.refreshing, isTrue);
       expect(stores.statusStore.refreshActivityVisible, isFalse);
       expect(find.text('Fetching network status…'), findsNothing);
-      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(find.text('Bring your devices together'), findsOneWidget);
       expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
       expect(find.text('Refreshing...'), findsNothing);
       expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
@@ -141,7 +393,7 @@ void _registerDashboardTests() {
       nextHealth.complete(false);
       await periodicRefresh;
       await tester.pump();
-      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(find.text('Bring your devices together'), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );
@@ -169,8 +421,11 @@ void _registerDashboardTests() {
 
     // Healthy hero: status + Virtual IP first, with no redundant identity
     // sentence or network-id line.
-    expect(find.text('Network status'), findsOneWidget);
-    expect(find.text('Normal'), findsWidgets);
+    expect(find.text('Local network connected'), findsOneWidget);
+    expect(find.text('Network status'), findsNothing);
+    expect(find.text('Normal'), findsNothing);
+    expect(find.text('Connection details'), findsOneWidget);
+    expect(find.text('Control server'), findsNothing);
     expect(find.text('Your device is on the P2WLAN network'), findsNothing);
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.text('Virtual IP address'), findsOneWidget);
@@ -180,7 +435,6 @@ void _registerDashboardTests() {
     expect(_heroCount(tester, 'dashboard-count-online'), '2');
     expect(_heroCount(tester, 'dashboard-count-direct'), '1');
     expect(_heroCount(tester, 'dashboard-count-relay'), '1');
-    expect(_heroCount(tester, 'dashboard-nat-type'), 'Restricted Cone');
 
     // Device preview section is titled "Devices" and contains connected peers.
     expect(find.text('Devices'), findsOneWidget);
@@ -192,6 +446,17 @@ void _registerDashboardTests() {
 
     // Healthy hero: no duplicate inline refresh; status polling is automatic.
     expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
+
+    final requestsBeforeDetails =
+        (stores.statusStore.diagnosticsApi as _FakeDiagnosticsApi)
+            .statusFetchCount;
+    await _expandHomeConnectionDetails(tester);
+    expect(
+      (stores.statusStore.diagnosticsApi as _FakeDiagnosticsApi)
+          .statusFetchCount,
+      requestsBeforeDetails,
+    );
+    expect(_heroCount(tester, 'dashboard-nat-type'), 'Restricted Cone');
 
     // Network components: only rows the fixture can judge. The fixture has no
     // ready_phase, so the Overlay route row is honestly omitted.
@@ -233,6 +498,7 @@ void _registerDashboardTests() {
         ),
       );
 
+      await _expandHomeConnectionDetails(tester);
       expect(_heroCount(tester, 'dashboard-nat-type'), 'Port-Restricted Cone');
       expect(find.text('Endpoint independent'), findsNothing);
     },
@@ -280,6 +546,59 @@ void _registerDashboardTests() {
     expect(find.text('Control server'), findsOneWidget);
   });
 
+  for (final component in ['control', 'route']) {
+    testWidgets(
+      'Home folded details expose a new $component issue without reopening',
+      (tester) async {
+        final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+        final api = _FakeDiagnosticsApi(health: true, snapshot: base);
+        final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+        addTearDown(stores.dispose);
+        await stores.statusStore.refresh();
+        await tester.pumpWidget(
+          _TestApp(
+            child: DashboardPage(
+              settingsStore: stores.settingsStore,
+              statusStore: stores.statusStore,
+            ),
+          ),
+        );
+        await _expandHomeConnectionDetails(tester);
+        await tester.tap(find.text('Connection details'));
+        await tester.pumpAndSettle();
+        expect(find.text('Control server'), findsNothing);
+        final raw = jsonDecode(jsonEncode(base.raw)) as Map<String, dynamic>;
+        final health = raw['health'] as Map<String, dynamic>;
+        health['status'] = 'degraded';
+        if (component == 'control') {
+          health['control_connected'] = false;
+          health['control_api_reachable'] = false;
+        } else {
+          raw['ready_phase'] = 'error';
+        }
+        api.snapshot = DiagnosticsSnapshot.fromJson(raw);
+        await stores.statusStore.refresh();
+        await tester.pumpAndSettle();
+        final summary = tester.widget<Text>(
+          find.byKey(const Key('home-connection-details-summary')),
+        );
+        expect(
+          summary.data,
+          contains(
+            component == 'control'
+                ? 'Control server: Disconnected'
+                : 'Overlay route: Error',
+          ),
+        );
+        expect(summary.data, isNot(contains('Normal')));
+        // Updating the summary does not override the user's closed disclosure.
+        expect(find.text('Control server'), findsNothing);
+        expect(find.text('Overlay route'), findsNothing);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
   testWidgets('Home never counts an offline peer with a stale active path', (
     tester,
   ) async {
@@ -318,6 +637,58 @@ void _registerDashboardTests() {
     expect(_heroCount(tester, 'dashboard-count-relay'), '0');
     expect(find.text('offline-stale-direct'), findsNothing);
   });
+
+  testWidgets(
+    'Home does not confirm a selected path before validation commits',
+    (tester) async {
+      final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final selected =
+          _peerJson(
+              nodeId: 'selected-before-validation',
+              deviceName: 'Selected device',
+              virtualIp: '10.20.0.98',
+              online: true,
+              state: 'idle',
+              activePath: null,
+              relayConfirmedEndpoint: null,
+              direct: _emptyPathHealth(),
+              relay: _emptyPathHealth(),
+            )
+            ..['current_path_selection'] = {
+              'path': 'direct',
+              'direct_confirmed': true,
+            };
+      final snapshot = _snapshotWithPeers(base, [selected]);
+      // Selection can arrive before the daemon commits verified active state.
+      expect(snapshot.peers.single.path, 'direct');
+      expect(snapshot.peers.single.isDirectVerified, isFalse);
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+        ),
+      ))!;
+      addTearDown(stores.dispose);
+      await stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: DashboardPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
+        ),
+      );
+      expect(_heroCount(tester, 'dashboard-count-online'), '1');
+      expect(_heroCount(tester, 'dashboard-count-available'), '0');
+      expect(_heroCount(tester, 'dashboard-count-direct'), '0');
+      final row = find.byKey(
+        const Key('home-device-row-selected-before-validation'),
+      );
+      expect(
+        find.descendant(of: row, matching: find.text('probing')),
+        findsOneWidget,
+      );
+    },
+  );
 
   testWidgets('Home counts an online peer without a verified path as probing', (
     tester,
@@ -425,7 +796,9 @@ void _registerDashboardTests() {
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.text('Data may be out of date'), findsOneWidget);
     expect(find.byKey(const Key('home-stale-refresh')), findsNothing);
-    expect(find.text('Stale'), findsOneWidget);
+    expect(find.text('Last known connection'), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-count-available')), findsNothing);
+    expect(find.text('Network components'), findsNothing);
     // Staleness is not an issue banner.
     expect(find.text('Check issues'), findsNothing);
   });
@@ -661,9 +1034,9 @@ void _registerDashboardTests() {
         .toList();
     final speedIndex = labels.indexWhere(
       (label) =>
-          label.contains('K/S') ||
-          label.contains('M/S') ||
-          label.contains('G/S'),
+          label.contains('KB/s') ||
+          label.contains('MB/s') ||
+          label.contains('GB/s'),
     );
     final latencyIndex = labels.indexOf('12 ms');
     final pathIndex = labels.indexOf('Direct');
@@ -752,9 +1125,10 @@ void _registerDashboardTests() {
 
     expect(find.text('No other devices online'), findsOneWidget);
     expect(
-      find.text('Devices appear here when they come online.'),
+      find.text('Invite another device to the same room to see it here.'),
       findsOneWidget,
     );
+    await _expandHomeConnectionDetails(tester);
     expect(find.text('0 / 0'), findsOneWidget);
     expect(_heroCount(tester, 'dashboard-count-online'), '0');
   });
@@ -1063,9 +1437,10 @@ void _registerDashboardTests() {
       expect(tester.takeException(), isNull, reason: 'size $size');
       expect(find.text('10.20.0.10'), findsOneWidget, reason: 'size $size');
       expect(find.text('direct-laptop'), findsOneWidget, reason: 'size $size');
+      await _expandHomeConnectionDetails(tester);
       expect(find.text('Control server'), findsOneWidget, reason: 'size $size');
       expect(
-        find.text('Network components'),
+        find.text('Connection details'),
         findsOneWidget,
         reason: 'size $size',
       );
@@ -1073,6 +1448,79 @@ void _registerDashboardTests() {
     tester.view.resetPhysicalSize();
     tester.view.resetDevicePixelRatio();
   });
+
+  for (final width in [390.0, 800.0]) {
+    testWidgets(
+      'Home preview keeps long identities readable at $width and 200% text',
+      (tester) async {
+        tester.view.physicalSize = Size(width, 1100);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+        final raw = jsonDecode(jsonEncode(base.raw)) as Map<String, dynamic>;
+        final first =
+            (raw['peers'] as List<dynamic>).first as Map<String, dynamic>;
+        first['device_name'] = 'Engineering workstation';
+        final snapshot = DiagnosticsSnapshot.fromJson(raw);
+        final stores = (await tester.runAsync(
+          () => _makeStores(
+            api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+          ),
+        ))!;
+        addTearDown(stores.dispose);
+        await stores.statusStore.refresh();
+        PeerSnapshot? opened;
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.lightTheme,
+            home: AppStringsScope(
+              strings: AppStrings.fromCode('en'),
+              child: MediaQuery(
+                data: MediaQueryData(
+                  size: Size(width, 1100),
+                  textScaler: const TextScaler.linear(2),
+                ),
+                child: Scaffold(
+                  body: Row(
+                    children: [
+                      if (width >= 800) const SizedBox(width: 197),
+                      Expanded(
+                        child: DashboardPage(
+                          settingsStore: stores.settingsStore,
+                          statusStore: stores.statusStore,
+                          onOpenPeer: (peer) => opened = peer,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        expect(tester.takeException(), isNull);
+        final row = find.byKey(
+          Key('home-device-row-${snapshot.peers.first.nodeId}'),
+        );
+        await tester.ensureVisible(row);
+        await tester.pump();
+        final name = find.descendant(
+          of: row,
+          matching: find.text('Engineering workstation'),
+        );
+        expect(tester.widget<Text>(name).maxLines, isNull);
+        expect(
+          find.descendant(of: row, matching: find.text('10.20.0.11')),
+          findsOneWidget,
+        );
+        await tester.tap(row);
+        expect(opened?.nodeId, snapshot.peers.first.nodeId);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 
   testWidgets('Home dark theme renders the full healthy page', (tester) async {
     tester.view.physicalSize = const Size(1280, 900);
@@ -1102,8 +1550,9 @@ void _registerDashboardTests() {
 
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.text('direct-laptop'), findsOneWidget);
+    await _expandHomeConnectionDetails(tester);
     expect(find.text('Control server'), findsOneWidget);
-    expect(find.text('Network components'), findsOneWidget);
+    expect(find.text('Connection details'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 }
@@ -1373,4 +1822,26 @@ class _ControllableOfflineDiagnosticsApi extends _FakeDiagnosticsApi {
     _nextHealth = null;
     return pending.future;
   }
+}
+
+Future<void> _expandHomeConnectionDetails(WidgetTester tester) async {
+  if (find.text('Control server').evaluate().isNotEmpty) return;
+  final heading = find.text('Connection details');
+  await tester.ensureVisible(heading);
+  await tester.pumpAndSettle();
+  await tester.tap(heading);
+  await tester.pumpAndSettle();
+}
+
+class _ManualLaunchDaemon extends _FakeDaemonController {
+  _ManualLaunchDaemon(super.api);
+  static const command = 'sudo p2pnet-daemon --config ./demo.json';
+
+  @override
+  Future<DaemonCommandResult> start(AppSettings settings) async =>
+      const DaemonCommandResult(
+        ok: false,
+        message: 'Use the manual launch command.',
+        manualCommand: command,
+      );
 }

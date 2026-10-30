@@ -1,0 +1,29 @@
+{
+  "type": "path_telemetry",
+  "payload": {
+    "device_id": "rust-reporter",
+    "network_id": "fixture-network",
+    "sent_at": 1700000000123,
+    "observations": [
+      {
+        "remote_device_id": "rust-remote",
+        "network_id": "fixture-network",
+        "lifecycle": "online",
+        "observed_at": 1700000000,
+        "current_path": "direct",
+        "previous_path": "relay",
+        "transition_reason": "direct_committed",
+        "network_generation": 2,
+        "peer_session_generation": 1,
+        "remote_candidate_epoch": 2,
+        "observation_revision": 8,
+        "direct_state": "ready",
+        "relay_state": "none",
+        "path_age_ms": 125,
+        "last_direct_latency_ms": 24,
+        "last_relay_latency_ms": 40,
+        "selected_mtu": 1420
+      }
+    ]
+  }
+}

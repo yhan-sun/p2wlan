@@ -8,17 +8,17 @@ part of '../diagnostics_page.dart';
 class _IssuesPanel extends StatelessWidget {
   const _IssuesPanel({
     required this.issues,
-    required this.refreshing,
-    this.onRecheck,
     this.onOpenDevices,
     this.onOpenSettings,
+    this.onReauthenticate,
+    this.onOpenTechnicalDetails,
   });
 
   final List<DiagnosticIssue> issues;
-  final bool refreshing;
-  final VoidCallback? onRecheck;
   final VoidCallback? onOpenDevices;
   final VoidCallback? onOpenSettings;
+  final VoidCallback? onReauthenticate;
+  final VoidCallback? onOpenTechnicalDetails;
 
   @override
   Widget build(BuildContext context) {
@@ -32,10 +32,10 @@ class _IssuesPanel extends StatelessWidget {
             if (index != 0) const SizedBox(height: AppTokens.space10),
             _IssueRow(
               issue: issues[index],
-              refreshing: refreshing,
-              onRecheck: onRecheck,
               onOpenDevices: onOpenDevices,
               onOpenSettings: onOpenSettings,
+              onReauthenticate: onReauthenticate,
+              onOpenTechnicalDetails: onOpenTechnicalDetails,
             ),
           ],
         ],
@@ -47,17 +47,17 @@ class _IssuesPanel extends StatelessWidget {
 class _IssueRow extends StatelessWidget {
   const _IssueRow({
     required this.issue,
-    required this.refreshing,
-    this.onRecheck,
     this.onOpenDevices,
     this.onOpenSettings,
+    this.onReauthenticate,
+    this.onOpenTechnicalDetails,
   });
 
   final DiagnosticIssue issue;
-  final bool refreshing;
-  final VoidCallback? onRecheck;
   final VoidCallback? onOpenDevices;
   final VoidCallback? onOpenSettings;
+  final VoidCallback? onReauthenticate;
+  final VoidCallback? onOpenTechnicalDetails;
 
   @override
   Widget build(BuildContext context) {
@@ -131,12 +131,8 @@ class _IssueRow extends StatelessWidget {
       case DiagnosticIssueKind.stale:
       case DiagnosticIssueKind.serviceUnavailable:
       case DiagnosticIssueKind.statusUnavailable:
-        if (onRecheck == null) return null;
-        return OutlinedButton.icon(
-          onPressed: refreshing ? null : onRecheck,
-          icon: const Icon(Icons.refresh_rounded, size: 16),
-          label: Text(strings.checkAgain),
-        );
+        // The primary status card owns the one recheck action.
+        return null;
       case DiagnosticIssueKind.peerPath:
         if (onOpenDevices == null) return null;
         return OutlinedButton.icon(
@@ -145,18 +141,40 @@ class _IssueRow extends StatelessWidget {
           label: Text(strings.openDevices),
         );
       case DiagnosticIssueKind.reauthRequired:
-        if (onOpenSettings == null) return null;
+        final action = onReauthenticate ?? onOpenSettings;
+        if (action == null) return null;
         return OutlinedButton.icon(
-          onPressed: onOpenSettings,
-          icon: const Icon(Icons.settings_outlined, size: 16),
-          label: Text(strings.openSettings),
+          key: const Key('diagnostics-reauthenticate'),
+          onPressed: action,
+          icon: const Icon(Icons.login_rounded, size: 16),
+          label: Text(
+            onReauthenticate != null
+                ? (strings.isZh ? '重新登录' : 'Sign in again')
+                : strings.openSettings,
+          ),
         );
+      case DiagnosticIssueKind.controlDisconnected:
+        if (onOpenSettings != null) {
+          return OutlinedButton.icon(
+            onPressed: onOpenSettings,
+            icon: const Icon(Icons.settings_outlined, size: 16),
+            label: Text(strings.connectionSettings),
+          );
+        }
+        return _technicalAction(strings);
       case DiagnosticIssueKind.serviceHealth:
       case DiagnosticIssueKind.criticalTask:
-      case DiagnosticIssueKind.controlDisconnected:
       case DiagnosticIssueKind.relay:
-        // No invented auto-fix: explain, do not fake an operation.
-        return null;
+        return _technicalAction(strings);
     }
+  }
+
+  Widget? _technicalAction(AppStrings strings) {
+    if (onOpenTechnicalDetails == null) return null;
+    return OutlinedButton.icon(
+      onPressed: onOpenTechnicalDetails,
+      icon: const Icon(Icons.manage_search_rounded, size: 16),
+      label: Text(strings.isZh ? '查看详细原因' : 'View details'),
+    );
   }
 }

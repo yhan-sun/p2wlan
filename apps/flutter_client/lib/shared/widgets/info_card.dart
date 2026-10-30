@@ -16,7 +16,12 @@ class AppPanel extends StatelessWidget {
       AppTokens.space16,
       0,
     ),
-    this.contentPadding = const EdgeInsets.all(AppTokens.space16),
+    this.contentPadding = const EdgeInsets.fromLTRB(
+      AppTokens.space16,
+      0,
+      AppTokens.space16,
+      AppTokens.space16,
+    ),
     this.flushContent = false,
   });
 
@@ -69,8 +74,6 @@ class _PanelHeader extends StatelessWidget {
   Widget build(BuildContext context) {
     final titleWidget = Text(
       title,
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
       style: TextStyle(
         fontSize: 14,
         fontWeight: FontWeight.w600,
@@ -84,7 +87,8 @@ class _PanelHeader extends StatelessWidget {
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        if (constraints.maxWidth < 360) {
+        if (constraints.maxWidth < 360 ||
+            MediaQuery.textScalerOf(context).scale(14) > 18) {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [

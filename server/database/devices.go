@@ -783,21 +783,34 @@ func (db *DB) UpdateDeviceName(deviceID, deviceName string) error {
 
 // UpdateDeviceVirtualIP changes a device's assigned virtual IP after validating the network pool.
 func (db *DB) UpdateDeviceVirtualIP(deviceID, virtualIP string) error {
+	return db.UpdateDeviceSettings(deviceID, "", virtualIP)
+}
+
+// UpdateDeviceSettings validates and commits all supplied settings atomically.
+// Empty fields preserve the current value, matching the device PATCH contract.
+func (db *DB) UpdateDeviceSettings(deviceID, deviceName, virtualIP string) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	var networkID string
-	if err := tx.QueryRow(`SELECT network_id FROM devices WHERE id = ?`, deviceID).Scan(&networkID); err != nil {
+	var networkID, currentName, currentIP string
+	if err := tx.QueryRow(`SELECT network_id, device_name, virtual_ip FROM devices WHERE id = ?`, deviceID).Scan(&networkID, &currentName, &currentIP); err != nil {
 		return err
 	}
-	reservedIP, err := db.reserveVirtualIP(tx, networkID, virtualIP, deviceID)
-	if err != nil {
-		return err
+	if deviceName == "" {
+		deviceName = currentName
 	}
-	if _, err := tx.Exec(`UPDATE devices SET virtual_ip = ? WHERE id = ?`, reservedIP, deviceID); err != nil {
+	if virtualIP == "" {
+		virtualIP = currentIP
+	} else {
+		virtualIP, err = db.reserveVirtualIP(tx, networkID, virtualIP, deviceID)
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`UPDATE devices SET device_name = ?, virtual_ip = ? WHERE id = ?`, deviceName, virtualIP, deviceID); err != nil {
 		return err
 	}
 	return tx.Commit()

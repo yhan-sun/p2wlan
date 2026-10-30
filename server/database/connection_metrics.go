@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -9,11 +10,11 @@ import (
 )
 
 const (
-	ConnectionMetricsSchemaVersion       = 1
-	ConnectionMetricsBucketSeconds int64 = 3600
-	ConnectionMetricsRetentionHours      = 24 * 30
-	DefaultConnectionTrendsWindowHours   = 24
-	MaxConnectionTrendsWindowHours       = ConnectionMetricsRetentionHours
+	ConnectionMetricsSchemaVersion           = 1
+	ConnectionMetricsBucketSeconds     int64 = 3600
+	ConnectionMetricsRetentionHours          = 24 * 30
+	DefaultConnectionTrendsWindowHours       = 24
+	MaxConnectionTrendsWindowHours           = ConnectionMetricsRetentionHours
 )
 
 var ErrInvalidConnectionTrendsWindow = errors.New("connection trends window_hours out of range")
@@ -70,6 +71,7 @@ type AdminConnectionTrendBucket struct {
 }
 
 type AdminConnectionTrendsFilter struct {
+	Context     context.Context
 	NetworkID   string
 	WindowHours int
 }
@@ -353,12 +355,15 @@ func (db *DB) AdminConnectionTrends(filter AdminConnectionTrendsFilter) (*AdminC
 	if err != nil {
 		return nil, err
 	}
+	if filter.Context == nil {
+		filter.Context = context.Background()
+	}
 
 	generatedAt := time.Now().Unix()
 	currentBucket := connectionMetricBucketStart(generatedAt)
 	startBucket := currentBucket - int64(filter.WindowHours-1)*ConnectionMetricsBucketSeconds
 
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(filter.Context, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin connection trends snapshot: %w", err)
 	}
@@ -372,7 +377,7 @@ func (db *DB) AdminConnectionTrends(filter AdminConnectionTrendsFilter) (*AdminC
 	if filter.NetworkID != "" {
 		conditions = append(conditions, "network_id = ?")
 		args = append(args, filter.NetworkID)
-		if err := tx.QueryRow(`SELECT name FROM networks WHERE id = ?`, filter.NetworkID).Scan(&networkName); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err := tx.QueryRowContext(filter.Context, `SELECT name FROM networks WHERE id = ?`, filter.NetworkID).Scan(&networkName); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("query connection trend network: %w", err)
 		}
 	}
@@ -403,7 +408,7 @@ func (db *DB) AdminConnectionTrends(filter AdminConnectionTrendsFilter) (*AdminC
 		GROUP BY bucket_start
 		ORDER BY bucket_start ASC
 	`
-	rows, err := tx.Query(query, args...)
+	rows, err := tx.QueryContext(filter.Context, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query connection trends: %w", err)
 	}

@@ -27,14 +27,38 @@ class _AdvancedNetworkSection extends StatelessWidget {
             const SizedBox(height: 16),
             _SettingsField(
               controller: state._mtuController,
+              focusNode: state._focusFor(state._mtuController),
+              errorText: state._fieldErrors[state._mtuController],
+              onChanged: (_) => state._clearFieldError(state._mtuController),
               label: strings.mtu,
               helper: strings.mtuHelper,
               keyboardType: TextInputType.number,
               textInputAction: TextInputAction.next,
             ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton(
+                key: const ValueKey('settings-mtu-default'),
+                onPressed: saving
+                    ? null
+                    : () {
+                        state._mtuController.text = defaultMtu.toString();
+                        state._clearFieldError(state._mtuController);
+                      },
+                child: Text(
+                  strings.isZh
+                      ? '使用默认 MTU ($defaultMtu)'
+                      : 'Use default MTU ($defaultMtu)',
+                ),
+              ),
+            ),
             const SizedBox(height: 16),
             _SettingsField(
               controller: state._overlayCidrController,
+              focusNode: state._focusFor(state._overlayCidrController),
+              errorText: state._fieldErrors[state._overlayCidrController],
+              onChanged: (_) =>
+                  state._clearFieldError(state._overlayCidrController),
               label: strings.overlayCidr,
               helper: strings.overlayCidrHelper,
               textInputAction: TextInputAction.next,
@@ -47,6 +71,10 @@ class _AdvancedNetworkSection extends StatelessWidget {
           children: [
             _SettingsField(
               controller: state._udpBindController,
+              focusNode: state._focusFor(state._udpBindController),
+              errorText: state._fieldErrors[state._udpBindController],
+              onChanged: (_) =>
+                  state._clearFieldError(state._udpBindController),
               label: strings.udpBind,
               helper: strings.udpBindHelper,
               textInputAction: TextInputAction.next,
@@ -54,6 +82,10 @@ class _AdvancedNetworkSection extends StatelessWidget {
             const SizedBox(height: 16),
             _SettingsField(
               controller: state._udpAdvertiseController,
+              focusNode: state._focusFor(state._udpAdvertiseController),
+              errorText: state._fieldErrors[state._udpAdvertiseController],
+              onChanged: (_) =>
+                  state._clearFieldError(state._udpAdvertiseController),
               label: strings.udpAdvertise,
               helper: strings.udpAdvertiseHelper,
               textInputAction: TextInputAction.next,

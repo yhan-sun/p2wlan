@@ -268,3 +268,101 @@ async fn signal_websocket_exchanges_active_path_telemetry_when_advertised() {
     client.abort();
     server.await.unwrap();
 }
+
+#[tokio::test]
+#[allow(clippy::result_large_err)]
+async fn path_telemetry_ready_resync_uses_the_message_byte_budget() {
+    use crate::peer::path_telemetry::wire::MAX_PATH_TELEMETRY_FRAME_BYTES;
+    use crate::peer::{
+        NetworkPath, PathObservabilitySnapshot, PathTelemetryHub, PathTransitionDiagnostics,
+    };
+    use futures_util::{SinkExt, StreamExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        config.max_message_size = Some(MAX_PATH_TELEMETRY_FRAME_BYTES);
+        let mut socket = tokio_tungstenite::accept_hdr_async_with_config(
+            stream,
+            |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+             mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                response.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(SIGNAL_WS_PROTOCOL));
+                Ok(response)
+            },
+            Some(config),
+        ).await.unwrap();
+        socket.send(WebSocketMessage::Text(serde_json::json!({
+            "type":"ready", "protocol_version":1, "node_id":"reporter", "network_id":"network",
+            "capabilities":["path_telemetry_v1"], "server_time_ms":1
+        }).to_string().into())).await.unwrap();
+        let mut peers = std::collections::HashSet::new();
+        while peers.len() < 32 {
+            let message = time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .map_err(|_| "first telemetry resync did not complete".to_owned())?
+                .ok_or_else(|| "socket closed during resync".to_owned())?
+                .map_err(|error| format!("64KiB Control reader rejected first resync: {error}"))?;
+            let WebSocketMessage::Text(text) = message else {
+                continue;
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            for observation in value["payload"]["observations"].as_array().unwrap() {
+                assert!(peers.insert(observation["remote_device_id"].as_str().unwrap().to_owned()));
+            }
+            socket
+                .send(WebSocketMessage::Text(
+                    serde_json::json!({
+                        "type":"path_telemetry_ack", "protocol_version":1,
+                        "sent_at":value["payload"]["sent_at"]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        Ok::<_, String>(peers.len())
+    });
+    let hub = Arc::new(PathTelemetryHub::new("reporter".into(), "network".into()));
+    let snapshot = PathObservabilitySnapshot {
+        lifecycle: "online".into(),
+        current_path: Some(NetworkPath::Direct),
+        path_state_revision: 32,
+        transitions: (0..32)
+            .map(|revision| PathTransitionDiagnostics {
+                age_ms: 100,
+                revision,
+                event_kind: "DirectValidationSucceeded".into(),
+                decision: "committed".into(),
+                reason_code: "direct_committed".into(),
+                epoch: None,
+                previous_path: Some(NetworkPath::Relay),
+                current_path: Some(NetworkPath::Direct),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    for index in 0..32 {
+        hub.enqueue(&format!("remote-{index:04}"), &snapshot);
+    }
+    // Only reconnect/ready can mark these snapshots dirty now.
+    assert_eq!(hub.drain_dirty(32).len(), 32);
+    let (wake_tx, _wake_rx) = wake::channel(4);
+    let client = tokio::spawn(async move {
+        run_signal_websocket(
+            &format!("http://{address}"),
+            "dc-delivery-test",
+            "reporter",
+            "network",
+            Some(42),
+            wake_tx,
+            Arc::new(AtomicBool::new(false)),
+            Some(hub),
+        )
+        .await;
+    });
+    let result = server.await.unwrap();
+    client.abort();
+    assert_eq!(result, Ok(32));
+}

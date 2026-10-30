@@ -27,7 +27,7 @@ function PreferenceRow({ label, children }: { label: string; children: ReactNode
   return <div className="console-preference-row"><span>{tr(label)}</span>{children}</div>
 }
 
-export function ConsolePreferences({ onLogout, onOpen }: { onLogout: () => void; onOpen?: () => void }) {
+export function ConsolePreferences({ onLogout, onOpen, showLabel = false }: { onLogout: () => void; onOpen?: () => void; showLabel?: boolean }) {
   const theme = useTheme()
   const [open, setOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)
@@ -48,7 +48,7 @@ export function ConsolePreferences({ onLogout, onOpen }: { onLogout: () => void;
   return <div className="console-preferences" ref={root} onBlur={(event) => {
     if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) setOpen(false)
   }}>
-    <button ref={trigger} type="button" className="icon-button-v2" title={tr('控制台偏好')} aria-label={tr('控制台偏好')} aria-expanded={open} aria-controls={panelId} aria-haspopup="dialog" onClick={() => { if (!open) onOpen?.(); setOpen((value) => !value) }}><Settings2 size={17} /></button>
+    <button ref={trigger} type="button" className={`icon-button-v2${showLabel ? ' preferences-with-label' : ''}`} title={tr('控制台偏好')} aria-label={tr(showLabel ? '偏好设置' : '控制台偏好')} aria-expanded={open} aria-controls={panelId} aria-haspopup="dialog" onClick={() => { if (!open) onOpen?.(); setOpen((value) => !value) }}><Settings2 size={16} />{showLabel && <span>{tr('偏好设置')}</span>}</button>
     {open && <section id={panelId} className="console-preferences-panel" role="dialog" aria-label={tr('控制台偏好')}>
       <header><strong>{tr('控制台偏好')}</strong><button ref={closeButton} type="button" className="icon-button-v2" aria-label={tr('关闭偏好')} onClick={close}><X size={16} /></button></header>
       <RefreshToggle />

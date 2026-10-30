@@ -130,7 +130,7 @@ void _registerTroubleshootingShellTests() {
 
     expect(find.byType(DiagnosticsPage), findsOneWidget);
     expect(find.text('System status'), findsOneWidget);
-    expect(find.text('P2WLAN is running normally'), findsOneWidget);
+    expect(find.text('Default local connection is healthy'), findsOneWidget);
     expect(find.text('Health checks'), findsOneWidget);
     expect(find.text('Advanced diagnostics'), findsOneWidget);
     expect(find.text('Tunnels'), findsNothing);
@@ -149,7 +149,7 @@ void _registerTroubleshootingShellTests() {
     await goToTroubleshooting(tester);
 
     expect(find.byType(DiagnosticsPage), findsOneWidget);
-    expect(find.text('P2WLAN is running normally'), findsOneWidget);
+    expect(find.text('Default local connection is healthy'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -229,7 +229,7 @@ void _registerTroubleshootingShellTests() {
       Theme.of(tester.element(find.byType(DiagnosticsPage))).brightness,
       Brightness.dark,
     );
-    expect(find.text('P2WLAN is running normally'), findsOneWidget);
+    expect(find.text('Default local connection is healthy'), findsOneWidget);
     expect(find.text('Health checks'), findsOneWidget);
     await _expandAdvanced(tester);
     expect(find.text('Network & routes'), findsOneWidget);
@@ -257,7 +257,7 @@ void _registerTroubleshootingShellTests() {
     await tester.pumpAndSettle();
     await _expandAdvanced(tester);
 
-    expect(find.text('P2WLAN is running normally'), findsOneWidget);
+    expect(find.text('Default local connection is healthy'), findsOneWidget);
     expect(find.text('Runtime details'), findsOneWidget);
     expect(find.text('Raw /status JSON'), findsOneWidget);
     expect(tester.takeException(), isNull);

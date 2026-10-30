@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { flexRender, getCoreRowModel, useReactTable, type ColumnDef } from '@tanstack/react-table'
-import { ChevronLeft, ChevronRight, CircleAlert, Network, Search, X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, CircleAlert, Info, Network, Search, X } from 'lucide-react'
 import { lazy, useEffect, useMemo, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { AsyncView } from '../../AsyncView'
@@ -121,9 +121,8 @@ export function ConnectionsPage() {
 
   const columns = useMemo<ColumnDef<AdminConnection, unknown>[]>(() => [
     { id: 'direction', header: '方向', cell: ({ row }) => <ConnectionDirection connection={row.original} /> },
-    { id: 'network', header: 'Network', cell: ({ row }) => <div className="primary-secondary"><strong title={row.original.network_name}>{row.original.network_name}</strong><span className="mono" title={row.original.network_id}>{row.original.network_id}</span></div> },
-    { id: 'path', header: '路径', cell: ({ row }) => <PathBadge connection={row.original} /> },
-    { id: 'fresh', header: 'Status', cell: ({ row }) => <FreshnessBadge connection={row.original} /> },
+    { id: 'network', header: 'Network', cell: ({ row }) => <span className="connection-network-name" title={row.original.network_name}>{row.original.network_name}</span> },
+    { id: 'path', header: '路径与状态', cell: ({ row }) => <div className="connection-path-cell"><PathBadge connection={row.original} /><FreshnessBadge connection={row.original} /></div> },
     { id: 'rtt', header: 'RTT', cell: ({ row }) => row.original.last_validation_rtt_ms === undefined ? '—' : `${row.original.last_validation_rtt_ms} ms` },
     { id: 'age', header: 'Age', cell: ({ row }) => <span title={formatMilliseconds(row.original.path_age_ms)}>{formatMilliseconds(row.original.path_age_ms)}</span> },
     { id: 'reason', header: '原因', cell: ({ row }) => <span className="connection-reason" title={reasonLabel(row.original.transition_reason)}>{reasonLabel(row.original.transition_reason)}</span> },
@@ -138,35 +137,25 @@ export function ConnectionsPage() {
   })
 
   return <div className="page-stack connections-page">
-    <div className="page-intro connections-intro">
-      <div>
-        <h2>{tr(view === 'topology' ? '连接拓扑' : '全部观测')}</h2>
-        <p>{tr('查看设备之间的连接路径、延迟与最近变化。')}</p>
-        <details className="connection-observation-help">
-          <summary>{tr('观测说明')}</summary>
-          <p>{tr("路径只来自守护进程已提交的权威单向观测。“新鲜”表示观测仍在有效租约内，不代表目标应用一定可达。")}</p>
-        </details>
-      </div>
-    </div>
-
+    <h3 className="sr-only">{tr(view === 'topology' ? '连接拓扑' : '全部观测')}</h3>
     <div className="connections-toolbar">
       <label className="search-field connections-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={tr("搜索设备、账号或网络")} aria-label={tr("搜索连接")} /></label>
-      <select className="select-field" value={networkId} onChange={(event) => changeFilter({ network_id: event.target.value })} aria-label={tr("按网络过滤")}>
+      <label className="connection-filter"><span>{tr('Network')}</span><select className="select-field" value={networkId} onChange={(event) => changeFilter({ network_id: event.target.value })} aria-label={tr("按网络过滤")}>
         <option value="">{tr("全部网络")}</option>
         {networkId && !selectedNetwork && <option value={networkId}>{networkId}</option>}
         {networkItems.map((network) => <option key={network.id} value={network.id}>{network.name}</option>)}
-      </select>
-      <select className="select-field" value={path} onChange={(event) => changeFilter({ path: event.target.value })} aria-label={tr("按路径过滤")}>
+      </select></label>
+      <label className="connection-filter"><span>{tr('路径')}</span><select className="select-field" value={path} onChange={(event) => changeFilter({ path: event.target.value })} aria-label={tr("按路径过滤")}>
         <option value="">{tr("全部路径")}</option>
         <option value="direct">{tr("Direct")}</option>
         <option value="relay">{tr("Relay")}</option>
         <option value="none">{tr("None")}</option>
-      </select>
-      <select className="select-field" value={freshness} onChange={(event) => changeFilter({ freshness: event.target.value, show_stale: null, view: null, tab: view === 'topology' ? 'topology' : 'all' })} aria-label={tr("按观测新鲜度过滤")}>
+      </select></label>
+      <label className="connection-filter"><span>{tr('观测新鲜度')}</span><select className="select-field" value={freshness} onChange={(event) => changeFilter({ freshness: event.target.value, show_stale: null, view: null, tab: view === 'topology' ? 'topology' : 'all' })} aria-label={tr("按观测新鲜度过滤")}>
         <option value="">{tr("全部观测")}</option>
         <option value="fresh">{tr("Fresh")}</option>
         <option value="stale">{tr("Stale / reporter offline")}</option>
-      </select>
+      </select></label>
       {networks.hasNextPage && <button
         className="button secondary compact"
         onClick={() => networks.fetchNextPage()}
@@ -182,6 +171,10 @@ export function ConnectionsPage() {
     {(networks.error || networks.fetchStatus === 'paused') && <div className="connection-context-note"><span>{tr('网络目录')}</span><QueryStatus queries={[networks]} /></div>}
     {(view === 'table' || networkId) && <div className="connections-result-bar">
       <QueryStatus queries={[view === 'table' ? result : topology]} />
+      <details className="connection-observation-help">
+        <summary aria-label={tr('观测说明')}><Info size={14} aria-hidden /><span>{tr('观测说明')}</span></summary>
+        <p>{tr("路径只来自守护进程已提交的权威单向观测。“新鲜”表示观测仍在有效租约内，不代表目标应用一定可达。")}</p>
+      </details>
       {activeItems.length > 0 && <SnapshotExport items={query.trim() === committedQuery ? activeItems : []} filename="connections" total={view === 'table' ? result.data?.total : topology.data?.total} scope={{ network_id: networkId, account_id: accountId, device_id: deviceId, q: committedQuery, path, freshness, view, page: view === 'table' ? page : 1, ...(directionOnly ? { reporting_device_id: directionOnly.reporting_device_id, remote_device_id: directionOnly.remote_device_id } : {}) }} />}
     </div>}
 
@@ -225,14 +218,19 @@ export function ConnectionsPage() {
     </section> : <section className="panel-v2 connections-panel topology-mode">
       {!networkId ? <div className="connection-topology-empty choose-network">
         <Network size={20} />
-        <div><strong>{tr("选择一个网络查看实时拓扑")}</strong><span>{tr("拓扑不会跨网络拼接，也不会根据成员关系、信令或 RTT 推断连接。")}</span></div>
-      </div> : topology.data ? <>
-        {topology.data.total > topology.data.items.length && <div className="connection-partial-warning"><CircleAlert size={15} />{tr("当前网络共有 ")}{topology.data.total} {tr("条匹配观测，拓扑仅展示前 ")}{topology.data.items.length} {tr("条；请收紧搜索或路径过滤。")}</div>}
+        <div><strong>{tr("选择一个网络查看实时拓扑")}</strong><span>{tr('使用上方网络筛选，查看设备和已上报的连接路径。')}</span></div>
+      </div> : <>
+        {topology.data && topology.data.total > topology.data.items.length && <div className="connection-partial-warning"><CircleAlert size={15} />{tr("当前网络共有 ")}{topology.data.total} {tr("条匹配观测，拓扑仅展示前 ")}{topology.data.items.length} {tr("条；请收紧搜索或路径过滤。")}</div>}
         <AsyncView><ConnectionTopology
-          connections={topology.data.items}
+          connections={topology.data?.items ?? []}
           networkName={selectedNetwork?.name ?? networkId}
           showStale={showStaleTopology}
-          partial={topology.data.total > topology.data.items.length}
+          partial={Boolean(topology.data && topology.data.total > topology.data.items.length)}
+          loading={!topology.data && topology.isPending}
+          offline={!topology.data && topology.fetchStatus === 'paused'}
+          error={!topology.data ? topology.error : undefined}
+          onRetry={() => { void topology.refetch() }}
+          fullscreenStatus={<QueryStatus queries={[topology]} />}
           selected={selected}
           directionOnly={Boolean(directionOnly)}
           onClearSelection={() => selectConnection(null)}
@@ -240,7 +238,7 @@ export function ConnectionsPage() {
           onShowStaleChange={(value) => changeFilter({ freshness: value ? '' : 'fresh', tab: 'topology', view: null, show_stale: null })}
           onSelect={selectConnection}
         /></AsyncView>
-      </> : topology.fetchStatus === 'paused' ? null : topology.isPending ? <LoadingBlock label={tr("正在读取权威连接拓扑…")} /> : topology.error ? <ErrorBlock error={topology.error} /> : <ErrorBlock error={new Error('控制面未返回连接拓扑。')} />}
+      </>}
     </section>}
 
     {selected && connectionDetailIsOpen(searchParams) && <ConnectionDrawer key={`${selected.network_id}:${selected.reporting_device_id}:${selected.remote_device_id}`} connection={selected} onClose={() => setSearchParams(closeConnectionDetailSearch, { replace: true })} />}

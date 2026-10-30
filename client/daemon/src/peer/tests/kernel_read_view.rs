@@ -184,6 +184,43 @@ async fn old_expectations_reject_real_generation_and_lifecycle_changes() {
 }
 
 #[tokio::test]
+async fn original_membership_readers_share_capture_and_strict_identity_checks() {
+    let (peers, _active) = fixture().await;
+    let first = {
+        let _membership = peers.peer_membership.read().unwrap();
+        let first = peers
+            .try_capture_original_kernel_read_peer(PEER, TARGET.parse().unwrap(), None)
+            .unwrap();
+        assert!(first.try_identity_at(&peers, Instant::now()).is_ok());
+        assert!(matches!(
+            peers.peer_membership.try_write(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        first
+    };
+    assert!(peers.peer_membership.try_write().is_ok());
+
+    let prepared = peers
+        .prepare_original_kernel_read_view(PEER, TARGET)
+        .unwrap();
+    let gate = peers.network_epoch_gate();
+    let mut epoch = gate.lock().await;
+    let membership = peers.peer_membership.read().unwrap();
+    let phase = peers
+        .publish_original_kernel_read_view(&mut epoch, &prepared)
+        .unwrap();
+    // A compatible membership reader cannot substitute the held epoch grant.
+    assert_eq!(
+        first.try_identity_at(&peers, Instant::now()),
+        Err(OverlayCreditOutcome::Contended(CreditLock::Epoch))
+    );
+    drop(phase);
+    drop(membership);
+    drop(epoch);
+    assert!(peers.peer_membership.try_write().is_ok());
+}
+
+#[tokio::test]
 async fn busy_or_inactive_canonical_owners_publish_nothing() {
     let (peers, _active) = fixture().await;
     let gate = peers.network_epoch_gate();
@@ -198,7 +235,7 @@ async fn busy_or_inactive_canonical_owners_publish_nothing() {
             .is_none());
     }
     {
-        let _membership = peers.peer_membership.lock().unwrap();
+        let _membership = peers.peer_membership.write().unwrap();
         assert!(peers
             .publish_original_kernel_read_view(&mut epoch, &prepared)
             .is_none());

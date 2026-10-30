@@ -32,7 +32,7 @@ const graph = await compileSource('src/features/relationships/TopologyCanvas.tsx
   name: 'test-layout-functions',
   setup(builder) {
     builder.onLoad({ filter: /TopologyCanvas\.tsx$/ }, ({ path: filename }) => ({
-      contents: `${readFileSync(filename, 'utf8')}\nexport { buildGraph, filterTopology };`,
+      contents: `${readFileSync(filename, 'utf8')}\nexport { buildGraph, filterTopology, handleNodeKeyDown };`,
       loader: 'tsx',
       resolveDir: path.dirname(filename),
     }))
@@ -112,6 +112,27 @@ test('telemetry-only node changes preserve layout geometry', () => {
   })
   const positions = (layout) => layout.nodes.map(({ id, position, width, height }) => ({ id, position, width, height }))
   assert.deepEqual(positions(before), positions(after))
+})
+
+test('resource nodes open the same detail identity with Enter and Space', () => {
+  const selected = []
+  const makeEvent = (key, overrides = {}) => ({
+    key, repeat: false, nativeEvent: { isComposing: false },
+    target: { closest: () => ({ dataset: { id: 'account:a' } }) },
+    preventDefault() { this.prevented = true }, stopPropagation() { this.stopped = true },
+    ...overrides,
+  })
+  for (const key of ['Enter', ' ']) {
+    const event = makeEvent(key)
+    graph.handleNodeKeyDown(event, (id) => selected.push(id))
+    assert.equal(event.prevented, true)
+    assert.equal(event.stopped, true)
+  }
+  for (const event of [makeEvent('Enter', { repeat: true }), makeEvent(' ', { nativeEvent: { isComposing: true } }), makeEvent('Tab'), makeEvent('Enter', { target: { closest: () => null } })]) {
+    graph.handleNodeKeyDown(event, () => assert.fail('only deliberate node activation opens details'))
+  }
+  assert.deepEqual(selected, ['account:a', 'account:a'])
+  assert.ok(graph.buildGraph(topologyFixture()).nodes.every((node) => node.focusable && node.ariaRole === 'button'))
 })
 
 async function withOverlayHarness(run) {

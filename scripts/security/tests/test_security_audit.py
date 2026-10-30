@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -205,7 +207,84 @@ jobs:
             self.assertTrue(any(item["code"] == "remote_shell_pipe" for item in evidence["findings"]))
 
 
+class ProductionCredentialGateTests(unittest.TestCase):
+    def run_gate(self, files: dict[str, str]) -> subprocess.CompletedProcess:
+        workflow = (SECURITY_DIR.parents[1] / ".github/workflows/ci.yml").read_text()
+        marker = "      - name: Scan production credential transport\n        run: |\n"
+        command = textwrap.dedent(workflow.split(marker, 1)[1].split("\n\n", 1)[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, contents in files.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents, encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True)
+            return subprocess.run(["bash", "-c", command], cwd=root, capture_output=True, text=True)
+
+    def test_detector_and_negative_fixture_are_not_runtime_calls(self) -> None:
+        result = self.run_gate({
+            "scripts/security/credential_scan.py": 'pattern = "sessionStorage"\n',
+            "scripts/security/tests/test_security_audit.py": 'fixture = "localStorage"\n',
+        })
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_production_and_neighboring_scripts_still_reject_credential_transport(self) -> None:
+        cases = {
+            "apps/flutter_client/lib/transport.dart": 'sessionStorage.setItem("token", token);',
+            "client/daemon/src/transport.rs": 'localStorage.setItem("token", token);',
+            "scripts/security/runtime.py": 'daemon --token secret',
+            "scripts/security/tests/neighbor.py": 'p2wlan-daemon.token',
+        }
+        for path, contents in cases.items():
+            with self.subTest(path=path):
+                result = self.run_gate({path: contents})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(path, result.stdout)
+                self.assertIn("unsafe production credential transport", result.stderr)
+
+
 class CredentialScanTests(unittest.TestCase):
+    def test_fixed_asset_recovery_timestamp_storage_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "server/admin/legacy_chunks.go"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                '  const previous=Number(sessionStorage.getItem("p2wlan-admin-asset-recovery")||0);\n'
+                '    sessionStorage.setItem("p2wlan-admin-asset-recovery",String(Date.now()));\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(credential_scan.run(root)["result"], "pass")
+
+    def test_browser_storage_timestamp_exception_rejects_other_values_and_calls(self) -> None:
+        statements = (
+            'sessionStorage.setItem("p2wlan-admin-asset-recovery", token);',
+            'sessionStorage.setItem("p2wlan-admin-asset-recovery", String(now));',
+            'sessionStorage.setItem("p2wlan-admin-asset-recovery", String(Date.now()) + token);',
+            'sessionStorage.setItem("another-key", String(Date.now()));',
+            'sessionStorage.setItem(key, String(Date.now()));',
+            'localStorage.setItem("p2wlan-admin-asset-recovery", String(Date.now()));',
+            'const previous=Number(sessionStorage.getItem("another-key")||0);',
+            'const previous=sessionStorage.getItem("p2wlan-admin-asset-recovery");',
+            'const previous=Number(sessionStorage.getItem("p2wlan-admin-asset-recovery")||token);',
+            'sessionStorage.setItem("p2wlan-admin-asset-recovery",String(Date.now())); sessionStorage.setItem("token", token);',
+            'sessionStorage.setItem(\n"p2wlan-admin-asset-recovery", token);',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "server/admin/legacy_chunks.go"
+            path.parent.mkdir(parents=True)
+            for statement in statements:
+                with self.subTest(statement=statement):
+                    path.write_text(statement, encoding="utf-8")
+                    evidence = credential_scan.run(root)
+                    self.assertEqual(evidence["result"], "fail")
+                    self.assertTrue(any(
+                        item["code"] == "browser_secret_storage"
+                        for item in evidence["findings"]
+                    ))
+
     def test_high_confidence_token_and_xtrace_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

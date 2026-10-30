@@ -1,4 +1,5 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, type RefObject } from 'react'
+import { activateModalSurface } from './modalFocus'
 
 interface OverlayEntry {
   close: () => void
@@ -36,10 +37,11 @@ function closeTopOverlay(event: KeyboardEvent) {
 }
 
 /** Share Escape handling and scroll ownership across fullscreen views and dialogs. */
-export function useOverlay(active: boolean, onClose: () => void, options: { lockScroll?: boolean } = {}) {
+export function useOverlay(active: boolean, onClose: () => void, options: { lockScroll?: boolean; modalRef?: RefObject<HTMLElement | null> } = {}) {
   const close = useRef(onClose)
   close.current = onClose
   const lockScroll = options.lockScroll ?? true
+  const modalRef = options.modalRef
 
   useEffect(() => {
     if (!active) return
@@ -47,11 +49,13 @@ export function useOverlay(active: boolean, onClose: () => void, options: { lock
     if (overlays.length === 0) window.addEventListener('keydown', closeTopOverlay, true)
     overlays.push(overlay)
     updateScrollLock()
+    const releaseFocus = modalRef?.current ? activateModalSurface(modalRef.current) : undefined
     return () => {
       const index = overlays.indexOf(overlay)
       if (index !== -1) overlays.splice(index, 1)
       updateScrollLock()
+      releaseFocus?.()
       if (overlays.length === 0) window.removeEventListener('keydown', closeTopOverlay, true)
     }
-  }, [active, lockScroll])
+  }, [active, lockScroll, modalRef])
 }

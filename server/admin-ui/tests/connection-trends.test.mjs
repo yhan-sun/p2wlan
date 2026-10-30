@@ -139,7 +139,7 @@ test('scoped health renders its own cached summary and suppresses unsupported tr
   assert.match(html, /321/)
   assert.match(html, /清除账号范围: owner/)
   assert.match(html, /清除设备范围: lab-stale/)
-  assert.match(html, /趋势按网络汇总，保留当前排障上下文/)
+  assert.match(html, /查看历史趋势/)
   assert.match(html, /account_id=owner.*device_id=lab-stale.*tab=trends/)
   assert.doesNotMatch(html, /type="range"|connection-trends/)
   assert.equal(client.getQueryCache().findAll({ queryKey: ['connection-trends'] }).length, 0)

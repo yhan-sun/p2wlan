@@ -213,6 +213,18 @@ export function ResourceReturnLink() {
   return origin ? <div className="resource-return"><Link className="text-link" to={origin.to} state={origin.state}><ChevronLeft size={15} />{tr(origin.label)}</Link></div> : null
 }
 
-export function ResourceEmptyState({ message, onClear }: { message: string; onClear?: () => void }) {
-  return <div className="resource-empty-state" role="status"><span>{tr(message)}</span>{onClear && <button type="button" className="button secondary compact" onClick={onClear}>{tr('清除筛选')}</button>}</div>
+export function ResourceEmptyState({ message, description, onClear, onReset, action }: {
+  message: string
+  description?: string
+  onClear?: () => void
+  onReset?: () => void
+  action?: { to: string; label: string }
+}) {
+  return <div className="resource-empty-state" role="status">
+    <strong>{tr(message)}</strong>
+    {description && <p>{tr(description)}</p>}
+    {onReset ? <button type="button" className="button secondary" onClick={onReset}>{tr('重新从首页加载')}</button>
+      : onClear ? <button type="button" className="button secondary" onClick={onClear}>{tr('清除筛选')}</button>
+        : action && <Link className="button secondary" to={action.to}>{tr(action.label)}</Link>}
+  </div>
 }

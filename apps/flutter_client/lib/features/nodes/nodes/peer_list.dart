@@ -6,15 +6,15 @@ part of '../nodes_page.dart';
 class _PeerList extends StatelessWidget {
   const _PeerList({
     required this.peers,
-    required this.peerTransferRates,
+    required this.showScope,
     required this.compact,
     required this.onTap,
   });
 
-  final List<PeerSnapshot> peers;
-  final Map<String, int> peerTransferRates;
+  final List<NetworkPeerSnapshot> peers;
+  final bool showScope;
   final bool compact;
-  final ValueChanged<PeerSnapshot> onTap;
+  final ValueChanged<NetworkPeerSnapshot> onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -24,13 +24,21 @@ class _PeerList extends StatelessWidget {
       child: Column(
         children: [
           for (var index = 0; index < peers.length; index++) ...[
-            if (index > 0) const SizedBox(height: AppTokens.space4),
+            if (index > 0) const Divider(height: 1, indent: 56, endIndent: 14),
             _PeerListRow(
-              peer: peers[index],
-              speedBytesPerSecond: peerTransferRates[peers[index].nodeId],
+              peer: peers[index].peer,
+              scopeIdentity: peers[index].isPrimary
+                  ? null
+                  : peers[index].identity,
+              scopeLabel: showScope
+                  ? (peers[index].roomName ??
+                        (strings.isZh ? '当前网络' : 'Current network'))
+                  : null,
+              current: peers[index].current,
+              speedBytesPerSecond: peers[index].transferBytesPerSecond,
               strings: strings,
               compact: compact,
-              onTap: onTap,
+              onTap: (_) => onTap(peers[index]),
             ),
           ],
         ],
@@ -46,8 +54,14 @@ class _PeerListRow extends StatelessWidget {
     required this.strings,
     required this.compact,
     required this.onTap,
+    this.scopeIdentity,
+    this.scopeLabel,
+    this.current = true,
   });
 
+  final String? scopeIdentity;
+  final String? scopeLabel;
+  final bool current;
   final PeerSnapshot peer;
   final int? speedBytesPerSecond;
   final AppStrings strings;
@@ -59,9 +73,8 @@ class _PeerListRow extends StatelessWidget {
     return Material(
       color: Colors.transparent,
       child: InkWell(
-        key: Key('node-row-${peer.nodeId}'),
+        key: Key('node-row-${scopeIdentity ?? peer.nodeId}'),
         onTap: () => onTap(peer),
-        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
         child: Padding(
           padding: EdgeInsets.symmetric(
             horizontal: 14,
@@ -72,6 +85,8 @@ class _PeerListRow extends StatelessWidget {
             speedBytesPerSecond: speedBytesPerSecond,
             strings: strings,
             compact: compact,
+            scopeLabel: scopeLabel,
+            current: current,
           ),
         ),
       ),
@@ -82,16 +97,20 @@ class _PeerListRow extends StatelessWidget {
 /// First level: status, name/IP, speed, latency, connection path, and a quiet
 /// affordance for opening details. The identity uses two short lines so the
 /// device name keeps its full width instead of competing with the IP address.
-/// The three metrics stay on one line; technical metadata still stays behind
-/// the detail surface.
+/// Available live metrics align with the list header. Offline and stale rows
+/// keep their connection state without presenting historical traffic as live.
 class _RowContent extends StatelessWidget {
   const _RowContent({
     required this.peer,
     required this.speedBytesPerSecond,
     required this.strings,
     required this.compact,
+    this.scopeLabel,
+    this.current = true,
   });
 
+  final String? scopeLabel;
+  final bool current;
   final PeerSnapshot peer;
   final int? speedBytesPerSecond;
   final AppStrings strings;
@@ -105,38 +124,50 @@ class _RowContent extends StatelessWidget {
         peer: peer,
         speedBytesPerSecond: speedBytesPerSecond,
         strings: strings,
+        scopeLabel: scopeLabel,
+        current: current,
       );
     }
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        _PeerLeading(peer: peer, strings: strings),
+        _PeerLeading(peer: peer, strings: strings, current: current),
         const SizedBox(width: AppTokens.space10),
         Expanded(
-          child: _PeerPrimaryText(peer: peer, strings: strings),
+          child: _PeerPrimaryText(
+            peer: peer,
+            strings: strings,
+            scopeLabel: scopeLabel,
+          ),
         ),
         const SizedBox(width: AppTokens.space10),
         SizedBox(
-          width: compact ? 184 : 202,
+          width: 202,
           child: Row(
             mainAxisAlignment: MainAxisAlignment.end,
             children: [
               _PeerMetricText(
-                value: formatTransferRate(speedBytesPerSecond),
-                width: 58,
+                value: current && peer.online && speedBytesPerSecond != null
+                    ? formatTransferRate(speedBytesPerSecond)
+                    : '',
+                width: 72,
                 color: theme.colorScheme.onSurfaceVariant,
               ),
               const SizedBox(width: 8),
               _PeerMetricText(
-                value: formatLatency(peer.latencyMs),
-                width: 50,
+                value: current && peer.online && peer.latencyMs != null
+                    ? formatLatency(peer.latencyMs)
+                    : '',
+                width: 48,
                 color: theme.colorScheme.onSurfaceVariant,
               ),
               const SizedBox(width: 8),
               _PeerMetricText(
-                value: _rowPathLabel(strings, peer),
-                width: 58,
-                color: _rowStatusColor(context, peer),
+                value: current ? _rowPathLabel(strings, peer) : strings.stale,
+                width: 60,
+                color: current
+                    ? _rowStatusColor(context, peer)
+                    : P2WlanColors.of(context).offline,
               ),
             ],
           ),
@@ -152,17 +183,18 @@ class _RowContent extends StatelessWidget {
   }
 }
 
-/// Phone layout for a peer row. Keep the complete interaction in one compact
-/// row: a two-line identity on the left, transfer rate, RTT, path, and the
-/// detail affordance on the right. The identity grows vertically rather than
-/// squeezing the device name and IP into a single line.
+/// Phone rows give identity the full width, with labeled live metrics below.
 class _CompactRowContent extends StatelessWidget {
   const _CompactRowContent({
     required this.peer,
     required this.speedBytesPerSecond,
     required this.strings,
+    this.scopeLabel,
+    this.current = true,
   });
 
+  final String? scopeLabel;
+  final bool current;
   final PeerSnapshot peer;
   final int? speedBytesPerSecond;
   final AppStrings strings;
@@ -170,35 +202,67 @@ class _CompactRowContent extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final statusLabel = _rowPathLabel(strings, peer);
-    final statusColor = _rowStatusColor(context, peer);
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.center,
+    final statusLabel = current ? _rowPathLabel(strings, peer) : strings.stale;
+    final statusColor = current
+        ? _rowStatusColor(context, peer)
+        : P2WlanColors.of(context).offline;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _PeerLeading(peer: peer, strings: strings),
-        const SizedBox(width: AppTokens.space8),
-        Expanded(
-          child: _PeerPrimaryText(peer: peer, strings: strings),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            _PeerLeading(peer: peer, strings: strings, current: current),
+            const SizedBox(width: AppTokens.space8),
+            Expanded(
+              child: _PeerPrimaryText(
+                peer: peer,
+                strings: strings,
+                scopeLabel: scopeLabel,
+                compact: true,
+              ),
+            ),
+            const SizedBox(width: AppTokens.space4),
+            Icon(
+              Icons.chevron_right_rounded,
+              size: 20,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ],
         ),
-        const SizedBox(width: AppTokens.space4),
-        _PeerMetricText(
-          value: formatTransferRate(speedBytesPerSecond),
-          width: 36,
-          color: theme.colorScheme.onSurfaceVariant,
-        ),
-        const SizedBox(width: 2),
-        _PeerMetricText(
-          value: formatLatency(peer.latencyMs),
-          width: 36,
-          color: theme.colorScheme.onSurfaceVariant,
-        ),
-        const SizedBox(width: 2),
-        _PeerMetricText(value: statusLabel, width: 46, color: statusColor),
-        const SizedBox(width: 2),
-        Icon(
-          Icons.chevron_right_rounded,
-          size: 20,
-          color: theme.colorScheme.onSurfaceVariant,
+        const SizedBox(height: 6),
+        Padding(
+          padding: const EdgeInsets.only(left: 40),
+          child: Wrap(
+            spacing: 12,
+            runSpacing: 4,
+            children: [
+              Text(
+                statusLabel,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: statusColor,
+                ),
+              ),
+              if (current && peer.online && peer.latencyMs != null)
+                Text(
+                  'RTT ${formatLatency(peer.latencyMs)}',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              if (current && peer.online && speedBytesPerSecond != null)
+                Text(
+                  formatTransferRate(speedBytesPerSecond),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+            ],
+          ),
         ),
       ],
     );
@@ -227,7 +291,7 @@ class _PeerMetricText extends StatelessWidget {
         textAlign: TextAlign.end,
         style: TextStyle(
           color: color,
-          fontSize: width < 50 ? 10 : 11,
+          fontSize: 12,
           fontWeight: FontWeight.w600,
           height: 1.2,
           fontFeatures: AppTokens.tabularFontFeatures,
@@ -238,7 +302,13 @@ class _PeerMetricText extends StatelessWidget {
 }
 
 class _PeerLeading extends StatelessWidget {
-  const _PeerLeading({required this.peer, required this.strings});
+  const _PeerLeading({
+    required this.peer,
+    required this.strings,
+    this.current = true,
+  });
+
+  final bool current;
 
   final PeerSnapshot peer;
   final AppStrings strings;
@@ -247,9 +317,11 @@ class _PeerLeading extends StatelessWidget {
   Widget build(BuildContext context) {
     final colors = P2WlanColors.of(context);
     final theme = Theme.of(context);
-    final statusColor = _rowStatusColor(context, peer);
+    final statusColor = current
+        ? _rowStatusColor(context, peer)
+        : P2WlanColors.of(context).offline;
     return Semantics(
-      label: _rowPathLabel(strings, peer),
+      label: current ? _rowPathLabel(strings, peer) : strings.stale,
       child: SizedBox(
         width: 32,
         height: 32,
@@ -291,7 +363,15 @@ class _PeerLeading extends StatelessWidget {
 }
 
 class _PeerPrimaryText extends StatelessWidget {
-  const _PeerPrimaryText({required this.peer, required this.strings});
+  const _PeerPrimaryText({
+    required this.peer,
+    required this.strings,
+    this.scopeLabel,
+    this.compact = false,
+  });
+
+  final String? scopeLabel;
+  final bool compact;
 
   final PeerSnapshot peer;
   final AppStrings strings;
@@ -309,10 +389,10 @@ class _PeerPrimaryText extends StatelessWidget {
             Flexible(
               child: Text(
                 dash(peer.displayName),
-                maxLines: 1,
+                maxLines: compact ? 2 : 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  fontSize: 13.5,
+                  fontSize: 14,
                   fontWeight: FontWeight.w700,
                   color: theme.colorScheme.onSurface,
                 ),
@@ -334,16 +414,22 @@ class _PeerPrimaryText extends StatelessWidget {
         const SizedBox(height: 2),
         Text(
           dash(peer.virtualIp),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
           style: TextStyle(
             fontSize: 12,
-            fontWeight: FontWeight.w600,
+            fontWeight: FontWeight.w400,
             color: theme.colorScheme.onSurfaceVariant,
             fontFeatures: AppTokens.tabularFontFeatures,
-            height: 1.15,
+            height: 1.3,
           ),
         ),
+        if (scopeLabel != null)
+          Text(
+            scopeLabel!,
+            style: TextStyle(
+              fontSize: 12,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
       ],
     );
   }
@@ -369,43 +455,66 @@ class _NodesEmptyState extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 28, horizontal: 16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 34, color: theme.colorScheme.onSurfaceVariant),
-            const SizedBox(height: AppTokens.space10),
-            Text(
-              title,
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                color: theme.colorScheme.onSurface,
-                fontSize: 15,
-                fontWeight: FontWeight.w700,
-              ),
+    final colors = P2WlanColors.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              color: colors.surfaceMuted,
+              borderRadius: BorderRadius.circular(AppTokens.radiusMd),
             ),
-            const SizedBox(height: AppTokens.space4),
-            Text(
-              body,
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                color: theme.colorScheme.onSurfaceVariant,
-                fontSize: 13,
-                height: 1.35,
-              ),
+            child: Icon(
+              icon,
+              size: 22,
+              color: theme.colorScheme.onSurfaceVariant,
             ),
-            if (actionLabel != null && onAction != null) ...[
-              const SizedBox(height: AppTokens.space12),
-              OutlinedButton.icon(
-                onPressed: onAction,
-                icon: const Icon(Icons.clear_rounded, size: 17),
-                label: Text(actionLabel!),
-              ),
-            ],
-          ],
-        ),
+          ),
+          const SizedBox(width: AppTokens.space12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurface,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: AppTokens.space4),
+                Text(
+                  body,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontSize: 13,
+                    height: 1.4,
+                  ),
+                ),
+                if (actionLabel != null && onAction != null) ...[
+                  const SizedBox(height: AppTokens.space12),
+                  OutlinedButton.icon(
+                    onPressed: onAction,
+                    icon: Icon(
+                      actionLabel == stringsOf(context).clearSearch ||
+                              actionLabel == stringsOf(context).clearFilter
+                          ? Icons.clear_rounded
+                          : Icons.group_add_outlined,
+                      size: 16,
+                    ),
+                    label: Text(actionLabel!),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

@@ -128,6 +128,7 @@ export interface AdminTopologyNode {
   last_seen?: number
   online?: boolean
   focus?: boolean
+  has_personal_devices?: boolean
 }
 
 export interface AdminTopologyEdge {

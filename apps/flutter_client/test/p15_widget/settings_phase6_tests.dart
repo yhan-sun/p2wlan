@@ -541,7 +541,19 @@ void _registerSettingsPhase6Tests() {
       await tester.enterText(_settingsTextField('MTU'), '1400');
       await tester.pump();
       await _tapSave(tester);
-      await _waitFor(tester, () => stores.settingsStore.settings.mtu == 1400);
+      await _waitFor(
+        tester,
+        () => find.byKey(const Key('settings-save-button')).evaluate().isEmpty,
+      );
+      expect(find.byKey(const Key('settings-save-button')), findsNothing);
+      expect(stores.settingsStore.settings.mtu, 1400);
+      final persisted = (await tester.runAsync(
+        () async => jsonDecode(
+          await File(stores.settingsStore.configPath!).readAsString(),
+        ) as Map<String, dynamic>,
+      ))!;
+      expect(persisted['mtu'], 1400);
+      expect(persisted['authToken'], isEmpty);
       expect(stores.settingsStore.settings.authToken, 'existing-secret');
       expect(await tester.runAsync(() => repo.read()), 'existing-secret');
       await _openCategory(tester, 'Account & Connection');
@@ -598,6 +610,7 @@ Future<_Stores> _pumpSettingsShell(
   PlatformCapabilities? capabilities,
   double textScale = 1.0,
   bool dark = false,
+  VoidCallback? onReauthenticate,
 }) async {
   // Reset the element tree so a previous pump's shell state (section /
   // selected category) does not leak into this new shell instance.
@@ -630,6 +643,7 @@ Future<_Stores> _pumpSettingsShell(
     settingsStore: stores.settingsStore,
     statusStore: stores.statusStore,
     capabilities: caps,
+    onReauthenticate: onReauthenticate,
   );
   if (textScale != 1.0) {
     final unscaledShell = shell;

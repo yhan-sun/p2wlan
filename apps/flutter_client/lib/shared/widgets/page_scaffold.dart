@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 
 import '../../app/app_tokens.dart';
-import '../layout/app_breakpoints.dart';
 
 class PageScaffold extends StatelessWidget {
   const PageScaffold({
@@ -27,16 +26,13 @@ class PageScaffold extends StatelessWidget {
     return SafeArea(
       child: LayoutBuilder(
         builder: (context, constraints) {
-          // Content density follows the shell's compact breakpoint: below it
-          // (phones / very narrow windows) the page uses tighter padding.
-          final isNarrow =
-              constraints.maxWidth < AppBreakpoints.compactMaxWidth;
+          final isNarrow = constraints.maxWidth < 480;
           final horizontalPadding = isNarrow
-              ? AppTokens.space14
-              : AppTokens.space24;
+              ? AppTokens.space16
+              : AppTokens.space28;
           final verticalPadding = isNarrow
-              ? AppTokens.space14
-              : AppTokens.space20;
+              ? AppTokens.space20
+              : AppTokens.space24;
 
           return ListView(
             padding: EdgeInsets.fromLTRB(
@@ -50,27 +46,22 @@ class PageScaffold extends StatelessWidget {
                 child: ConstrainedBox(
                   constraints: BoxConstraints(maxWidth: maxWidth),
                   child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       if (showHeader) ...[
                         Align(
-                          alignment: isNarrow
-                              ? Alignment.center
-                              : Alignment.centerLeft,
+                          alignment: Alignment.centerLeft,
                           child: Column(
                             mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: isNarrow
-                                ? CrossAxisAlignment.center
-                                : CrossAxisAlignment.start,
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text(
                                 title,
-                                textAlign: isNarrow
-                                    ? TextAlign.center
-                                    : TextAlign.left,
+                                textAlign: TextAlign.left,
                                 style: TextStyle(
-                                  fontSize: isNarrow ? 20 : 22,
-                                  fontWeight: FontWeight.w600,
+                                  fontSize: isNarrow ? 22 : 24,
+                                  height: 1.25,
+                                  fontWeight: FontWeight.w700,
                                   color: Theme.of(context)
                                       .colorScheme
                                       .onSurface,
@@ -78,14 +69,13 @@ class PageScaffold extends StatelessWidget {
                                 ),
                               ),
                               if (trimmedSubtitle.isNotEmpty) ...[
-                                const SizedBox(height: 3),
+                                const SizedBox(height: 6),
                                 Text(
                                   trimmedSubtitle,
-                                  textAlign: isNarrow
-                                      ? TextAlign.center
-                                      : TextAlign.left,
+                                  textAlign: TextAlign.left,
                                   style: TextStyle(
-                                    fontSize: 13,
+                                    fontSize: 14,
+                                    height: 1.45,
                                     fontWeight: FontWeight.w400,
                                     color: Theme.of(context)
                                         .colorScheme
@@ -96,7 +86,7 @@ class PageScaffold extends StatelessWidget {
                             ],
                           ),
                         ),
-                        const SizedBox(height: AppTokens.space16),
+                        const SizedBox(height: AppTokens.space20),
                       ],
                       ...children,
                     ],

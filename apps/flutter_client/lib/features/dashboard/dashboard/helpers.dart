@@ -84,16 +84,12 @@ _PeerCounts _countPeers(List<PeerSnapshot> peers) {
       continue;
     }
     online += 1;
-    switch (peer.path) {
-      case 'direct':
-        direct += 1;
-      case 'relay':
-        relay += 1;
-      case 'probing' || 'direct_trial':
-        probing += 1;
-      default:
-        // The peer is present but has no verified usable path yet.
-        probing += 1;
+    if (peer.isDirectVerified) {
+      direct += 1;
+    } else if (peer.isRelayVerified) {
+      relay += 1;
+    } else {
+      probing += 1;
     }
   }
   return _PeerCounts(
@@ -123,6 +119,7 @@ List<PeerSnapshot> _topOverviewPeers(
 
 String _peerStatusLabel(AppStrings strings, PeerSnapshot peer) {
   if (!peer.online || peer.path == 'offline') return strings.offline;
+  if (!peer.isDirectVerified && !peer.isRelayVerified) return strings.probing;
   return switch (peer.path) {
     'direct' => strings.direct,
     'relay' => strings.relay,
@@ -138,6 +135,7 @@ Color _peerStatusColor(BuildContext context, PeerSnapshot peer) {
   if (!peer.online || peer.path == 'offline') {
     return c.offline;
   }
+  if (!peer.isDirectVerified && !peer.isRelayVerified) return c.probing;
   return switch (peer.path) {
     'direct' => c.direct,
     'relay' => c.relay,

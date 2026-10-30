@@ -16,7 +16,7 @@ String formatOptionalBool(bool? value) =>
 String formatInt(int value) => value.toString();
 
 String formatBytes(int value) {
-  const units = ['B', 'KB', 'MB', 'GB'];
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   var size = value.toDouble();
   var index = 0;
   while (size >= 1024 && index < units.length - 1) {
@@ -37,9 +37,9 @@ String formatTransferRate(int? bytesPerSecond) {
   const mega = kilo * 1024;
   const giga = mega * 1024;
   final (value, unit) = switch (bytesPerSecond.toDouble()) {
-    >= giga => (bytesPerSecond / giga, 'G/S'),
-    >= mega => (bytesPerSecond / mega, 'M/S'),
-    _ => (bytesPerSecond / kilo, 'K/S'),
+    >= giga => (bytesPerSecond / giga, 'GB/s'),
+    >= mega => (bytesPerSecond / mega, 'MB/s'),
+    _ => (bytesPerSecond / kilo, 'KB/s'),
   };
   final text = value == value.roundToDouble()
       ? value.toStringAsFixed(0)
@@ -79,4 +79,23 @@ String pathLabel(String path) {
     default:
       return dash(path);
   }
+}
+
+String formatOptionalBytes(int? value) =>
+    value == null || value < 0 ? '—' : formatBytes(value);
+
+/// Human duration for connection/service age; transport RTTs keep formatDuration.
+String formatElapsedTime(int? milliseconds, {bool isZh = false}) {
+  if (milliseconds == null || milliseconds < 0) return '—';
+  final seconds = milliseconds ~/ 1000;
+  final days = seconds ~/ 86400;
+  final hours = seconds % 86400 ~/ 3600;
+  final minutes = seconds % 3600 ~/ 60;
+  final rest = seconds % 60;
+  if (days > 0) return isZh ? '$days 天 $hours 小时' : '${days}d ${hours}h';
+  if (hours > 0) {
+    return isZh ? '$hours 小时 $minutes 分钟' : '${hours}h ${minutes}m';
+  }
+  if (minutes > 0) return isZh ? '$minutes 分钟 $rest 秒' : '${minutes}m ${rest}s';
+  return isZh ? '$rest 秒' : '${rest}s';
 }

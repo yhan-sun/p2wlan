@@ -5,6 +5,7 @@ import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { AccountScopePicker } from '../../AccountScopePicker'
 import { AsyncView } from '../../AsyncView'
 import { CopyValue } from '../../CopyValue'
+import { PageHeader } from '../../components/ui/console'
 import { SnapshotExport } from '../../SnapshotExport'
 import { ApiError, adminApi } from '../../api'
 import { getLocale, tr } from '../../i18n'
@@ -28,15 +29,20 @@ function NetworkOverview({ data, search, onSelect, incomplete = false, summaryOn
   const networks = summarizeNetworks(data).filter((item) => !normalizedSearch || item.searchText.includes(normalizedSearch))
   return <section className="network-overview">
     <header className="network-overview-heading">
-      <div><span className="section-kicker">{tr("NETWORKS")}</span><h3>{tr("资源总览")}</h3><p>{tr("选择网络或个人设备分组，查看成员和设备关系。")}</p></div>
+      <div><h3>{tr("资源总览")}</h3><p>{tr("选择网络或个人设备分组，查看成员和设备关系。")}</p></div>
       <span className="network-total">{networks.length} {tr("个资源分组")}</span>
     </header>
     {networks.length > 0 ? <div className="network-overview-grid">
       {networks.map((item) => <button type="button" className="network-overview-card" key={item.id} onClick={() => onSelect(item.id)}>
-        <span className={`network-overview-icon ${item.node.kind === 'room' ? 'room' : ''}`}>{item.node.kind === 'room' ? <RadioTower size={19} /> : <Network size={19} />}</span>
-        <span className="network-overview-copy"><span className="network-kind-label">{tr(item.personal ? '个人设备' : item.node.kind === 'room' ? '房间网络' : '普通网络')}</span><strong>{item.node.label}</strong><span className="network-cidr">{tr(item.personal ? '仅属于此账号' : item.node.cidr || '未配置网段')}</span></span>
-        <span className="network-overview-stats">{summaryOnly ? <span>{tr("设备详情按需加载")}</span> : <><strong>{item.onlineCount}<i>{tr("/")}{item.deviceCount}</i></strong><span>{tr(item.deviceCount === 1 ? 'device online' : 'devices online')}</span></>}</span>
-        <span className="network-overview-footer"><span>{incomplete ? tr("已加载成员：") : ""}{item.memberCount} {tr(getLocale() === 'en-US' ? item.memberCount === 1 ? 'member' : 'members' : '位成员')}{item.owner ? ` · ${tr('所有者')} ${item.owner}` : ''}</span><span className="network-open-label">{tr("查看关系 ")}<ArrowUpRight size={14} /></span></span>
+        <span className="network-overview-card-heading">
+          <span className={`network-overview-icon ${item.node.kind === 'room' ? 'room' : ''}`}>{item.personal ? <MonitorSmartphone size={19} aria-hidden /> : item.node.kind === 'room' ? <RadioTower size={19} aria-hidden /> : <Network size={19} aria-hidden />}</span>
+          <span className="network-overview-copy"><strong>{item.node.label}</strong><span className="network-cidr">{tr(item.personal ? '仅属于此账号' : item.node.cidr || '未配置网段')}</span></span>
+        </span>
+        <span className="network-overview-card-meta"><span className="network-kind-label">{tr(item.personal ? '个人设备' : item.node.kind === 'room' ? '房间网络' : '普通网络')}</span>{item.owner && !item.personal && <span className="network-overview-owner">{tr('所有者')} {item.owner}</span>}</span>
+        <span className="network-overview-footer">
+          <span className="network-overview-stats">{summaryOnly ? <span>{tr("设备详情按需加载")}</span> : <span><strong>{item.onlineCount}<i>{tr("/")}{item.deviceCount}</i></strong> {tr(item.deviceCount === 1 ? 'device online' : 'devices online')}</span>}<span>{incomplete ? tr("已加载成员：") : ""}{item.memberCount} {tr(getLocale() === 'en-US' ? item.memberCount === 1 ? 'member' : 'members' : '位成员')}</span></span>
+          <span className="network-open-label">{tr("查看关系 ")}<ArrowUpRight size={14} aria-hidden /></span>
+        </span>
       </button>)}
     </div> : <div className="network-overview-empty"><Search size={18} /><strong>{tr(incomplete ? "已加载资源中没有匹配项" : "没有匹配的资源分组")}</strong><span>{tr(incomplete ? "继续加载账号，或选择账号范围后搜索。" : "试试网络、账号或设备名称。")}</span>{onClear && <button type="button" className="button secondary compact" onClick={onClear}>{tr('清除筛选')}</button>}</div>}
   </section>
@@ -152,15 +158,16 @@ export function RelationshipsPage({ accountScope }: { accountScope?: { id: strin
   }, [total, offset, selectedNetworkId, accountId, search, debounced, accountNetworks.isSuccess])
   const partialIndex = Boolean(globalData?.partial || globalTopology.hasNextPage)
   const notFound = selected.error instanceof ApiError && selected.error.status === 404
-  return <div className="page-stack topology-page-stack">
+  return <div className="page-stack topology-page-stack relationship-workspace">
     {!accountScope && !selectedNetworkId && <ResourceReturnLink />}
-    <div className="page-intro topology-toolbar"><div><h2>{selectedNetwork?.node.label || tr(accountId ? '账号资源关系' : '资源关系')}</h2><p>{tr(selectedNetworkId ? '按资源 ID 独立读取成员和设备，不受列表加载范围限制。' : accountId ? '先选择网络或个人设备分组，再加载该分组的关系。' : '搜索仅针对已加载资源；选择账号可查看其全部网络。')}</p></div><div className="toolbar-controls topology-toolbar-controls">
+    <PageHeader title={selectedNetwork?.node.label || tr(accountId ? '账号资源关系' : '资源关系')} description={tr(selectedNetworkId ? '按资源 ID 独立读取成员和设备，不受列表加载范围限制。' : accountId ? '先选择网络或个人设备分组，再加载该分组的关系。' : '搜索仅针对已加载资源；选择账号可查看其全部网络。')} />
+    <div className="relationship-workspace-toolbar">
       <div className="search-field"><Search size={16} /><input value={selectedNetworkId ? detailSearch : search} onChange={(event) => update(selectedNetworkId ? { resource_q: event.target.value } : { q: event.target.value, relationship_page: '' }, true)} placeholder={tr(selectedNetworkId ? '搜索成员、设备或 IP' : accountId ? '搜索名称、ID、网段或房间码' : '搜索已加载的资源')} aria-label={tr(selectedNetworkId ? '搜索成员、设备或 IP' : accountId ? '搜索名称、ID、网段或房间码' : '搜索已加载的资源')} /></div>
       {(selectedNetworkId ? detailSearch : search) && <button type="button" className="button secondary compact" onClick={() => update(selectedNetworkId ? { resource_q: '' } : { q: '', relationship_page: '' })}>{tr('清除筛选')}</button>}
       {!accountId && !selectedNetworkId && <select className="select-field" aria-label={tr('关系数据范围')} value={topologyView} onChange={(event) => update({ topology_view: event.target.value })}><option value="summary">{tr('账号与网络')}</option><option value="full">{tr('包含设备与信令')}</option></select>}
       {!accountScope && <AccountScopePicker value={account} onChange={(next) => update({ account_id: next?.id || '', account_name: next?.username || '', network_id: '', resource_q: '', relationship_page: '' })} />}
-    </div></div>
-    <QueryStatus queries={[active]} />
+    </div>
+    <QueryStatus queries={[active]} refreshMode={!accountId && !selectedNetworkId ? 'manual' : 'automatic'} />
     <Panel className="topology-main-panel">
       <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>{tr('连线表示成员关系和设备挂载。实时 Direct / Relay 路径请到「连接排障」查看。')}</span></div>
       {selectedNetworkId ? <>
@@ -176,7 +183,9 @@ export function RelationshipsPage({ accountScope }: { accountScope?: { id: strin
         <div className="network-graph-heading"><button className="button secondary compact" onClick={() => setSelectedNetworkId(`personal:${accountId}`)}><MonitorSmartphone size={15} />{tr('查看个人设备')}</button><span>{tr('共享网络按账号成员关系分页列出。')}</span></div>
         {accountNetworks.isPending || search !== debounced ? <PendingBlock queries={[accountNetworks]} /> : accountNetworks.error && !accountNetworks.data ? <ErrorBlock error={accountNetworks.error} onRetry={() => { void accountNetworks.refetch() }} /> : accountNetworks.data && <>
           <div className="network-overview-grid">{accountNetworks.data.items.map((network) => <button key={network.id} type="button" className="network-overview-card" onClick={() => setSelectedNetworkId(network.id)}>
-            <span className="network-overview-icon"><Network size={19} /></span><span className="network-overview-copy"><span className="network-kind-label">{tr(network.is_room ? '房间网络' : '普通网络')}</span><strong>{network.name}</strong><span className="network-cidr">{network.cidr}</span></span><span className="network-overview-stats"><strong>{network.online_devices}/{network.device_count}</strong><span>{tr('设备在线')}</span></span><span className="network-overview-footer">{network.member_count} {tr('位成员')}<span className="network-open-label">{tr('查看关系')}<ArrowUpRight size={14} /></span></span>
+            <span className="network-overview-card-heading"><span className={`network-overview-icon ${network.is_room ? 'room' : ''}`}>{network.is_room ? <RadioTower size={19} aria-hidden /> : <Network size={19} aria-hidden />}</span><span className="network-overview-copy"><strong>{network.name}</strong><span className="network-cidr">{network.cidr}</span></span></span>
+            <span className="network-overview-card-meta"><span className="network-kind-label">{tr(network.is_room ? '房间网络' : '普通网络')}</span>{network.owner_username && <span className="network-overview-owner">{tr('所有者')} {network.owner_username}</span>}</span>
+            <span className="network-overview-footer"><span className="network-overview-stats"><span><strong>{network.online_devices}<i>/{network.device_count}</i></strong> {tr('设备在线')}</span><span>{network.member_count} {tr('位成员')}</span></span><span className="network-open-label">{tr('查看关系')}<ArrowUpRight size={14} aria-hidden /></span></span>
           </button>)}</div>
           {!accountNetworks.data.items.length && <ResourceEmptyState message={search ? '没有匹配的资源分组' : '该账号暂无共享网络，可查看个人设备。'} onClear={search ? () => update({ q: '', relationship_page: '' }) : undefined} />}
           <Pagination total={accountNetworks.data.total} offset={offset} limit={25} onChange={(value) => update({ relationship_page: value ? String(value / 25) : '' })} />

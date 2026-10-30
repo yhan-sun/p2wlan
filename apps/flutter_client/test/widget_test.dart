@@ -4,14 +4,19 @@ import 'package:flutter/foundation.dart'
     show debugDefaultTargetPlatformOverride;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
+import 'package:p2wlan_flutter_client/core/build_info.dart';
+import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
 import 'package:p2wlan_flutter_client/app/p2wlan_app.dart';
 import 'package:p2wlan_flutter_client/features/dashboard/dashboard_page.dart';
+import 'package:p2wlan_flutter_client/features/auth/login_page.dart';
 import 'package:p2wlan_flutter_client/features/diagnostics/diagnostics_page.dart';
 import 'package:p2wlan_flutter_client/features/nodes/nodes_page.dart';
+import 'package:p2wlan_flutter_client/features/rooms/rooms_page.dart';
 import 'package:p2wlan_flutter_client/features/settings/settings_page.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/app_nav_rail.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/desktop_sidebar.dart';
@@ -120,7 +125,7 @@ void main() {
     );
     expect(find.text('首页'), findsWidgets);
     expect(find.text('设备'), findsWidgets);
-    expect(find.text('互联'), findsWidgets);
+    expect(find.text('房间'), findsWidgets);
     expect(find.text('设置'), findsOneWidget);
     // No permanent "More" destination.
     expect(find.text('更多'), findsNothing);
@@ -142,7 +147,7 @@ void main() {
     expect(find.byType(NavigationBar), findsNothing);
     expect(find.text('首页'), findsOneWidget);
     expect(find.text('设备'), findsOneWidget);
-    expect(find.text('互联'), findsOneWidget);
+    expect(find.text('房间'), findsOneWidget);
     expect(find.text('故障排查'), findsNothing);
     expect(find.text('设置'), findsOneWidget);
     expect(find.text('隧道'), findsNothing);
@@ -167,13 +172,13 @@ void main() {
     expect(find.text('P2WLAN'), findsWidgets);
     expect(find.text('首页'), findsOneWidget);
     expect(find.text('设备'), findsOneWidget);
-    expect(find.text('互联'), findsOneWidget);
+    expect(find.text('房间'), findsOneWidget);
     expect(find.text('故障排查'), findsNothing);
     expect(find.text('设置'), findsOneWidget);
     expect(find.text('隧道'), findsNothing);
     // Sidebar status footer renders (daemon is offline in this harness), and
     // the top bar no longer duplicates it: only the hero badge remains.
-    expect(find.text('无法连接本地服务'), findsOneWidget);
+    expect(find.text('本机网络尚未连接'), findsOneWidget);
     expect(find.byType(StatusBadge), findsOneWidget);
   });
 
@@ -373,7 +378,7 @@ void main() {
     await tester.pump();
     expect(find.byType(DesktopSidebar), findsOneWidget);
     expect(find.byType(DiagnosticsPage), findsOneWidget);
-    expect(find.text('无法连接本地服务'), findsOneWidget);
+    expect(find.text('本机网络尚未连接'), findsOneWidget);
 
     // Shrink back to Medium then Compact: section survives, bottom bar is
     // still exactly three destinations, and a primary destination can be
@@ -489,9 +494,73 @@ void main() {
     // foundation debug variables are unset before it runs tear-downs.
     debugDefaultTargetPlatformOverride = null;
   });
+
+  testWidgets('reauthentication can cancel back to the same settings page', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await _pumpTestApp(tester);
+    await tester.tap(find.text('设置').last);
+    await tester.pumpAndSettle();
+    final settings = tester.widget<SettingsPage>(find.byType(SettingsPage));
+    final original = settings.settingsStore.settings;
+    settings.onReauthenticate!();
+    await tester.pumpAndSettle();
+    expect(find.byType(LoginPage), findsOneWidget);
+    expect(
+      tester.widget<LoginPage>(find.byType(LoginPage)).isReauthentication,
+      isTrue,
+    );
+    tester.widget<LoginPage>(find.byType(LoginPage)).onCancel!();
+    await tester.pumpAndSettle();
+    expect(find.byType(LoginPage), findsNothing);
+    expect(find.byType(SettingsPage), findsOneWidget);
+    expect(settings.settingsStore.settings.authToken, original.authToken);
+    expect(
+      settings.settingsStore.settings.controlServer,
+      original.controlServer,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('rooms reauthentication returns and replaces expired owner', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final daemon = await _pumpTestApp(tester);
+    await tester.tap(find.text('房间').last);
+    await tester.pumpAndSettle();
+    final rooms = tester.widget<RoomsPage>(find.byType(RoomsPage));
+    final oldState = tester.state(find.byType(RoomsPage));
+    rooms.onReauthenticate!();
+    await tester.pumpAndSettle();
+    expect(find.byType(LoginPage), findsOneWidget);
+    tester.widget<LoginPage>(find.byType(LoginPage)).onCancel!();
+    await tester.pumpAndSettle();
+    expect(tester.state(find.byType(RoomsPage)), same(oldState));
+
+    // A successful credential refresh must discard the old page's API and
+    // cached account data, even though the selected section stays Rooms.
+    await tester.runAsync(
+      () => rooms.settingsStore.updateSettings(
+        rooms.settingsStore.settings.copyWith(authToken: 'renewed-test-token'),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(RoomsPage), findsOneWidget);
+    expect(tester.state(find.byType(RoomsPage)), isNot(same(oldState)));
+    expect(daemon.stopCalls, 1);
+    expect(tester.takeException(), isNull);
+  });
 }
 
-Future<void> _pumpTestApp(WidgetTester tester) async {
+Future<_FakeDaemonController> _pumpTestApp(WidgetTester tester) async {
   final tempDir = await tester.runAsync(
     () => Directory.systemTemp.createTemp('p2wlan_app_widget_test_'),
   );
@@ -516,14 +585,86 @@ Future<void> _pumpTestApp(WidgetTester tester) async {
       tempDir.deleteSync(recursive: true);
     }
   });
+  final diagnostics = _OfflineDiagnosticsApi();
+  final daemon = _FakeDaemonController();
   await tester.pumpWidget(
     P2WlanApp(
       initialRefresh: false,
       autoStartPolling: false,
+      autoCheckForUpdates: false,
       settingsStore: settingsStore,
+      diagnosticsApi: diagnostics,
+      daemonController: daemon,
     ),
   );
   await _waitForBootstrap(tester);
+  return daemon;
+}
+
+// Shell tests can run beside a connected desktop app. Disabling startup
+// refresh does not prevent account changes from stopping a daemon, so both
+// boundaries must stay fake even when the test enters runAsync.
+class _FakeDaemonController implements DaemonController {
+  var stopCalls = 0;
+
+  @override
+  Future<DaemonCommandResult> stop(String diagnosticsUrl) async {
+    stopCalls += 1;
+    return const DaemonCommandResult(
+      ok: true,
+      message: 'fake stop',
+      graceful: true,
+    );
+  }
+
+  @override
+  Future<AndroidVpnStatus?> androidStatus() async => null;
+
+  @override
+  Future<Map<String, String>?> roomDeviceIdentity(AppSettings settings) async =>
+      null;
+
+  @override
+  ClientBuildInfo get clientBuildInfo => ClientBuildInfo.current;
+
+  @override
+  DaemonBuildInfo? get lastDaemonBuildInfo => null;
+
+  @override
+  String get clientLogPath => '/fake-logs/client.log';
+
+  @override
+  String get daemonLogPath => '/fake-logs/daemon.log';
+
+  // Unlike extending DaemonController, an unexpected method cannot fall
+  // through to process discovery, credential files or native channels.
+  @override
+  dynamic noSuchMethod(Invocation invocation) => throw UnsupportedError(
+    'Unexpected shell daemon call: ${invocation.memberName}',
+  );
+}
+
+class _OfflineDiagnosticsApi implements DiagnosticsApi {
+  @override
+  void cancelSpeedTest() {}
+
+  @override
+  DiagnosticsApiException? healthFailureFor(String diagnosticsUrl) => null;
+
+  @override
+  Future<bool> fetchHealth(String diagnosticsUrl) async => false;
+
+  @override
+  Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async =>
+      throw const DiagnosticsApiException('offline shell fixture');
+
+  @override
+  void close() {}
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => throw UnsupportedError(
+    'Unexpected shell diagnostics call: ${invocation.memberName}',
+  );
 }
 
 Future<void> _waitForBootstrap(WidgetTester tester) async {

@@ -123,17 +123,21 @@ func TestRelayBackpressurePreservesOtherSourcesAndControl(t *testing.T) {
 	local, remote := net.Pipe()
 	defer local.Close()
 	defer remote.Close()
-	destination := &peer{conn: local, send: make(chan []byte, 8), done: make(chan struct{})}
+	destination := &peer{conn: local, send: make(chan queuedFrame, 8), done: make(chan struct{})}
 	h.register(destination, "scope", "target")
+	busy := &peer{done: make(chan struct{})}
+	other := &peer{done: make(chan struct{})}
+	h.register(busy, "scope", "busy")
+	h.register(other, "scope", "other")
 	for i := 0; i < 4; i++ {
-		if code, _ := h.forward("scope", "busy", "target", []byte("data"), 65535); code != 0 {
+		if code, _ := h.forward(busy, "target", []byte("data"), 65535); code != 0 {
 			t.Fatal(code)
 		}
 	}
-	if code, _ := h.forward("scope", "busy", "target", []byte("excess"), 65535); code != 4008 {
+	if code, _ := h.forward(busy, "target", []byte("excess"), 65535); code != 4008 {
 		t.Fatal("missing per-source backpressure")
 	}
-	if code, _ := h.forward("scope", "other", "target", []byte("data"), 65535); code != 0 {
+	if code, _ := h.forward(other, "target", []byte("data"), 65535); code != 0 {
 		t.Fatal("busy source starved other source")
 	}
 	if !destination.enqueue(makeFrame(msgPong, []byte("control"))) {
@@ -153,18 +157,20 @@ func TestRelayBackpressurePreservesOtherSourcesAndControl(t *testing.T) {
 		t.Fatal(err)
 	}
 	for len(destination.send) > 0 {
-		destination.releaseFrame(<-destination.send)
+		destination.releaseFrame((<-destination.send).data)
 	}
 	if destination.queuedBytes != 0 || len(destination.queuedBySource) != 0 {
 		t.Fatal("queue credits leaked")
 	}
-	if code, _ := h.forward("different-scope", "other", "target", []byte("cross-scope"), 65535); code != 404 {
+	outsider := &peer{done: make(chan struct{})}
+	h.register(outsider, "different-scope", "other")
+	if code, _ := h.forward(outsider, "target", []byte("cross-scope"), 65535); code != 404 {
 		t.Fatal("cross-scope frame forwarded")
 	}
 }
 
 func TestRelayQueueByteBudgetAndInFlightAccounting(t *testing.T) {
-	p := &peer{send: make(chan []byte, 1024), done: make(chan struct{})}
+	p := &peer{send: make(chan queuedFrame, 1024), done: make(chan struct{})}
 	frame, _ := receivedFrame("source", make([]byte, 60000))
 	accepted := 0
 	for p.enqueue(frame) {
@@ -183,7 +189,7 @@ func TestRelayQueueByteBudgetAndInFlightAccounting(t *testing.T) {
 	if !p.enqueue(makeFrame(msgPong, []byte{1})) {
 		t.Fatal("business bytes consumed control headroom")
 	}
-	p.releaseFrame(inFlight)
+	p.releaseFrame(inFlight.data)
 	if !p.enqueue(frame) {
 		t.Fatal("write completion did not release budget")
 	}
@@ -243,7 +249,7 @@ func TestRevocationPagingRetriesExactCursorAndGatesReadiness(t *testing.T) {
 	a, b := net.Pipe()
 	defer a.Close()
 	defer b.Close()
-	p := &peer{conn: a, ticketJTI: "active", send: make(chan []byte, 1), done: make(chan struct{})}
+	p := &peer{conn: a, ticketJTI: "active", send: make(chan queuedFrame, 1), done: make(chan struct{})}
 	s.hub.register(p, "scope", "active")
 	s.revocationLastSuccess = time.Now().Add(-time.Minute)
 	s.closePeersWhenRevocationsStale()

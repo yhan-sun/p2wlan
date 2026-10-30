@@ -14,6 +14,7 @@ import '../../core/capabilities/permission_preflight.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/daemon/diagnostics_auth.dart';
 import '../../core/models/diagnostics_models.dart';
+import '../../core/presentation/network_overview.dart';
 import '../../core/security/redactor.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -21,6 +22,7 @@ import '../../shared/formatters.dart';
 import '../../shared/permission_copy.dart';
 import '../../shared/log_tail.dart';
 import '../../shared/log_presentation.dart';
+import '../../shared/network_overview_presentation.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
@@ -30,6 +32,7 @@ part 'diagnostics/actions.dart';
 part 'diagnostics/advanced.dart';
 part 'diagnostics/checks.dart';
 part 'diagnostics/overview.dart';
+part 'diagnostics/rooms.dart';
 part 'diagnostics/issues.dart';
 part 'diagnostics/network.dart';
 part 'diagnostics/platform_panel.dart';
@@ -50,6 +53,9 @@ class DiagnosticsPage extends StatefulWidget {
     this.openLogs,
     this.onOpenDevices,
     this.onOpenSettings,
+    this.onReauthenticate,
+    this.onOpenRooms,
+    this.onOpenRoom,
   });
 
   final StatusStore statusStore;
@@ -82,6 +88,9 @@ class DiagnosticsPage extends StatefulWidget {
 
   /// Shell callback for the "open settings" (reauth) issue action.
   final VoidCallback? onOpenSettings;
+  final VoidCallback? onReauthenticate;
+  final VoidCallback? onOpenRooms;
+  final ValueChanged<String>? onOpenRoom;
 
   @override
   State<DiagnosticsPage> createState() => _DiagnosticsPageState();
@@ -90,6 +99,23 @@ class DiagnosticsPage extends StatefulWidget {
 class _DiagnosticsPageState extends State<DiagnosticsPage> {
   late final PlatformCapabilities _capabilities;
   var _advancedExpanded = false;
+  final _advancedKey = GlobalKey();
+
+  void _openAdvanced() {
+    setState(() => _advancedExpanded = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final target = _advancedKey.currentContext;
+      if (mounted && target != null) {
+        Scrollable.ensureVisible(
+          target,
+          duration: MediaQuery.disableAnimationsOf(context)
+              ? Duration.zero
+              : AppTokens.durationMedium,
+          alignment: 0,
+        );
+      }
+    });
+  }
 
   @override
   void initState() {
@@ -101,10 +127,15 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return AnimatedBuilder(
-      animation: Listenable.merge([widget.statusStore, widget.settingsStore]),
+      animation: Listenable.merge([
+        widget.statusStore,
+        widget.settingsStore,
+        widget.statusStore.parallelRooms,
+      ]),
       builder: (context, _) {
         final statusStore = widget.statusStore;
         final snapshot = statusStore.snapshot;
+        final overview = NetworkOverview.read(statusStore);
         final model = buildDiagnosticsModel(
           strings: strings,
           healthReachable: statusStore.healthReachable,
@@ -116,12 +147,45 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
             _capabilities.canActAsLocalVpnNode &&
             _capabilities.canControlLocalDaemon;
         final refreshing = statusStore.refreshActivityVisible;
+        // The overview already explains these conditions. Keep distinct
+        // recovery issues without repeating the same warning and retry.
+        final visibleIssues = model.issues.where((issue) {
+          return !(model.overall == DiagnosticOverall.unavailable &&
+                  issue.kind == DiagnosticIssueKind.serviceUnavailable) &&
+              !(model.overall == DiagnosticOverall.stale &&
+                  issue.kind == DiagnosticIssueKind.stale);
+        }).toList();
         return PageScaffold(
           title: strings.troubleshooting,
           subtitle: strings.diagnosticsSubtitle,
           showHeader: widget.showHeader,
           maxWidth: diagnosticsPageMaxWidth,
           children: [
+            if (overview.hasRooms) ...[
+              _RoomConnectionsPanel(
+                scopes: overview.rooms.toList(),
+                onOpenRoom: widget.onOpenRoom,
+                onOpenRooms: widget.onOpenRooms,
+              ),
+              const SizedBox(height: AppTokens.space20),
+            ],
+            Wrap(
+              spacing: AppTokens.space12,
+              runSpacing: AppTokens.space4,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                Text(
+                  strings.isZh
+                      ? '检查范围：本机默认连接'
+                      : 'Checking: default local connection',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: AppTokens.space10),
             _SystemStatusCard(
               model: model,
               refreshing: refreshing,
@@ -130,29 +194,37 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
             // Issues only appear when there is something to do; a healthy page
             // never shows a redundant "no issues" card (the status card above
             // already says everything is fine).
-            if (model.issues.isNotEmpty) ...[
+            if (visibleIssues.isNotEmpty) ...[
               const SizedBox(height: AppTokens.space14),
               _IssuesPanel(
-                issues: model.issues,
-                refreshing: refreshing,
-                onRecheck: statusStore.refresh,
+                issues: visibleIssues,
                 onOpenDevices: widget.onOpenDevices,
                 onOpenSettings: widget.onOpenSettings,
+                onReauthenticate: widget.onReauthenticate,
+                onOpenTechnicalDetails: _openAdvanced,
               ),
+            ],
+            if (model.issues.isNotEmpty) ...[
+              const SizedBox(height: AppTokens.space8),
+              _SupportTools(statusStore: statusStore),
             ],
             if (model.checks.isNotEmpty) ...[
               const SizedBox(height: AppTokens.space14),
               _ChecksPanel(checks: model.checks),
             ],
             const SizedBox(height: AppTokens.space14),
-            _AdvancedDisclosure(
-              open: _advancedExpanded,
-              onToggle: () =>
-                  setState(() => _advancedExpanded = !_advancedExpanded),
-              children: _buildAdvancedChildren(
-                statusStore: statusStore,
-                snapshot: snapshot,
-                canLocal: canLocal,
+            KeyedSubtree(
+              key: _advancedKey,
+              child: _AdvancedDisclosure(
+                open: _advancedExpanded,
+                onToggle: () =>
+                    setState(() => _advancedExpanded = !_advancedExpanded),
+                children: _buildAdvancedChildren(
+                  statusStore: statusStore,
+                  snapshot: snapshot,
+                  canLocal: canLocal,
+                  showSupportTools: model.issues.isEmpty,
+                ),
               ),
             ),
           ],
@@ -169,6 +241,7 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
     required StatusStore statusStore,
     required DiagnosticsSnapshot? snapshot,
     required bool canLocal,
+    required bool showSupportTools,
   }) {
     if (!_advancedExpanded) return const [];
     final children = <Widget>[];
@@ -219,8 +292,10 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
     }
 
     // 6. Support tools: copy diagnostics summary (kept, but demoted here).
-    children.add(const SizedBox(height: AppTokens.space14));
-    children.add(_SupportTools(statusStore: statusStore));
+    if (showSupportTools) {
+      children.add(const SizedBox(height: AppTokens.space14));
+      children.add(_SupportTools(statusStore: statusStore));
+    }
 
     // 7. Raw JSON stays the lowest-level disclosure.
     children.add(const SizedBox(height: AppTokens.space14));

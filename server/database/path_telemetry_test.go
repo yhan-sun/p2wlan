@@ -1,6 +1,7 @@
 package database
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -36,6 +37,9 @@ func setupTelemetryTestDB(t *testing.T) (*DB, string, string, string, string) {
 		t.Fatalf("CreateDevice B: %v", err)
 	}
 
+	if _, err := db.Exec(`UPDATE devices SET registration_seq = 1 WHERE id = ?`, devA.ID); err != nil {
+		t.Fatal(err)
+	}
 	return db, u1.ID, net1.ID, devA.ID, devB.ID
 }
 
@@ -229,7 +233,11 @@ func TestPathTelemetrySessionFencing(t *testing.T) {
 		t.Fatalf("session 1 revision 100 failed: %+v, %v", s1, err)
 	}
 
-	// Reconnect / new session: registration_seq = 2, sends revision 1 (Direct)
+	// Reconnect / new session: advance the authoritative registration before reporting.
+	if _, err := db.Exec(`UPDATE devices SET registration_seq = 2 WHERE id = ?`, devAID); err != nil {
+		t.Fatal(err)
+	}
+	// registration_seq = 2 sends revision 1 (Direct).
 	s2, err := db.RecordPathObservations(devAID, netID, 2, []PathObservation{makeObs(1, "direct")}, true)
 	if err != nil || s2.Accepted != 1 {
 		t.Fatalf("session 2 revision 1 should supersede session 1: %+v, %v", s2, err)
@@ -243,8 +251,9 @@ func TestPathTelemetrySessionFencing(t *testing.T) {
 
 	// Delayed packet from session 1 arrives with revision 101 -> must be REJECTED!
 	s3, err := db.RecordPathObservations(devAID, netID, 1, []PathObservation{makeObs(101, "relay")}, false)
-	if err != nil || s3.Rejected != 1 {
-		t.Fatalf("old session 1 packet should be rejected even with rev 101: %+v, %v", s3, err)
+	var conflict *RegistrationSessionConflictError
+	if !errors.As(err, &conflict) || conflict.CurrentSequence != 2 {
+		t.Fatalf("old session 1 packet should conflict even with rev 101: %+v, %v", s3, err)
 	}
 
 	// Verify state is STILL Direct from session 2
@@ -447,5 +456,68 @@ func TestPathTelemetryMigrationPreservesOldDB(t *testing.T) {
 	}
 	if page.Total != 0 {
 		t.Fatalf("expected 0 connections, got %d", page.Total)
+	}
+}
+
+func TestPathTelemetryEnforcesRealCommunicationAuthorization(t *testing.T) {
+	db := roomTestDB(t)
+	owner := roomTestUser(t, db, "telemetry-owner")
+	member := roomTestUser(t, db, "telemetry-member")
+	personalOwner := roomTestDevice(t, db, owner, "default", "telemetry-personal-owner")
+	personalMember := roomTestDevice(t, db, member, "default", "telemetry-personal-member")
+	room := roomTestRoom(t, db, owner)
+	if _, err := db.JoinRoom(member, room.Code, "safe-password", ""); err != nil {
+		t.Fatal(err)
+	}
+	reporter := roomTestDevice(t, db, owner, room.ID, "telemetry-room-owner")
+	remote := roomTestDevice(t, db, member, room.ID, "telemetry-room-member")
+	record := func(from, to *Device, revision uint64, wantAccepted int) {
+		t.Helper()
+		summary, err := db.RecordPathObservations(from.ID, from.NetworkID, from.RegistrationSeq, []PathObservation{{RemoteDeviceID: to.ID, NetworkID: from.NetworkID, ObservationRevision: revision, Lifecycle: "online", CurrentPath: strPtr("direct")}}, false)
+		if err != nil || summary.Accepted != wantAccepted || summary.Rejected != 1-wantAccepted {
+			t.Fatalf("communication %s -> %s: %+v %v", from.ID, to.ID, summary, err)
+		}
+	}
+	record(personalOwner, personalMember, 1, 0)
+	record(reporter, remote, 1, 1)
+	access, err := db.RequestRoomDevice(member, room.ID, remote.PublicKey, remote.DeviceName, remote.Platform, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ChangeRoomDeviceAccess(owner, room.ID, access.ID, "block"); err != nil {
+		t.Fatal(err)
+	}
+	record(reporter, remote, 2, 0)
+	var revision uint64
+	if err := db.QueryRow(`SELECT observation_revision FROM peer_path_observations WHERE reporting_device_id=? AND remote_device_id=?`, reporter.ID, remote.ID).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	if revision != 1 {
+		t.Fatalf("revoked observation replaced prior snapshot with revision %d", revision)
+	}
+	if _, err := db.RemoveRoomMember(owner, room.ID, member, false); err != nil {
+		t.Fatal(err)
+	}
+	record(reporter, remote, 3, 0)
+}
+
+func TestPathTelemetryRejectsOwnerWithoutExistingObservation(t *testing.T) {
+	db, _, netID, reporter, remote := setupTelemetryTestDB(t)
+	if _, err := db.Exec(`UPDATE devices SET registration_seq=2,registration_incarnation=9002 WHERE id=?`, reporter); err != nil {
+		t.Fatal(err)
+	}
+	for _, sequence := range []int64{0, 1, 3} {
+		_, err := db.RecordPathObservations(reporter, netID, sequence, []PathObservation{{RemoteDeviceID: remote, ObservationRevision: 1000}}, false)
+		var conflict *RegistrationSessionConflictError
+		if !errors.As(err, &conflict) || conflict.CurrentSequence != 2 {
+			t.Fatalf("sequence %d must conflict without prior telemetry: %v", sequence, err)
+		}
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM peer_path_observations`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("rejected owners persisted %d rows", count)
 	}
 }

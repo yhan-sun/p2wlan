@@ -166,7 +166,7 @@ impl PeerManager {
         &self,
         operation: impl FnOnce() -> R,
     ) -> R {
-        let _held = self.peer_membership.try_lock().unwrap();
+        let _held = self.peer_membership.try_write().unwrap();
         operation()
     }
 
@@ -270,7 +270,7 @@ impl PeerManager {
         use OverlayCreditOutcome::{Contended, Stale};
         let membership = self
             .peer_membership
-            .try_lock()
+            .try_read()
             .map_err(|_| Contended(CreditLock::Membership))?;
         let lifecycle = membership
             .active_generation(peer)

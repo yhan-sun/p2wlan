@@ -194,7 +194,7 @@ func TestPersonalTopologyReportsEdgeBudgetWithoutDanglingNodes(t *testing.T) {
 	}
 	_, err = db.Exec(`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64)
 		INSERT INTO signals(id,from_node_id,to_node_id,type,created_at)
-		SELECT 'edge-signal-'||a.n||'-'||b.n,'edge-device-'||a.n,'edge-device-'||b.n,'candidate',1 FROM seq a CROSS JOIN seq b`)
+		SELECT 'edge-signal-'||a.n||'-'||b.n,'edge-device-'||a.n,'edge-device-'||b.n,'candidate',? FROM seq a CROSS JOIN seq b`, time.Now().Unix())
 	if err != nil {
 		t.Fatal(err)
 	}

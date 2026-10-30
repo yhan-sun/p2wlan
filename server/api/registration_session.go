@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"sync"
@@ -14,57 +16,110 @@ import (
 
 type registrationSessionContextKey struct{}
 
-type registrationSessionLocker interface {
-	Lock(deviceID string) func()
+type registrationSessionGate struct {
+	server   *Server
+	deviceID string
+	release  func()
 }
 
-type deviceRegistrationSessionLocks struct {
-	locks sync.Map // map[string]*sync.Mutex
+type registrationSessionGateContextKey struct{}
+
+func (gate *registrationSessionGate) releaseCurrent() {
+	if gate.release != nil {
+		gate.release()
+		gate.release = nil
+	}
 }
 
-func newRegistrationSessionLocks() *deviceRegistrationSessionLocks {
-	return &deviceRegistrationSessionLocks{}
+// All fenced REST handlers finish their state changes before their first
+// response write. Releasing at this boundary avoids holding a device lock while
+// a slow network reader receives JSON, without allocating a second response.
+type registrationSessionResponseWriter struct {
+	http.ResponseWriter
+	release func()
 }
 
-func (locks *deviceRegistrationSessionLocks) Lock(deviceID string) func() {
-	value, _ := locks.locks.LoadOrStore(deviceID, &sync.Mutex{})
-	lock := value.(*sync.Mutex)
-	lock.Lock()
-	return lock.Unlock
+func (w *registrationSessionResponseWriter) WriteHeader(status int) {
+	w.release()
+	w.ResponseWriter.WriteHeader(status)
 }
 
-// RequireCurrentDeviceRegistrationSession validates the sequence proof and
-// serializes the validated device-token REST action with device
-// re-registration.  The mutex is deliberately per device: a long signal poll
-// for one daemon must not delay an unrelated daemon's registration.
-// Endpoint and presence writes additionally re-check the sequence in their
-// database write transaction. The signaling hub and this lock are process
-// local, so a future multi-process control-plane deployment must add shared
-// session fencing and connection eviction before it is supported.
+func (w *registrationSessionResponseWriter) Write(body []byte) (int, error) {
+	w.release()
+	return w.ResponseWriter.Write(body)
+}
+
+// RequireCurrentDeviceRegistrationSession serializes state-changing work with
+// re-registration. Request/response network I/O and idle signal waits do not
+// hold a device lock. Each resumed poll revalidates credential and sequence.
 func (s *Server) RequireCurrentDeviceRegistrationSession(next http.HandlerFunc) http.HandlerFunc {
-	return s.requireCurrentDeviceRegistrationSession(next)
-}
-
-func (s *Server) requireCurrentDeviceRegistrationSession(next http.HandlerFunc) http.HandlerFunc {
-	validated := auth.RequireCurrentDeviceRegistrationSession(s.db)(func(w http.ResponseWriter, r *http.Request) {
-		if _, err := auth.GetDeviceClaims(r.Context()); err == nil {
-			if sequence, ok := registrationSequenceFromHeader(r); ok {
-				r = r.WithContext(context.WithValue(r.Context(), registrationSessionContextKey{}, sequence))
-			}
-		}
-		next(w, r)
-	})
-
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, err := auth.GetDeviceClaims(r.Context())
 		if err != nil {
-			validated(w, r)
+			next(w, r)
 			return
 		}
-		unlock := s.lockDeviceRegistrationSession(claims.DeviceID)
-		defer unlock()
-		validated(w, r)
+		// Ordinary control requests already have this production mux limit.
+		// Read outside the session lock so a partial JSON body cannot prevent
+		// the same device from registering its replacement process.
+		const maxControlBody = 1 << 20
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxControlBody+1))
+		if err != nil {
+			if r.Context().Err() == nil {
+				var tooLarge *http.MaxBytesError
+				if errors.As(err, &tooLarge) {
+					http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+				} else {
+					http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+				}
+			}
+			return
+		}
+		if len(body) > maxControlBody {
+			http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		gate := &registrationSessionGate{server: s, deviceID: claims.DeviceID}
+		r = r.WithContext(context.WithValue(r.Context(), registrationSessionGateContextKey{}, gate))
+		if sequence, ok := registrationSequenceFromHeader(r); ok {
+			r = r.WithContext(context.WithValue(r.Context(), registrationSessionContextKey{}, sequence))
+		}
+		guarded := &registrationSessionResponseWriter{ResponseWriter: w, release: gate.releaseCurrent}
+		defer gate.releaseCurrent()
+		if !resumeDeviceRegistrationSession(guarded, r) {
+			return
+		}
+		next(guarded, r)
 	}
+}
+
+func pauseDeviceRegistrationSession(r *http.Request) {
+	if gate, ok := r.Context().Value(registrationSessionGateContextKey{}).(*registrationSessionGate); ok {
+		gate.releaseCurrent()
+	}
+}
+
+func resumeDeviceRegistrationSession(w http.ResponseWriter, r *http.Request) bool {
+	gate, ok := r.Context().Value(registrationSessionGateContextKey{}).(*registrationSessionGate)
+	if !ok || gate.release != nil {
+		return true
+	}
+	unlock, ok := gate.server.lockDeviceRegistrationSession(w, r, gate.deviceID)
+	if !ok {
+		return false
+	}
+	gate.release = unlock
+	accepted := false
+	// The original auth check may predate body I/O or an idle long poll.
+	// Recheck both revocation/expiry and the registration under the short lock.
+	auth.RequireDeviceAuth(gate.server.db)(auth.RequireCurrentDeviceRegistrationSession(gate.server.db)(func(http.ResponseWriter, *http.Request) {
+		accepted = true
+	}))(w, r)
+	if !accepted {
+		gate.releaseCurrent()
+	}
+	return accepted
 }
 
 // WebSocketRegistrationSessionGuard keeps a device's registration lock from
@@ -78,11 +133,15 @@ func (s *Server) WebSocketRegistrationSessionGuard() signaling.UpgradeGuard {
 			http.Error(w, `{"error":"device authentication required"}`, http.StatusUnauthorized)
 			return nil, false
 		}
-		unlock := s.lockDeviceRegistrationSession(claims.DeviceID)
+		unlock, ok := s.lockDeviceRegistrationSession(w, r, claims.DeviceID)
+		if !ok {
+			return nil, false
+		}
 		accepted := false
-		auth.RequireCurrentDeviceRegistrationSession(s.db)(func(http.ResponseWriter, *http.Request) {
+		guarded := &registrationSessionResponseWriter{ResponseWriter: w, release: unlock}
+		auth.RequireDeviceAuth(s.db)(auth.RequireCurrentDeviceRegistrationSession(s.db)(func(http.ResponseWriter, *http.Request) {
 			accepted = true
-		})(w, r)
+		}))(guarded, r)
 		if !accepted {
 			unlock()
 			return nil, false
@@ -91,11 +150,26 @@ func (s *Server) WebSocketRegistrationSessionGuard() signaling.UpgradeGuard {
 	}
 }
 
-func (s *Server) lockDeviceRegistrationSession(deviceID string) func() {
-	if deviceID == "" {
-		return func() {}
+func (s *Server) lockDeviceRegistrationSession(w http.ResponseWriter, r *http.Request, deviceID string) (func(), bool) {
+	unlock, err := s.registrationSessionLocks.LockContext(r.Context(), deviceID)
+	if err == nil {
+		var once sync.Once
+		return func() { once.Do(unlock) }, true
 	}
-	return s.registrationSessionLocks.Lock(deviceID)
+	if r.Context().Err() == nil {
+		code := "registration_session_unavailable"
+		switch {
+		case errors.Is(err, errRegistrationSessionWaitTimeout):
+			code = "registration_session_wait_timeout"
+		case errors.Is(err, errRegistrationSessionCapacity):
+			code = "registration_session_capacity"
+		}
+		w.Header().Set("Retry-After", "2")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "registration session temporarily unavailable", "error_code": code,
+		})
+	}
+	return nil, false
 }
 
 func registrationSequenceFromHeader(r *http.Request) (int64, bool) {

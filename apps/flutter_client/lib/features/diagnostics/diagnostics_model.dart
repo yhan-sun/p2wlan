@@ -114,6 +114,11 @@ DiagnosticsModel buildDiagnosticsModel({
   required bool snapshotStale,
   required DiagnosticsSnapshot? snapshot,
 }) {
+  final stale =
+      snapshotStale ||
+      (snapshot != null &&
+          (snapshot.peerSnapshotStale ||
+              snapshot.capturedRevision != snapshot.revision));
   final checks = _buildChecks(
     strings: strings,
     healthReachable: healthReachable,
@@ -123,7 +128,7 @@ DiagnosticsModel buildDiagnosticsModel({
     strings: strings,
     healthReachable: healthReachable,
     statusReachable: statusReachable,
-    snapshotStale: snapshotStale,
+    snapshotStale: stale,
     snapshot: snapshot,
   );
 
@@ -134,7 +139,7 @@ DiagnosticsModel buildDiagnosticsModel({
     // Actionable bad issues outrank staleness: reauth / fatal task etc. must
     // surface as "needs attention", never be hidden behind a stale banner.
     overall = DiagnosticOverall.attention;
-  } else if (snapshotStale && snapshot != null) {
+  } else if (stale && snapshot != null) {
     overall = DiagnosticOverall.stale;
   } else if (issues.isNotEmpty) {
     overall = DiagnosticOverall.attention;
@@ -165,7 +170,18 @@ DiagnosticsModel buildDiagnosticsModel({
     overall: overall,
     title: title,
     detail: detail,
-    checks: checks,
+    checks: stale && snapshot != null
+        ? [
+            for (final check in checks)
+              DiagnosticCheck(
+                title: check.title,
+                value: strings.isZh
+                    ? '上次状态：${check.value}'
+                    : 'Last reported: ${check.value}',
+                severity: DiagnosticSeverity.neutral,
+              ),
+          ]
+        : checks,
     issues: issues,
   );
 }

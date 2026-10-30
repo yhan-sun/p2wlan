@@ -26,7 +26,7 @@ import {
   Users,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { CopyValue } from '../../CopyValue'
 import { accountColor, accountIdentity, colorWithAlpha } from '../../colors'
@@ -208,6 +208,9 @@ function buildGraph(data: AdminTopology, narrow = false): { nodes: Node[]; edges
       },
       draggable: false,
       selectable: true,
+      focusable: true,
+      ariaRole: 'button',
+      ariaLabel: node.label,
     }
   })
 
@@ -237,6 +240,16 @@ function buildGraph(data: AdminTopology, narrow = false): { nodes: Node[]; edges
   })
 
   return { nodes, edges }
+}
+
+function handleNodeKeyDown(event: KeyboardEvent<HTMLDivElement>, onSelect: (id: string) => void) {
+  if ((event.key !== 'Enter' && event.key !== ' ') || event.repeat || event.nativeEvent.isComposing) return
+  const node = (event.target as Element).closest<HTMLElement>('.react-flow__node')
+  const id = node?.dataset.id
+  if (!id) return
+  event.preventDefault()
+  event.stopPropagation()
+  onSelect(id)
 }
 
 function DetailPanel({ node, onClose, accountId, networkId }: { node: AdminTopologyNode; onClose: () => void; accountId?: string; networkId?: string }) {
@@ -304,6 +317,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [showOffline, setShowOffline] = useState(true)
   const [showSignals, setShowSignals] = useState(false)
+  const surfaceRef = useRef<HTMLDivElement>(null)
   const narrow = useNarrowViewport()
   const visibleData = useMemo(
     () => data ? filterTopology(data, { showOffline, showSignals }, search) : undefined,
@@ -319,7 +333,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
     : undefined
   const selected = visibleData?.nodes.find((node) => node.id === selectedId)
   const canvasVisible = !loading && !error && graph.nodes.length > 0
-  useOverlay(fullscreen && canvasVisible, () => setFullscreen(false))
+  useOverlay(fullscreen && canvasVisible, () => setFullscreen(false), { modalRef: surfaceRef })
   useEffect(() => {
     if (!canvasVisible) setFullscreen(false)
     if (selectedId && !selected) setSelectedId(null)
@@ -331,6 +345,12 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
 
   return (
     <div
+      ref={surfaceRef}
+      onKeyDownCapture={(event) => handleNodeKeyDown(event, setSelectedId)}
+      role={fullscreen ? 'dialog' : undefined}
+      aria-modal={fullscreen ? true : undefined}
+      aria-label={fullscreen ? tr('全屏资源关系图') : undefined}
+      tabIndex={fullscreen ? -1 : undefined}
       className={`topology-canvas ${compact ? 'compact' : ''} ${fullscreen ? 'fullscreen' : ''} ${mobileStack ? 'mobile-stack' : ''}`}
       style={mobileStackHeight ? { '--topology-mobile-height': `${mobileStackHeight}px` } as CSSProperties : undefined}
     >
@@ -392,7 +412,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
           <button className={`topology-filter-button ${showSignals ? 'active' : ''}`} aria-pressed={showSignals} onClick={() => setShowSignals((value) => !value)} title={tr("显示或隐藏控制面的待处理信令")}>
             <RadioTower size={15} />{tr("控制信令")}</button>
         </>}
-        <button className="icon-button topology-fullscreen-button" onClick={() => { setSelectedId(null); setFullscreen((value) => !value) }} aria-label={tr(fullscreen ? '退出全屏' : '全屏')}>
+        <button data-fullscreen-toggle className="icon-button topology-fullscreen-button" onClick={() => { setSelectedId(null); setFullscreen((value) => !value) }} aria-label={tr(fullscreen ? '退出全屏' : '全屏')}>
           {fullscreen ? <Shrink size={16} /> : <Expand size={16} />}
         </button>
       </div>

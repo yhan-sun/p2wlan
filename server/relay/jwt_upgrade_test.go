@@ -30,6 +30,9 @@ func TestJWTUpgradeRelayTicketValidation(t *testing.T) {
 		{name: "array_audience", valid: true},
 		{name: "string_audience", valid: true, mutate: func(c jwt.MapClaims, _ map[string]any) { c["aud"] = "relay-test" }},
 		{name: "expired", mutate: func(c jwt.MapClaims, _ map[string]any) { c["exp"] = now.Add(-time.Hour).Unix() }},
+		{name: "expired_inside_clock_skew", mutate: func(c jwt.MapClaims, _ map[string]any) {
+			c["iat"], c["nbf"], c["exp"] = now.Add(-time.Minute).Unix(), now.Add(-time.Minute).Unix(), now.Unix()
+		}},
 		{name: "not_yet_valid", mutate: func(c jwt.MapClaims, _ map[string]any) { c["nbf"] = now.Add(time.Hour).Unix() }},
 		{name: "wrong_issuer", mutate: func(c jwt.MapClaims, _ map[string]any) { c["iss"] = "other-control" }},
 		{name: "wrong_audience", mutate: func(c jwt.MapClaims, _ map[string]any) { c["aud"] = []string{"other-relay"} }},

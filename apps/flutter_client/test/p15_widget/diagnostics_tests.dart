@@ -28,9 +28,11 @@ void _registerDiagnosticsTests() {
       expect(find.text('Troubleshooting'), findsOneWidget);
       // System status is the first visual.
       expect(find.text('System status'), findsOneWidget);
-      expect(find.text('P2WLAN is running normally'), findsOneWidget);
+      expect(find.text('Default local connection is healthy'), findsOneWidget);
       expect(
-        find.text('No issues found that need your attention.'),
+        find.text(
+          'The default local service reports no issues. Verify application connectivity using the virtual IP.',
+        ),
         findsOneWidget,
       );
       expect(find.text('Check again'), findsOneWidget);
@@ -109,7 +111,7 @@ void _registerDiagnosticsTests() {
       ),
     );
 
-    expect(find.text('P2WLAN is running normally'), findsOneWidget);
+    expect(find.text('Default local connection is healthy'), findsOneWidget);
     expect(find.text('No action needed'), findsNothing);
     expect(find.textContaining('Relay'), findsNothing);
 
@@ -196,10 +198,13 @@ void _registerDiagnosticsTests() {
 
     expect(find.text('Diagnostics unavailable'), findsOneWidget);
     expect(
-      find.text('Unable to read the current P2WLAN status. Please try again.'),
+      find.text(
+        'Unable to read the default local connection. Check that it is started, or try again.',
+      ),
       findsOneWidget,
     );
-    expect(find.text('Cannot reach the P2WLAN service'), findsOneWidget);
+    expect(find.text('Cannot reach the P2WLAN service'), findsNothing);
+    expect(find.text('Check again'), findsOneWidget);
     expect(find.textContaining('SocketException'), findsNothing);
     expect(find.textContaining('ClientException'), findsNothing);
     expect(find.textContaining('GET /health failed'), findsNothing);
@@ -238,7 +243,7 @@ void _registerDiagnosticsTests() {
       ),
       findsOneWidget,
     );
-    expect(find.text('P2WLAN is running normally'), findsNothing);
+    expect(find.text('Default local connection is healthy'), findsNothing);
     // With no status snapshot the service check reports the reachable fact
     // instead of claiming full health.
     expect(find.text('reachable'), findsOneWidget);
@@ -272,10 +277,11 @@ void _registerDiagnosticsTests() {
       find.text('Showing data from the last successful refresh.'),
       findsOneWidget,
     );
-    expect(find.text('Running normally'), findsOneWidget);
-    expect(find.text('Try refreshing the status.'), findsOneWidget);
-    // The stale issue offers a real recheck action.
-    expect(find.text('Check again'), findsWidgets);
+    expect(find.text('Running normally'), findsNothing);
+    expect(find.text('Last reported: Running normally'), findsOneWidget);
+    expect(find.text('Try refreshing the status.'), findsNothing);
+    // The status card owns the only retry; cached checks are labeled.
+    expect(find.text('Check again'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -301,7 +307,10 @@ void _registerDiagnosticsTests() {
     );
 
     // Stale data plus a real bad issue: attention wins, never the stale hero.
-    expect(find.text('P2WLAN needs attention'), findsOneWidget);
+    expect(
+      find.text('Default local connection needs attention'),
+      findsOneWidget,
+    );
     expect(find.text('Diagnostics data is stale'), findsNothing);
     expect(find.text('Re-authentication required'), findsWidgets);
     expect(tester.takeException(), isNull);
@@ -348,6 +357,46 @@ void _registerDiagnosticsTests() {
     expect(openedSettings, isTrue);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets(
+    'reauth action signs in directly and exposes one support summary',
+    (tester) async {
+      final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final expired = _mutateSnapshot(snapshot, (raw) {
+        raw['health']['reauth_required'] = true;
+        return raw;
+      });
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: true, snapshot: expired),
+        ),
+      ))!;
+      addTearDown(stores.dispose);
+      await stores.statusStore.refresh();
+      var signedIn = false;
+      var openedSettings = false;
+      await tester.pumpWidget(
+        _TestApp(
+          child: DiagnosticsPage(
+            statusStore: stores.statusStore,
+            capabilities: PlatformCapabilities.fromPlatform('ios'),
+            onOpenSettings: () => openedSettings = true,
+            onReauthenticate: () => signedIn = true,
+          ),
+        ),
+      );
+      await tester.ensureVisible(
+        find.byKey(const Key('diagnostics-reauthenticate')),
+      );
+      await tester.tap(find.byKey(const Key('diagnostics-reauthenticate')));
+      expect(signedIn, isTrue);
+      expect(openedSettings, isFalse);
+      expect(find.text('Copy diagnostics summary'), findsOneWidget);
+      await _expandAdvanced(tester);
+      expect(find.text('Copy diagnostics summary'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets(
     'critical task errors stay out of the default view and redacted',
@@ -593,8 +642,8 @@ void _registerDiagnosticsTests() {
       ),
     );
 
-    // Copy is demoted to Advanced → Support tools, not the page's first action.
-    expect(find.text('Copy diagnostics summary'), findsNothing);
+    // A reported peer issue exposes the redacted summary beside recovery.
+    expect(find.text('Copy diagnostics summary'), findsOneWidget);
     await _expandAdvanced(tester);
     expect(find.text('Copy diagnostics summary'), findsOneWidget);
 

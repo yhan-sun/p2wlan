@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -23,11 +22,13 @@ import (
 )
 
 const (
-	ProtocolName            = "p2wlan.signaling.v1"
-	ProtocolVersion         = 1
-	DefaultMaxConnections   = 10_000
-	sendQueueCapacity       = 64
-	readLimitBytes          = 64 << 10
+	ProtocolName          = "p2wlan.signaling.v1"
+	ProtocolVersion       = 1
+	DefaultMaxConnections = 10_000
+	sendQueueCapacity     = 64
+	// MaxClientMessageBytes also bounds HTTP path telemetry and Rust batches.
+	MaxClientMessageBytes   = 64 << 10
+	readLimitBytes          = MaxClientMessageBytes
 	writeWait               = 5 * time.Second
 	upgradeHandshakeTimeout = 5 * time.Second
 	pongWait                = 45 * time.Second
@@ -77,7 +78,10 @@ type Client struct {
 	registrationSeq int64
 	roomRosterWake  bool
 	expiresAt       time.Time
-	sequence        atomic.Uint64
+	// notifyMu owns notification sequence assignment and FIFO publication.
+	// The critical section performs no I/O or blocking channel sends.
+	notifyMu sync.Mutex
+	sequence uint64
 }
 
 type TelemetryHandler func(reportingDeviceID, networkID string, registrationSeq int64, payload []byte) (interface{}, error)

@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+
 import 'package:p2wlan_flutter_client/app/app_strings.dart';
 import 'package:p2wlan_flutter_client/app/app_theme.dart';
 import 'package:p2wlan_flutter_client/app/app_tokens.dart';
@@ -252,6 +253,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Sign in failed'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 10));
     expect(find.text('Incorrect email or password.'), findsOneWidget);
     expect(find.textContaining('邮箱'), findsNothing);
   });
@@ -498,6 +500,8 @@ void main() {
   testWidgets('login error keeps the submit button in the same vertical slot', (
     tester,
   ) async {
+    await tester.binding.setSurfaceSize(const Size(800, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
     final stores = (await tester.runAsync(_makeStores))!;
     addTearDown(stores.dispose);
     final fake = _FakeControlApi(
@@ -650,6 +654,283 @@ void main() {
     },
   );
 
+  testWidgets('account Next focuses password and password Done submits once', (
+    tester,
+  ) async {
+    final stores = (await tester.runAsync(_makeStores))!;
+    addTearDown(stores.dispose);
+    final fake = _FakeControlApi();
+    var authenticated = false;
+    await _pumpLogin(
+      tester,
+      stores,
+      controlApi: fake,
+      controlServer: 'https://control.example.com',
+      onAuthenticated: () => authenticated = true,
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'account',
+    );
+    await tester.testTextInput.receiveAction(TextInputAction.next);
+    await tester.pump();
+    final password = tester.widget<TextField>(
+      find.byKey(const ValueKey('login-password')),
+    );
+    expect(password.focusNode!.hasFocus, isTrue);
+    expect(fake.authenticateCalls, 0);
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await _waitFor(tester, () => authenticated);
+    await tester.pumpAndSettle();
+    expect(fake.lastEmail, 'account');
+  });
+
+  testWidgets('validation stays beside the field and focuses the first error', (
+    tester,
+  ) async {
+    final stores = (await tester.runAsync(_makeStores))!;
+    addTearDown(stores.dispose);
+    await _pumpLogin(
+      tester,
+      stores,
+      controlServer: 'https://control.example.com',
+    );
+    await tester.tap(find.text('Sign in'));
+    await tester.pumpAndSettle();
+    final identifier = tester.widget<TextField>(
+      find.byKey(const ValueKey('login-identifier')),
+    );
+    expect(identifier.decoration!.errorText, 'Enter your email or username');
+    expect(identifier.focusNode!.hasFocus, isTrue);
+    await tester.pump(const Duration(seconds: 10));
+    expect(find.text('Enter your email or username'), findsOneWidget);
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'account',
+    );
+    await tester.pump();
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const ValueKey('login-identifier')))
+          .decoration!
+          .errorText,
+      isNull,
+    );
+  });
+
+  testWidgets(
+    'small-screen sign-in failure scrolls into view with large text',
+    (tester) async {
+      final stores = (await tester.runAsync(_makeStores))!;
+      addTearDown(stores.dispose);
+      await tester.binding.setSurfaceSize(const Size(320, 568));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final api = _FakeControlApi(
+        error: const ControlApiException('无法连接控制服务器：无法连接'),
+      );
+      await _pumpLogin(
+        tester,
+        stores,
+        controlApi: api,
+        controlServer: 'https://control.example.com',
+        textScale: 1.5,
+      );
+      await tester.enterText(
+        find.byKey(const ValueKey('login-identifier')),
+        'demo@example.com',
+      );
+      await tester.enterText(
+        find.byKey(const ValueKey('login-password')),
+        'example-password',
+      );
+      final submit = find.text('Sign in');
+      await tester.ensureVisible(submit);
+      await tester.pumpAndSettle();
+      await tester.tap(submit);
+      await _waitFor(
+        tester,
+        () => find.text('Cannot reach control server').evaluate().isNotEmpty,
+      );
+      await tester.pumpAndSettle();
+      final message = find.text(
+        'Check your network or the self-hosted server address.',
+      );
+      expect(tester.getBottomLeft(message).dy, lessThanOrEqualTo(568));
+      expect(
+        tester.getTopLeft(find.text('Cannot reach control server')).dy,
+        greaterThanOrEqualTo(0),
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('reauthentication prefills the known identity and can cancel', (
+    tester,
+  ) async {
+    final stores = (await tester.runAsync(_makeStores))!;
+    addTearDown(stores.dispose);
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(
+          accountUsername: 'saved-account',
+          accountEmail: 'saved@example.com',
+        ),
+      ),
+    );
+    var cancellations = 0;
+    await _pumpLogin(
+      tester,
+      stores,
+      isReauthentication: true,
+      onCancel: () => cancellations++,
+    );
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const ValueKey('login-identifier')))
+          .controller!
+          .text,
+      'saved-account',
+    );
+    expect(find.text("Don't have an account? Create one"), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('login-cancel')));
+    expect(cancellations, 1);
+  });
+
+  testWidgets('switching accounts does not reuse the previous username', (
+    tester,
+  ) async {
+    final stores = (await tester.runAsync(_makeStores))!;
+    addTearDown(stores.dispose);
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(
+          accountEmail: 'previous@example.com',
+          accountUsername: 'previous-account',
+        ),
+      ),
+    );
+    var authenticated = false;
+    await _pumpLogin(
+      tester,
+      stores,
+      controlApi: _FakeControlApi(),
+      controlServer: 'https://control.example.com',
+      onAuthenticated: () => authenticated = true,
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'next@example.com',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
+    await tester.tap(find.text('Sign in'));
+    await _waitFor(tester, () => authenticated);
+    expect(stores.settingsStore.settings.accountEmail, 'next@example.com');
+    expect(stores.settingsStore.settings.accountUsername, isEmpty);
+  });
+
+  testWidgets('reauthentication disables cancellation while submitting', (
+    tester,
+  ) async {
+    final stores = (await tester.runAsync(_makeStores))!;
+    addTearDown(stores.dispose);
+    final fake = _FakeControlApi(completer: Completer<AuthSession>());
+    await _pumpLogin(
+      tester,
+      stores,
+      controlApi: fake,
+      controlServer: 'https://control.example.com',
+      isReauthentication: true,
+      onCancel: () {},
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-identifier')),
+      'account',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('login-password')),
+      'secret123',
+    );
+    await tester.tap(find.text('Sign in'));
+    await tester.pump();
+    expect(
+      tester
+          .widget<TextButton>(find.byKey(const ValueKey('login-cancel')))
+          .onPressed,
+      isNull,
+    );
+    expect(tester.widget<PopScope>(find.byType(PopScope)).canPop, isFalse);
+    await tester.pumpWidget(const SizedBox.shrink());
+    fake.completer!.complete(
+      const AuthSession(
+        token: 'late-token',
+        controlServer: 'https://control.example.com',
+      ),
+    );
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 20)),
+    );
+    await tester.pump();
+    expect(stores.settingsStore.settings.authToken, isEmpty);
+  });
+
+  for (final language in ['en', 'zh-Hans']) {
+    testWidgets(
+      'credential recovery failure explains sign in again in $language',
+      (tester) async {
+        final stores = (await tester.runAsync(_makeStores))!;
+        addTearDown(stores.dispose);
+        final fake = _FakeControlApi(
+          error: SettingsCredentialRestoreException(
+            StateError('private save detail'),
+            StateError('private restore detail'),
+          ),
+        );
+        await _pumpLogin(
+          tester,
+          stores,
+          controlApi: fake,
+          controlServer: 'https://control.example.com',
+          languageCode: language,
+        );
+        await tester.enterText(
+          find.byKey(const ValueKey('login-identifier')),
+          'demo@example.com',
+        );
+        await tester.enterText(
+          find.byKey(const ValueKey('login-password')),
+          'demo-password',
+        );
+        final submit = find.text(AppStrings.fromCode(language).signIn);
+        await tester.ensureVisible(submit);
+        await tester.tap(submit);
+        await tester.pumpAndSettle();
+        expect(
+          find.text(
+            language == 'en'
+                ? 'Settings could not be saved and your sign-in credential could not be restored. Sign in again before reconnecting.'
+                : '配置保存失败，登录凭据未能恢复，请重新登录后再连接。',
+          ),
+          findsOneWidget,
+        );
+        expect(find.textContaining('private restore detail'), findsNothing);
+        expect(
+          tester
+              .widget<TextField>(find.byKey(const ValueKey('login-identifier')))
+              .controller!
+              .text,
+          'demo@example.com',
+        );
+      },
+    );
+  }
+
   for (final size in const [Size(390, 844), Size(700, 1000), Size(1280, 900)]) {
     testWidgets('layout fits ${size.width.toInt()}x${size.height.toInt()}', (
       tester,
@@ -680,6 +961,9 @@ Future<void> _pumpLogin(
   String? controlServer,
   String languageCode = 'en',
   VoidCallback? onAuthenticated,
+  VoidCallback? onCancel,
+  bool isReauthentication = false,
+  double textScale = 1,
 }) async {
   if (controlServer != null) {
     await tester.runAsync(
@@ -690,6 +974,11 @@ Future<void> _pumpLogin(
   }
   await tester.pumpWidget(
     MaterialApp(
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context)
+            .copyWith(textScaler: TextScaler.linear(textScale)),
+        child: child!,
+      ),
       theme: AppTheme.lightTheme,
       darkTheme: AppTheme.darkTheme,
       themeMode: ThemeMode.light,
@@ -701,6 +990,8 @@ Future<void> _pumpLogin(
           capabilities: capabilities,
           controlApi: controlApi,
           onAuthenticated: onAuthenticated ?? () {},
+          onCancel: onCancel,
+          isReauthentication: isReauthentication,
         ),
       ),
     ),

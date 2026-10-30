@@ -26,8 +26,8 @@ func seedAdminTestData(t *testing.T, db *DB) {
 		fmt.Sprintf(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, last_seen, app_version, online, created_at) VALUES ('d2', 'u1', 'room-1', 'pk2', 'Alice Linux', 'linux', '10.66.1.2', 'unknown', %d, '0.1.163', 0, 50)`, now-300),
 		fmt.Sprintf(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, relay_rtt_ms, last_seen, app_version, online, created_at) VALUES ('d3', 'u2', 'room-1', 'pk3', 'Bob PC', 'windows', '10.66.1.3', 'p2v2:g=1;m=address_dependent', 32, %d, '0.1.163', 1, 51)`, now-5),
 		`INSERT INTO tunnels (id, device_id, protocol, local_port, remote_port, active, created_at) VALUES ('t1', 'd1', 'tcp', 22, 22022, 1, 60)`,
-		`INSERT INTO signals (id, from_node_id, to_node_id, type, created_at) VALUES ('s1', 'd1', 'd2', 'offer', 70)`,
-		`INSERT INTO signals (id, from_node_id, to_node_id, type, created_at) VALUES ('s2', 'd2', 'd3', 'candidate', 90)`,
+		fmt.Sprintf(`INSERT INTO signals (id, from_node_id, to_node_id, type, created_at) VALUES ('s1', 'd1', 'd2', 'offer', %d)`, now-10),
+		fmt.Sprintf(`INSERT INTO signals (id, from_node_id, to_node_id, type, created_at) VALUES ('s2', 'd2', 'd3', 'candidate', %d)`, now-5),
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {

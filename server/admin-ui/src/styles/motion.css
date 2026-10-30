@@ -1,0 +1,57 @@
+/* Motion belongs to navigation and deliberate actions, never polling updates. */
+:root {
+  --motion-fast: 120ms;
+  --motion-normal: 180ms;
+  --motion-enter: 220ms;
+  --ease-ui: cubic-bezier(.2, .7, .2, 1);
+}
+
+/* Opacity preserves the containing block of fixed topology surfaces. */
+.route-view { min-width: 0; animation: route-arrive 160ms var(--ease-ui); }
+@keyframes route-arrive { from { opacity: .45; } to { opacity: 1; } }
+.login-card-v2 { animation: login-arrive var(--motion-enter) var(--ease-ui); }
+@keyframes login-arrive { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.console-preferences-panel { transform-origin: bottom left; animation: preferences-arrive var(--motion-normal) var(--ease-ui); }
+@keyframes preferences-arrive { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
+
+.button, .icon-button-v2, .icon-button, .theme-switch, .copy-value-button,
+.locale-switch button, .console-segmented button {
+  transition: color var(--motion-fast) var(--ease-ui), background-color var(--motion-fast) var(--ease-ui),
+    border-color var(--motion-fast) var(--ease-ui), box-shadow var(--motion-fast) var(--ease-ui), transform var(--motion-fast) var(--ease-ui);
+}
+.button:not(:disabled):active, .icon-button-v2:not(:disabled):active,
+.theme-switch:active, .copy-value-button:not(:disabled):active { transform: scale(.975); }
+.search-field, .input-with-icon, .select-field {
+  transition: border-color var(--motion-fast) var(--ease-ui), box-shadow var(--motion-fast) var(--ease-ui);
+}
+.nav-link { transition: color var(--motion-fast) var(--ease-ui), background-color var(--motion-fast) var(--ease-ui); }
+.nav-link::before { transition: opacity var(--motion-normal) var(--ease-ui); }
+.nav-link svg, .brand-symbol svg { stroke-width: 1.65; }
+.data-table td { transition: background-color var(--motion-fast) var(--ease-ui); }
+.tabs-v2 button::after { transform: scaleX(0); transition: transform var(--motion-normal) var(--ease-ui); }
+.tabs-v2 button.active::after { transform: scaleX(1); }
+.text-link > .lucide-arrow-right, .text-link > .lucide-arrow-up-right,
+.overview-row-arrow { transition: transform var(--motion-normal) var(--ease-ui); }
+@media (hover: hover) {
+  .text-link:hover > .lucide-arrow-right, .text-link:hover > .lucide-arrow-up-right,
+  .overview-account-row:hover .overview-row-arrow, .overview-attention-row:hover .overview-row-arrow { transform: translateX(2px); }
+}
+.copy-value-button[data-copy-state='copied'] { color: var(--success-text); }
+.copy-value-button[data-copy-state='copied'] > svg { animation: copy-confirm 160ms var(--ease-ui); }
+@keyframes copy-confirm { from { opacity: .4; transform: scale(.8); } to { opacity: 1; transform: none; } }
+.theme-switch > svg { animation: theme-change var(--motion-normal) var(--ease-ui); }
+@keyframes theme-change { from { opacity: .35; transform: rotate(-12deg); } to { opacity: 1; transform: none; } }
+
+/* Browsers without interpolated details keep their native immediate disclosure. */
+@supports (interpolate-size: allow-keywords) and selector(details::details-content) {
+  details { interpolate-size: allow-keywords; }
+  details::details-content {
+    block-size: 0; overflow: clip;
+    transition: block-size var(--motion-normal) var(--ease-ui), content-visibility var(--motion-normal) allow-discrete;
+  }
+  details[open]::details-content { block-size: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  details::details-content { transition: none !important; }
+}

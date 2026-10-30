@@ -173,7 +173,7 @@ impl PeerManager {
         let Ok(mut connections) = self.connections.try_write() else {
             return Contended(CreditLock::Connections);
         };
-        let membership = match self.peer_membership.try_lock() {
+        let membership = match self.peer_membership.try_read() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return Contended(CreditLock::Membership),
