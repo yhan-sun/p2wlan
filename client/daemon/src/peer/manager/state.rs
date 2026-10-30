@@ -482,8 +482,9 @@ pub struct PeerManager {
     /// missing peer. Structural add/remove, identity, online, and remote
     /// incarnation transitions update this state while they own the network
     /// epoch and connection writer; ordinary metadata/endpoint refreshes do
-    /// not rotate the session generation.
-    peer_membership: Arc<std::sync::Mutex<PeerMembershipState>>,
+    /// not rotate the session generation. Concurrent lifecycle readers share
+    /// this same owner; try-only qualification still refuses a membership writer.
+    peer_membership: Arc<std::sync::RwLock<PeerMembershipState>>,
     kernel_read_views: kernel_read_view::ReadViewRegistry,
     #[cfg(test)]
     authenticated_probe_verify_gate: AuthenticatedProbeVerifyGateSlot,

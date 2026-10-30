@@ -699,7 +699,7 @@ impl PeerManager {
         }
         let Some(session_generation) = self
             .peer_membership
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .active_generation(node_id)
         else {

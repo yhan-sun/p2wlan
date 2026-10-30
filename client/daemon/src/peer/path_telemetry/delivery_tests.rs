@@ -51,6 +51,20 @@ fn delivery_snapshot(generation: u64, revision: u64) -> PathObservabilitySnapsho
     }
 }
 
+fn delivery_sender(
+    hub: Arc<PathTelemetryHub>,
+    address: std::net::SocketAddr,
+) -> PathTelemetrySender {
+    PathTelemetrySender::new(hub, format!("http://{address}"), "dc-delivery-test".into())
+        .with_http_client(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(super::sender::TELEMETRY_REQUEST_TIMEOUT)
+                .build()
+                .unwrap(),
+        )
+}
+
 #[tokio::test]
 async fn path_telemetry_http_failure_preserves_latest_generation_for_fallback_retry() {
     let hub = Arc::new(PathTelemetryHub::new("reporter".into(), "network".into()));
@@ -69,11 +83,7 @@ async fn path_telemetry_http_failure_preserves_latest_generation_for_fallback_re
         body
     });
     hub.enqueue("unchanged", &delivery_snapshot(1, 2));
-    let sender = PathTelemetrySender::new(
-        hub.clone(),
-        format!("http://{address}"),
-        "dc-delivery-test".into(),
-    );
+    let sender = delivery_sender(hub.clone(), address);
     assert!(sender.flush_http().await.is_err());
     assert_eq!(
         server.await.unwrap()["observations"]
@@ -93,11 +103,7 @@ async fn path_telemetry_http_failure_preserves_latest_generation_for_fallback_re
             .unwrap();
         body
     });
-    let retry_sender = PathTelemetrySender::new(
-        hub.clone(),
-        format!("http://{retry_address}"),
-        "dc-delivery-test".into(),
-    );
+    let retry_sender = delivery_sender(hub.clone(), retry_address);
     assert_eq!(
         retry_sender.flush_http().await.unwrap(),
         2,
@@ -126,16 +132,27 @@ async fn path_telemetry_http_transport_failure_is_requeued_and_classified() {
     hub.enqueue("remote", &delivery_snapshot(1, 1));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    drop(listener);
-    let sender = PathTelemetrySender::new(
-        hub.clone(),
-        format!("http://{address}"),
-        "dc-delivery-test".into(),
-    );
-    assert!(sender.flush_http().await.is_err());
+    // A closed port is not a portable transport-error fixture: Windows may
+    // spend the entire request deadline connecting. Accept the real request
+    // and explicitly close without an HTTP response instead.
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let body = read_telemetry_request(&mut stream).await;
+        stream.shutdown().await.unwrap();
+        body
+    });
+    let sender = delivery_sender(hub.clone(), address);
+    let result = sender.flush_http().await;
+    let body = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("transport fixture did not receive and close the request")
+        .unwrap();
+    assert_eq!(body["observations"][0]["remote_device_id"], "remote");
+    assert!(result.is_err(), "unexpected delivery result: {result:?}");
     assert!(hub.has_dirty());
-    assert_eq!(hub.metrics().send_transport_failures, 1);
-    assert_eq!(hub.metrics().send_timeouts, 0);
+    assert_eq!(hub.metrics().send_transport_failures, 1, "{result:?}");
+    assert_eq!(hub.metrics().send_timeouts, 0, "{result:?}");
+    assert_eq!(hub.metrics().send_http_failures, 0, "{result:?}");
 }
 
 #[tokio::test]
@@ -150,11 +167,7 @@ async fn path_telemetry_http_timeout_is_requeued_and_classified() {
         read_telemetry_request(&mut stream).await;
         std::future::pending::<()>().await;
     });
-    let sender = PathTelemetrySender::new(
-        hub.clone(),
-        format!("http://{address}"),
-        "dc-delivery-test".into(),
-    );
+    let sender = delivery_sender(hub.clone(), address);
     let result = sender.flush_http().await;
     server.abort();
     assert!(result.is_err());

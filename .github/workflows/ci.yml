@@ -301,10 +301,14 @@ jobs:
           PY
       - name: Scan production credential transport
         run: |
+          # Detector definitions and their negative fixtures are not runtime
+          # storage calls. Security Audit still scans both for actual secrets.
           if git grep -nE 'localStorage|sessionStorage|--token([ =]|$)|p2wlan-daemon\.token' -- \
             'apps/flutter_client/lib/**' \
             'client/**' \
             'scripts/**' \
+            ':!scripts/security/credential_scan.py' \
+            ':!scripts/security/tests/test_security_audit.py' \
             ':!scripts/dual-end/mini-air-smoke.sh'; then
             echo "unsafe production credential transport found" >&2
             exit 1

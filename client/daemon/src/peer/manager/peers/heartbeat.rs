@@ -31,7 +31,7 @@ impl PeerManager {
         {
             return None;
         }
-        let membership = self.peer_membership.try_lock().ok()?;
+        let membership = self.peer_membership.try_read().ok()?;
         let lifecycle = membership.active_generation(&info.node_id)?;
         let epoch = PathEpoch::new(
             self.current_network_generation_sync(),

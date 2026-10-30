@@ -60,6 +60,12 @@ impl PathTelemetrySender {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn with_http_client(mut self, client: Client) -> Self {
+        self.http = client;
+        self
+    }
+
     /// Check if telemetry endpoint is supported by the server.
     pub fn is_supported(&self) -> bool {
         self.telemetry_supported.load(Ordering::Acquire)

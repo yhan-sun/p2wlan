@@ -108,7 +108,7 @@ async fn changed_correctness_or_other_metadata_fields_keep_original_epoch_fence(
 async fn busy_original_metadata_owners_never_partially_refresh_timestamp() {
     let (manager, mut peer) = setup().await;
     peer.last_seen = 11;
-    let membership = manager.peer_membership.lock().unwrap();
+    let membership = manager.peer_membership.write().unwrap();
     assert!(manager.try_refresh_peer_last_seen(&peer).is_none());
     drop(membership);
     let ledger = manager.remote_identity_ledger.lock().unwrap();
@@ -127,7 +127,7 @@ async fn retired_membership_generation_and_missing_profile_cannot_use_heartbeat_
     peer.last_seen = 11;
     manager
         .peer_membership
-        .lock()
+        .write()
         .unwrap()
         .publish(&peer.node_id, false, true);
     assert!(manager.try_refresh_peer_last_seen(&peer).is_none());
@@ -278,7 +278,7 @@ async fn path_telemetry_heartbeat_samples_current_committed_state_without_a_tran
     // A stale membership cannot refresh the cached path's freshness.
     manager
         .peer_membership
-        .lock()
+        .write()
         .unwrap()
         .publish(&peer.node_id, false, true);
     peer.last_seen += 5;

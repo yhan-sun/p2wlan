@@ -36,7 +36,7 @@ impl PeerManager {
         Self {
             local_node_id_for_traversal: std::sync::RwLock::new(config.node.node_id.clone()),
             connections: Arc::new(ConnectionsTable::new(HashMap::new())),
-            peer_membership: Arc::new(std::sync::Mutex::new(PeerMembershipState::default())),
+            peer_membership: Arc::new(std::sync::RwLock::new(PeerMembershipState::default())),
             kernel_read_views: kernel_read_view::ReadViewRegistry::default(),
             #[cfg(test)]
             authenticated_probe_verify_gate: Arc::new(std::sync::Mutex::new(None)),
@@ -918,7 +918,7 @@ impl PeerManager {
     /// lock, where awaiting the connection map is not acceptable.
     pub(crate) fn peer_exists_sync(&self, node_id: &str) -> bool {
         self.peer_membership
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains(node_id)
     }
@@ -932,7 +932,7 @@ impl PeerManager {
         expected: PeerSessionGeneration,
     ) -> bool {
         self.peer_membership
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .active_generation_is_current(node_id, expected)
     }
@@ -946,14 +946,14 @@ impl PeerManager {
         node_id: &str,
     ) -> Option<PeerSessionGeneration> {
         self.peer_membership
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .active_generation(node_id)
     }
 
     fn peer_session_generation_any_sync(&self, node_id: &str) -> Option<PeerSessionGeneration> {
         self.peer_membership
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .generation(node_id)
     }
@@ -1210,7 +1210,7 @@ impl PeerManager {
         node_id: &str,
     ) -> Option<(PeerSessionGeneration, bool)> {
         self.peer_membership
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .peers
             .get(node_id)
