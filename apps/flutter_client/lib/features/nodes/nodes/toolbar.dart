@@ -76,8 +76,6 @@ class _NodeToolbar extends StatelessWidget {
                 : '${allPeers.length} device connections · $onlineCount online')
           : strings.deviceCountSummary(allPeers.length, onlineCount),
       key: const Key('nodes-summary'),
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
       style: TextStyle(fontSize: 12, color: theme.colorScheme.onSurfaceVariant),
     );
     final menus = Wrap(

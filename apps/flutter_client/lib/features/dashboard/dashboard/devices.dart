@@ -25,7 +25,7 @@ class _OnlineDevicesSection extends StatelessWidget {
     final strings = AppStringsScope.of(context);
     final theme = Theme.of(context);
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Wrap(
           alignment: WrapAlignment.spaceBetween,
@@ -153,6 +153,9 @@ class _DeviceRow extends StatelessWidget {
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final colors = P2WlanColors.of(context);
+                final stackMetrics =
+                    constraints.maxWidth < 480 ||
+                    MediaQuery.textScalerOf(context).scale(12) > 16;
                 final leading = Stack(
                   clipBehavior: Clip.none,
                   children: [
@@ -197,7 +200,7 @@ class _DeviceRow extends StatelessWidget {
                   children: [
                     Text(
                       peer.displayName,
-                      maxLines: 1,
+                      maxLines: stackMetrics ? null : 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         color: theme.colorScheme.onSurface,
@@ -208,8 +211,10 @@ class _DeviceRow extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      [dash(peer.virtualIp), ?roomName].join(' · '),
-                      maxLines: 1,
+                      stackMetrics
+                          ? dash(peer.virtualIp)
+                          : [dash(peer.virtualIp), ?roomName].join(' · '),
+                      maxLines: stackMetrics ? null : 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         color: theme.colorScheme.onSurfaceVariant,
@@ -218,6 +223,15 @@ class _DeviceRow extends StatelessWidget {
                         fontFeatures: AppTokens.tabularFontFeatures,
                       ),
                     ),
+                    if (roomName != null && stackMetrics)
+                      Text(
+                        roomName!,
+                        style: TextStyle(
+                          color: theme.colorScheme.onSurfaceVariant,
+                          fontSize: 12,
+                          height: 1.3,
+                        ),
+                      ),
                   ],
                 );
                 final chevron = Icon(
@@ -228,30 +242,33 @@ class _DeviceRow extends StatelessWidget {
                 final metrics = Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    _HomeMetricText(
-                      value: formatTransferRate(
-                        current ? speedBytesPerSecond : null,
+                    if (current && speedBytesPerSecond != null)
+                      _HomeMetricText(
+                        value: formatTransferRate(
+                          current ? speedBytesPerSecond : null,
+                        ),
+                        width: 72,
+                        color: theme.colorScheme.onSurfaceVariant,
                       ),
-                      width: constraints.maxWidth < 520 ? 38 : 58,
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
-                    SizedBox(width: constraints.maxWidth < 520 ? 2 : 6),
-                    _HomeMetricText(
-                      value: formatLatency(current ? peer.latencyMs : null),
-                      width: constraints.maxWidth < 520 ? 38 : 50,
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
-                    SizedBox(width: constraints.maxWidth < 520 ? 2 : 6),
+                    if (current && speedBytesPerSecond != null)
+                      const SizedBox(width: 8),
+                    if (current && peer.latencyMs != null) ...[
+                      _HomeMetricText(
+                        value: formatLatency(peer.latencyMs),
+                        width: 64,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                      const SizedBox(width: 6),
+                    ],
                     _HomeMetricText(
                       value: statusLabel,
-                      width: constraints.maxWidth < 520 ? 46 : 58,
+                      width: 64,
                       color: statusColor,
                     ),
                   ],
                 );
 
-                if (constraints.maxWidth < 520 ||
-                    MediaQuery.textScalerOf(context).scale(12) > 16) {
+                if (stackMetrics) {
                   return Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
@@ -278,22 +295,24 @@ class _DeviceRow extends StatelessWidget {
                                 color: statusColor,
                               ),
                             ),
-                            Text(
-                              formatLatency(current ? peer.latencyMs : null),
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: theme.colorScheme.onSurfaceVariant,
+                            if (current && peer.latencyMs != null)
+                              Text(
+                                formatLatency(peer.latencyMs),
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
                               ),
-                            ),
-                            Text(
-                              formatTransferRate(
-                                current ? speedBytesPerSecond : null,
+                            if (current && speedBytesPerSecond != null)
+                              Text(
+                                formatTransferRate(
+                                  current ? speedBytesPerSecond : null,
+                                ),
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
                               ),
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
                           ],
                         ),
                       ),
@@ -308,7 +327,7 @@ class _DeviceRow extends StatelessWidget {
                     const SizedBox(width: AppTokens.space10),
                     Expanded(child: identity),
                     SizedBox(
-                      width: constraints.maxWidth < 520 ? 132 : 186,
+                      width: current && speedBytesPerSecond != null ? 220 : 140,
                       child: Align(
                         alignment: Alignment.centerRight,
                         child: metrics,

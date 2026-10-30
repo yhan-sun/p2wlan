@@ -110,42 +110,81 @@ class _NetworkHero extends StatelessWidget {
           _ => false,
         };
 
-    final header = Wrap(
-      alignment: WrapAlignment.spaceBetween,
-      crossAxisAlignment: WrapCrossAlignment.center,
-      spacing: AppTokens.space12,
-      runSpacing: AppTokens.space10,
-      children: [
-        Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.hub_outlined,
-              size: 19,
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-            const SizedBox(width: AppTokens.space8),
-            Flexible(
-              child: Text(
-                strings.homeNetworkTitle,
-                style: TextStyle(
-                  color: theme.colorScheme.onSurface,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  height: 1.4,
+    final header = hasSnapshot
+        ? Row(
+            children: [
+              Icon(
+                status == _NetworkStatus.healthy
+                    ? Icons.check_circle_outline_rounded
+                    : Icons.info_outline_rounded,
+                size: 20,
+                color: status == _NetworkStatus.healthy
+                    ? P2WlanColors.of(context).successText
+                    : P2WlanColors.of(context).warningText,
+              ),
+              const SizedBox(width: AppTokens.space8),
+              Expanded(
+                child: Text(
+                  status == _NetworkStatus.healthy
+                      ? (strings.isZh ? '本机网络已连接' : 'Local network connected')
+                      : status == _NetworkStatus.stale
+                      ? (strings.isZh ? '上次连接信息' : 'Last known connection')
+                      : _networkStatusLabel(
+                          strings,
+                          status,
+                          canControlLocalDaemon,
+                        ),
+                  key: const Key('home-connection-heading'),
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurface,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    height: 1.35,
+                  ),
                 ),
               ),
-            ),
-          ],
-        ),
-        StatusBadge(
-          label: startupPending
-              ? (strings.isZh ? '连接中' : 'Connecting')
-              : _networkStatusLabel(strings, status, canControlLocalDaemon),
-          tone: _networkStatusTone(status),
-        ),
-      ],
-    );
+            ],
+          )
+        : Wrap(
+            alignment: WrapAlignment.spaceBetween,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: AppTokens.space12,
+            runSpacing: AppTokens.space10,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.hub_outlined,
+                    size: 19,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: AppTokens.space8),
+                  Flexible(
+                    child: Text(
+                      strings.homeNetworkTitle,
+                      style: TextStyle(
+                        color: theme.colorScheme.onSurface,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        height: 1.4,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              StatusBadge(
+                label: startupPending
+                    ? (strings.isZh ? '连接中' : 'Connecting')
+                    : _networkStatusLabel(
+                        strings,
+                        status,
+                        canControlLocalDaemon,
+                      ),
+                tone: _networkStatusTone(status),
+              ),
+            ],
+          );
 
     final showStartGuide =
         status == _NetworkStatus.stopped && canControlLocalDaemon;
@@ -256,7 +295,7 @@ class _NetworkHero extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           header,
-          const SizedBox(height: AppTokens.space24),
+          SizedBox(height: hasSnapshot ? AppTokens.space12 : AppTokens.space24),
           infoBlock,
           if (showActions) ...[
             const SizedBox(height: AppTokens.space24),
@@ -309,7 +348,7 @@ class _HeroSurface extends StatelessWidget {
             : AppTokens.shadowBorder,
       ),
       child: Padding(
-        padding: const EdgeInsets.all(AppTokens.space24),
+        padding: const EdgeInsets.all(AppTokens.space20),
         child: child,
       ),
     );
@@ -337,15 +376,13 @@ class _VirtualIpBlock extends StatelessWidget {
     return LayoutBuilder(
       builder: (context, constraints) {
         final stackStop =
-            constraints.maxWidth < 360 ||
+            constraints.maxWidth < 300 ||
             MediaQuery.textScalerOf(context).scale(12) > 16;
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
               strings.virtualIpLabel,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 color: theme.colorScheme.onSurfaceVariant,
                 fontSize: 12,
@@ -378,7 +415,7 @@ class _VirtualIpBlock extends StatelessWidget {
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(
                                     color: theme.colorScheme.onSurface,
-                                    fontSize: 28,
+                                    fontSize: 26,
                                     fontWeight: FontWeight.w700,
                                     height: 1.1,
                                     fontFeatures: AppTokens.tabularFontFeatures,
@@ -447,19 +484,21 @@ class _StopDaemonButton extends StatelessWidget {
       key: const Key('dashboard-stop-button'),
       onPressed: daemonBusy ? null : onStopDaemon,
       style: OutlinedButton.styleFrom(
-        foregroundColor: colors.dangerText,
-        backgroundColor: colors.dangerSurface,
-        side: BorderSide(color: colors.dangerBorder),
+        foregroundColor: Theme.of(context).colorScheme.onSurfaceVariant,
+        side: BorderSide(color: colors.border),
         minimumSize: const Size(0, 40),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
         visualDensity: VisualDensity.compact,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(AppTokens.radiusMd),
         ),
-        textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+        textStyle: Theme.of(context).textTheme.labelMedium
+            ?.copyWith(fontSize: 12, fontWeight: FontWeight.w600),
       ),
       icon: daemonBusy
-          ? _ButtonSpinner(color: colors.dangerText)
+          ? _ButtonSpinner(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            )
           : const Icon(Icons.stop_rounded, size: 17),
       label: Text(daemonBusy ? strings.daemonWorking : strings.stopP2wlan),
     );
@@ -511,84 +550,77 @@ class _HomeMetrics extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final colors = P2WlanColors.of(context);
-    final cells = <Widget>[
-      _MetricCell(
-        key: const Key('dashboard-count-online'),
-        value: '${counts.online}',
-        label: strings.onlineDevices,
-      ),
-      _MetricCell(
-        key: const Key('dashboard-count-available'),
-        value: '${counts.direct + counts.relay}',
-        label: strings.isZh ? '确认链路' : 'Confirmed paths',
-        tooltip: strings.isZh ? '本机已确认的直连或中继路径；在线设备不一定已有可用路径。' : 'Direct or relay paths confirmed by this device. An online device may still be establishing a path.',
-      ),
-      _MetricCell(
-        key: const Key('dashboard-count-direct'),
-        value: '${counts.direct}',
-        label: strings.direct,
-      ),
-      _MetricCell(
-        key: const Key('dashboard-count-relay'),
-        value: '${counts.relay}',
-        label: strings.relay,
-      ),
-    ];
-    return Container(
-      padding: const EdgeInsets.all(AppTokens.space16),
-      decoration: BoxDecoration(
-        color: colors.surfaceMuted,
-        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-      ),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          if (constraints.maxWidth < 360 ||
-              MediaQuery.textScalerOf(context).scale(12) > 16) {
-            return Column(
-              children: [
-                Row(
-                  children: [
-                    cells[0],
-                    _MetricDivider(color: colors.border),
-                    cells[1],
-                  ],
-                ),
-                const SizedBox(height: 16),
-                Divider(height: 1, color: colors.border),
-                const SizedBox(height: 16),
-                Row(
-                  children: [
-                    cells[2],
-                    _MetricDivider(color: colors.border),
-                    cells[3],
-                  ],
-                ),
-              ],
-            );
-          }
-          return Row(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _MetricCell(
+              key: const Key('dashboard-count-online'),
+              value: '${counts.online}',
+              label: strings.onlineDevices,
+            ),
+            Container(width: 1, height: 36, color: colors.border),
+            _MetricCell(
+              key: const Key('dashboard-count-available'),
+              value: '${counts.direct + counts.relay}',
+              label: strings.isZh ? '确认链路' : 'Confirmed paths',
+              tooltip: strings.isZh ? '本机已确认的直连或中继路径；在线设备不一定已有可用路径。' : 'Direct or relay paths confirmed by this device. An online device may still be establishing a path.',
+            ),
+          ],
+        ),
+        const SizedBox(height: AppTokens.space10),
+        Center(
+          child: Wrap(
+            spacing: AppTokens.space16,
+            runSpacing: AppTokens.space6,
             children: [
-              for (var i = 0; i < cells.length; i++) ...[
-                if (i > 0) _MetricDivider(color: colors.border),
-                cells[i],
-              ],
+              _PathBreakdown(
+                key: const Key('dashboard-count-direct'),
+                value: counts.direct,
+                label: strings.direct,
+              ),
+              _PathBreakdown(
+                key: const Key('dashboard-count-relay'),
+                value: counts.relay,
+                label: strings.relay,
+              ),
             ],
-          );
-        },
-      ),
+          ),
+        ),
+      ],
     );
   }
 }
 
-class _MetricDivider extends StatelessWidget {
-  const _MetricDivider({required this.color});
-
-  final Color color;
+class _PathBreakdown extends StatelessWidget {
+  const _PathBreakdown({super.key, required this.value, required this.label});
+  final int value;
+  final String label;
 
   @override
-  Widget build(BuildContext context) {
-    return Container(width: 1, height: 34, color: color);
-  }
+  Widget build(BuildContext context) => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Text(
+        '$value',
+        style: const TextStyle(
+          fontSize: 12,
+          fontWeight: FontWeight.w600,
+          fontFeatures: AppTokens.tabularFontFeatures,
+        ),
+      ),
+      const SizedBox(width: 4),
+      Text(
+        label,
+        style: TextStyle(
+          fontSize: 12,
+          color: Theme.of(context).colorScheme.onSurfaceVariant,
+        ),
+      ),
+    ],
+  );
 }
 
 class _MetricCell extends StatelessWidget {
@@ -629,8 +661,6 @@ class _MetricCell extends StatelessWidget {
         const SizedBox(height: 2),
         Text(
           label,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
           textAlign: TextAlign.center,
           style: TextStyle(
             color: theme.colorScheme.onSurfaceVariant,

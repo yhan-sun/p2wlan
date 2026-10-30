@@ -97,7 +97,7 @@ class _SettingsCategoryCard extends StatelessWidget {
           borderRadius: BorderRadius.circular(12),
           onTap: onTap,
           child: ConstrainedBox(
-            constraints: BoxConstraints(minHeight: spacious ? 150 : 118),
+            constraints: BoxConstraints(minHeight: spacious ? 140 : 112),
             child: Padding(
               padding: EdgeInsets.all(spacious ? 20 : 16),
               child: Column(
@@ -126,7 +126,7 @@ class _SettingsCategoryCard extends StatelessWidget {
                       ),
                     ],
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 10),
                   Text(
                     subtitle,
                     style: TextStyle(
@@ -135,7 +135,7 @@ class _SettingsCategoryCard extends StatelessWidget {
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 10),
                   Text(
                     summary,
                     maxLines: 1,
@@ -143,7 +143,6 @@ class _SettingsCategoryCard extends StatelessWidget {
                     style: TextStyle(
                       fontSize: 13,
                       height: 1.3,
-                      fontWeight: FontWeight.w600,
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
@@ -164,14 +163,10 @@ class _SettingsCategoryIcon extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Container(
-      width: 36,
-      height: 36,
-      decoration: BoxDecoration(
-        color: theme.colorScheme.primary.withValues(alpha: .07),
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Icon(category.icon, size: 19, color: theme.colorScheme.primary),
+    return Icon(
+      category.icon,
+      size: 21,
+      color: theme.colorScheme.onSurfaceVariant,
     );
   }
 }
@@ -441,7 +436,7 @@ class _MobileSettingsCategoryPage extends StatelessWidget {
                     maxWidth: settingsPageMaxWidth,
                   ),
                   child: Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 20, 20, 20),
+                    padding: const EdgeInsets.fromLTRB(16, 20, 16, 20),
                     child: _CategoryDetailView(
                       category: category,
                       state: state,

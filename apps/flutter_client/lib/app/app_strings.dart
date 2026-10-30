@@ -406,8 +406,8 @@ class AppStrings {
   String get recentDaemonLogs => isZh ? '最近 daemon 日志' : 'Recent daemon logs';
 
   String get nodesSubtitle => isZh
-      ? '查看当前连接中的设备状态；已加入房间的设备名册可在房间内查看。'
-      : 'Live devices in current connections. Open a room to view its registered devices.';
+      ? '查看设备连接状态；房间成员可在房间内查看。'
+      : 'Connection status for your devices. View room members in Rooms.';
   String get noPeers => isZh
       ? '当前没有发现其他设备。'
       : 'No other devices are present in the current snapshot.';

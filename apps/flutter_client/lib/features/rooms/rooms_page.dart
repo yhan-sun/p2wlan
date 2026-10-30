@@ -1068,10 +1068,11 @@ class _RoomsPageState extends State<RoomsPage> {
     return LayoutBuilder(
       builder: (context, constraints) {
         const gap = 16.0;
-        final columns = ((constraints.maxWidth + gap) / 340).floor().clamp(
-          1,
-          4,
-        );
+        final minCardWidth =
+            340 * MediaQuery.textScalerOf(context).scale(14) / 14;
+        final columns = ((constraints.maxWidth + gap) / minCardWidth)
+            .floor()
+            .clamp(1, _rooms.length.clamp(1, 4));
         final width = (constraints.maxWidth - gap * (columns - 1)) / columns;
         return Wrap(
           spacing: gap,
@@ -1437,7 +1438,7 @@ class _RoomsPageState extends State<RoomsPage> {
                     ?.copyWith(fontSize: 15, fontWeight: FontWeight.w700),
               ),
             ),
-            if (constraints.maxWidth >= 1028 &&
+            if (constraints.maxWidth >= 988 &&
                 MediaQuery.textScalerOf(context).scale(14) < 20)
               Padding(
                 padding: const EdgeInsets.fromLTRB(14, 0, 14, 10),
@@ -1473,10 +1474,24 @@ class _RoomsPageState extends State<RoomsPage> {
                   horizontal: 18,
                   vertical: 8,
                 ),
-                child: Text(
-                  '${user.isEmpty ? '成员信息同步中' : _memberLabel(user)} · ${user == roster.room.ownerId ? '房主' : '成员'} · ${devices.where((d) => (d['user_id'] ?? '') == user).length} 台设备',
+                child: DefaultTextStyle.merge(
                   style: Theme.of(context).textTheme.bodySmall
                       ?.copyWith(fontWeight: FontWeight.w600),
+                  child: MediaQuery.textScalerOf(context).scale(14) < 20
+                      ? Text(
+                          '${user.isEmpty ? '成员信息同步中' : _memberLabel(user)} · ${user == roster.room.ownerId ? '房主' : '成员'} · ${devices.where((d) => (d['user_id'] ?? '') == user).length} 台设备',
+                        )
+                      : Wrap(
+                          spacing: 12,
+                          runSpacing: 4,
+                          children: [
+                            Text(user.isEmpty ? '成员信息同步中' : _memberLabel(user)),
+                            Text(user == roster.room.ownerId ? '房主' : '成员'),
+                            Text(
+                              '${devices.where((d) => (d['user_id'] ?? '') == user).length} 台设备',
+                            ),
+                          ],
+                        ),
                 ),
               ),
               for (final device in devices.where(
@@ -1728,10 +1743,10 @@ class _RoomsPageState extends State<RoomsPage> {
             : colors.error,
       ),
     );
-    final pathWidget = Text(
-      staleRoster && peer == null && !local ? '成员信息待更新' : path,
-    );
-    final dataWidget = Text(_deviceDataLabel(device, snapshot));
+    final pathLabel = staleRoster && peer == null && !local ? '成员信息待更新' : path;
+    final pathWidget = Text(pathLabel);
+    final dataLabel = _deviceDataLabel(device, snapshot);
+    final dataWidget = Text(dataLabel);
     final content = InkWell(
       key: ValueKey(
         'room-device-${device['id'] ?? device['public_key'] ?? ip}',
@@ -1745,12 +1760,14 @@ class _RoomsPageState extends State<RoomsPage> {
         child: LayoutBuilder(
           builder: (context, constraints) {
             final wide =
-                constraints.maxWidth >= 1000 &&
+                constraints.maxWidth >= 960 &&
                 MediaQuery.textScalerOf(context).scale(14) < 20;
             final header = Row(
               children: [
-                Icon(Icons.computer_rounded, color: statusColor, size: 22),
-                const SizedBox(width: 10),
+                if (MediaQuery.textScalerOf(context).scale(14) < 20) ...[
+                  Icon(Icons.computer_rounded, color: statusColor, size: 22),
+                  const SizedBox(width: 10),
+                ],
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -1784,6 +1801,31 @@ class _RoomsPageState extends State<RoomsPage> {
                       value,
                     ],
                   );
+            Widget inlineMetric(String label, Widget value) => Wrap(
+              spacing: 6,
+              runSpacing: 2,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                Text(
+                  label,
+                  style: Theme.of(context).textTheme.bodySmall
+                      ?.copyWith(color: P2WlanColors.of(context).textSecondary),
+                ),
+                value,
+              ],
+            );
+            final connectionMetrics = [
+              status,
+              inlineMetric(
+                dataLabel == pathLabel ? '链路 / 数据' : '链路',
+                pathWidget,
+              ),
+              Tooltip(
+                message: '端到端实测延迟',
+                child: inlineMetric('延迟', latencyWidget),
+              ),
+              if (dataLabel != pathLabel) inlineMetric('数据', dataWidget),
+            ];
             if (wide) {
               return Row(
                 children: [
@@ -1819,13 +1861,7 @@ class _RoomsPageState extends State<RoomsPage> {
                     spacing: 12,
                     runSpacing: 4,
                     crossAxisAlignment: WrapCrossAlignment.center,
-                    children: [
-                      ipWidget,
-                      status,
-                      pathWidget,
-                      Tooltip(message: '端到端实测延迟', child: latencyWidget),
-                      dataWidget,
-                    ],
+                    children: [ipWidget, ...connectionMetrics],
                   ),
                 ],
               );
@@ -1836,26 +1872,13 @@ class _RoomsPageState extends State<RoomsPage> {
                 header,
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 2),
-                  child: Row(
-                    children: [
-                      Text(
-                        '虚拟 IP · ',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                      Flexible(child: ipWidget),
-                    ],
-                  ),
+                  child: Semantics(label: '虚拟 IP', child: ipWidget),
                 ),
                 Wrap(
                   spacing: 12,
                   runSpacing: 8,
                   crossAxisAlignment: WrapCrossAlignment.center,
-                  children: [
-                    status,
-                    pathWidget,
-                    Tooltip(message: '端到端实测延迟', child: latencyWidget),
-                    dataWidget,
-                  ],
+                  children: [...connectionMetrics],
                 ),
               ],
             );
@@ -1901,6 +1924,86 @@ class _RoomsPageState extends State<RoomsPage> {
             await _parallel.setAutoConnect(room, value);
             if (isCurrent()) _autoConnect[room.id] = value;
           }, requiresAuthentication: false),
+  );
+
+  Widget _managementList(List<Widget> rows) => _surfaceCard(
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (var i = 0; i < rows.length; i++) ...[
+          if (i > 0) const Divider(height: 1),
+          rows[i],
+        ],
+      ],
+    ),
+  );
+
+  Widget _managementRow({
+    required Widget title,
+    Widget? subtitle,
+    Widget? action,
+    bool actionBesideSubtitle = false,
+  }) => Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+    child: LayoutBuilder(
+      builder: (context, constraints) {
+        final heading = DefaultTextStyle.merge(
+          style: Theme.of(context).textTheme.bodyLarge,
+          child: title,
+        );
+        final description = subtitle == null
+            ? null
+            : DefaultTextStyle.merge(
+                style: Theme.of(context).textTheme.bodySmall,
+                child: subtitle,
+              );
+        final information = Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            heading,
+            if (description != null) ...[
+              const SizedBox(height: 4),
+              description,
+            ],
+          ],
+        );
+        if (action == null) return information;
+        if (constraints.maxWidth < 360 ||
+            MediaQuery.textScalerOf(context).scale(14) >= 20) {
+          if (actionBesideSubtitle && description != null) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                heading,
+                const SizedBox(height: 4),
+                Row(
+                  children: [
+                    Expanded(child: description),
+                    action,
+                  ],
+                ),
+              ],
+            );
+          }
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              information,
+              const SizedBox(height: 8),
+              Align(alignment: Alignment.centerRight, child: action),
+            ],
+          );
+        }
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Expanded(child: information),
+            const SizedBox(width: 16),
+            action,
+          ],
+        );
+      },
+    ),
   );
 
   Widget _roomDetails(RoomRoster roster) {
@@ -2094,18 +2197,16 @@ class _RoomsPageState extends State<RoomsPage> {
             '${room.isOwner ? '成员管理' : '房间成员'} · ${roster.members.length}',
           ),
           children: [
-            for (final member in roster.members)
-              _surfaceCard(
-                child: ListTile(
-                  leading: Icon(
-                    member['role'] == 'owner'
-                        ? Icons.star_outline_rounded
-                        : Icons.person_outline_rounded,
-                  ),
+            _managementList([
+              for (final member in roster.members)
+                _managementRow(
                   title: Text(_memberLabel(member['user_id'] as String? ?? '')),
                   subtitle: Text(member['role'] == 'owner' ? '房主' : '成员'),
-                  trailing: room.isOwner && member['role'] != 'owner'
+                  actionBesideSubtitle: true,
+                  action: room.isOwner && member['role'] != 'owner'
                       ? PopupMenuButton<bool>(
+                          tooltip:
+                              '管理成员 ${_memberLabel(member['user_id'] as String? ?? '')}',
                           enabled: !_serverActionsBusy,
                           onSelected: (ban) => _removeMember(
                             room,
@@ -2119,7 +2220,7 @@ class _RoomsPageState extends State<RoomsPage> {
                         )
                       : null,
                 ),
-              ),
+            ]),
           ],
         ),
         if (room.isOwner)
@@ -2146,7 +2247,6 @@ class _RoomsPageState extends State<RoomsPage> {
                           }),
                   ),
                 SwitchListTile.adaptive(
-                  contentPadding: EdgeInsets.zero,
                   title: const Text('锁定新成员加入'),
                   subtitle: const Text('锁定后密码和邀请都无法添加新成员'),
                   value: room.locked,
@@ -2190,10 +2290,10 @@ class _RoomsPageState extends State<RoomsPage> {
             title: const Text('邀请管理'),
             children: [
               if (_invitesError != null)
-                ListTile(
+                _managementRow(
                   title: const Text('邀请信息更新失败'),
                   subtitle: Text(_invitesError!),
-                  trailing: TextButton(
+                  action: TextButton(
                     onPressed: _serverActionsBusy || _refreshing
                         ? null
                         : () => _refresh(),
@@ -2205,47 +2305,58 @@ class _RoomsPageState extends State<RoomsPage> {
                   padding: EdgeInsets.symmetric(vertical: 12),
                   child: Text('尚未生成邀请；已生成链接的凭证不会再次返回。'),
                 ),
-              for (final invite in _invites)
-                _surfaceCard(
-                  child: ListTile(
-                    title: Text(
-                      '已使用 ${invite['uses']} / ${invite['max_uses']} 次',
+              if (_invites.isNotEmpty)
+                _managementList([
+                  for (final invite in _invites)
+                    _managementRow(
+                      title: Text(
+                        '已使用 ${invite['uses']} / ${invite['max_uses']} 次',
+                      ),
+                      subtitle: Text(
+                        '有效期至 ${DateTime.fromMillisecondsSinceEpoch((invite['expires_at'] as num).toInt() * 1000).toLocal()}${invite['revoked'] == true ? ' · 已撤销' : ''}',
+                      ),
+                      action: IconButton(
+                        tooltip: '撤销邀请',
+                        icon: const Icon(Icons.link_off_rounded),
+                        onPressed:
+                            _serverActionsBusy || invite['revoked'] == true
+                            ? null
+                            : () async {
+                                if (await _confirm(
+                                      '撤销邀请',
+                                      '链接将不能再用于加入，已加入成员不受影响。',
+                                    ) &&
+                                    mounted) {
+                                  await _run((isCurrent) async {
+                                    await _api.request('DELETE', [
+                                      room.id,
+                                      'invites',
+                                      invite['id'] as String,
+                                    ]);
+                                  });
+                                }
+                              },
+                      ),
                     ),
-                    subtitle: Text(
-                      '有效期至 ${DateTime.fromMillisecondsSinceEpoch((invite['expires_at'] as num).toInt() * 1000).toLocal()}${invite['revoked'] == true ? ' · 已撤销' : ''}',
-                    ),
-                    trailing: IconButton(
-                      tooltip: '撤销邀请',
-                      icon: const Icon(Icons.link_off_rounded),
-                      onPressed: _serverActionsBusy || invite['revoked'] == true
-                          ? null
-                          : () async {
-                              if (await _confirm(
-                                    '撤销邀请',
-                                    '链接将不能再用于加入，已加入成员不受影响。',
-                                  ) &&
-                                  mounted) {
-                                await _run((isCurrent) async {
-                                  await _api.request('DELETE', [
-                                    room.id,
-                                    'invites',
-                                    invite['id'] as String,
-                                  ]);
-                                });
-                              }
-                            },
+                ]),
+              if (roster.bannedUserIds.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                    child: Text(
+                      '封禁账号',
+                      style: Theme.of(context).textTheme.titleMedium,
                     ),
                   ),
                 ),
-              if (roster.bannedUserIds.isNotEmpty) ...[
-                const SizedBox(height: 16),
-                Text('封禁账号', style: Theme.of(context).textTheme.titleMedium),
-                for (final user in roster.bannedUserIds)
-                  _surfaceCard(
-                    child: ListTile(
+                _managementList([
+                  for (final user in roster.bannedUserIds)
+                    _managementRow(
                       title: const Text('已封禁账号'),
                       subtitle: SelectableText(user),
-                      trailing: Tooltip(
+                      action: Tooltip(
                         message: '解除账号 $user 的封禁',
                         child: TextButton(
                           onPressed: _serverActionsBusy
@@ -2269,7 +2380,7 @@ class _RoomsPageState extends State<RoomsPage> {
                         ),
                       ),
                     ),
-                  ),
+                ]),
               ],
             ],
           ),

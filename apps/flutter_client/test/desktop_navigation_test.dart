@@ -172,6 +172,27 @@ void main() {
       final ordinaryHeight = tester.getSize(footer).height;
       await tester.pumpWidget(_host(sidebar(), textScale: 2));
       await tester.pumpAndSettle();
+      for (final label in [
+        strings.home,
+        strings.devices,
+        strings.sectionLabel('interconnect'),
+        strings.settings,
+      ]) {
+        final text = find.text(label);
+        await tester.scrollUntilVisible(
+          text,
+          80,
+          scrollable: find
+              .descendant(
+                of: find.byType(DesktopSidebar),
+                matching: find.byType(Scrollable),
+              )
+              .first,
+        );
+        final paragraph = tester.renderObject<RenderParagraph>(text);
+        expect(paragraph.didExceedMaxLines, isFalse, reason: label);
+        expect(tester.getRect(text).right, lessThanOrEqualTo(196));
+      }
       final footerRect = tester.getRect(footer);
       expect(tester.getSize(find.byType(DesktopSidebar)).width, 196);
       expect(footerRect.height, greaterThan(ordinaryHeight));

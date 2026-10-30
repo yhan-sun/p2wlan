@@ -604,7 +604,7 @@ void main() {
       const second = 'account-shared-prefix-00000000-bbbbbbbb';
       final api = await pump(
         tester,
-        textScale: 1.5,
+        textScale: 2,
         configureApi: (api) => api.bannedUserIds.addAll([first, second]),
       );
       await tester.ensureVisible(find.text('邀请管理'));
@@ -614,6 +614,11 @@ void main() {
       expect(find.text(first), findsOneWidget);
       expect(find.text(second), findsOneWidget);
       final action = find.byTooltip('解除账号 $second 的封禁');
+      expect(tester.getSize(find.text(second)).width, greaterThan(260));
+      expect(
+        tester.getTopLeft(action).dy,
+        greaterThan(tester.getBottomLeft(find.text(second)).dy),
+      );
       await tester.ensureVisible(action);
       await tester.pumpAndSettle();
       await tester.tap(action);
@@ -745,7 +750,8 @@ void main() {
     await pump(tester, snapshot: _snapshot(capturedMismatch: true));
     expect(find.text('18 ms'), findsNothing);
     expect(find.text('直连'), findsNothing);
-    expect(find.text('状态待更新'), findsNWidgets(4));
+    expect(find.text('状态待更新'), findsNWidgets(3));
+    expect(find.text('链路 / 数据'), findsOneWidget);
     await tester.ensureVisible(
       find.byKey(const ValueKey('room-device-device-1')),
     );
@@ -868,6 +874,39 @@ void main() {
       await tester.pumpWidget(const SizedBox.shrink());
     },
   );
+
+  testWidgets('two room cards share the available desktop width', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    const secondId = 'room-1123456789abcdef0123456789abcdef';
+    await pump(
+      tester,
+      enterRoom: false,
+      configureApi: (api) =>
+          api.pendingList = Completer<List<FriendRoom>>()
+            ..complete([
+              for (final id in [_roomId, secondId])
+                FriendRoom.fromJson({
+                  ..._room('member'),
+                  'id': id,
+                  'member_count': 2,
+                  'online_member_count': 1,
+                }),
+            ]),
+    );
+    final first = find.byKey(const ValueKey('room-card-$_roomId'));
+    final second = find.byKey(const ValueKey('room-card-$secondId'));
+    expect(tester.getSize(first).width, greaterThan(580));
+    expect(tester.getSize(first).width, tester.getSize(second).width);
+    expect(tester.getTopLeft(first).dy, tester.getTopLeft(second).dy);
+    expect(tester.getTopRight(second).dx, closeTo(1252, 1));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 
   for (final restoreToken in [false, true]) {
     testWidgets(
@@ -1439,7 +1478,7 @@ void main() {
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
-      await pump(tester, enterRoom: false, textScale: 1.8);
+      await pump(tester, enterRoom: false, textScale: 2);
       expect(tester.takeException(), isNull);
       await tester.ensureVisible(
         find.byKey(const ValueKey('room-card-$_roomId')),
@@ -1830,7 +1869,8 @@ void main() {
   ) async {
     await pump(tester, snapshot: _snapshot(stale: true));
     expect(find.text('18 ms'), findsNothing);
-    expect(find.text('状态待更新'), findsNWidgets(4));
+    expect(find.text('状态待更新'), findsNWidgets(3));
+    expect(find.text('链路 / 数据'), findsOneWidget);
     expect(find.text('直连'), findsNothing);
     expect(find.text('近期已收房间数据'), findsNothing);
     await tester.pumpWidget(const SizedBox.shrink());

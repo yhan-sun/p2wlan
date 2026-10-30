@@ -259,8 +259,15 @@ void _registerNodesTests() {
     // Offline wins: the cover never carries a stale Direct/Relay claim or a
     // fabricated latency.
     expect(find.text('Offline'), findsNWidgets(2));
-    // Each offline row has unknown speed and latency.
-    expect(find.text('—'), findsNWidgets(6));
+    // Offline rows omit traffic and latency placeholders entirely.
+    for (final id in ['offline-errored-001', 'offline-plain-002']) {
+      final row = find.byKey(Key('node-row-$id'));
+      expect(find.descendant(of: row, matching: find.text('—')), findsNothing);
+      expect(
+        find.descendant(of: row, matching: find.textContaining('KB/s')),
+        findsNothing,
+      );
+    }
     expect(find.text('Direct'), findsOneWidget);
     expect(find.text('Relay'), findsOneWidget);
     expect(find.text('10 ms'), findsNothing);

@@ -563,7 +563,7 @@ void main() {
         );
         expect(find.text('Shared laptop'), findsOneWidget);
         expect(find.text('12 ms'), findsNothing);
-        expect(find.text('8 K/S'), findsNothing);
+        expect(find.text('8 KB/s'), findsNothing);
         expect(find.text('Network components'), findsNothing);
         final homePeer = find.byKey(const Key('home-device-row-same-node'));
         expect(
@@ -638,7 +638,7 @@ void main() {
           ),
         );
         expect(tester.takeException(), isNull);
-        final latency = find.text('12 ms');
+        final latency = find.textContaining('12 ms');
         expect(latency, findsOneWidget);
         expect(
           tester.widget<Text>(latency).overflow,

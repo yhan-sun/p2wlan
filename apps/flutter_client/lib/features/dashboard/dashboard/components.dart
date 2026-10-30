@@ -1,5 +1,73 @@
 part of '../dashboard_page.dart';
 
+class _ConnectionDetails extends StatelessWidget {
+  const _ConnectionDetails({required this.snapshot, required this.counts});
+  final DiagnosticsSnapshot snapshot;
+  final _PeerCounts counts;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final colors = P2WlanColors.of(context);
+    final overlayTone = _overlayTone(snapshot);
+    final separator = strings.isZh ? '：' : ': ';
+    final issues = <String>[
+      if (!snapshot.health.controlConnected)
+        '${strings.componentControlServer}$separator${_controlStatusLabel(strings, snapshot)}',
+      if (overlayTone == StatusTone.bad || overlayTone == StatusTone.warn)
+        '${strings.componentOverlayRoute}$separator${_overlayLabel(strings, overlayTone!)}',
+      if (counts.total > 0 && counts.direct + counts.relay < counts.total)
+        '${strings.componentPeerConnectivity}$separator${counts.direct + counts.relay} / ${counts.total}',
+    ];
+    if (issues.isEmpty && snapshot.health.status.toLowerCase() != 'healthy') {
+      issues.add(strings.isZh ? '连接状态需要检查' : 'Connection needs review');
+    }
+    final shape = RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+      side: BorderSide(color: colors.border),
+    );
+    return ExpansionTile(
+      key: const Key('home-connection-details'),
+      tilePadding: const EdgeInsets.symmetric(horizontal: AppTokens.space16),
+      childrenPadding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+      minTileHeight: 64,
+      dense: true,
+      backgroundColor: colors.surface,
+      collapsedBackgroundColor: colors.surface,
+      shape: shape,
+      collapsedShape: shape,
+      initiallyExpanded: snapshot.health.status.toLowerCase() != 'healthy',
+      title: Text(
+        strings.isZh ? '连接详情' : 'Connection details',
+        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+      ),
+      subtitle: Text(
+        issues.isEmpty
+            ? '${strings.componentControlServer} · ${_controlStatusLabel(strings, snapshot)}'
+            : issues.join(strings.isZh ? '；' : '; '),
+        key: const Key('home-connection-details-summary'),
+        style: TextStyle(
+          fontSize: 12,
+          height: 1.4,
+          color: overlayTone == StatusTone.bad
+              ? colors.dangerText
+              : issues.isNotEmpty
+              ? colors.warningText
+              : Theme.of(context).colorScheme.onSurfaceVariant,
+        ),
+      ),
+      children: [_NetworkComponentsSection(snapshot: snapshot, counts: counts)],
+    );
+  }
+}
+
+String _controlStatusLabel(AppStrings strings, DiagnosticsSnapshot snapshot) =>
+    snapshot.health.controlConnected
+    ? strings.componentStatusNormal
+    : snapshot.health.controlApiReachable && !snapshot.health.deviceLeaseHealthy
+    ? strings.componentStatusLeaseLost
+    : strings.componentStatusDisconnected;
+
 /// Plain-language network component status. Only rows that can be judged
 /// reliably from real snapshot data are shown — no fabricated states.
 class _NetworkComponentsSection extends StatelessWidget {
@@ -14,17 +82,10 @@ class _NetworkComponentsSection extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final theme = Theme.of(context);
-
     final rows = <Widget>[
       _ComponentRow(
         label: strings.componentControlServer,
-        value: snapshot.health.controlConnected
-            ? strings.componentStatusNormal
-            : snapshot.health.controlApiReachable &&
-                  !snapshot.health.deviceLeaseHealthy
-            ? strings.componentStatusLeaseLost
-            : strings.componentStatusDisconnected,
+        value: _controlStatusLabel(strings, snapshot),
         tone: snapshot.health.controlConnected
             ? StatusTone.good
             : StatusTone.warn,
@@ -50,16 +111,6 @@ class _NetworkComponentsSection extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Text(
-          strings.networkComponents,
-          style: TextStyle(
-            color: theme.colorScheme.onSurface,
-            fontSize: 15,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 0,
-          ),
-        ),
-        const SizedBox(height: AppTokens.space12),
         for (var index = 0; index < rows.length; index++) ...[
           if (index > 0) const SizedBox(height: AppTokens.space10),
           rows[index],

@@ -1,11 +1,11 @@
 part of '../p15_widget_test.dart';
 
 void _registerDashboardTests() {
-  test('formats peer throughput in K/S, M/S, and G/S', () {
+  test('formats peer throughput in KB/s, MB/s, and GB/s', () {
     expect(formatTransferRate(null), '—');
-    expect(formatTransferRate(1024), '1 K/S');
-    expect(formatTransferRate(1024 * 1024), '1 M/S');
-    expect(formatTransferRate(1024 * 1024 * 1024), '1 G/S');
+    expect(formatTransferRate(1024), '1 KB/s');
+    expect(formatTransferRate(1024 * 1024), '1 MB/s');
+    expect(formatTransferRate(1024 * 1024 * 1024), '1 GB/s');
   });
 
   testWidgets('Home renders stopped state with start action', (tester) async {
@@ -174,8 +174,11 @@ void _registerDashboardTests() {
 
     // Healthy hero: status + Virtual IP first, with no redundant identity
     // sentence or network-id line.
-    expect(find.text('Network status'), findsOneWidget);
-    expect(find.text('Normal'), findsWidgets);
+    expect(find.text('Local network connected'), findsOneWidget);
+    expect(find.text('Network status'), findsNothing);
+    expect(find.text('Normal'), findsNothing);
+    expect(find.text('Connection details'), findsOneWidget);
+    expect(find.text('Control server'), findsNothing);
     expect(find.text('Your device is on the P2WLAN network'), findsNothing);
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.text('Virtual IP address'), findsOneWidget);
@@ -185,7 +188,6 @@ void _registerDashboardTests() {
     expect(_heroCount(tester, 'dashboard-count-online'), '2');
     expect(_heroCount(tester, 'dashboard-count-direct'), '1');
     expect(_heroCount(tester, 'dashboard-count-relay'), '1');
-    expect(_heroCount(tester, 'dashboard-nat-type'), 'Restricted Cone');
 
     // Device preview section is titled "Devices" and contains connected peers.
     expect(find.text('Devices'), findsOneWidget);
@@ -197,6 +199,17 @@ void _registerDashboardTests() {
 
     // Healthy hero: no duplicate inline refresh; status polling is automatic.
     expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
+
+    final requestsBeforeDetails =
+        (stores.statusStore.diagnosticsApi as _FakeDiagnosticsApi)
+            .statusFetchCount;
+    await _expandHomeConnectionDetails(tester);
+    expect(
+      (stores.statusStore.diagnosticsApi as _FakeDiagnosticsApi)
+          .statusFetchCount,
+      requestsBeforeDetails,
+    );
+    expect(_heroCount(tester, 'dashboard-nat-type'), 'Restricted Cone');
 
     // Network components: only rows the fixture can judge. The fixture has no
     // ready_phase, so the Overlay route row is honestly omitted.
@@ -238,6 +251,7 @@ void _registerDashboardTests() {
         ),
       );
 
+      await _expandHomeConnectionDetails(tester);
       expect(_heroCount(tester, 'dashboard-nat-type'), 'Port-Restricted Cone');
       expect(find.text('Endpoint independent'), findsNothing);
     },
@@ -284,6 +298,59 @@ void _registerDashboardTests() {
     );
     expect(find.text('Control server'), findsOneWidget);
   });
+
+  for (final component in ['control', 'route']) {
+    testWidgets(
+      'Home folded details expose a new $component issue without reopening',
+      (tester) async {
+        final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+        final api = _FakeDiagnosticsApi(health: true, snapshot: base);
+        final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+        addTearDown(stores.dispose);
+        await stores.statusStore.refresh();
+        await tester.pumpWidget(
+          _TestApp(
+            child: DashboardPage(
+              settingsStore: stores.settingsStore,
+              statusStore: stores.statusStore,
+            ),
+          ),
+        );
+        await _expandHomeConnectionDetails(tester);
+        await tester.tap(find.text('Connection details'));
+        await tester.pumpAndSettle();
+        expect(find.text('Control server'), findsNothing);
+        final raw = jsonDecode(jsonEncode(base.raw)) as Map<String, dynamic>;
+        final health = raw['health'] as Map<String, dynamic>;
+        health['status'] = 'degraded';
+        if (component == 'control') {
+          health['control_connected'] = false;
+          health['control_api_reachable'] = false;
+        } else {
+          raw['ready_phase'] = 'error';
+        }
+        api.snapshot = DiagnosticsSnapshot.fromJson(raw);
+        await stores.statusStore.refresh();
+        await tester.pumpAndSettle();
+        final summary = tester.widget<Text>(
+          find.byKey(const Key('home-connection-details-summary')),
+        );
+        expect(
+          summary.data,
+          contains(
+            component == 'control'
+                ? 'Control server: Disconnected'
+                : 'Overlay route: Error',
+          ),
+        );
+        expect(summary.data, isNot(contains('Normal')));
+        // Updating the summary does not override the user's closed disclosure.
+        expect(find.text('Control server'), findsNothing);
+        expect(find.text('Overlay route'), findsNothing);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 
   testWidgets('Home never counts an offline peer with a stale active path', (
     tester,
@@ -482,13 +549,7 @@ void _registerDashboardTests() {
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.text('Data may be out of date'), findsOneWidget);
     expect(find.byKey(const Key('home-stale-refresh')), findsNothing);
-    expect(
-      find.descendant(
-        of: find.byType(StatusBadge),
-        matching: find.text('Stale'),
-      ),
-      findsOneWidget,
-    );
+    expect(find.text('Last known connection'), findsOneWidget);
     expect(find.byKey(const Key('dashboard-count-available')), findsNothing);
     expect(find.text('Network components'), findsNothing);
     // Staleness is not an issue banner.
@@ -726,9 +787,9 @@ void _registerDashboardTests() {
         .toList();
     final speedIndex = labels.indexWhere(
       (label) =>
-          label.contains('K/S') ||
-          label.contains('M/S') ||
-          label.contains('G/S'),
+          label.contains('KB/s') ||
+          label.contains('MB/s') ||
+          label.contains('GB/s'),
     );
     final latencyIndex = labels.indexOf('12 ms');
     final pathIndex = labels.indexOf('Direct');
@@ -820,6 +881,7 @@ void _registerDashboardTests() {
       find.text('Invite another device to the same room to see it here.'),
       findsOneWidget,
     );
+    await _expandHomeConnectionDetails(tester);
     expect(find.text('0 / 0'), findsOneWidget);
     expect(_heroCount(tester, 'dashboard-count-online'), '0');
   });
@@ -1128,9 +1190,10 @@ void _registerDashboardTests() {
       expect(tester.takeException(), isNull, reason: 'size $size');
       expect(find.text('10.20.0.10'), findsOneWidget, reason: 'size $size');
       expect(find.text('direct-laptop'), findsOneWidget, reason: 'size $size');
+      await _expandHomeConnectionDetails(tester);
       expect(find.text('Control server'), findsOneWidget, reason: 'size $size');
       expect(
-        find.text('Network components'),
+        find.text('Connection details'),
         findsOneWidget,
         reason: 'size $size',
       );
@@ -1138,6 +1201,79 @@ void _registerDashboardTests() {
     tester.view.resetPhysicalSize();
     tester.view.resetDevicePixelRatio();
   });
+
+  for (final width in [390.0, 800.0]) {
+    testWidgets(
+      'Home preview keeps long identities readable at $width and 200% text',
+      (tester) async {
+        tester.view.physicalSize = Size(width, 1100);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+        final raw = jsonDecode(jsonEncode(base.raw)) as Map<String, dynamic>;
+        final first =
+            (raw['peers'] as List<dynamic>).first as Map<String, dynamic>;
+        first['device_name'] = 'Engineering workstation';
+        final snapshot = DiagnosticsSnapshot.fromJson(raw);
+        final stores = (await tester.runAsync(
+          () => _makeStores(
+            api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+          ),
+        ))!;
+        addTearDown(stores.dispose);
+        await stores.statusStore.refresh();
+        PeerSnapshot? opened;
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.lightTheme,
+            home: AppStringsScope(
+              strings: AppStrings.fromCode('en'),
+              child: MediaQuery(
+                data: MediaQueryData(
+                  size: Size(width, 1100),
+                  textScaler: const TextScaler.linear(2),
+                ),
+                child: Scaffold(
+                  body: Row(
+                    children: [
+                      if (width >= 800) const SizedBox(width: 197),
+                      Expanded(
+                        child: DashboardPage(
+                          settingsStore: stores.settingsStore,
+                          statusStore: stores.statusStore,
+                          onOpenPeer: (peer) => opened = peer,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        expect(tester.takeException(), isNull);
+        final row = find.byKey(
+          Key('home-device-row-${snapshot.peers.first.nodeId}'),
+        );
+        await tester.ensureVisible(row);
+        await tester.pump();
+        final name = find.descendant(
+          of: row,
+          matching: find.text('Engineering workstation'),
+        );
+        expect(tester.widget<Text>(name).maxLines, isNull);
+        expect(
+          find.descendant(of: row, matching: find.text('10.20.0.11')),
+          findsOneWidget,
+        );
+        await tester.tap(row);
+        expect(opened?.nodeId, snapshot.peers.first.nodeId);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 
   testWidgets('Home dark theme renders the full healthy page', (tester) async {
     tester.view.physicalSize = const Size(1280, 900);
@@ -1167,8 +1303,9 @@ void _registerDashboardTests() {
 
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.text('direct-laptop'), findsOneWidget);
+    await _expandHomeConnectionDetails(tester);
     expect(find.text('Control server'), findsOneWidget);
-    expect(find.text('Network components'), findsOneWidget);
+    expect(find.text('Connection details'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 }
@@ -1438,4 +1575,13 @@ class _ControllableOfflineDiagnosticsApi extends _FakeDiagnosticsApi {
     _nextHealth = null;
     return pending.future;
   }
+}
+
+Future<void> _expandHomeConnectionDetails(WidgetTester tester) async {
+  if (find.text('Control server').evaluate().isNotEmpty) return;
+  final heading = find.text('Connection details');
+  await tester.ensureVisible(heading);
+  await tester.pumpAndSettle();
+  await tester.tap(heading);
+  await tester.pumpAndSettle();
 }

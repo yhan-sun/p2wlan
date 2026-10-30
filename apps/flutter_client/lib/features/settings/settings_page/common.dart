@@ -46,12 +46,12 @@ class _PreferenceRow extends StatelessWidget {
                 ),
               ),
               if (subtitle != null && subtitle!.isNotEmpty) ...[
-                const SizedBox(height: 2),
+                const SizedBox(height: 4),
                 Text(
                   subtitle!,
                   style: TextStyle(
                     fontSize: 12,
-                    height: 1.3,
+                    height: 1.45,
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
                 ),
@@ -103,10 +103,7 @@ class _PreferenceRow extends StatelessWidget {
         ),
         child: Container(
           constraints: const BoxConstraints(minHeight: 60),
-          padding: const EdgeInsets.symmetric(
-            horizontal: AppTokens.space8,
-            vertical: AppTokens.space12,
-          ),
+          padding: const EdgeInsets.symmetric(vertical: AppTokens.space12),
           child: LayoutBuilder(
             builder: (context, constraints) {
               final largeText = MediaQuery.textScalerOf(context).scale(14) > 18;
@@ -261,14 +258,16 @@ class _SettingsGroup extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(bottom: 16),
       child: _SettingsSurface(
-        padding: const EdgeInsets.all(20),
+        padding: EdgeInsets.all(
+          MediaQuery.sizeOf(context).width < 480 ? 16 : 20,
+        ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Text(
               title,
               style: TextStyle(
-                fontSize: 14,
+                fontSize: 15,
                 height: 1.3,
                 fontWeight: FontWeight.w600,
                 color: theme.colorScheme.onSurface,
@@ -285,7 +284,7 @@ class _SettingsGroup extends StatelessWidget {
                 ),
               ),
             ],
-            const SizedBox(height: 18),
+            const SizedBox(height: 16),
             ...children,
           ],
         ),
@@ -368,6 +367,7 @@ class _SettingsField extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Align(
       alignment: Alignment.centerLeft,
       child: ConstrainedBox(
@@ -387,9 +387,22 @@ class _SettingsField extends StatelessWidget {
           onTapOutside: (_) => FocusManager.instance.primaryFocus?.unfocus(),
           decoration: InputDecoration(
             labelText: label,
+            floatingLabelBehavior: FloatingLabelBehavior.always,
+            floatingLabelStyle: const TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w600,
+            ),
             hintText: hintText,
-            helperText: helper,
-            helperMaxLines: 3,
+            helper: helper == null
+                ? null
+                : Text(
+                    helper!,
+                    style: TextStyle(
+                      fontSize: 12,
+                      height: 1.45,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
             errorText: errorText,
             errorMaxLines: 3,
           ),
@@ -470,21 +483,29 @@ class _SaveBar extends StatelessWidget {
               busy ? (strings.isZh ? '保存中…' : 'Saving…') : strings.saveChanges,
             ),
           );
-          final actions = Wrap(
-            alignment: WrapAlignment.end,
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              TextButton(
-                key: const Key('settings-undo-button'),
-                onPressed: busy ? null : onUndo,
-                child: Text(strings.settingsUndo),
-              ),
-              save,
-            ],
+          final undo = TextButton(
+            key: const Key('settings-undo-button'),
+            onPressed: busy ? null : onUndo,
+            child: Text(strings.settingsUndo),
           );
-          if (constraints.maxWidth < 620 ||
-              MediaQuery.textScalerOf(context).scale(14) > 18) {
+          final largeText = MediaQuery.textScalerOf(context).scale(14) > 18;
+          if (constraints.maxWidth < 400 || largeText) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                label,
+                const SizedBox(height: 12),
+                save,
+                const SizedBox(height: 4),
+                Align(alignment: Alignment.centerRight, child: undo),
+              ],
+            );
+          }
+          final actions = Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [undo, const SizedBox(width: 8), save],
+          );
+          if (constraints.maxWidth < 620) {
             return Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [

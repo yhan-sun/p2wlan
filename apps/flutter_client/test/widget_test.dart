@@ -4,6 +4,9 @@ import 'package:flutter/foundation.dart'
     show debugDefaultTargetPlatformOverride;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
+import 'package:p2wlan_flutter_client/core/build_info.dart';
+import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
@@ -530,7 +533,7 @@ void main() {
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
-    await _pumpTestApp(tester);
+    final daemon = await _pumpTestApp(tester);
     await tester.tap(find.text('房间').last);
     await tester.pumpAndSettle();
     final rooms = tester.widget<RoomsPage>(find.byType(RoomsPage));
@@ -552,11 +555,12 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byType(RoomsPage), findsOneWidget);
     expect(tester.state(find.byType(RoomsPage)), isNot(same(oldState)));
+    expect(daemon.stopCalls, 1);
     expect(tester.takeException(), isNull);
   });
 }
 
-Future<void> _pumpTestApp(WidgetTester tester) async {
+Future<_FakeDaemonController> _pumpTestApp(WidgetTester tester) async {
   final tempDir = await tester.runAsync(
     () => Directory.systemTemp.createTemp('p2wlan_app_widget_test_'),
   );
@@ -581,14 +585,86 @@ Future<void> _pumpTestApp(WidgetTester tester) async {
       tempDir.deleteSync(recursive: true);
     }
   });
+  final diagnostics = _OfflineDiagnosticsApi();
+  final daemon = _FakeDaemonController();
   await tester.pumpWidget(
     P2WlanApp(
       initialRefresh: false,
       autoStartPolling: false,
+      autoCheckForUpdates: false,
       settingsStore: settingsStore,
+      diagnosticsApi: diagnostics,
+      daemonController: daemon,
     ),
   );
   await _waitForBootstrap(tester);
+  return daemon;
+}
+
+// Shell tests can run beside a connected desktop app. Disabling startup
+// refresh does not prevent account changes from stopping a daemon, so both
+// boundaries must stay fake even when the test enters runAsync.
+class _FakeDaemonController implements DaemonController {
+  var stopCalls = 0;
+
+  @override
+  Future<DaemonCommandResult> stop(String diagnosticsUrl) async {
+    stopCalls += 1;
+    return const DaemonCommandResult(
+      ok: true,
+      message: 'fake stop',
+      graceful: true,
+    );
+  }
+
+  @override
+  Future<AndroidVpnStatus?> androidStatus() async => null;
+
+  @override
+  Future<Map<String, String>?> roomDeviceIdentity(AppSettings settings) async =>
+      null;
+
+  @override
+  ClientBuildInfo get clientBuildInfo => ClientBuildInfo.current;
+
+  @override
+  DaemonBuildInfo? get lastDaemonBuildInfo => null;
+
+  @override
+  String get clientLogPath => '/fake-logs/client.log';
+
+  @override
+  String get daemonLogPath => '/fake-logs/daemon.log';
+
+  // Unlike extending DaemonController, an unexpected method cannot fall
+  // through to process discovery, credential files or native channels.
+  @override
+  dynamic noSuchMethod(Invocation invocation) => throw UnsupportedError(
+    'Unexpected shell daemon call: ${invocation.memberName}',
+  );
+}
+
+class _OfflineDiagnosticsApi implements DiagnosticsApi {
+  @override
+  void cancelSpeedTest() {}
+
+  @override
+  DiagnosticsApiException? healthFailureFor(String diagnosticsUrl) => null;
+
+  @override
+  Future<bool> fetchHealth(String diagnosticsUrl) async => false;
+
+  @override
+  Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async =>
+      throw const DiagnosticsApiException('offline shell fixture');
+
+  @override
+  void close() {}
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => throw UnsupportedError(
+    'Unexpected shell diagnostics call: ${invocation.memberName}',
+  );
 }
 
 Future<void> _waitForBootstrap(WidgetTester tester) async {

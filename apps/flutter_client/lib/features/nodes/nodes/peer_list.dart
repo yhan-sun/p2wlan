@@ -97,8 +97,8 @@ class _PeerListRow extends StatelessWidget {
 /// First level: status, name/IP, speed, latency, connection path, and a quiet
 /// affordance for opening details. The identity uses two short lines so the
 /// device name keeps its full width instead of competing with the IP address.
-/// The three metrics stay on one line; technical metadata still stays behind
-/// the detail surface.
+/// Available live metrics align with the list header. Offline and stale rows
+/// keep their connection state without presenting historical traffic as live.
 class _RowContent extends StatelessWidget {
   const _RowContent({
     required this.peer,
@@ -142,25 +142,29 @@ class _RowContent extends StatelessWidget {
         ),
         const SizedBox(width: AppTokens.space10),
         SizedBox(
-          width: compact ? 184 : 202,
+          width: 202,
           child: Row(
             mainAxisAlignment: MainAxisAlignment.end,
             children: [
               _PeerMetricText(
-                value: formatTransferRate(speedBytesPerSecond),
-                width: 58,
+                value: current && peer.online && speedBytesPerSecond != null
+                    ? formatTransferRate(speedBytesPerSecond)
+                    : '',
+                width: 72,
                 color: theme.colorScheme.onSurfaceVariant,
               ),
               const SizedBox(width: 8),
               _PeerMetricText(
-                value: formatLatency(current ? peer.latencyMs : null),
-                width: 50,
+                value: current && peer.online && peer.latencyMs != null
+                    ? formatLatency(peer.latencyMs)
+                    : '',
+                width: 48,
                 color: theme.colorScheme.onSurfaceVariant,
               ),
               const SizedBox(width: 8),
               _PeerMetricText(
                 value: current ? _rowPathLabel(strings, peer) : strings.stale,
-                width: 58,
+                width: 60,
                 color: current
                     ? _rowStatusColor(context, peer)
                     : P2WlanColors.of(context).offline,
@@ -179,10 +183,7 @@ class _RowContent extends StatelessWidget {
   }
 }
 
-/// Phone layout for a peer row. Keep the complete interaction in one compact
-/// row: a two-line identity on the left, transfer rate, RTT, path, and the
-/// detail affordance on the right. The identity grows vertically rather than
-/// squeezing the device name and IP into a single line.
+/// Phone rows give identity the full width, with labeled live metrics below.
 class _CompactRowContent extends StatelessWidget {
   const _CompactRowContent({
     required this.peer,
@@ -218,6 +219,7 @@ class _CompactRowContent extends StatelessWidget {
                 peer: peer,
                 strings: strings,
                 scopeLabel: scopeLabel,
+                compact: true,
               ),
             ),
             const SizedBox(width: AppTokens.space4),
@@ -243,20 +245,22 @@ class _CompactRowContent extends StatelessWidget {
                   color: statusColor,
                 ),
               ),
-              Text(
-                formatLatency(current ? peer.latencyMs : null),
-                style: TextStyle(
-                  fontSize: 12,
-                  color: theme.colorScheme.onSurfaceVariant,
+              if (current && peer.online && peer.latencyMs != null)
+                Text(
+                  'RTT ${formatLatency(peer.latencyMs)}',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
                 ),
-              ),
-              Text(
-                formatTransferRate(speedBytesPerSecond),
-                style: TextStyle(
-                  fontSize: 12,
-                  color: theme.colorScheme.onSurfaceVariant,
+              if (current && peer.online && speedBytesPerSecond != null)
+                Text(
+                  formatTransferRate(speedBytesPerSecond),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
                 ),
-              ),
             ],
           ),
         ),
@@ -363,9 +367,11 @@ class _PeerPrimaryText extends StatelessWidget {
     required this.peer,
     required this.strings,
     this.scopeLabel,
+    this.compact = false,
   });
 
   final String? scopeLabel;
+  final bool compact;
 
   final PeerSnapshot peer;
   final AppStrings strings;
@@ -383,7 +389,7 @@ class _PeerPrimaryText extends StatelessWidget {
             Flexible(
               child: Text(
                 dash(peer.displayName),
-                maxLines: 1,
+                maxLines: compact ? 2 : 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
                   fontSize: 14,
@@ -407,17 +413,23 @@ class _PeerPrimaryText extends StatelessWidget {
         ),
         const SizedBox(height: 2),
         Text(
-          [dash(peer.virtualIp), ?scopeLabel].join(' · '),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
+          dash(peer.virtualIp),
           style: TextStyle(
             fontSize: 12,
-            fontWeight: FontWeight.w600,
+            fontWeight: FontWeight.w400,
             color: theme.colorScheme.onSurfaceVariant,
             fontFeatures: AppTokens.tabularFontFeatures,
-            height: 1.15,
+            height: 1.3,
           ),
         ),
+        if (scopeLabel != null)
+          Text(
+            scopeLabel!,
+            style: TextStyle(
+              fontSize: 12,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
       ],
     );
   }

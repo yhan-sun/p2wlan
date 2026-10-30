@@ -86,12 +86,18 @@ class _SidebarBrandHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return SizedBox(
+    return ConstrainedBox(
       key: const Key('desktop-sidebar-brand'),
-      height: 68,
+      constraints: const BoxConstraints(minHeight: 68),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: AppTokens.space20),
-        child: Row(
+        padding: const EdgeInsets.symmetric(
+          horizontal: AppTokens.space20,
+          vertical: 16,
+        ),
+        child: Wrap(
+          spacing: AppTokens.space10,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             Container(
               width: 32,
@@ -106,18 +112,13 @@ class _SidebarBrandHeader extends StatelessWidget {
                 color: theme.colorScheme.onPrimary,
               ),
             ),
-            const SizedBox(width: AppTokens.space10),
-            Flexible(
-              child: Text(
-                strings.appName,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 0,
-                  color: theme.colorScheme.onSurface,
-                ),
+            Text(
+              strings.appName,
+              style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0,
+                color: theme.colorScheme.onSurface,
               ),
             ),
           ],
@@ -172,41 +173,45 @@ class _SidebarItem extends StatelessWidget {
                   borderRadius: BorderRadius.circular(AppTokens.radiusMd),
                   hoverColor: selected ? null : colors.hoverSurface,
                   child: ExcludeSemantics(
-                    child: SizedBox(
-                      height: 44,
-                      child: Row(
-                        children: [
-                          const SizedBox(width: AppTokens.space8),
-                          AnimatedContainer(
-                            duration: AppTokens.durationMedium,
-                            width: 2,
-                            height: selected ? 18 : 0,
-                            decoration: BoxDecoration(
-                              color: selected
-                                  ? theme.colorScheme.primary
-                                  : Colors.transparent,
-                              borderRadius: BorderRadius.circular(2),
-                            ),
-                          ),
-                          const SizedBox(width: AppTokens.space8),
-                          Icon(icon, size: 20, color: foreground),
-                          const SizedBox(width: AppTokens.space10),
-                          Expanded(
-                            child: Text(
-                              label,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 14,
-                                fontWeight: selected
-                                    ? FontWeight.w600
-                                    : FontWeight.w500,
-                                color: foreground,
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(minHeight: 44),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 10),
+                        child: Row(
+                          children: [
+                            const SizedBox(width: AppTokens.space8),
+                            AnimatedContainer(
+                              duration: AppTokens.durationMedium,
+                              width: 2,
+                              height: selected ? 18 : 0,
+                              decoration: BoxDecoration(
+                                color: selected
+                                    ? theme.colorScheme.primary
+                                    : Colors.transparent,
+                                borderRadius: BorderRadius.circular(2),
                               ),
                             ),
-                          ),
-                          const SizedBox(width: AppTokens.space8),
-                        ],
+                            const SizedBox(width: AppTokens.space8),
+                            if (MediaQuery.textScalerOf(context).scale(14) <=
+                                18) ...[
+                              Icon(icon, size: 20, color: foreground),
+                              const SizedBox(width: AppTokens.space10),
+                            ],
+                            Expanded(
+                              child: Text(
+                                label,
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: selected
+                                      ? FontWeight.w600
+                                      : FontWeight.w500,
+                                  color: foreground,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: AppTokens.space8),
+                          ],
+                        ),
                       ),
                     ),
                   ),
@@ -316,11 +321,14 @@ class _SidebarFooter extends StatelessWidget {
                                     ],
                                   ),
                                 ),
-                                Icon(
-                                  Icons.chevron_right_rounded,
-                                  size: 16,
-                                  color: theme.colorScheme.onSurfaceVariant,
-                                ),
+                                if (MediaQuery.textScalerOf(context)
+                                        .scale(13) <=
+                                    18)
+                                  Icon(
+                                    Icons.chevron_right_rounded,
+                                    size: 16,
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
                               ],
                             ),
                           ),

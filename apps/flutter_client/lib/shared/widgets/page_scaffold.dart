@@ -28,7 +28,7 @@ class PageScaffold extends StatelessWidget {
         builder: (context, constraints) {
           final isNarrow = constraints.maxWidth < 480;
           final horizontalPadding = isNarrow
-              ? AppTokens.space20
+              ? AppTokens.space16
               : AppTokens.space28;
           final verticalPadding = isNarrow
               ? AppTokens.space20
@@ -60,6 +60,7 @@ class PageScaffold extends StatelessWidget {
                                 textAlign: TextAlign.left,
                                 style: TextStyle(
                                   fontSize: isNarrow ? 22 : 24,
+                                  height: 1.25,
                                   fontWeight: FontWeight.w700,
                                   color: Theme.of(context)
                                       .colorScheme
@@ -73,8 +74,8 @@ class PageScaffold extends StatelessWidget {
                                   trimmedSubtitle,
                                   textAlign: TextAlign.left,
                                   style: TextStyle(
-                                    fontSize: 13,
-                                    height: 1.5,
+                                    fontSize: 14,
+                                    height: 1.45,
                                     fontWeight: FontWeight.w400,
                                     color: Theme.of(context)
                                         .colorScheme
@@ -85,7 +86,7 @@ class PageScaffold extends StatelessWidget {
                             ],
                           ),
                         ),
-                        const SizedBox(height: AppTokens.space24),
+                        const SizedBox(height: AppTokens.space20),
                       ],
                       ...children,
                     ],

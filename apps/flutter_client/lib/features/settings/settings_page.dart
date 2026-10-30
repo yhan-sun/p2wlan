@@ -479,9 +479,9 @@ class _SettingsPageState extends State<SettingsPage> {
             : _SettingsLayout.rootDetail;
         return Padding(
           padding: EdgeInsets.fromLTRB(
-            isNarrow ? 20 : 28,
+            isNarrow ? 16 : 28,
             isNarrow ? 20 : 24,
-            isNarrow ? 20 : 28,
+            isNarrow ? 16 : 28,
             20,
           ),
           child: Center(
@@ -501,24 +501,25 @@ class _SettingsPageState extends State<SettingsPage> {
                             strings.settings,
                             style: TextStyle(
                               fontSize: isNarrow ? 22 : 24,
-                              height: 1.2,
+                              height: 1.25,
                               fontWeight: FontWeight.w700,
                               color: theme.colorScheme.onSurface,
                             ),
                           ),
-                          const SizedBox(height: 3),
+                          const SizedBox(height: 6),
                           Text(
                             strings.settingsSubtitle,
                             textAlign: TextAlign.left,
                             style: TextStyle(
-                              fontSize: 13,
+                              fontSize: 14,
+                              height: 1.45,
                               color: theme.colorScheme.onSurfaceVariant,
                             ),
                           ),
                         ],
                       ),
                     ),
-                    const SizedBox(height: AppTokens.space16),
+                    const SizedBox(height: AppTokens.space20),
                   ],
                   Expanded(
                     child: _SettingsShell(

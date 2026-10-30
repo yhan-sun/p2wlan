@@ -220,47 +220,20 @@ class _DashboardPageState extends State<DashboardPage> {
                 !showRoomOverview &&
                 snapshot != null) ...[
               const SizedBox(height: AppTokens.space16),
-              LayoutBuilder(
-                builder: (context, constraints) {
-                  final devices = _DashboardSectionSurface(
-                    child: _OnlineDevicesSection(
-                      peers: overviewPeers,
-                      current: !primaryStale,
-                      peerTransferRates: peerTransferRates,
-                      onOpenDevices: widget.onOpenDevices,
-                      onOpenPeer: widget.onOpenPeer,
-                      onOpenRooms: widget.onOpenRooms,
-                    ),
-                  );
-                  if (primaryStale) return devices;
-                  final components = _DashboardSectionSurface(
-                    child: _NetworkComponentsSection(
-                      snapshot: snapshot,
-                      counts: counts,
-                    ),
-                  );
-
-                  if (constraints.maxWidth < 820) {
-                    return Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        devices,
-                        const SizedBox(height: AppTokens.space16),
-                        components,
-                      ],
-                    );
-                  }
-
-                  return Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Expanded(flex: 5, child: devices),
-                      const SizedBox(width: AppTokens.space16),
-                      SizedBox(width: 340, child: components),
-                    ],
-                  );
-                },
+              _DashboardSectionSurface(
+                child: _OnlineDevicesSection(
+                  peers: overviewPeers,
+                  current: !primaryStale,
+                  peerTransferRates: peerTransferRates,
+                  onOpenDevices: widget.onOpenDevices,
+                  onOpenPeer: widget.onOpenPeer,
+                  onOpenRooms: widget.onOpenRooms,
+                ),
               ),
+              if (!primaryStale) ...[
+                const SizedBox(height: AppTokens.space12),
+                _ConnectionDetails(snapshot: snapshot, counts: counts),
+              ],
             ],
             if (capabilities.canActAsLocalVpnNode &&
                 !showRoomOverview &&

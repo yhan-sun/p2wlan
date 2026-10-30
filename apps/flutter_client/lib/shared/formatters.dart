@@ -37,9 +37,9 @@ String formatTransferRate(int? bytesPerSecond) {
   const mega = kilo * 1024;
   const giga = mega * 1024;
   final (value, unit) = switch (bytesPerSecond.toDouble()) {
-    >= giga => (bytesPerSecond / giga, 'G/S'),
-    >= mega => (bytesPerSecond / mega, 'M/S'),
-    _ => (bytesPerSecond / kilo, 'K/S'),
+    >= giga => (bytesPerSecond / giga, 'GB/s'),
+    >= mega => (bytesPerSecond / mega, 'MB/s'),
+    _ => (bytesPerSecond / kilo, 'KB/s'),
   };
   final text = value == value.roundToDouble()
       ? value.toStringAsFixed(0)

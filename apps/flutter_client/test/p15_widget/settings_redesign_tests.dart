@@ -571,6 +571,72 @@ void _registerSettingsRedesignTests() {
       }
     });
   }
+
+  for (final size in [const Size(320, 740), const Size(390, 844)]) {
+    testWidgets(
+      'Settings large English form keeps help and save actions usable at ${size.width.toInt()}',
+      (tester) async {
+        final stores = (await tester.runAsync(
+          () => _makeStores(
+            api: _FakeDiagnosticsApi(health: false),
+            deviceName: 'Demo workstation',
+          ),
+        ))!;
+        addTearDown(stores.dispose);
+        tester.view.physicalSize = size;
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.darkTheme,
+            builder: (context, child) => MediaQuery(
+              data: MediaQuery.of(context)
+                  .copyWith(textScaler: const TextScaler.linear(2)),
+              child: child!,
+            ),
+            home: Scaffold(
+              body: SettingsPage(
+                settingsStore: stores.settingsStore,
+                statusStore: stores.statusStore,
+                capabilities: PlatformCapabilities.fromPlatform('android'),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await _openCategory(tester, 'General');
+        final helper = find.text(AppStrings.fromCode('en').deviceNameHelper);
+        await tester.ensureVisible(helper);
+        await tester.pumpAndSettle();
+        final richHelper = tester.widget<RichText>(
+          find.descendant(of: helper, matching: find.byType(RichText)),
+        );
+        expect(richHelper.maxLines, isNull);
+        final device = _settingsTextField('Device name');
+        await tester.ensureVisible(device);
+        await tester.enterText(device, 'Updated demo workstation');
+        await tester.pumpAndSettle();
+        final save = find.byKey(const Key('settings-save-button'));
+        final undo = find.byKey(const Key('settings-undo-button'));
+        expect(save.hitTestable(), findsOneWidget);
+        expect(undo.hitTestable(), findsOneWidget);
+        expect(tester.getSize(save).width, greaterThan(size.width - 90));
+        expect(
+          tester.getTopLeft(undo).dy,
+          greaterThan(tester.getBottomLeft(save).dy),
+        );
+        await tester.tap(undo);
+        await tester.pumpAndSettle();
+        expect(save, findsNothing);
+        expect(
+          tester.widget<TextField>(device).controller!.text,
+          'Demo workstation',
+        );
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 }
 
 class _PausedSettingsTokenRepository implements SecureTokenRepository {

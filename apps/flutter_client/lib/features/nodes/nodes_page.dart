@@ -319,6 +319,7 @@ class _NodesPageState extends State<NodesPage> {
                           ),
                       ],
                       _NodesSectionLabel(
+                        showMetrics: visiblePeers.isNotEmpty,
                         title: stringsOf(context).isZh
                             ? '其他设备'
                             : 'Other devices',

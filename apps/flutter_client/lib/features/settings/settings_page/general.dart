@@ -65,7 +65,11 @@ class _GeneralSection extends StatelessWidget {
             const SizedBox(height: 4),
             Text(
               strings.themeModeHelper,
-              style: Theme.of(context).textTheme.bodySmall,
+              style: TextStyle(
+                fontSize: 12,
+                height: 1.45,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 12),
             LayoutBuilder(
@@ -94,6 +98,13 @@ class _GeneralSection extends StatelessWidget {
                   key: const ValueKey('settings-theme-select'),
                   direction: vertical ? Axis.vertical : Axis.horizontal,
                   expandedInsets: vertical ? null : EdgeInsets.zero,
+                  style: ButtonStyle(
+                    shape: WidgetStatePropertyAll(
+                      RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                  ),
                   showSelectedIcon: false,
                   segments: [
                     for (final option in options)

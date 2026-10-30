@@ -94,7 +94,6 @@ class _LocalNodePanel extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _NodesSectionLabel(title: strings.thisDeviceTitle),
         Material(
           type: MaterialType.transparency,
           child: InkWell(
@@ -110,6 +109,13 @@ class _LocalNodePanel extends StatelessWidget {
                   final stacked =
                       constraints.maxWidth < 320 ||
                       MediaQuery.textScalerOf(context).scale(12) > 16;
+                  final localLabel = Text(
+                    strings.thisDeviceTitle,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  );
                   final identity = Expanded(
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
@@ -127,17 +133,22 @@ class _LocalNodePanel extends StatelessWidget {
                           ),
                         ),
                         const SizedBox(height: 2),
-                        Text(
-                          dash(virtualIp),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                            color: theme.colorScheme.onSurfaceVariant,
-                            fontFeatures: AppTokens.tabularFontFeatures,
-                            height: 1.3,
-                          ),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 2,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          children: [
+                            localLabel,
+                            Text(
+                              dash(virtualIp),
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: theme.colorScheme.onSurfaceVariant,
+                                fontFeatures: AppTokens.tabularFontFeatures,
+                                height: 1.3,
+                              ),
+                            ),
+                          ],
                         ),
                       ],
                     ),
@@ -202,21 +213,66 @@ class _NodesDevicePanel extends StatelessWidget {
 }
 
 class _NodesSectionLabel extends StatelessWidget {
-  const _NodesSectionLabel({required this.title});
+  const _NodesSectionLabel({required this.title, this.showMetrics = false});
 
   final String title;
+  final bool showMetrics;
 
   @override
   Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.onSurfaceVariant;
+    final strings = stringsOf(context);
+    final titleWidget = Text(
+      title,
+      style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600),
+    );
     return Padding(
       padding: const EdgeInsets.fromLTRB(14, 12, 14, 4),
-      child: Text(
-        title,
-        style: TextStyle(
-          color: Theme.of(context).colorScheme.onSurfaceVariant,
-          fontSize: 12,
-          fontWeight: FontWeight.w600,
-        ),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final columns =
+              showMetrics &&
+              constraints.maxWidth >= 472 &&
+              MediaQuery.textScalerOf(context).scale(12) <= 16;
+          if (!columns) return titleWidget;
+          return Row(
+            children: [
+              Expanded(child: titleWidget),
+              SizedBox(
+                width: 202,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    Tooltip(
+                      message: strings.transferSpeed,
+                      child: _PeerMetricText(
+                        value: strings.isZh ? '速率' : 'Rate',
+                        width: 72,
+                        color: color,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Tooltip(
+                      message: strings.latency,
+                      child: _PeerMetricText(
+                        value: 'RTT',
+                        width: 48,
+                        color: color,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    _PeerMetricText(
+                      value: strings.isZh ? '连接' : 'Path',
+                      width: 60,
+                      color: color,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 26),
+            ],
+          );
+        },
       ),
     );
   }
