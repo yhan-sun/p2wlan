@@ -32,6 +32,11 @@ export interface P2wlanVpnEngineStatusSnapshotV1 {
   code?: string;
 }
 
+export interface P2wlanVpnStopPredecessorV1 {
+  requestId: string;
+  afterStatusRevision: number;
+}
+
 export class P2wlanVpnEngineStatusSnapshotError extends Error {
   code: string;
 
@@ -303,9 +308,14 @@ export async function waitForAndFinalizeP2wlanVpnEngineStopSnapshot(
   filesDir: string,
   requestId: string,
   settingsRevision: number,
-  timeoutMs: number = 15000
+  timeoutMs: number = 15000,
+  predecessor?: P2wlanVpnStopPredecessorV1
 ): Promise<P2wlanVpnEngineStatusSnapshotV1> {
-  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 60000) {
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 60000 ||
+      (predecessor != undefined && (!validRequestId(predecessor.requestId) ||
+        !Number.isInteger(predecessor.afterStatusRevision) ||
+        predecessor.afterStatusRevision <= 0 ||
+        predecessor.afterStatusRevision > 9007199254740991))) {
     throw new P2wlanVpnEngineStatusSnapshotError(
       'VPN_ENGINE_STATUS_STOP_NOT_CONFIRMED'
     );
@@ -313,23 +323,30 @@ export async function waitForAndFinalizeP2wlanVpnEngineStopSnapshot(
   const deadline = Date.now() + timeoutMs;
   while (true) {
     const current = readP2wlanVpnEngineStatusSnapshotIfPresent(filesDir);
-    if (current == null || current.requestId != requestId ||
-        current.operation != 'stop' || current.settingsRevision != settingsRevision) {
+    if (current == null || current.settingsRevision != settingsRevision) {
       throw new P2wlanVpnEngineStatusSnapshotError(
         'VPN_ENGINE_STATUS_SNAPSHOT_STALE'
       );
     }
-    if (current.status == 'stopped') {
-      return current;
-    }
-    if (current.status == 'stopping' && current.code == 'ENGINE_NATIVE_STOPPED') {
-      return finalizeP2wlanVpnEngineStopSnapshot(
-        filesDir,
-        requestId,
-        settingsRevision
+    if (current.requestId != requestId) {
+      // The system may accept stop before onDestroy publishes the stop session.
+      // Wait only for the exact start session that the caller asked to stop.
+      if (predecessor == undefined || current.requestId != predecessor.requestId ||
+          current.operation != 'start' ||
+          current.revision < predecessor.afterStatusRevision) {
+        throw new P2wlanVpnEngineStatusSnapshotError(
+          'VPN_ENGINE_STATUS_SNAPSHOT_STALE'
+        );
+      }
+    } else if (current.operation != 'stop') {
+      throw new P2wlanVpnEngineStatusSnapshotError(
+        'VPN_ENGINE_STATUS_SNAPSHOT_STALE'
       );
-    }
-    if (current.status == 'draining' || current.status == 'failed') {
+    } else if (current.status == 'stopped') {
+      return current;
+    } else if (current.status == 'stopping' && current.code == 'ENGINE_NATIVE_STOPPED') {
+      return finalizeP2wlanVpnEngineStopSnapshot(filesDir, requestId, settingsRevision);
+    } else if (current.status == 'draining' || current.status == 'failed') {
       throw new P2wlanVpnEngineStatusSnapshotError(
         'VPN_ENGINE_STATUS_STOP_NOT_CONFIRMED'
       );

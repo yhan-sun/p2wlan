@@ -45,6 +45,11 @@ bash scripts/flutter_harmony.sh test --no-pub
 bash scripts/flutter_harmony.sh build hap --debug --no-pub --no-codesign --target-platform ohos-arm64
 ```
 
+停止回执的 host 竞争回归使用 Node.js 和已安装的 TypeScript 模块，在
+`apps/flutter_client/` 中运行 `node --test scripts/tests/harmony_stop_snapshot.test.cjs`。
+若 Node 无法解析 TypeScript，可用 `P2WLAN_TYPESCRIPT_MODULE` 指定其模块文件。
+该测试适配 SDK 文件接口，验证延迟交接、过期会话、超时和 draining；系统 VPN 仍需设备实测。
+
 未签名构建输出为 `build/ohos/hap/entry-default-unsigned.hap`。安装前仍需
 配置适用的调试签名。`local.properties`、SDK 插件生成的 npm 路径文件、
 缓存及 HAP 均为本机构建产物，不进入源码提交。

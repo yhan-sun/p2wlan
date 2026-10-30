@@ -193,7 +193,12 @@ class PlatformMethodCallHandler implements MethodCallHandler {
         void waitForAndFinalizeP2wlanVpnEngineStopSnapshot(
             this.filesDir,
             requestId as string,
-            settingsRevision as number
+            settingsRevision as number,
+            15000,
+            {
+              requestId: expectedStatusRequestId as string,
+              afterStatusRevision: afterStatusRevision as number
+            }
           ).then((snapshot) => {
           hilog.info(0x0000, 'P2WLAN', '[STOP_STAGE] status_finalized revision=%{public}s',
             String(snapshot.revision));
