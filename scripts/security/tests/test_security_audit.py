@@ -206,6 +206,46 @@ jobs:
 
 
 class CredentialScanTests(unittest.TestCase):
+    def test_fixed_asset_recovery_timestamp_storage_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "server/admin/legacy_chunks.go"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                '  const previous=Number(sessionStorage.getItem("p2wlan-admin-asset-recovery")||0);\n'
+                '    sessionStorage.setItem("p2wlan-admin-asset-recovery",String(Date.now()));\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(credential_scan.run(root)["result"], "pass")
+
+    def test_browser_storage_timestamp_exception_rejects_other_values_and_calls(self) -> None:
+        statements = (
+            'sessionStorage.setItem("p2wlan-admin-asset-recovery", token);',
+            'sessionStorage.setItem("p2wlan-admin-asset-recovery", String(now));',
+            'sessionStorage.setItem("p2wlan-admin-asset-recovery", String(Date.now()) + token);',
+            'sessionStorage.setItem("another-key", String(Date.now()));',
+            'sessionStorage.setItem(key, String(Date.now()));',
+            'localStorage.setItem("p2wlan-admin-asset-recovery", String(Date.now()));',
+            'const previous=Number(sessionStorage.getItem("another-key")||0);',
+            'const previous=sessionStorage.getItem("p2wlan-admin-asset-recovery");',
+            'const previous=Number(sessionStorage.getItem("p2wlan-admin-asset-recovery")||token);',
+            'sessionStorage.setItem("p2wlan-admin-asset-recovery",String(Date.now())); sessionStorage.setItem("token", token);',
+            'sessionStorage.setItem(\n"p2wlan-admin-asset-recovery", token);',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "server/admin/legacy_chunks.go"
+            path.parent.mkdir(parents=True)
+            for statement in statements:
+                with self.subTest(statement=statement):
+                    path.write_text(statement, encoding="utf-8")
+                    evidence = credential_scan.run(root)
+                    self.assertEqual(evidence["result"], "fail")
+                    self.assertTrue(any(
+                        item["code"] == "browser_secret_storage"
+                        for item in evidence["findings"]
+                    ))
+
     def test_high_confidence_token_and_xtrace_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

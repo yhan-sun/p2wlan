@@ -34,6 +34,9 @@ pub enum PathTelemetrySendFailure {
 struct LatestPathObservation {
     observation: PathTelemetryObservation,
     retries: u8,
+    // Three requeues still permit the queued final attempt. Exhaustion is
+    // reached only if that attempt also fails, and survives reconnects.
+    retry_exhausted: bool,
 }
 
 fn same_sample(left: &PathTelemetryObservation, right: &PathTelemetryObservation) -> bool {
@@ -136,6 +139,7 @@ impl PathTelemetryHub {
                 LatestPathObservation {
                     observation: obs,
                     retries: 0,
+                    retry_exhausted: false,
                 },
             );
         }
@@ -190,7 +194,11 @@ impl PathTelemetryHub {
         if let Ok(snapshots) = self.latest_snapshots.lock() {
             for peer_id in peer_ids {
                 if let Some(obs) = snapshots.get(&peer_id) {
-                    results.push(obs.observation.clone());
+                    // A ready/resync can queue this ID while its final HTTP
+                    // attempt is in flight. Recheck the sample at dispatch.
+                    if !obs.retry_exhausted {
+                        results.push(obs.observation.clone());
+                    }
                 }
             }
         }
@@ -294,8 +302,14 @@ impl PathTelemetryHub {
                 let Some(latest) = snapshots.get_mut(&observation.remote_device_id) else {
                     continue;
                 };
+                // An older in-flight failure cannot revive an exhausted
+                // replacement sample merely because its identity differs.
+                if latest.retry_exhausted {
+                    continue;
+                }
                 if same_sample(&latest.observation, observation) {
                     if latest.retries == MAX_TELEMETRY_RETRIES {
+                        latest.retry_exhausted = true;
                         exhausted = exhausted.saturating_add(1);
                         continue;
                     }
@@ -333,14 +347,16 @@ impl PathTelemetryHub {
 
     /// Mark all known peers dirty to trigger full resync on reconnect.
     pub fn mark_all_dirty(&self) {
-        if let (Ok(mut snapshots), Ok(mut peers), Ok(mut set)) = (
+        if let (Ok(snapshots), Ok(mut peers), Ok(mut set)) = (
             self.latest_snapshots.lock(),
             self.dirty_peers.lock(),
             self.dirty_set.lock(),
         ) {
-            for (peer_id, latest) in snapshots.iter_mut() {
-                latest.retries = 0;
-                if !set.contains(peer_id) && peers.len() < MAX_DIRTY_PEERS {
+            for (peer_id, latest) in snapshots.iter() {
+                if !latest.retry_exhausted
+                    && !set.contains(peer_id)
+                    && peers.len() < MAX_DIRTY_PEERS
+                {
                     peers.push_back(peer_id.clone());
                     set.insert(peer_id.clone());
                 }
@@ -409,6 +425,7 @@ impl PathTelemetryHub {
                 if let Some(latest) = snapshots.get_mut(&observation.remote_device_id) {
                     if same_sample(&latest.observation, observation) {
                         latest.retries = 0;
+                        latest.retry_exhausted = false;
                     }
                 }
             }

@@ -187,3 +187,95 @@ fn path_telemetry_retry_budget_is_bounded_and_new_samples_remain_deliverable() {
     hub.retry_observations(&batch.payload.observations);
     assert!(hub.has_dirty());
 }
+
+#[test]
+fn path_telemetry_ready_resync_preserves_retry_budget_and_last_queued_retry() {
+    let hub = PathTelemetryHub::new("reporter".into(), "network".into());
+    hub.enqueue("remote", &delivery_snapshot(1, 1));
+    for _ in 0..super::hub::MAX_TELEMETRY_RETRIES {
+        let batch = hub.drain_bounded_frame(32).unwrap();
+        hub.retry_observations(&batch.payload.observations);
+        hub.mark_all_dirty();
+    }
+    // The third requeue is still entitled to its final delivery attempt.
+    let final_attempt = hub.drain_bounded_frame(32).unwrap();
+    hub.retry_observations(&final_attempt.payload.observations);
+    assert_eq!(hub.metrics().retry_exhausted_observations, 1);
+    for _ in 0..4 {
+        hub.mark_all_dirty();
+        assert!(hub.drain_bounded_frame(32).is_none());
+    }
+    assert_eq!(hub.snapshot_all().len(), 1);
+    assert_eq!(hub.metrics().requeued_observations, 3);
+
+    hub.enqueue("remote", &delivery_snapshot(2, 1));
+    hub.mark_all_dirty();
+    let fresh = hub.drain_bounded_frame(32).unwrap();
+    assert_eq!(fresh.payload.observations[0].network_generation, 2);
+    hub.retry_observations(&fresh.payload.observations);
+    assert!(
+        hub.has_dirty(),
+        "a new authoritative sample gets a new budget"
+    );
+}
+
+#[test]
+fn path_telemetry_exhaustion_fences_a_resync_queued_during_delivery() {
+    let hub = PathTelemetryHub::new("reporter".into(), "network".into());
+    hub.enqueue("remote", &delivery_snapshot(1, 1));
+    for _ in 0..super::hub::MAX_TELEMETRY_RETRIES {
+        let batch = hub.drain_bounded_frame(32).unwrap();
+        hub.retry_observations(&batch.payload.observations);
+    }
+    let final_attempt = hub.drain_bounded_frame(32).unwrap();
+    // The HTTP fallback can still be in flight when WebSocket becomes ready.
+    hub.mark_all_dirty();
+    hub.retry_observations(&final_attempt.payload.observations);
+    assert_eq!(hub.metrics().retry_exhausted_observations, 1);
+    assert!(hub.drain_bounded_frame(32).is_none());
+    assert!(!hub.has_dirty());
+}
+
+#[test]
+fn path_telemetry_old_completion_cannot_revive_an_exhausted_new_sample() {
+    let hub = PathTelemetryHub::new("reporter".into(), "network".into());
+    hub.enqueue("remote", &delivery_snapshot(1, 1));
+    let old = hub.drain_bounded_frame(32).unwrap();
+    hub.enqueue("remote", &delivery_snapshot(2, 1));
+    for _ in 0..=super::hub::MAX_TELEMETRY_RETRIES {
+        let batch = hub.drain_bounded_frame(32).unwrap();
+        hub.retry_observations(&batch.payload.observations);
+    }
+    assert!(!hub.has_dirty());
+    hub.retry_observations(&old.payload.observations);
+    assert!(
+        !hub.has_dirty(),
+        "old failure cannot requeue exhausted latest"
+    );
+    hub.record_delivery_success(&old.payload.observations);
+    hub.mark_all_dirty();
+    assert!(hub.drain_bounded_frame(32).is_none());
+    assert_eq!(hub.metrics().retry_exhausted_observations, 1);
+}
+
+#[test]
+fn path_telemetry_matching_success_restores_an_exhausted_sample_budget() {
+    let hub = PathTelemetryHub::new("reporter".into(), "network".into());
+    hub.enqueue("remote", &delivery_snapshot(1, 1));
+    let original = hub.snapshot_all();
+    for _ in 0..=super::hub::MAX_TELEMETRY_RETRIES {
+        let batch = hub.drain_bounded_frame(32).unwrap();
+        hub.retry_observations(&batch.payload.observations);
+    }
+    // A matching in-flight transport may still succeed after another failed.
+    hub.record_delivery_success(&original);
+    hub.mark_all_dirty();
+    for _ in 0..super::hub::MAX_TELEMETRY_RETRIES {
+        let batch = hub.drain_bounded_frame(32).unwrap();
+        hub.retry_observations(&batch.payload.observations);
+    }
+    let final_attempt = hub.drain_bounded_frame(32).unwrap();
+    hub.retry_observations(&final_attempt.payload.observations);
+    assert!(!hub.has_dirty());
+    assert_eq!(hub.metrics().retry_exhausted_observations, 2);
+}

@@ -24,7 +24,7 @@ func TestLegacyChunksReloadTheDocumentWithoutLoadingNewDependencies(t *testing.T
 				}
 				continue
 			}
-			for _, required := range []string{"window.location.reload()", "sessionStorage", "export function " + name} {
+			for _, required := range []string{"window.location.reload()", "p2wlan-admin-asset-recovery", "const previous=Number(", "String(Date.now())", "export function " + name} {
 				if !strings.Contains(body, required) {
 					t.Fatalf("%s bridge missing %s", name, required)
 				}

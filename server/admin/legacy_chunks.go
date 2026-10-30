@@ -27,12 +27,11 @@ func serveLegacyChunkUpgrade(w http.ResponseWriter, r *http.Request, asset strin
 	// Keep the token and route untouched. If storage is blocked, or a reload
 	// was already attempted in the last minute, the old error boundary offers
 	// its existing explicit reload action instead of creating a reload loop.
-	body := fmt.Sprintf(`const key="p2wlan-admin-asset-recovery";
-try {
+	body := fmt.Sprintf(`try {
   const now=Date.now();
-  const previous=Number(sessionStorage.getItem(key)||0);
+  const previous=Number(sessionStorage.getItem("p2wlan-admin-asset-recovery")||0);
   if (navigator.onLine && (!Number.isFinite(previous)||previous<=0||now<previous||now-previous>=60000)) {
-    sessionStorage.setItem(key,String(now));
+    sessionStorage.setItem("p2wlan-admin-asset-recovery",String(Date.now()));
     window.location.reload();
   }
 } catch {}
