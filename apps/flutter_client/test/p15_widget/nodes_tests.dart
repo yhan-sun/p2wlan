@@ -289,7 +289,10 @@ void _registerNodesTests() {
       find.text('no direct probe ACK after 320 background UDP retry probes'),
       findsNothing,
     );
-    await tester.tap(find.byKey(const Key('nodes-issue-details-toggle')));
+    final issueDetails = find.byKey(const Key('nodes-issue-details-toggle'));
+    await tester.ensureVisible(issueDetails);
+    await tester.pumpAndSettle();
+    await tester.tap(issueDetails);
     await tester.pumpAndSettle();
     expect(
       find.text('no direct probe ACK after 320 background UDP retry probes'),
@@ -326,7 +329,10 @@ void _registerNodesTests() {
 
     await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Remove device').last);
+    final removeAction = find.text('Remove device').last;
+    await tester.ensureVisible(removeAction);
+    await tester.pumpAndSettle();
+    await tester.tap(removeAction);
     await tester.pumpAndSettle();
 
     expect(find.byType(AlertDialog), findsOneWidget);
@@ -381,7 +387,10 @@ void _registerNodesTests() {
     expect(find.text('1.0.0'), findsNothing);
     expect(find.text('State'), findsNothing);
 
-    await tester.tap(find.byKey(const Key('nodes-advanced-toggle')));
+    final advanced = find.byKey(const Key('nodes-advanced-toggle'));
+    await tester.ensureVisible(advanced);
+    await tester.pumpAndSettle();
+    await tester.tap(advanced);
     await tester.pumpAndSettle();
     expect(find.text('Node ID'), findsOneWidget);
     expect(find.text('Version'), findsOneWidget);
@@ -1007,7 +1016,10 @@ void _registerNodesTests() {
     expect(detailText('Node ID'), findsNothing);
 
     // Expanding Advanced reveals the technical metadata.
-    await tester.tap(find.byKey(const Key('nodes-advanced-toggle')));
+    final advanced = find.byKey(const Key('nodes-advanced-toggle'));
+    await tester.ensureVisible(advanced);
+    await tester.pumpAndSettle();
+    await tester.tap(advanced);
     await tester.pumpAndSettle();
     expect(detailText('Node ID'), findsOneWidget);
     expect(detailText('Version'), findsOneWidget);

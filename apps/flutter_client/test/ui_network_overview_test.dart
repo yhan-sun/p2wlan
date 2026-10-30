@@ -45,6 +45,7 @@ DiagnosticsSnapshot _snapshot(
   bool stale = false,
   bool capturedMismatch = false,
   bool online = true,
+  Map<String, dynamic>? stats,
 }) => DiagnosticsSnapshot.fromJson({
   'network_id': networkId,
   'node_id': 'local',
@@ -55,6 +56,7 @@ DiagnosticsSnapshot _snapshot(
   'revision': 8,
   'captured_revision': capturedMismatch ? 7 : 8,
   'peer_snapshot_stale': stale,
+  'stats': ?stats,
   'health': {
     'status': 'healthy',
     'control_connected': true,
@@ -95,12 +97,16 @@ class _Store extends StatusStore {
   _Store({required super.settingsStore, required super.parallelRooms})
     : super(diagnosticsApi: DiagnosticsApi(), enableEventPolling: false);
   DiagnosticsSnapshot? primary;
+  Map<String, PeerTransferRate> directionalRates = const {};
   @override
   DiagnosticsSnapshot? get snapshot => primary;
   @override
   bool get healthReachable => primary != null;
   @override
   bool get daemonReachable => primary != null;
+  @override
+  Map<String, PeerTransferRate> get peerDirectionalTransferRates =>
+      directionalRates;
   @override
   Map<String, int> get peerTransferRatesBytesPerSecond => const {
     'same-node': 8192,
@@ -166,6 +172,189 @@ Widget _app(Widget child, {double textScale = 1}) => AppStringsScope(
 );
 
 void main() {
+  String? trafficText(WidgetTester tester, String key) =>
+      tester.widget<Text>(find.byKey(ValueKey(key))).data;
+
+  testWidgets(
+    'home traffic deduplicates a room across owners and limits selected scope',
+    (tester) async {
+      final harness = (await tester.runAsync(_harness))!;
+      addTearDown(harness.dispose);
+      harness.store.primary = _snapshot(
+        _roomOne,
+        1,
+        stats: {'total_bytes_sent': 1024, 'total_bytes_received': 2048},
+      );
+      harness.store.parallelRooms.session(_roomOne)!.snapshot = _snapshot(
+        _roomOne,
+        1,
+        stats: {'total_bytes_sent': 8192, 'total_bytes_received': 16384},
+      );
+      harness.store.parallelRooms.session(_roomTwo)!.snapshot = _snapshot(
+        _roomTwo,
+        2,
+        stats: {'total_bytes_sent': 4096, 'total_bytes_received': 8192},
+      );
+      await tester.pumpWidget(
+        _app(
+          DashboardPage(
+            settingsStore: harness.settings,
+            statusStore: harness.store,
+          ),
+        ),
+      );
+      expect(trafficText(tester, 'home-traffic-current-upload'), '5.0 KB');
+      expect(trafficText(tester, 'home-traffic-current-download'), '10.0 KB');
+      expect(trafficText(tester, 'home-traffic-current-total'), '15.0 KB');
+
+      final details = find.byKey(const Key('home-traffic-details'));
+      await tester.ensureVisible(details);
+      await tester.pumpAndSettle();
+      await tester.tap(details);
+      await tester.pumpAndSettle();
+      expect(trafficText(tester, 'traffic-detail-current-total'), '15.0 KB');
+      expect(trafficText(tester, 'traffic-network-primary-total'), '3.0 KB');
+      expect(
+        find.byKey(const ValueKey('traffic-network-room:$_roomOne-total')),
+        findsNothing,
+      );
+      expect(
+        trafficText(tester, 'traffic-network-room:$_roomTwo-total'),
+        '12.0 KB',
+      );
+      await tester.tap(find.byTooltip('Close'));
+      await tester.pumpAndSettle();
+      final picker = find.byKey(const Key('network-scope-picker'));
+      await tester.ensureVisible(picker);
+      await tester.pumpAndSettle();
+      await tester.tap(picker);
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.widgetWithText(CheckedPopupMenuItem<String>, 'Room 2'),
+      );
+      await tester.pumpAndSettle();
+      expect(trafficText(tester, 'home-traffic-current-upload'), '4.0 KB');
+      expect(trafficText(tester, 'home-traffic-current-download'), '8.0 KB');
+      expect(trafficText(tester, 'home-traffic-current-total'), '12.0 KB');
+      await tester.ensureVisible(details);
+      await tester.pumpAndSettle();
+      await tester.tap(details);
+      await tester.pumpAndSettle();
+      expect(trafficText(tester, 'traffic-detail-current-total'), '12.0 KB');
+      expect(
+        find.byKey(const ValueKey('traffic-network-primary-total')),
+        findsNothing,
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  for (final missing in ['upload', 'download', 'both']) {
+    testWidgets('home traffic leaves missing $missing scope counters unknown', (
+      tester,
+    ) async {
+      final harness = (await tester.runAsync(_harness))!;
+      addTearDown(harness.dispose);
+      harness.store.parallelRooms.session(_roomOne)!.snapshot = _snapshot(
+        _roomOne,
+        1,
+        stats: {'total_bytes_sent': 1024, 'total_bytes_received': 2048},
+      );
+      harness.store.parallelRooms.session(_roomTwo)!.snapshot = _snapshot(
+        _roomTwo,
+        2,
+        stats: missing == 'both'
+            ? null
+            : {
+                if (missing != 'upload') 'total_bytes_sent': 4096,
+                if (missing != 'download') 'total_bytes_received': 4096,
+              },
+      );
+      await tester.pumpWidget(
+        _app(
+          DashboardPage(
+            settingsStore: harness.settings,
+            statusStore: harness.store,
+          ),
+        ),
+      );
+      expect(
+        trafficText(tester, 'home-traffic-current-upload'),
+        missing == 'download' ? '5.0 KB' : '—',
+      );
+      expect(
+        trafficText(tester, 'home-traffic-current-download'),
+        missing == 'upload' ? '6.0 KB' : '—',
+      );
+      expect(trafficText(tester, 'home-traffic-current-total'), '—');
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets(
+    'home traffic details never borrow primary rates for parallel same-node peers',
+    (tester) async {
+      final harness = (await tester.runAsync(_harness))!;
+      addTearDown(harness.dispose);
+      harness.store.primary = _snapshot(harness.settings.settings.networkId, 9);
+      harness.store.directionalRates = const {
+        'same-node': PeerTransferRate(
+          uploadBytesPerSecond: 1024,
+          downloadBytesPerSecond: 2048,
+        ),
+      };
+      await tester.pumpWidget(
+        _app(
+          DashboardPage(
+            settingsStore: harness.settings,
+            statusStore: harness.store,
+          ),
+        ),
+      );
+      final details = find.byKey(const Key('home-traffic-details'));
+      await tester.ensureVisible(details);
+      await tester.pumpAndSettle();
+      await tester.tap(details);
+      await tester.pumpAndSettle();
+      Finder network(String id) => find
+          .ancestor(
+            of: find.byKey(ValueKey('traffic-network-$id-total')),
+            matching: find.byType(Container),
+          )
+          .first;
+      final primary = network('primary');
+      expect(
+        find.descendant(
+          of: primary,
+          matching: find.text('Upload rate  1 KB/s'),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: primary,
+          matching: find.text('Download rate  2 KB/s'),
+        ),
+        findsOneWidget,
+      );
+      for (final room in [_roomOne, _roomTwo]) {
+        final parallel = network('room:$room');
+        expect(
+          find.descendant(of: parallel, matching: find.text('Upload rate  —')),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: parallel,
+            matching: find.text('Download rate  —'),
+          ),
+          findsOneWidget,
+        );
+      }
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   for (final largeText in [false, true]) {
     testWidgets('diagnostics keeps room recovery scoped (large: $largeText)', (
       tester,

@@ -17,7 +17,7 @@ void main() {
   final binding = TestWidgetsFlutterBinding.ensureInitialized();
 
   test(
-    'explicit quit terminates macOS app once after the daemon stops',
+    'explicit quit flushes history after daemon stop before terminating once',
     () async {
       final snapshot = await _loadFixtureSnapshot();
       final api = _FakeDiagnosticsApi(snapshot: snapshot);
@@ -29,6 +29,7 @@ void main() {
       final stores = await _makeStores(api: api, daemonController: daemon);
       addTearDown(stores.dispose);
       final calls = <String>[];
+      final historyFlushed = Completer<void>();
       for (final name in ['window_manager', 'tray_manager']) {
         final channel = MethodChannel(name);
         binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
@@ -48,6 +49,10 @@ void main() {
       final controller = DesktopTrayController(
         settingsStore: stores.settingsStore,
         statusStore: stores.statusStore,
+        beforeQuit: () async {
+          calls.add('history.flush');
+          await historyFlushed.future;
+        },
       );
       await controller.initialize();
       calls.clear();
@@ -60,6 +65,10 @@ void main() {
       expect(calls, isNot(contains('window_manager.destroy')));
       expect(calls, isNot(contains('window_manager.close')));
       stopped.complete(const DaemonCommandResult(ok: true, message: 'stopped'));
+      await Future<void>.delayed(Duration.zero);
+      expect(calls, contains('history.flush'));
+      expect(calls, isNot(contains('tray_manager.destroy')));
+      historyFlushed.complete();
       await first;
       await controller.dispose();
       final terminalCall = Platform.isMacOS

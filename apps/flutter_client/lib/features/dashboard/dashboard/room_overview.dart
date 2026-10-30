@@ -4,6 +4,7 @@ class _RoomHomeOverview extends StatelessWidget {
   const _RoomHomeOverview({
     required this.overview,
     required this.selectedId,
+    required this.trafficSection,
     this.onOpenDevices,
     this.onOpenRooms,
     this.onOpenRoom,
@@ -12,6 +13,7 @@ class _RoomHomeOverview extends StatelessWidget {
 
   final NetworkOverview overview;
   final String? selectedId;
+  final Widget trafficSection;
   final VoidCallback? onOpenDevices;
   final VoidCallback? onOpenRooms;
   final ValueChanged<String>? onOpenRoom;
@@ -145,6 +147,8 @@ class _RoomHomeOverview extends StatelessWidget {
             ],
           ),
         ),
+        const SizedBox(height: AppTokens.space16),
+        trafficSection,
         const SizedBox(height: AppTokens.space16),
         _DashboardSectionSurface(
           child: Column(

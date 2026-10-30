@@ -15,6 +15,7 @@ import '../../core/api/control_api.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/presentation/network_overview.dart';
+import '../../core/presentation/traffic_statistics.dart';
 import '../../shared/network_overview_presentation.dart';
 import '../../shared/widgets/network_scope_picker.dart';
 import '../../core/security/redactor.dart';
@@ -28,11 +29,14 @@ import '../../shared/widgets/device_type_icon.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
+import '../../shared/widgets/traffic_history_section.dart';
+import '../../shared/widgets/traffic_totals.dart';
 
 part 'nodes/local_node.dart';
 part 'nodes/toolbar.dart';
 part 'nodes/peer_list.dart';
 part 'nodes/peer_detail.dart';
+part 'nodes/peer_traffic.dart';
 part 'nodes/peer_dialogs.dart';
 part 'nodes/helpers.dart';
 part 'nodes/speed_test.dart';
@@ -99,6 +103,7 @@ class _NodesPageState extends State<NodesPage> {
   var _filter = _NodeFilter.all;
   var _sort = _NodeSort.recommended;
   String? _copiedKey;
+  Timer? _copyFeedbackTimer;
   String? _busyPeerId;
   String? _openedInitialPeerId;
   var _initialPeerOpenScheduled = false;
@@ -128,6 +133,7 @@ class _NodesPageState extends State<NodesPage> {
     widget.statusStore.removeListener(_pruneHiddenPeers);
     _searchController.dispose();
     _searchFocusNode.dispose();
+    _copyFeedbackTimer?.cancel();
     _controlApi.close();
     super.dispose();
   }
@@ -407,7 +413,9 @@ class _NodesPageState extends State<NodesPage> {
     await Clipboard.setData(ClipboardData(text: value));
     if (!mounted) return;
     setState(() => _copiedKey = key);
-    Future<void>.delayed(const Duration(milliseconds: 1400), () {
+    showAppNotice(context, content: Text(stringsOf(context).copied));
+    _copyFeedbackTimer?.cancel();
+    _copyFeedbackTimer = Timer(const Duration(milliseconds: 1400), () {
       if (mounted && _copiedKey == key) setState(() => _copiedKey = null);
     });
   }
@@ -563,6 +571,11 @@ class _NodesPageState extends State<NodesPage> {
     PeerSnapshot peer, {
     required bool mobile,
   }) async {
+    final snapshot = widget.statusStore.snapshot;
+    final networkId =
+        snapshot?.peers.any((item) => item.nodeId == peer.nodeId) == true
+        ? snapshot!.networkId
+        : null;
     if (mobile) {
       await Navigator.of(context, rootNavigator: true).push(
         MaterialPageRoute<void>(
@@ -571,6 +584,7 @@ class _NodesPageState extends State<NodesPage> {
             peer: peer,
             strings: stringsOf(context),
             statusStore: widget.statusStore,
+            networkId: networkId,
             copiedKey: _copiedKey,
             busyPeerId: _busyPeerId,
             onCopy: _copy,
@@ -588,6 +602,7 @@ class _NodesPageState extends State<NodesPage> {
         peer: peer,
         strings: stringsOf(context),
         statusStore: widget.statusStore,
+        networkId: networkId,
         copiedKey: _copiedKey,
         busyPeerId: _busyPeerId,
         onCopy: _copy,

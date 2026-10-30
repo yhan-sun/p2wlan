@@ -41,10 +41,12 @@ class DesktopTrayController with TrayListener, WindowListener {
   DesktopTrayController({
     required this.settingsStore,
     required this.statusStore,
+    this.beforeQuit,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
+  final Future<void> Function()? beforeQuit;
 
   static const _macosTrayIconSize = 22;
   static const _windowsTrayIconAsset = 'assets/tray_icon.ico';
@@ -699,6 +701,7 @@ class DesktopTrayController with TrayListener, WindowListener {
         await _updateMenu();
         return;
       }
+      await beforeQuit?.call();
       await _destroyTrayWindowAndExit();
     } catch (_) {
       _quitting = false;

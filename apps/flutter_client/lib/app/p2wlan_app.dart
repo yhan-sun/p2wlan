@@ -2,6 +2,7 @@ import 'package:p2wlan_flutter_client/shared/widgets/app_notice.dart';
 
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'dart:ui' show AppExitResponse;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -18,6 +19,9 @@ import '../core/daemon/daemon_controller.dart';
 import '../core/platform/windows_startup_registration.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
+import '../core/presentation/network_overview.dart';
+import '../core/traffic/traffic_history_store.dart';
+import '../shared/widgets/traffic_history_scope.dart';
 import '../core/update/update_models.dart';
 import '../core/update/update_service.dart';
 import '../features/auth/login_page.dart';
@@ -36,6 +40,7 @@ class P2WlanApp extends StatefulWidget {
     this.settingsStore,
     this.diagnosticsApi,
     this.daemonController,
+    this.trafficHistoryStore,
     this.updateService,
     this.autoCheckForUpdates = true,
     this.enableDesktopTray = false,
@@ -49,6 +54,10 @@ class P2WlanApp extends StatefulWidget {
   final SettingsStore? settingsStore;
   final DiagnosticsApi? diagnosticsApi;
   final DaemonController? daemonController;
+
+  /// The executable supplies durable storage. Embedded/test hosts default to
+  /// memory-only history, avoiding implicit writes to the user's profile.
+  final TrafficHistoryStore? trafficHistoryStore;
   final UpdateService? updateService;
   final bool autoCheckForUpdates;
   final bool enableDesktopTray;
@@ -65,6 +74,7 @@ class P2WlanApp extends StatefulWidget {
 class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
   late final SettingsStore _settingsStore;
   late final StatusStore _statusStore;
+  late final TrafficHistoryStore _trafficHistory;
   DesktopTrayController? _desktopTrayController;
   DesktopWindowStatusController? _desktopWindowStatusController;
   final _navigatorKey = GlobalKey<NavigatorState>();
@@ -99,6 +109,11 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
           ? StatusStore.defaultWindowsRouteVerificationInterval
           : StatusStore.defaultRouteVerificationInterval,
     );
+    _trafficHistory =
+        widget.trafficHistoryStore ?? TrafficHistoryStore(persistent: false);
+    _statusStore.addListener(_recordTraffic);
+    _statusStore.parallelRooms.addListener(_recordTraffic);
+    _settingsStore.addListener(_recordTraffic);
     _roomLinkSubscription = widget.roomLinks?.listen((uri) {
       if (uri.scheme != 'p2wlan' ||
           uri.host != 'join' ||
@@ -115,11 +130,43 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _statusStore.updateAppLifecycleState(state);
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      unawaited(_trafficHistory.flush());
+    }
+  }
+
+  void _recordTraffic() {
+    if (!mounted) return;
+    _trafficHistory.observe(
+      settings: _settingsStore.settings,
+      scopes: NetworkOverview.read(_statusStore).scopes,
+    );
+  }
+
+  Future<void> _flushTrafficHistory() async {
+    _recordTraffic();
+    // Disk stalls must not indefinitely hold the native application exit.
+    // The existing atomic history file remains intact if this budget expires.
+    await _trafficHistory.flush().timeout(
+      const Duration(seconds: 3),
+      onTimeout: () {},
+    );
+  }
+
+  @override
+  Future<AppExitResponse> didRequestAppExit() async {
+    await _flushTrafficHistory();
+    return AppExitResponse.exit;
   }
 
   Future<void> _bootstrap() async {
     writeDesktopTrayLifecycleTrace('bootstrap.begin');
     await _settingsStore.load();
+    if (!mounted) return;
+    await _trafficHistory.load();
+    if (!mounted) return;
+    _recordTraffic();
     writeDesktopTrayLifecycleTrace('bootstrap.settings-loaded');
     _authenticated = _settingsStore.settings.hasAuthenticatedConnection;
     if (mounted) {
@@ -132,6 +179,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
       _desktopTrayController = DesktopTrayController(
         settingsStore: _settingsStore,
         statusStore: _statusStore,
+        beforeQuit: _flushTrafficHistory,
       );
       writeDesktopTrayLifecycleTrace('bootstrap.tray-controller.created');
       final trayInitialization = _desktopTrayController!.initialize();
@@ -333,6 +381,12 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_desktopTrayController?.dispose());
     _desktopWindowStatusController?.dispose();
+    _statusStore.removeListener(_recordTraffic);
+    _statusStore.parallelRooms.removeListener(_recordTraffic);
+    _settingsStore.removeListener(_recordTraffic);
+    // Normal desktop exit awaits flush in beforeQuit; other hosts still get
+    // a final best-effort checkpoint when the widget is removed.
+    unawaited(_trafficHistory.flush().whenComplete(_trafficHistory.dispose));
     _statusStore.dispose();
     _settingsStore.dispose();
     super.dispose();
@@ -361,7 +415,12 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
           darkTheme: AppTheme.darkTheme,
           themeMode: themeMode,
           builder: (context, child) {
-            final content = child ?? const SizedBox.shrink();
+            final content = TrafficHistoryScope(
+              store: _trafficHistory,
+              settings: _settingsStore.settings,
+              onRefresh: _recordTraffic,
+              child: child ?? const SizedBox.shrink(),
+            );
             if (kIsWeb || !Platform.isWindows) return content;
 
             // Hidden Windows title bars still need a native resize hit area at

@@ -9,10 +9,16 @@ import 'package:flutter/services.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/rooms/room_api.dart';
 import '../../core/models/diagnostics_models.dart';
+import '../../core/presentation/network_overview.dart';
+import '../../core/presentation/traffic_statistics.dart';
 import '../../app/app_strings.dart';
 import '../../app/p2wlan_colors.dart';
 import '../../app/app_tokens.dart';
 import '../../shared/widgets/app_motion.dart';
+import '../../shared/formatters.dart';
+import '../../shared/widgets/traffic_history_scope.dart';
+import '../../shared/widgets/traffic_history_section.dart';
+import '../../shared/widgets/traffic_totals.dart';
 import '../../shared/widgets/status_badge.dart';
 import 'room_join_dialog.dart';
 import '../nodes/nodes_page.dart';
@@ -1522,6 +1528,7 @@ class _RoomsPageState extends State<RoomsPage> {
       builder: (dialogContext) => AnimatedBuilder(
         animation: _roomViewRevision,
         builder: (context, _) {
+          final trafficScope = _roomTrafficScope(room);
           final snapshot = _sameSession ? _roomSnapshot(room) : null;
           final peers = snapshot != null && !_snapshotStale(snapshot)
               ? snapshot.peers
@@ -1536,14 +1543,43 @@ class _RoomsPageState extends State<RoomsPage> {
             }
           }
           final peer = roomPeerForDevice(current, peers);
-          final local = roomDeviceIsSnapshotLocal(current, snapshot);
+          final local =
+              _isLocalDevice(room, current) ||
+              roomDeviceIsSnapshotLocal(current, snapshot) ||
+              roomDeviceIsSnapshotLocal(current, trafficScope?.snapshot);
           final available = _sameSession && _rooms.any((r) => r.id == room.id);
           final user = current['user_id'] as String? ?? '';
+          final localRate = local ? _roomTransferRate(trafficScope) : null;
+          final peerRate =
+              trafficScope?.isPrimary == true &&
+                  trafficScope?.isRunning == true &&
+                  identical(trafficScope?.snapshot, snapshot) &&
+                  peer != null
+              ? widget.statusStore.peerDirectionalTransferRates[peer.nodeId]
+              : null;
           return DeviceDetailsDialog(
             strings: AppStrings.fromCode(
               widget.settingsStore.settings.languageCode,
             ),
             peer: peer,
+            networkId: room.id,
+            current: available && trafficScope?.isRunning == true,
+            trafficCounters:
+                available && local && trafficScope?.snapshot != null
+                ? TrafficCounters.fromSnapshot(trafficScope!.snapshot!)
+                : null,
+            serviceUptimeMs: local
+                ? trafficScope?.snapshot?.reportedUptimeMs
+                : null,
+            transferBytesPerSecond: local
+                ? (localRate == null
+                      ? null
+                      : localRate.uploadBytesPerSecond +
+                            localRate.downloadBytesPerSecond)
+                : (peerRate == null
+                      ? null
+                      : peerRate.uploadBytesPerSecond +
+                            peerRate.downloadBytesPerSecond),
             contextHeader: Align(
               alignment: Alignment.centerLeft,
               child: Text(
@@ -2010,6 +2046,116 @@ class _RoomsPageState extends State<RoomsPage> {
     ),
   );
 
+  NetworkScopeSnapshot? _roomTrafficScope(FriendRoom room) => !_sameSession
+      ? null
+      : NetworkOverview.read(widget.statusStore).scopes
+            .where(
+              (scope) =>
+                  scope.roomId == room.id &&
+                  scope.snapshot?.networkId == room.id,
+            )
+            .firstOrNull;
+
+  PeerTransferRate? _roomTransferRate(NetworkScopeSnapshot? scope) {
+    if (scope == null ||
+        !scope.isPrimary ||
+        !scope.isRunning ||
+        scope.ownerRevision != widget.statusStore.sessionRevision ||
+        !identical(scope.snapshot, widget.statusStore.snapshot)) {
+      return null;
+    }
+    final peers = scope.peers.where((item) => item.online).toList();
+    final rates = widget.statusStore.peerDirectionalTransferRates;
+    if (peers.isEmpty || peers.any((item) => rates[item.peer.nodeId] == null)) {
+      return null;
+    }
+    return PeerTransferRate(
+      uploadBytesPerSecond: peers.fold(
+        0,
+        (sum, item) => sum + rates[item.peer.nodeId]!.uploadBytesPerSecond,
+      ),
+      downloadBytesPerSecond: peers.fold(
+        0,
+        (sum, item) => sum + rates[item.peer.nodeId]!.downloadBytesPerSecond,
+      ),
+    );
+  }
+
+  Widget _roomTrafficCard(FriendRoom room) {
+    final scope = _roomTrafficScope(room);
+    final snapshot = scope?.snapshot;
+    final counters = snapshot == null
+        ? const TrafficCounters()
+        : TrafficCounters.fromSnapshot(snapshot);
+    final rate = _roomTransferRate(scope);
+    return _surfaceCard(
+      child: Padding(
+        key: ValueKey('room-traffic-${room.id}'),
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Wrap(
+              spacing: 10,
+              runSpacing: 6,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                Text(
+                  '本机在此房间的流量',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                if (snapshot != null && scope?.isRunning != true)
+                  const StatusBadge(label: '上次数据', tone: StatusTone.warn),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text('当前记录', style: Theme.of(context).textTheme.bodySmall),
+            const SizedBox(height: 12),
+            TrafficTotals(
+              counters: counters,
+              keyPrefix: 'room-traffic-${room.id}',
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 24,
+              runSpacing: 8,
+              children: [
+                _roomMetric(
+                  '服务运行时长',
+                  formatElapsedTime(snapshot?.reportedUptimeMs, isZh: true),
+                ),
+                _roomMetric(
+                  '当前上传速率',
+                  formatTransferRate(rate?.uploadBytesPerSecond),
+                ),
+                _roomMetric(
+                  '当前下载速率',
+                  formatTransferRate(rate?.downloadBytesPerSecond),
+                ),
+                _roomMetric(
+                  '当前合计速率',
+                  formatTransferRate(
+                    rate == null
+                        ? null
+                        : rate.uploadBytesPerSecond +
+                              rate.downloadBytesPerSecond,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(
+              snapshot == null
+                  ? '本机未连接此房间或运行信息不可用；远程设备名册不提供设备间流量。'
+                  : '本机与当前设备记录的业务流量；服务重启或记录移除后重新累计。',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _roomDetails(RoomRoster roster) {
     final room = roster.room;
     final compact = MediaQuery.sizeOf(context).width < 700;
@@ -2162,6 +2308,17 @@ class _RoomsPageState extends State<RoomsPage> {
         ),
         const SizedBox(height: 12),
         _deviceList(roster),
+        const SizedBox(height: 4),
+        _roomTrafficCard(room),
+        if (TrafficHistoryScope.maybeOf(context) != null) ...[
+          const SizedBox(height: 12),
+          _surfaceCard(
+            child: Padding(
+              padding: const EdgeInsets.all(18),
+              child: TrafficHistorySection(networkId: room.id),
+            ),
+          ),
+        ],
         ExpansionTile(
           key: ValueKey('room-connection-options-${room.id}'),
           expansionAnimationStyle: expansionMotion,

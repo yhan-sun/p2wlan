@@ -1,10 +1,17 @@
 part of '../nodes_page.dart';
 
 class _DetailLine extends StatelessWidget {
-  const _DetailLine({required this.label, required this.value});
+  const _DetailLine({
+    required this.label,
+    required this.value,
+    this.onCopy,
+    this.copyKey,
+  });
 
   final String label;
   final String value;
+  final VoidCallback? onCopy;
+  final Key? copyKey;
 
   @override
   Widget build(BuildContext context) {
@@ -29,6 +36,25 @@ class _DetailLine extends StatelessWidget {
               fontFeatures: AppTokens.tabularFontFeatures,
             ),
           );
+          if (onCopy != null) {
+            final strings = stringsOf(context);
+            return Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [labelText, const SizedBox(height: 3), valueText],
+                  ),
+                ),
+                IconButton(
+                  key: copyKey,
+                  tooltip: strings.isZh ? '复制$label' : 'Copy $label',
+                  onPressed: onCopy,
+                  icon: const Icon(Icons.copy_outlined, size: 17),
+                ),
+              ],
+            );
+          }
           if (constraints.maxWidth < 340) {
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -92,7 +118,9 @@ class _ConnectionSummary extends StatelessWidget {
             borderRadius: BorderRadius.circular(AppTokens.radiusLg),
             border: Border.all(color: colors.border),
           ),
-          child: constraints.maxWidth < 330
+          child:
+              constraints.maxWidth < 330 ||
+                  MediaQuery.textScalerOf(context).scale(12) > 16
               ? Column(
                   children: [
                     metrics[0],
@@ -166,8 +194,6 @@ class _DetailMetric extends StatelessWidget {
             children: [
               Text(
                 label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
                 style: TextStyle(
                   color: theme.colorScheme.onSurfaceVariant,
                   fontSize: 11,
@@ -203,6 +229,10 @@ class _PeerDetailsContent extends StatelessWidget {
     required this.peer,
     required this.strings,
     this.current = true,
+    this.trafficCounters,
+    this.transferBytesPerSecond,
+    this.serviceUptimeMs,
+    this.networkId,
     this.copiedKey,
     this.busy = false,
     this.onCopy,
@@ -214,6 +244,10 @@ class _PeerDetailsContent extends StatelessWidget {
   final PeerSnapshot peer;
   final AppStrings strings;
   final bool current;
+  final TrafficCounters? trafficCounters;
+  final int? transferBytesPerSecond;
+  final int? serviceUptimeMs;
+  final String? networkId;
   final String? copiedKey;
   final bool busy;
   final Future<void> Function(String value, String key)? onCopy;
@@ -231,15 +265,39 @@ class _PeerDetailsContent extends StatelessWidget {
         const SizedBox(height: AppTokens.space12),
         _ConnectionSummary(peer: peer, strings: strings, current: current),
         const SizedBox(height: AppTokens.space12),
+        _PeerTrafficSection(
+          counters: trafficCounters ?? TrafficCounters.fromPeer(peer),
+          strings: strings,
+          current: current && (trafficCounters != null || peer.online),
+          localScope: trafficCounters != null,
+          serviceUptimeMs: serviceUptimeMs,
+          transferBytesPerSecond: transferBytesPerSecond,
+          networkId: networkId,
+          peerId: peer.nodeId,
+        ),
+        const SizedBox(height: AppTokens.space12),
         _DetailSection(
           key: const Key('peer-detail-network-card'),
           icon: Icons.lan_outlined,
           title: strings.sectionNetwork,
           rows: [
             _DetailLine(label: strings.lastSeen, value: _formatLastSeen(peer)),
-            _DetailLine(label: strings.virtualIp, value: dash(peer.virtualIp)),
-            _DetailLine(label: strings.endpoint, value: dash(peer.endpoint)),
-            _DetailLine(label: strings.relay, value: dash(peer.relayServer)),
+            _networkLine(strings.virtualIp, peer.virtualIp, 'ip'),
+            _DetailLine(
+              label: strings.isZh ? '连接时长' : 'Connected for',
+              value: formatElapsedTime(
+                current && peer.online ? peer.connectedForMs : null,
+                isZh: strings.isZh,
+              ),
+            ),
+            _DetailLine(
+              label: strings.natType,
+              value: peer.natType.trim().toLowerCase() == 'unknown'
+                  ? '—'
+                  : dash(peer.natType),
+            ),
+            _networkLine(strings.endpoint, peer.endpoint, 'endpoint'),
+            _networkLine(strings.relay, peer.relayServer, 'relay'),
           ],
         ),
         if (error != null && error.isNotEmpty) ...[
@@ -270,6 +328,18 @@ class _PeerDetailsContent extends StatelessWidget {
           ),
         ],
       ],
+    );
+  }
+
+  Widget _networkLine(String label, String? rawValue, String field) {
+    final value = rawValue?.trim() ?? '';
+    return _DetailLine(
+      label: label,
+      value: dash(value),
+      copyKey: Key('node-detail-copy-$field-${peer.nodeId}'),
+      onCopy: value.isEmpty || onCopy == null
+          ? null
+          : () => onCopy!(value, '${peer.nodeId}:$field'),
     );
   }
 }
@@ -475,6 +545,17 @@ class _AdvancedSectionState extends State<_AdvancedSection> {
                               _DetailLine(
                                 label: strings.nodeId,
                                 value: peer.nodeId,
+                                copyKey: Key(
+                                  'node-detail-copy-id-${peer.nodeId}',
+                                ),
+                                onCopy:
+                                    peer.nodeId.trim().isEmpty ||
+                                        widget.onCopy == null
+                                    ? null
+                                    : () => widget.onCopy!(
+                                        peer.nodeId,
+                                        '${peer.nodeId}:id',
+                                      ),
                               ),
                               _DetailLine(
                                 label: strings.version,
@@ -493,7 +574,8 @@ class _AdvancedSectionState extends State<_AdvancedSection> {
                                   label: strings.pathDecision,
                                   value: peer.currentPathSelection!.reason,
                                 ),
-                              if (widget.onCopy != null) ...[
+                              if (widget.onCopy != null &&
+                                  peer.virtualIp.trim().isNotEmpty) ...[
                                 const SizedBox(height: AppTokens.space6),
                                 _CopyPingAction(
                                   peer: peer,
@@ -580,12 +662,14 @@ class _DetailSection extends StatelessWidget {
                 Icon(icon, size: 18, color: theme.colorScheme.primary),
                 const SizedBox(width: AppTokens.space8),
               ],
-              Text(
-                title,
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: theme.colorScheme.onSurface,
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: theme.colorScheme.onSurface,
+                  ),
                 ),
               ),
             ],
@@ -795,7 +879,7 @@ class _DetailActions extends StatelessWidget {
                 icon: const Icon(Icons.speed_rounded, size: 18),
                 label: Text(strings.speedTest),
               ),
-            if (onCopy != null)
+            if (onCopy != null && peer.virtualIp.trim().isNotEmpty)
               OutlinedButton.icon(
                 onPressed: () => onCopy!(peer.virtualIp, ipKey),
                 icon: Icon(
@@ -867,6 +951,11 @@ class DeviceDetailsDialog extends StatelessWidget {
     this.contextHeader,
     required this.strings,
     this.statusStore,
+    this.networkId,
+    this.current,
+    this.trafficCounters,
+    this.serviceUptimeMs,
+    this.transferBytesPerSecond,
     this.copiedKey,
     this.busyPeerId,
     this.onCopy,
@@ -880,6 +969,14 @@ class DeviceDetailsDialog extends StatelessWidget {
   final Widget? contextHeader;
   final AppStrings strings;
   final StatusStore? statusStore;
+  final String? networkId;
+  final bool? current;
+
+  /// Local-device counters from its own network scope; peer counters default
+  /// to TrafficCounters.fromPeer and never borrow another scope's statistics.
+  final TrafficCounters? trafficCounters;
+  final int? serviceUptimeMs;
+  final int? transferBytesPerSecond;
   final String? copiedKey;
   final String? busyPeerId;
   final Future<void> Function(String value, String key)? onCopy;
@@ -900,7 +997,21 @@ class DeviceDetailsDialog extends StatelessWidget {
     Widget details(PeerSnapshot currentPeer) => _PeerDetailsContent(
       peer: currentPeer,
       strings: strings,
-      current: _primaryPeerCurrent(statusStore, currentPeer.nodeId),
+      current:
+          current ??
+          _primaryPeerCurrent(
+            statusStore,
+            currentPeer.nodeId,
+            networkId: networkId,
+          ),
+      trafficCounters: trafficCounters,
+      serviceUptimeMs: serviceUptimeMs,
+      transferBytesPerSecond:
+          transferBytesPerSecond ??
+          (current == null
+              ? _primaryPeerRate(statusStore, currentPeer.nodeId, networkId)
+              : null),
+      networkId: networkId,
       copiedKey: copiedKey,
       busy: busyPeerId == currentPeer.nodeId,
       onCopy: onCopy,
@@ -912,96 +1023,115 @@ class DeviceDetailsDialog extends StatelessWidget {
       onSpeedTest: onSpeedTest,
     );
 
-    return Dialog(
-      insetPadding: const EdgeInsets.symmetric(
-        horizontal: AppTokens.space16,
-        vertical: AppTokens.space24,
-      ),
-      backgroundColor: Colors.transparent,
-      surfaceTintColor: Colors.transparent,
-      child: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxWidth: dialogWidth,
-          maxHeight: maxDialogHeight,
+    return AppStringsScope(
+      strings: strings,
+      child: Dialog(
+        insetPadding: const EdgeInsets.symmetric(
+          horizontal: AppTokens.space16,
+          vertical: AppTokens.space24,
         ),
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            color: colors.surfaceMuted,
-            borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-            boxShadow: AppTokens.shadowBorder,
+        backgroundColor: Colors.transparent,
+        surfaceTintColor: Colors.transparent,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: dialogWidth,
+            maxHeight: maxDialogHeight,
           ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 12, 10, 12),
-                  child: Row(
-                    children: [
-                      Container(
-                        width: 34,
-                        height: 34,
-                        alignment: Alignment.center,
-                        decoration: BoxDecoration(
-                          color: colors.selectedSurface,
-                          borderRadius: BorderRadius.circular(
-                            AppTokens.radiusSm,
-                          ),
-                        ),
-                        child: Icon(
-                          Icons.devices_rounded,
-                          size: 18,
-                          color: theme.colorScheme.primary,
-                        ),
-                      ),
-                      const SizedBox(width: AppTokens.space10),
-                      Expanded(
-                        child: Text(
-                          strings.deviceDetails,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: theme.colorScheme.onSurface,
-                            fontSize: 15,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ),
-                      IconButton(
-                        key: const Key('nodes-detail-close'),
-                        tooltip: strings.close,
-                        onPressed: () => Navigator.of(context).pop(),
-                        icon: const Icon(Icons.close_rounded, size: 20),
-                      ),
-                    ],
-                  ),
-                ),
-                Divider(height: 1, color: colors.divider),
-                Flexible(
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.all(AppTokens.space20),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: colors.surfaceMuted,
+              borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+              boxShadow: AppTokens.shadowBorder,
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 12, 10, 12),
+                    child: Row(
                       children: [
-                        if (contextHeader != null) ...[
-                          contextHeader!,
-                          const SizedBox(height: 12),
-                        ],
-                        content ??
-                            (statusStore == null
-                                ? details(peer!)
-                                : AnimatedBuilder(
-                                    animation: statusStore!,
-                                    builder: (context, _) => details(
-                                      _latestPeer(statusStore, peer!),
-                                    ),
-                                  )),
+                        Container(
+                          width: 34,
+                          height: 34,
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: colors.selectedSurface,
+                            borderRadius: BorderRadius.circular(
+                              AppTokens.radiusSm,
+                            ),
+                          ),
+                          child: Icon(
+                            Icons.devices_rounded,
+                            size: 18,
+                            color: theme.colorScheme.primary,
+                          ),
+                        ),
+                        const SizedBox(width: AppTokens.space10),
+                        Expanded(
+                          child: Text(
+                            strings.deviceDetails,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: theme.colorScheme.onSurface,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          key: const Key('nodes-detail-close'),
+                          tooltip: strings.close,
+                          onPressed: () => Navigator.of(context).pop(),
+                          icon: const Icon(Icons.close_rounded, size: 20),
+                        ),
                       ],
                     ),
                   ),
-                ),
-              ],
+                  Divider(height: 1, color: colors.divider),
+                  Flexible(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(AppTokens.space20),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (contextHeader != null) ...[
+                            contextHeader!,
+                            const SizedBox(height: 12),
+                          ],
+                          if (content != null && trafficCounters != null) ...[
+                            _PeerTrafficSection(
+                              counters: trafficCounters!,
+                              strings: strings,
+                              current: current ?? true,
+                              localScope: true,
+                              serviceUptimeMs: serviceUptimeMs,
+                              transferBytesPerSecond: transferBytesPerSecond,
+                              networkId: networkId,
+                            ),
+                            const SizedBox(height: 12),
+                          ],
+                          content ??
+                              (statusStore == null
+                                  ? details(peer!)
+                                  : AnimatedBuilder(
+                                      animation: statusStore!,
+                                      builder: (context, _) => details(
+                                        _latestPeer(
+                                          statusStore,
+                                          peer!,
+                                          networkId: networkId,
+                                        ),
+                                      ),
+                                    )),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -1016,6 +1146,7 @@ class _MobilePeerDetails extends StatelessWidget {
     required this.peer,
     required this.strings,
     this.statusStore,
+    this.networkId,
     this.copiedKey,
     this.busyPeerId,
     this.onCopy,
@@ -1027,6 +1158,7 @@ class _MobilePeerDetails extends StatelessWidget {
   final PeerSnapshot peer;
   final AppStrings strings;
   final StatusStore? statusStore;
+  final String? networkId;
   final String? copiedKey;
   final String? busyPeerId;
   final Future<void> Function(String value, String key)? onCopy;
@@ -1041,7 +1173,17 @@ class _MobilePeerDetails extends StatelessWidget {
     Widget details(PeerSnapshot currentPeer) => _PeerDetailsContent(
       peer: currentPeer,
       strings: strings,
-      current: _primaryPeerCurrent(statusStore, currentPeer.nodeId),
+      current: _primaryPeerCurrent(
+        statusStore,
+        currentPeer.nodeId,
+        networkId: networkId,
+      ),
+      transferBytesPerSecond: _primaryPeerRate(
+        statusStore,
+        currentPeer.nodeId,
+        networkId,
+      ),
+      networkId: networkId,
       copiedKey: copiedKey,
       busy: busyPeerId == currentPeer.nodeId,
       onCopy: onCopy,
@@ -1053,41 +1195,49 @@ class _MobilePeerDetails extends StatelessWidget {
       onSpeedTest: onSpeedTest,
     );
 
-    return Scaffold(
-      key: const Key('nodes-mobile-detail'),
-      backgroundColor: colors.surfaceMuted,
-      appBar: AppBar(
-        leading: const AppBackButton(key: Key('nodes-mobile-detail-back')),
-        title: Text(strings.deviceDetails),
-        backgroundColor: colors.surface,
-        elevation: 0,
-        scrolledUnderElevation: 0,
-        surfaceTintColor: Colors.transparent,
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(1),
-          child: Divider(height: 1, color: colors.divider),
+    return AppStringsScope(
+      strings: strings,
+      child: Scaffold(
+        key: const Key('nodes-mobile-detail'),
+        backgroundColor: colors.surfaceMuted,
+        appBar: AppBar(
+          leading: const AppBackButton(key: Key('nodes-mobile-detail-back')),
+          title: Text(strings.deviceDetails),
+          backgroundColor: colors.surface,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+          surfaceTintColor: Colors.transparent,
+          bottom: PreferredSize(
+            preferredSize: const Size.fromHeight(1),
+            child: Divider(height: 1, color: colors.divider),
+          ),
         ),
-      ),
-      body: SafeArea(
-        top: false,
-        child: LayoutBuilder(
-          builder: (context, constraints) => SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(
-              AppTokens.space16,
-              AppTokens.space16,
-              AppTokens.space16,
-              AppTokens.space32,
-            ),
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 620),
-                child: statusStore == null
-                    ? details(peer)
-                    : AnimatedBuilder(
-                        animation: statusStore!,
-                        builder: (context, _) =>
-                            details(_latestPeer(statusStore, peer)),
-                      ),
+        body: SafeArea(
+          top: false,
+          child: LayoutBuilder(
+            builder: (context, constraints) => SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(
+                AppTokens.space16,
+                AppTokens.space16,
+                AppTokens.space16,
+                AppTokens.space32,
+              ),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 620),
+                  child: statusStore == null
+                      ? details(peer)
+                      : AnimatedBuilder(
+                          animation: statusStore!,
+                          builder: (context, _) => details(
+                            _latestPeer(
+                              statusStore,
+                              peer,
+                              networkId: networkId,
+                            ),
+                          ),
+                        ),
+                ),
               ),
             ),
           ),
@@ -1097,13 +1247,34 @@ class _MobilePeerDetails extends StatelessWidget {
   }
 }
 
-bool _primaryPeerCurrent(StatusStore? store, String nodeId) =>
+bool _primaryPeerCurrent(
+  StatusStore? store,
+  String nodeId, {
+  String? networkId,
+}) =>
     store == null ||
-    NetworkOverview.read(store).peers.any(
-      (item) => item.isPrimary && item.current && item.peer.nodeId == nodeId,
-    );
+    ((networkId == null || store.snapshot?.networkId == networkId) &&
+        NetworkOverview.read(store).peers.any(
+          (item) =>
+              item.isPrimary && item.current && item.peer.nodeId == nodeId,
+        ));
 
-PeerSnapshot _latestPeer(StatusStore? store, PeerSnapshot fallback) {
+int? _primaryPeerRate(StatusStore? store, String nodeId, String? networkId) {
+  if (store == null ||
+      !_primaryPeerCurrent(store, nodeId, networkId: networkId)) {
+    return null;
+  }
+  return store.peerTransferRatesBytesPerSecond[nodeId];
+}
+
+PeerSnapshot _latestPeer(
+  StatusStore? store,
+  PeerSnapshot fallback, {
+  String? networkId,
+}) {
+  if (networkId != null && store?.snapshot?.networkId != networkId) {
+    return fallback;
+  }
   final peers = store?.snapshot?.peers;
   if (peers == null) return fallback;
   for (final peer in peers) {

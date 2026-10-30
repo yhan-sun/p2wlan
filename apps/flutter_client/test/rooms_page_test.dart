@@ -12,12 +12,15 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/capabilities/platform_capabilities.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
+import 'package:p2wlan_flutter_client/core/presentation/network_overview.dart';
+import 'package:p2wlan_flutter_client/core/traffic/traffic_history_store.dart';
 import 'package:p2wlan_flutter_client/core/rooms/room_api.dart';
 import 'package:p2wlan_flutter_client/core/rooms/room_profiles.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
 import 'package:p2wlan_flutter_client/features/rooms/rooms_page.dart';
+import 'package:p2wlan_flutter_client/shared/widgets/traffic_history_scope.dart';
 
 final _token =
     'a.${base64Url.encode(utf8.encode(jsonEncode({'user_id': 'member'})))}.b';
@@ -187,6 +190,18 @@ class _PulsingStatusStore extends StatusStore {
     super.daemonController,
     super.enableFreshnessTimer = false,
   });
+  DiagnosticsSnapshot? snapshotOverride;
+  Map<String, PeerTransferRate>? ratesOverride;
+  bool? staleOverride;
+  @override
+  DiagnosticsSnapshot? get snapshot => snapshotOverride ?? super.snapshot;
+  @override
+  bool get snapshotStale => staleOverride ?? super.snapshotStale;
+  @override
+  bool get online => snapshotOverride != null || super.online;
+  @override
+  Map<String, PeerTransferRate> get peerDirectionalTransferRates =>
+      ratesOverride ?? super.peerDirectionalTransferRates;
   void pulse() => notifyListeners();
 }
 
@@ -278,6 +293,30 @@ DiagnosticsSnapshot _snapshot({
   ],
 });
 
+DiagnosticsSnapshot _trafficSnapshot({
+  bool stale = false,
+  int? upload = 1024 * 1024,
+  int? download = 2 * 1024 * 1024,
+  int? uptimeMs = 3723000,
+  String networkId = _roomId,
+}) {
+  final raw = jsonDecode(
+    jsonEncode(_snapshot(stale: stale).raw),
+  ) as Map<String, dynamic>;
+  raw['network_id'] = networkId;
+  raw['stats'] = {
+    'total_peers': 2,
+    'total_bytes_sent': ?upload,
+    'total_bytes_received': ?download,
+  };
+  if (uptimeMs != null) raw['uptime_ms'] = uptimeMs;
+  for (final peer in raw['peers'] as List<dynamic>) {
+    (peer as Map<String, dynamic>)['bytes_sent'] = 1024;
+    peer['bytes_received'] = 2048;
+  }
+  return DiagnosticsSnapshot.fromJson(raw);
+}
+
 void main() {
   Future<_FakeRoomApi> pump(
     WidgetTester tester, {
@@ -303,6 +342,7 @@ void main() {
     onStores,
     double textScale = 1,
     bool disableAnimations = false,
+    TrafficHistoryStore? history,
     void Function(_FakeRoomApi)? configureApi,
     void Function(VoidCallback)? onStatusPulse,
   }) async {
@@ -379,7 +419,14 @@ void main() {
             textScaler: TextScaler.linear(textScale),
             disableAnimations: disableAnimations,
           ),
-          child: child!,
+          child: history == null
+              ? child!
+              : TrafficHistoryScope(
+                  store: history,
+                  settings: settings.settings,
+                  onRefresh: () {},
+                  child: child!,
+                ),
         ),
         home: shell
             ? P2WlanShell(
@@ -1870,7 +1917,13 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('离线'), findsOneWidget);
     expect(find.text('未连接'), findsWidgets);
-    expect(find.text('—'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const ValueKey('room-device-device-1')),
+        matching: find.text('—'),
+      ),
+      findsOneWidget,
+    );
     expect(find.text('未测得'), findsNothing);
     final badge = tester.widget<Text>(find.text('离线'));
     final colors = P2WlanColors.of(tester.element(find.text('离线')));
@@ -1882,6 +1935,287 @@ void main() {
     expect(find.byType(PopupMenuButton<bool>), findsNothing);
     expect(find.text('房主小林'), findsOneWidget);
     expect(find.textContaining('user-'), findsNothing);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets(
+    'room traffic uses its runtime counters and never another network rate',
+    (tester) async {
+      await pump(
+        tester,
+        snapshot: _trafficSnapshot(),
+        onStores: (_, status, _, _) {
+          status.snapshotOverride = _trafficSnapshot(
+            networkId: 'different-network',
+            upload: 900000000,
+          );
+          status.ratesOverride = {
+            'device-1': const PeerTransferRate(
+              uploadBytesPerSecond: 900000,
+              downloadBytesPerSecond: 900000,
+            ),
+          };
+        },
+      );
+      expect(
+        tester
+            .widget<Text>(
+              find.byKey(const ValueKey('room-traffic-$_roomId-upload')),
+            )
+            .data,
+        '1.0 MB',
+      );
+      expect(
+        tester
+            .widget<Text>(
+              find.byKey(const ValueKey('room-traffic-$_roomId-download')),
+            )
+            .data,
+        '2.0 MB',
+      );
+      expect(
+        tester
+            .widget<Text>(
+              find.byKey(const ValueKey('room-traffic-$_roomId-total')),
+            )
+            .data,
+        '3.0 MB',
+      );
+      expect(find.text('1 小时 2 分钟'), findsOneWidget);
+      final uploadRate = find
+          .ancestor(of: find.text('当前上传速率'), matching: find.byType(Wrap))
+          .first;
+      expect(
+        find.descendant(of: uploadRate, matching: find.text('—')),
+        findsOneWidget,
+      );
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('room-device-device-1')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('room-device-device-1')));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<Text>(find.byKey(const ValueKey('peer-traffic-total')))
+            .data,
+        '3.0 KB',
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'room primary traffic preserves stale totals and hides live rates',
+    (tester) async {
+      late _PulsingStatusStore status;
+      await pump(
+        tester,
+        primaryRoom: true,
+        canConnect: true,
+        onStores: (_, store, _, _) {
+          status = store;
+          store.snapshotOverride = _trafficSnapshot();
+          store.ratesOverride = {
+            'device-1': const PeerTransferRate(
+              uploadBytesPerSecond: 1024,
+              downloadBytesPerSecond: 2048,
+            ),
+            'discovered': const PeerTransferRate(
+              uploadBytesPerSecond: 0,
+              downloadBytesPerSecond: 0,
+            ),
+          };
+        },
+      );
+      expect(find.text('1 KB/s'), findsOneWidget);
+      expect(find.text('2 KB/s'), findsOneWidget);
+      expect(find.text('3 KB/s'), findsOneWidget);
+      status.staleOverride = true;
+      status.pulse();
+      await tester.pump();
+      expect(find.text('上次数据'), findsOneWidget);
+      expect(
+        tester
+            .widget<Text>(
+              find.byKey(const ValueKey('room-traffic-$_roomId-total')),
+            )
+            .data,
+        '3.0 MB',
+      );
+      expect(find.text('1 KB/s'), findsNothing);
+      expect(find.text('2 KB/s'), findsNothing);
+      status.staleOverride = false;
+      status.snapshotOverride = _trafficSnapshot(upload: 1024, download: 2048);
+      status.ratesOverride = {};
+      status.pulse();
+      await tester.pump();
+      expect(
+        tester
+            .widget<Text>(
+              find.byKey(const ValueKey('room-traffic-$_roomId-total')),
+            )
+            .data,
+        '3.0 KB',
+      );
+      expect(find.text('上次数据'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  for (final zeroUpload in [false, true]) {
+    testWidgets(
+      'room counters distinguish missing data and zero (zero: $zeroUpload)',
+      (tester) async {
+        await pump(
+          tester,
+          snapshot: _trafficSnapshot(
+            upload: zeroUpload ? 0 : null,
+            download: null,
+            uptimeMs: null,
+          ),
+        );
+        expect(
+          tester
+              .widget<Text>(
+                find.byKey(const ValueKey('room-traffic-$_roomId-upload')),
+              )
+              .data,
+          zeroUpload ? '0 B' : '—',
+        );
+        expect(
+          tester
+              .widget<Text>(
+                find.byKey(const ValueKey('room-traffic-$_roomId-download')),
+              )
+              .data,
+          '—',
+        );
+        expect(
+          tester
+              .widget<Text>(
+                find.byKey(const ValueKey('room-traffic-$_roomId-total')),
+              )
+              .data,
+          '—',
+        );
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
+
+  testWidgets(
+    'local room device detail receives only this room traffic and uptime',
+    (tester) async {
+      await pump(tester, snapshot: _trafficSnapshot());
+      final local = find.byKey(const ValueKey('room-device-10.21.1.2'));
+      await tester.ensureVisible(local);
+      await tester.pumpAndSettle();
+      await tester.tap(local);
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<Text>(find.byKey(const ValueKey('peer-traffic-total')))
+            .data,
+        '3.0 MB',
+      );
+      expect(
+        find.descendant(
+          of: find.byType(Dialog),
+          matching: find.text('1 小时 2 分钟'),
+        ),
+        findsOneWidget,
+      );
+      expect(find.textContaining('本机在此网络的业务流量'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'offline room keeps its own saved history without live counters',
+    (tester) async {
+      final history = TrafficHistoryStore(persistent: false);
+      await history.load();
+      addTearDown(history.dispose);
+      NetworkScopeSnapshot scope(DiagnosticsSnapshot snapshot) =>
+          NetworkScopeSnapshot(
+            id: 'room:${snapshot.networkId}',
+            roomId: snapshot.networkId,
+            name: 'Safe fixture',
+            profileId: null,
+            ownerRevision: 1,
+            snapshot: snapshot,
+            state: NetworkDisplayState.running,
+            peers: snapshot.peers,
+            transferRates: const {},
+          );
+      await pump(
+        tester,
+        history: history,
+        onStores: (settings, _, _, _) {
+          final baseline = _trafficSnapshot();
+          history.observe(
+            settings: settings.settings,
+            scopes: [scope(baseline)],
+          );
+          final next =
+              jsonDecode(jsonEncode(baseline.raw)) as Map<String, dynamic>;
+          final peer =
+              (next['peers'] as List<dynamic>).first as Map<String, dynamic>;
+          peer['bytes_sent'] = 3072;
+          peer['bytes_received'] = 6144;
+          history.observe(
+            settings: settings.settings,
+            scopes: [scope(DiagnosticsSnapshot.fromJson(next))],
+          );
+          history.observe(
+            settings: settings.settings,
+            scopes: [scope(_trafficSnapshot(networkId: 'another-room'))],
+          );
+        },
+      );
+      expect(
+        tester
+            .widget<Text>(
+              find.byKey(const ValueKey('room-traffic-$_roomId-total')),
+            )
+            .data,
+        '—',
+      );
+      expect(
+        tester
+            .widget<Text>(find.byKey(const ValueKey('traffic-history-total')))
+            .data,
+        '6.0 KB',
+      );
+      expect(find.textContaining('重启后保留'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets('room traffic stays readable on narrow screens at 200 percent', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(360, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await pump(
+      tester,
+      textScale: 2,
+      snapshot: _trafficSnapshot(upload: 1 << 50, download: 1 << 51),
+    );
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('room-traffic-$_roomId')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('本机在此房间的流量'), findsOneWidget);
+    expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -1930,6 +2264,7 @@ void main() {
         findsOneWidget,
       );
       expect(find.byType(PopupMenuButton<String>), findsNothing);
+      expect(find.byKey(const Key('peer-detail-traffic-card')), findsNothing);
       await tester.tap(find.byKey(const Key('nodes-detail-close')));
       await tester.pumpAndSettle();
       await tester.pumpWidget(const SizedBox.shrink());

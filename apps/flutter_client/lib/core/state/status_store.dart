@@ -137,6 +137,8 @@ class StatusStore extends ChangeNotifier {
   String? _speedTestPeerVirtualIp;
   DateTime? _speedTestStartedAt;
   var _peerTrafficSamples = <String, _PeerTrafficSample>{};
+  _PeerTrafficOwner? _peerTrafficOwner;
+  int? _peerTrafficUptimeMs;
   var _peerTransferRatesBytesPerSecond = <String, int>{};
   var _peerDirectionalTransferRates = <String, PeerTransferRate>{};
   final _peerOrder = <String, int>{};
@@ -640,8 +642,7 @@ class StatusStore extends ChangeNotifier {
             _snapshot != null &&
             _consecutiveHealthFailures < _automaticHealthFailureThreshold) {
           _snapshotStale = true;
-          _peerTransferRatesBytesPerSecond.clear();
-          _peerDirectionalTransferRates.clear();
+          _clearPeerTrafficSampling();
         } else {
           _clearSnapshot();
         }
@@ -776,13 +777,19 @@ class StatusStore extends ChangeNotifier {
   void _clearSnapshot() {
     _snapshot = null;
     _snapshotStale = false;
-    _peerTrafficSamples = <String, _PeerTrafficSample>{};
-    _peerTransferRatesBytesPerSecond = <String, int>{};
-    _peerDirectionalTransferRates = <String, PeerTransferRate>{};
-    _lastPeerTrafficSampleAt = null;
+    _clearPeerTrafficSampling();
     _staleTimer?.cancel();
     _staleTimer = null;
     _lastRouteVerificationAt = null;
+  }
+
+  void _clearPeerTrafficSampling() {
+    _peerTrafficSamples = <String, _PeerTrafficSample>{};
+    _peerTrafficOwner = null;
+    _peerTrafficUptimeMs = null;
+    _peerTransferRatesBytesPerSecond = <String, int>{};
+    _peerDirectionalTransferRates = <String, PeerTransferRate>{};
+    _lastPeerTrafficSampleAt = null;
   }
 
   bool _shouldVerifyRoutes(DateTime now) {
@@ -796,6 +803,63 @@ class StatusStore extends ChangeNotifier {
     DateTime fetchedAt, {
     required bool throttle,
   }) {
+    // A successful HTTP response can still contain a cached or incomplete
+    // catalog. Never use it as a rate baseline, including inside the throttle.
+    if (snapshot.peerSnapshotStale ||
+        snapshot.capturedRevision != snapshot.revision ||
+        snapshot.stats.totalPeers != snapshot.peers.length) {
+      _clearPeerTrafficSampling();
+      return;
+    }
+    final owner = (
+      processId: snapshot.processId,
+      runtimeIncarnation: snapshot.runtimeIncarnation,
+      nodeId: snapshot.nodeId,
+      networkId: snapshot.networkId,
+      networkGeneration: snapshot.networkGeneration,
+    );
+    final previousUptime = _peerTrafficUptimeMs;
+    final restarted =
+        previousUptime != null &&
+        previousUptime > 0 &&
+        snapshot.uptimeMs > 0 &&
+        snapshot.uptimeMs < previousUptime;
+    if (_snapshotStale || owner != _peerTrafficOwner || restarted) {
+      _clearPeerTrafficSampling();
+    }
+    _peerTrafficOwner = owner;
+    _peerTrafficUptimeMs = snapshot.uptimeMs;
+
+    final eligible = <String, PeerSnapshot>{};
+    for (final peer in snapshot.peers) {
+      final nodeId = peer.nodeId.trim();
+      final sent = peer.reportedBytesSent;
+      final received = peer.reportedBytesReceived;
+      if (nodeId.isEmpty ||
+          !peer.online ||
+          peer.path == 'offline' ||
+          sent == null ||
+          received == null ||
+          sent < 0 ||
+          received < 0) {
+        continue;
+      }
+      eligible[nodeId] = peer;
+    }
+    _peerTrafficSamples.removeWhere((nodeId, sample) {
+      final peer = eligible[nodeId];
+      return peer == null ||
+          sample.identity != _peerTrafficIdentity(peer) ||
+          peer.reportedBytesSent! < sample.bytesSent ||
+          peer.reportedBytesReceived! < sample.bytesReceived;
+    });
+    _peerTransferRatesBytesPerSecond.removeWhere(
+      (nodeId, _) => !_peerTrafficSamples.containsKey(nodeId),
+    );
+    _peerDirectionalTransferRates.removeWhere(
+      (nodeId, _) => !_peerTrafficSamples.containsKey(nodeId),
+    );
+
     final lastSampleAt = _lastPeerTrafficSampleAt;
     if (throttle &&
         lastSampleAt != null &&
@@ -805,16 +869,18 @@ class StatusStore extends ChangeNotifier {
     final nextSamples = <String, _PeerTrafficSample>{};
     final nextRates = <String, int>{};
     final nextDirectionalRates = <String, PeerTransferRate>{};
-    for (final peer in snapshot.peers) {
-      final nodeId = peer.nodeId.trim();
-      if (nodeId.isEmpty) continue;
+    for (final entry in eligible.entries) {
+      final nodeId = entry.key;
+      final peer = entry.value;
+      final sent = peer.reportedBytesSent!;
+      final received = peer.reportedBytesReceived!;
       final previous = _peerTrafficSamples[nodeId];
       if (previous != null) {
         final elapsedMicros = fetchedAt
             .difference(previous.fetchedAt)
             .inMicroseconds;
-        final sentDelta = peer.bytesSent - previous.bytesSent;
-        final receivedDelta = peer.bytesReceived - previous.bytesReceived;
+        final sentDelta = sent - previous.bytesSent;
+        final receivedDelta = received - previous.bytesReceived;
         if (elapsedMicros > 0 && sentDelta >= 0 && receivedDelta >= 0) {
           final uploadBytesPerSecond =
               (sentDelta * Duration.microsecondsPerSecond / elapsedMicros)
@@ -830,8 +896,9 @@ class StatusStore extends ChangeNotifier {
         }
       }
       nextSamples[nodeId] = _PeerTrafficSample(
-        bytesSent: peer.bytesSent,
-        bytesReceived: peer.bytesReceived,
+        identity: _peerTrafficIdentity(peer),
+        bytesSent: sent,
+        bytesReceived: received,
         fetchedAt: fetchedAt,
       );
     }
@@ -848,6 +915,7 @@ class StatusStore extends ChangeNotifier {
     _staleTimer = Timer(maxSnapshotAge, () {
       if (_disposed || _snapshot == null || _snapshotStale) return;
       _snapshotStale = true;
+      _clearPeerTrafficSampling();
       notifyListeners();
     });
   }
@@ -1253,13 +1321,28 @@ class PeerTransferRate {
   final int downloadBytesPerSecond;
 }
 
+typedef _PeerTrafficOwner = ({
+  int? processId,
+  int? runtimeIncarnation,
+  String nodeId,
+  String networkId,
+  int networkGeneration,
+});
+
+(String, int?) _peerTrafficIdentity(PeerSnapshot peer) => (
+  peer.virtualIp,
+  peer.pathObservability.networkEpoch?.peerSessionGeneration,
+);
+
 class _PeerTrafficSample {
   const _PeerTrafficSample({
+    required this.identity,
     required this.bytesSent,
     required this.bytesReceived,
     required this.fetchedAt,
   });
 
+  final (String, int?) identity;
   final int bytesSent;
   final int bytesReceived;
   final DateTime fetchedAt;

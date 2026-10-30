@@ -60,6 +60,9 @@ class DiagnosticsSnapshot {
   final int networkGeneration;
   final int uptimeMs;
 
+  /// Missing legacy uptime is unknown, not a newly started service.
+  int? get reportedUptimeMs => _counterOrNull(raw['uptime_ms']);
+
   /// Authoritative daemon readiness phase (e.g. `connected_direct`,
   /// `connected_relay`, `discovering_peers`, `error`). Render this instead of
   /// inferring connectivity from `virtualIp` presence.
@@ -114,7 +117,7 @@ class DiagnosticsSnapshot {
       peerSnapshotAgeMs: _int(json['peer_snapshot_age_ms']),
       peerSnapshotShape: _string(json['peer_snapshot_shape']),
       networkGeneration: _int(json['network_generation']),
-      uptimeMs: _int(json['uptime_ms']),
+      uptimeMs: _counterOrNull(json['uptime_ms']) ?? 0,
       readyPhase: _string(json['ready_phase'], 'unknown'),
     );
   }
@@ -543,6 +546,8 @@ class PeerManagerStatsSnapshot {
     required this.relayConnections,
     required this.totalBytesSent,
     required this.totalBytesReceived,
+    this.totalBytesSentReported = true,
+    this.totalBytesReceivedReported = true,
     required this.pathObservability,
   });
 
@@ -551,6 +556,15 @@ class PeerManagerStatsSnapshot {
   final int relayConnections;
   final int totalBytesSent;
   final int totalBytesReceived;
+  final bool totalBytesSentReported;
+  final bool totalBytesReceivedReported;
+
+  int? get reportedBytesSent =>
+      totalBytesSentReported && totalBytesSent >= 0 ? totalBytesSent : null;
+  int? get reportedBytesReceived =>
+      totalBytesReceivedReported && totalBytesReceived >= 0
+      ? totalBytesReceived
+      : null;
   final PathObservabilityMetricsSnapshot pathObservability;
 
   factory PeerManagerStatsSnapshot.fromJson(JsonMap json) {
@@ -558,8 +572,11 @@ class PeerManagerStatsSnapshot {
       totalPeers: _int(json['total_peers']),
       directConnections: _int(json['direct_connections']),
       relayConnections: _int(json['relay_connections']),
-      totalBytesSent: _int(json['total_bytes_sent']),
-      totalBytesReceived: _int(json['total_bytes_received']),
+      totalBytesSent: _counterOrNull(json['total_bytes_sent']) ?? 0,
+      totalBytesReceived: _counterOrNull(json['total_bytes_received']) ?? 0,
+      totalBytesSentReported: _counterOrNull(json['total_bytes_sent']) != null,
+      totalBytesReceivedReported:
+          _counterOrNull(json['total_bytes_received']) != null,
       pathObservability: PathObservabilityMetricsSnapshot.fromJson(
         _map(json['path_observability']),
       ),

@@ -11,6 +11,7 @@ import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/daemon/daemon_controller.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/presentation/network_overview.dart';
+import '../../core/presentation/traffic_statistics.dart';
 import '../../core/rooms/room_profiles.dart';
 import '../../shared/network_overview_presentation.dart';
 import '../../shared/widgets/network_scope_picker.dart';
@@ -20,6 +21,9 @@ import '../../shared/formatters.dart';
 import '../../shared/permission_copy.dart';
 import '../../shared/widgets/app_motion.dart';
 import '../../shared/widgets/app_notice.dart';
+import '../../shared/widgets/traffic_totals.dart';
+import '../../shared/widgets/traffic_history_scope.dart';
+import '../../shared/widgets/traffic_history_section.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
 import '../../shared/widgets/device_type_icon.dart';
@@ -32,6 +36,7 @@ part 'dashboard/hero.dart';
 part 'dashboard/issues.dart';
 part 'dashboard/surface.dart';
 part 'dashboard/room_overview.dart';
+part 'dashboard/traffic.dart';
 
 /// Network Home: tells the user how the network is doing right now — status,
 /// Virtual IP, key metrics, a short device preview, and plain-language
@@ -176,6 +181,10 @@ class _DashboardPageState extends State<DashboardPage> {
               _RoomHomeOverview(
                 overview: overview,
                 selectedId: selectedId,
+                trafficSection: _TrafficOverviewSection(
+                  statusStore: widget.statusStore,
+                  selectedId: selectedId,
+                ),
                 onOpenDevices: widget.onOpenDevices,
                 onOpenRooms: widget.onOpenRooms,
                 onOpenRoom: widget.onOpenRoom,
@@ -221,6 +230,28 @@ class _DashboardPageState extends State<DashboardPage> {
             ],
             if (capabilities.canActAsLocalVpnNode &&
                 !showRoomOverview &&
+                snapshot == null &&
+                !(capabilities.canControlLocalDaemon &&
+                    status == _NetworkStatus.stopped) &&
+                widget.onOpenRooms != null) ...[
+              const SizedBox(height: AppTokens.space12),
+              _RoomEntryAction(onOpenRooms: widget.onOpenRooms!),
+            ],
+            if (capabilities.canActAsLocalVpnNode &&
+                !showRoomOverview &&
+                manualCommand != null) ...[
+              const SizedBox(height: AppTokens.space12),
+              _ManualCommandCard(command: manualCommand),
+            ],
+            if (capabilities.canActAsLocalVpnNode && !showRoomOverview) ...[
+              const SizedBox(height: AppTokens.space16),
+              _TrafficOverviewSection(
+                statusStore: widget.statusStore,
+                selectedId: selectedId,
+              ),
+            ],
+            if (capabilities.canActAsLocalVpnNode &&
+                !showRoomOverview &&
                 snapshot != null) ...[
               const SizedBox(height: AppTokens.space16),
               _DashboardSectionSurface(
@@ -237,21 +268,6 @@ class _DashboardPageState extends State<DashboardPage> {
                 const SizedBox(height: AppTokens.space12),
                 _ConnectionDetails(snapshot: snapshot, counts: counts),
               ],
-            ],
-            if (capabilities.canActAsLocalVpnNode &&
-                !showRoomOverview &&
-                snapshot == null &&
-                !(capabilities.canControlLocalDaemon &&
-                    status == _NetworkStatus.stopped) &&
-                widget.onOpenRooms != null) ...[
-              const SizedBox(height: AppTokens.space12),
-              _RoomEntryAction(onOpenRooms: widget.onOpenRooms!),
-            ],
-            if (capabilities.canActAsLocalVpnNode &&
-                !showRoomOverview &&
-                manualCommand != null) ...[
-              const SizedBox(height: AppTokens.space12),
-              _ManualCommandCard(command: manualCommand),
             ],
           ],
         );

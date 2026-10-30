@@ -23,6 +23,8 @@ class PeerSnapshot {
     required this.isRelay,
     required this.bytesSent,
     required this.bytesReceived,
+    this.bytesSentReported = true,
+    this.bytesReceivedReported = true,
     required this.relayServer,
     required this.warning,
     required this.connectedForMs,
@@ -56,6 +58,13 @@ class PeerSnapshot {
   final bool isRelay;
   final int bytesSent;
   final int bytesReceived;
+  final bool bytesSentReported;
+  final bool bytesReceivedReported;
+
+  int? get reportedBytesSent =>
+      bytesSentReported && bytesSent >= 0 ? bytesSent : null;
+  int? get reportedBytesReceived =>
+      bytesReceivedReported && bytesReceived >= 0 ? bytesReceived : null;
   final String? relayServer;
   final String? warning;
   final int? connectedForMs;
@@ -95,8 +104,10 @@ class PeerSnapshot {
       activePath: _nullableString(json['active_path']),
       directType: _string(json['direct_type'], 'unknown'),
       isRelay: _bool(json['is_relay']),
-      bytesSent: _int(json['bytes_sent']),
-      bytesReceived: _int(json['bytes_received']),
+      bytesSent: _counterOrNull(json['bytes_sent']) ?? 0,
+      bytesReceived: _counterOrNull(json['bytes_received']) ?? 0,
+      bytesSentReported: _counterOrNull(json['bytes_sent']) != null,
+      bytesReceivedReported: _counterOrNull(json['bytes_received']) != null,
       relayServer: _nullableString(json['relay_server']),
       warning: _nullableString(json['warning']),
       connectedForMs: _intOrNull(json['connected_for_ms']),
