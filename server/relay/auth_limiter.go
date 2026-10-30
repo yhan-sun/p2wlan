@@ -13,11 +13,12 @@ import (
 	"time"
 )
 
+const maxAuthFailureSources = 4096
+
 type authFailureBucket struct {
 	windowStart time.Time
 	failures    uint64
 	rateLimited uint64
-	lastSeen    time.Time
 }
 
 type authFailureLimiter struct {
@@ -26,6 +27,11 @@ type authFailureLimiter struct {
 	window  time.Duration
 	salt    []byte
 	buckets map[string]*authFailureBucket
+	// Unknown sources share a conservative bucket at capacity instead of
+	// evicting a source that has already exhausted its authentication budget.
+	overflow  *authFailureBucket
+	nextPrune time.Time
+	lastNow   time.Time
 }
 
 func newAuthFailureLimiter(limit int, window time.Duration) (*authFailureLimiter, error) {
@@ -53,7 +59,6 @@ func (l *authFailureLimiter) allow(source string, now time.Time) bool {
 	bucket := l.bucketForSourceLocked(source, now)
 	if bucket.failures >= uint64(l.limit) {
 		bucket.rateLimited++
-		bucket.lastSeen = now
 		return false
 	}
 	return true
@@ -67,7 +72,33 @@ func (l *authFailureLimiter) recordFailure(source string, now time.Time) {
 	defer l.mu.Unlock()
 	bucket := l.bucketForSourceLocked(source, now)
 	bucket.failures++
-	bucket.lastSeen = now
+}
+
+func (l *authFailureLimiter) expired(bucket *authFailureBucket, now time.Time) bool {
+	return bucket == nil || now.Before(bucket.windowStart) || now.Sub(bucket.windowStart) >= l.window
+}
+
+func (l *authFailureLimiter) pruneExpiredLocked(now time.Time) {
+	l.nextPrune = time.Time{}
+	for source, bucket := range l.buckets {
+		if l.expired(bucket, now) {
+			delete(l.buckets, source)
+		} else {
+			l.noteExpiryLocked(bucket.windowStart.Add(l.window))
+		}
+	}
+	if l.expired(l.overflow, now) {
+		l.overflow = nil
+	} else {
+		l.noteExpiryLocked(l.overflow.windowStart.Add(l.window))
+	}
+	l.lastNow = now
+}
+
+func (l *authFailureLimiter) noteExpiryLocked(expiry time.Time) {
+	if l.nextPrune.IsZero() || expiry.Before(l.nextPrune) {
+		l.nextPrune = expiry
+	}
 }
 
 func (l *authFailureLimiter) bucketForSourceLocked(source string, now time.Time) *authFailureBucket {
@@ -75,11 +106,25 @@ func (l *authFailureLimiter) bucketForSourceLocked(source string, now time.Time)
 	if source == "" {
 		source = "unknown"
 	}
-	bucket := l.buckets[source]
-	if bucket == nil || now.Before(bucket.windowStart) || now.Sub(bucket.windowStart) >= l.window {
-		bucket = &authFailureBucket{windowStart: now, lastSeen: now}
-		l.buckets[source] = bucket
+	if bucket := l.buckets[source]; !l.expired(bucket, now) {
+		return bucket
 	}
+	// Reclaim windows on a new/expired source. Both memory and the maximum
+	// work under the limiter lock are bounded by maxAuthFailureSources.
+	if l.nextPrune.IsZero() || !now.Before(l.nextPrune) || now.Before(l.lastNow) {
+		l.pruneExpiredLocked(now)
+	}
+	l.lastNow = now
+	if len(l.buckets) >= maxAuthFailureSources {
+		if l.overflow == nil {
+			l.overflow = &authFailureBucket{windowStart: now}
+			l.noteExpiryLocked(now.Add(l.window))
+		}
+		return l.overflow
+	}
+	bucket := &authFailureBucket{windowStart: now}
+	l.buckets[source] = bucket
+	l.noteExpiryLocked(now.Add(l.window))
 	return bucket
 }
 
@@ -89,32 +134,40 @@ func (l *authFailureLimiter) snapshots(now time.Time, maxEntries int) []AuthFail
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	snapshots := make([]AuthFailureSourceSnapshot, 0, len(l.buckets))
-	for source, bucket := range l.buckets {
-		if now.Before(bucket.windowStart) || now.Sub(bucket.windowStart) >= l.window {
-			continue
+	l.pruneExpiredLocked(now)
+	// Keep only the requested top entries while scanning the bounded table;
+	// metrics never allocates a copy proportional to historical source count.
+	maxEntries = min(maxEntries, maxAuthFailureSources+1)
+	snapshots := make([]AuthFailureSourceSnapshot, 0, maxEntries)
+	appendBucket := func(source string, bucket *authFailureBucket, overflow bool) {
+		if bucket == nil || (bucket.failures == 0 && bucket.rateLimited == 0) {
+			return
 		}
-		if bucket.failures == 0 && bucket.rateLimited == 0 {
-			continue
-		}
-		snapshots = append(snapshots, AuthFailureSourceSnapshot{
+		snapshot := AuthFailureSourceSnapshot{
+			Overflow:        overflow,
 			SourceKey:       l.sourceKey(source),
 			Failures:        bucket.failures,
 			RateLimited:     bucket.rateLimited,
 			WindowResetUnix: bucket.windowStart.Add(l.window).Unix(),
-		})
-	}
-	sort.Slice(snapshots, func(i, j int) bool {
-		leftTotal := snapshots[i].Failures + snapshots[i].RateLimited
-		rightTotal := snapshots[j].Failures + snapshots[j].RateLimited
-		if leftTotal != rightTotal {
-			return leftTotal > rightTotal
 		}
-		return snapshots[i].SourceKey < snapshots[j].SourceKey
-	})
-	if len(snapshots) > maxEntries {
-		snapshots = snapshots[:maxEntries]
+		index := sort.Search(len(snapshots), func(i int) bool {
+			leftTotal := snapshot.Failures + snapshot.RateLimited
+			rightTotal := snapshots[i].Failures + snapshots[i].RateLimited
+			return leftTotal > rightTotal || (leftTotal == rightTotal && snapshot.SourceKey < snapshots[i].SourceKey)
+		})
+		if index >= maxEntries {
+			return
+		}
+		if len(snapshots) < maxEntries {
+			snapshots = append(snapshots, AuthFailureSourceSnapshot{})
+		}
+		copy(snapshots[index+1:], snapshots[index:len(snapshots)-1])
+		snapshots[index] = snapshot
 	}
+	for source, bucket := range l.buckets {
+		appendBucket(source, bucket, false)
+	}
+	appendBucket("overflow", l.overflow, true)
 	return snapshots
 }
 

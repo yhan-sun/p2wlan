@@ -63,10 +63,7 @@ jobs:
           npm ci --no-audit --no-fund
           npm run typecheck
           npm run build
-          test -s ../admin/web/index.html
-          test -s ../admin/web/app.js
-          test -s ../admin/web/app.css
-          grep -q '/admin/app.js' ../admin/web/index.html
+          python3 ../../scripts/quality/check_admin_assets.py ../admin/web
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e

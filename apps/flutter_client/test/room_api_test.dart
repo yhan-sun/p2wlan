@@ -204,6 +204,37 @@ void main() {
     });
 
     test(
+      'every HTTP 401 keeps the canonical authentication failure code',
+      () async {
+        Object body = <String, dynamic>{};
+        server.listen((request) async {
+          await request.drain<void>();
+          request.response.statusCode = 401;
+          request.response.write(body is String ? body : jsonEncode(body));
+          await request.response.close();
+        });
+        for (final response in <Object>[
+          <String, dynamic>{},
+          {'error_code': ''},
+          {'error_code': 'room_join'},
+          {'error_code': 'other_auth_failure'},
+          {'error_code': 7},
+          'unauthorized',
+        ]) {
+          body = response;
+          await expectLater(
+            api.list(),
+            throwsA(
+              isA<RoomException>()
+                  .having((error) => error.code, 'code', 'auth_expired')
+                  .having((error) => error.message, 'message', '登录状态已失效，请重新登录'),
+            ),
+          );
+        }
+      },
+    );
+
+    test(
       'conflict errors retain operation-specific codes and safe messages',
       () async {
         var code = 'room_device_state_conflict';

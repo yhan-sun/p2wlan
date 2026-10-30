@@ -41,7 +41,7 @@ impl PeerManager {
             .unwrap_or_else(|p| p.into_inner());
         // The same publication gate fences this immutable input. Preparing a
         // private copy grants no membership or current-owner permission.
-        // Keep allocation out of the mutex used by native single-try readers.
+        // Keep allocation outside the membership guard used by native readers.
         let current = self.dplpmtud_capability.sender.borrow().clone();
         let prepared = (current.get(peer_id) != Some(&peer_session_generation)).then(|| {
             let mut next = (*current).clone();
@@ -50,7 +50,7 @@ impl PeerManager {
         });
         let membership = self
             .peer_membership
-            .lock()
+            .read()
             .unwrap_or_else(|p| p.into_inner());
         if membership.active_generation(peer_id) != Some(peer_session_generation) {
             return;
@@ -79,7 +79,7 @@ impl PeerManager {
     /// The publication gate excludes every watch writer before borrowing its
     /// immutable value. Both acquisitions are try-only and precede UDP guards.
     pub(crate) fn try_peer_dplpmtud_capability(&self, peer_id: &str) -> PeerDplpmtudCapability {
-        let membership = match self.peer_membership.try_lock() {
+        let membership = match self.peer_membership.try_read() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => return PeerDplpmtudCapability::Contended,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
@@ -102,7 +102,7 @@ impl PeerManager {
 
     #[cfg(test)]
     pub(crate) fn with_peer_membership_held_for_test<R>(&self, operation: impl FnOnce() -> R) -> R {
-        let _guard = self.peer_membership.lock().unwrap();
+        let _guard = self.peer_membership.write().unwrap();
         operation()
     }
 

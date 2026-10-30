@@ -36,8 +36,13 @@ func (h *Hub) notify(nodeID, networkID, kind string) bool {
 	if kind == "roster_changed" && !client.roomRosterWake {
 		kind = "signals_available"
 	}
+	// Counter order must be publication order: an atomic counter alone can
+	// enqueue sequence N+1 before a paused publisher enqueues N.
+	client.notifyMu.Lock()
+	defer client.notifyMu.Unlock()
+	client.sequence++
 	frame := serverMessage{Type: kind, ProtocolVersion: ProtocolVersion,
-		Sequence: client.sequence.Add(1), ServerTimeMS: time.Now().UnixMilli()}
+		Sequence: client.sequence, ServerTimeMS: time.Now().UnixMilli()}
 	if kind == "roster_changed" {
 		frame.NodeID, frame.NetworkID = client.nodeID, client.networkID
 	}

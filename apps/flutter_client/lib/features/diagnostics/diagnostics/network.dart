@@ -53,13 +53,14 @@ class _NetworkDiagnosticsSectionState
   Future<void> _verifyRoutes() async {
     if (!widget.capabilities.canVerifyRoutes) return;
     final url = widget.settingsStore.settings.diagnosticsUrl;
+    final revision = widget.statusStore.sessionRevision;
     if (!widget.statusStore.daemonReachable) return;
     setState(() {
       _verifying = true;
     });
     try {
       final result = await widget.statusStore.diagnosticsApi.verifyRoutes(url);
-      if (!mounted) return;
+      if (!_sameSession(revision, url)) return;
       setState(() => _routeState = result.toJson());
     } catch (_) {
       // Daemon may not expose /routes/verify yet; leave state unknown.
@@ -72,6 +73,7 @@ class _NetworkDiagnosticsSectionState
     if (!widget.capabilities.canRepairRoutes) return;
     final strings = AppStringsScope.of(context);
     final url = widget.settingsStore.settings.diagnosticsUrl;
+    final revision = widget.statusStore.sessionRevision;
     setState(() {
       _repairing = true;
       _message = null;
@@ -81,11 +83,11 @@ class _NetworkDiagnosticsSectionState
       final result = await widget.statusStore.diagnosticsApi.repairRoutes(url);
       final changed = result.changed;
       final after = result.after;
-      if (!mounted) return;
+      if (!_sameSession(revision, url)) return;
       // Refresh the authoritative route state from the verify API instead of
       // trusting the repair response to carry the full route table.
-      final routeState = await _fetchAuthoritativeState();
-      if (!mounted) return;
+      final routeState = await _fetchAuthoritativeState(url);
+      if (!_sameSession(revision, url)) return;
       setState(() {
         _routeState = routeState;
         _message = changed
@@ -93,7 +95,7 @@ class _NetworkDiagnosticsSectionState
             : strings.tunnelRouteAlreadyInstalled;
       });
     } catch (_) {
-      if (mounted) {
+      if (_sameSession(revision, url)) {
         setState(() {
           _message = strings.tunnelRouteRepairFailed;
           _messageIsError = true;
@@ -104,11 +106,15 @@ class _NetworkDiagnosticsSectionState
     }
   }
 
-  /// Fetches the authoritative route table from the daemon verify API, or null
-  /// when the endpoint is unavailable (state stays "unknown" in the UI).
-  Future<Map<String, dynamic>?> _fetchAuthoritativeState() async {
+  bool _sameSession(int revision, String url) =>
+      mounted &&
+      widget.statusStore.sessionRevision == revision &&
+      widget.settingsStore.settings.diagnosticsUrl == url;
+
+  /// Reads the same endpoint that handled the repair, without switching to a
+  /// replacement account or diagnostics scope across the await.
+  Future<Map<String, dynamic>?> _fetchAuthoritativeState(String url) async {
     try {
-      final url = widget.settingsStore.settings.diagnosticsUrl;
       final result = await widget.statusStore.diagnosticsApi.verifyRoutes(url);
       return result.toJson();
     } catch (_) {
@@ -121,14 +127,16 @@ class _NetworkDiagnosticsSectionState
   Future<void> _restartNetworkService() async {
     if (!widget.capabilities.canControlLocalDaemon) return;
     final strings = AppStringsScope.of(context);
+    final revision = widget.statusStore.sessionRevision;
+    final url = widget.settingsStore.settings.diagnosticsUrl;
     setState(() {
       _rebuilding = true;
       _message = null;
       _messageIsError = false;
     });
     try {
-      final stop = await widget.statusStore.stopDaemon();
-      if (!mounted) return;
+      final stop = await widget.statusStore.stopPrimaryDaemon();
+      if (!_sameSession(revision, url)) return;
       if (!stop.ok) {
         setState(() {
           _message = strings.tunnelRestartFailed;
@@ -137,7 +145,7 @@ class _NetworkDiagnosticsSectionState
         return;
       }
       final start = await widget.statusStore.startDaemon();
-      if (!mounted) return;
+      if (!_sameSession(revision, url)) return;
       setState(() {
         final ok = start.ok;
         _message = ok

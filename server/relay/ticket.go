@@ -166,6 +166,11 @@ func (s *RelayServer) verifyTicket(tokenStr string) (*relayTicketClaims, error) 
 	if claims.ExpiresAt == nil {
 		return nil, fmt.Errorf("missing exp")
 	}
+	// Clock skew tolerates issuer nbf/iat differences, but the connection
+	// lifecycle closes at exp itself. Reject before replacing a live owner.
+	if !time.Now().Before(claims.ExpiresAt.Time) {
+		return nil, fmt.Errorf("ticket expired")
+	}
 	if claims.NotBefore == nil {
 		return nil, fmt.Errorf("missing nbf")
 	}

@@ -15,6 +15,11 @@ func forwardedSource(frame []byte) (string, bool) {
 // Credits include the frame currently being written; a blocked writer cannot
 // admit unbounded memory or make one source occupy the whole destination.
 func (p *peer) enqueue(frame []byte) bool {
+	return p.enqueueFrame(queuedFrame{data: frame})
+}
+
+func (p *peer) enqueueFrame(queued queuedFrame) bool {
+	frame := queued.data
 	p.queueMu.Lock()
 	defer p.queueMu.Unlock()
 	if p.revoked.Load() || len(frame) > maxPeerQueuedBytes-p.queuedBytes {
@@ -34,7 +39,7 @@ func (p *peer) enqueue(frame []byte) bool {
 	default:
 	}
 	select {
-	case p.send <- frame:
+	case p.send <- queued:
 		p.queuedBytes += len(frame)
 		if business {
 			if p.queuedBySource == nil {

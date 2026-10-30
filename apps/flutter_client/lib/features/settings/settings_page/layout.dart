@@ -1,8 +1,6 @@
 part of '../settings_page.dart';
 
-/// The settings "home": a grouped list of categories with a short summary per
-/// row. Used for medium and compact layouts (and the standalone page below the
-/// desktop breakpoint). Tapping a category opens an adaptive detail surface.
+/// Category entry points use the available width without exposing form fields.
 class _SettingsRoot extends StatelessWidget {
   const _SettingsRoot({
     required this.categories,
@@ -17,62 +15,154 @@ class _SettingsRoot extends StatelessWidget {
   final ValueChanged<SettingsCategory> onSelect;
 
   @override
-  Widget build(BuildContext context) {
-    final strings = AppStringsScope.of(context);
-    Widget rowFor(int index) {
-      final category = categories[index];
-      return _PreferenceRow(
-        label: category.label(strings),
-        value: summaryFor(category),
-        leading: _SettingsCategoryIcon(category),
-        showDivider: index != categories.length - 1,
-        onTap: () => onSelect(category),
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final twoColumns =
+          constraints.maxWidth >= 520 &&
+          MediaQuery.textScalerOf(context).scale(14) <= 19;
+      final width = twoColumns
+          ? (constraints.maxWidth - 16) / 2
+          : constraints.maxWidth;
+      Widget cardFor(SettingsCategory category) => SizedBox(
+        width: width,
+        child: _SettingsCategoryCard(
+          category: category,
+          summary: summaryFor(category),
+          spacious: twoColumns,
+          onTap: () => onSelect(category),
+        ),
       );
-    }
-
-    return ListView(
-      padding: const EdgeInsets.symmetric(vertical: AppTokens.space6),
-      children: [
-        _SettingsSurface(
-          padding: const EdgeInsets.symmetric(
-            horizontal: AppTokens.space6,
-            vertical: AppTokens.space4,
-          ),
-          child: Column(
+      return ListView(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        children: [
+          Wrap(
+            spacing: 16,
+            runSpacing: twoColumns ? 16 : 12,
             children: [
-              for (var index = 0; index < categories.length; index++)
-                if (categories[index] == SettingsCategory.developer)
+              for (final category in categories)
+                if (category == SettingsCategory.developer)
                   AnimatedBuilder(
                     animation: statusListenable,
-                    builder: (context, _) => rowFor(index),
+                    builder: (context, _) => cardFor(category),
                   )
                 else
-                  rowFor(index),
+                  cardFor(category),
             ],
           ),
+        ],
+      );
+    },
+  );
+}
+
+class _SettingsCategoryCard extends StatelessWidget {
+  const _SettingsCategoryCard({
+    required this.category,
+    required this.summary,
+    required this.spacious,
+    required this.onTap,
+  });
+  final SettingsCategory category;
+  final String summary;
+  final bool spacious;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    final subtitle = switch (category) {
+      SettingsCategory.general =>
+        strings.isZh
+            ? '设备名称、外观与启动偏好'
+            : 'Device identity, appearance and startup',
+      SettingsCategory.accountNetwork =>
+        strings.isZh ? '账号登录、服务器与网络' : 'Account, server and network identity',
+      SettingsCategory.advancedNetwork =>
+        strings.isZh
+            ? '虚拟网卡、UDP 与中继'
+            : 'Virtual interface, UDP and relay options',
+      SettingsCategory.developer =>
+        strings.isZh ? '诊断服务、日志与版本' : 'Diagnostics, logs and client updates',
+    };
+    return Semantics(
+      container: true,
+      button: true,
+      onTap: onTap,
+      child: _SettingsTapSurface(
+        interactionKey: ValueKey('settings-category-card-${category.name}'),
+        outlined: true,
+        onTap: onTap,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: spacious ? 140 : 112),
+          child: Padding(
+            padding: EdgeInsets.all(spacious ? 20 : 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    _SettingsCategoryIcon(category),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        category.label(strings),
+                        style: TextStyle(
+                          fontSize: 15,
+                          height: 1.3,
+                          fontWeight: FontWeight.w600,
+                          color: theme.colorScheme.onSurface,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Icon(
+                      Icons.chevron_right_rounded,
+                      size: 20,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  subtitle,
+                  style: TextStyle(
+                    fontSize: 12,
+                    height: 1.45,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  summary,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    height: 1.3,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
-      ],
+      ),
     );
   }
 }
 
 class _SettingsCategoryIcon extends StatelessWidget {
   const _SettingsCategoryIcon(this.category);
-
   final SettingsCategory category;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final colors = P2WlanColors.of(context);
-    return Container(
-      width: 34,
-      height: 34,
-      decoration: BoxDecoration(
-        color: colors.selectedSurface,
-        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-      ),
-      child: Icon(category.icon, size: 18, color: theme.colorScheme.primary),
+    return Icon(
+      category.icon,
+      size: 21,
+      color: theme.colorScheme.onSurfaceVariant,
     );
   }
 }
@@ -126,60 +216,51 @@ class _CategoryRailItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final colors = P2WlanColors.of(context);
     return Padding(
       padding: const EdgeInsets.symmetric(
         vertical: 1,
         horizontal: AppTokens.space6,
       ),
       child: Semantics(
+        container: true,
         selected: selected,
         button: true,
-        child: MouseRegion(
-          cursor: SystemMouseCursors.click,
-          child: InkWell(
-            onTap: onTap,
-            borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-            child: AnimatedContainer(
-              duration: AppTokens.durationFast,
-              curve: AppTokens.curveEase,
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppTokens.space12,
-                vertical: AppTokens.space10,
-              ),
-              decoration: BoxDecoration(
-                color: selected ? colors.selectedSurface : Colors.transparent,
-                borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      label,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: selected
-                            ? FontWeight.w600
-                            : FontWeight.w500,
-                        color: selected
-                            ? theme.colorScheme.primary
-                            : theme.colorScheme.onSurfaceVariant,
-                      ),
+        onTap: onTap,
+        child: _SettingsTapSurface(
+          onTap: onTap,
+          selected: selected,
+          radius: AppTokens.radiusMd,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+              horizontal: AppTokens.space12,
+              vertical: AppTokens.space10,
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    label,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+                      color: selected
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
-                  if (selected)
-                    Container(
-                      width: 3,
-                      height: 14,
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.primary,
-                        borderRadius: BorderRadius.circular(2),
-                      ),
+                ),
+                if (selected)
+                  Container(
+                    width: 3,
+                    height: 14,
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.primary,
+                      borderRadius: BorderRadius.circular(2),
                     ),
-                ],
-              ),
+                  ),
+              ],
             ),
           ),
         ),
@@ -212,7 +293,7 @@ class _CategoryDetailView extends StatelessWidget {
     final statusSensitive =
         category == SettingsCategory.advancedNetwork ||
         category == SettingsCategory.developer ||
-        state._restartRequired;
+        state.widget.statusStore.primaryConfigurationPending;
     if (!statusSensitive) return _buildDetail(context);
     return AnimatedBuilder(
       animation: state._statusViewNotifier,
@@ -221,7 +302,8 @@ class _CategoryDetailView extends StatelessWidget {
   }
 
   Widget _buildDetail(BuildContext context) {
-    final dirty = state._categoryDirty(category);
+    final dirty =
+        state._categoryDirty(category) || state._savingCategory == category;
     final content = _categoryContent(category, state, strings, credentialState);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -243,7 +325,7 @@ class _CategoryDetailView extends StatelessWidget {
                 _SettingsErrorNotice(message: state._formError!),
                 const SizedBox(height: AppTokens.space12),
               ],
-              if (state._restartRequired) ...[
+              if (state.widget.statusStore.primaryConfigurationPending) ...[
                 _PendingRestartNotice(
                   busy: state._saving || state.widget.statusStore.daemonBusy,
                   canRestart: state._capabilities.canControlLocalDaemon,
@@ -251,25 +333,40 @@ class _CategoryDetailView extends StatelessWidget {
                 ),
                 const SizedBox(height: AppTokens.space12),
               ],
-              AbsorbPointer(absorbing: state._saving, child: content),
+              ExcludeFocus(
+                excluding: state._saving,
+                child: AbsorbPointer(absorbing: state._saving, child: content),
+              ),
             ],
           ),
         ),
-        if (dirty)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(2, AppTokens.space10, 2, 2),
-            child: AnimatedBuilder(
-              animation: state._statusViewNotifier,
-              builder: (context, _) => _SaveBar(
-                busy: state._saving,
-                restartRequired:
-                    state._restartRequired ||
-                    state._draftNeedsRestart(category),
-                onUndo: () => state._resetCategory(category),
-                onSave: () => state._saveCategory(category),
-              ),
-            ),
-          ),
+        _SettingsSaveSlot(
+          key: const Key('settings-save-slot'),
+          child: dirty
+              ? Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                    2,
+                    AppTokens.space10,
+                    2,
+                    2,
+                  ),
+                  child: AnimatedBuilder(
+                    animation: state._statusViewNotifier,
+                    builder: (context, _) => _SaveBar(
+                      busy: state._saving,
+                      restartRequired:
+                          state
+                              .widget
+                              .statusStore
+                              .primaryConfigurationPending ||
+                          state._draftNeedsRestart(category),
+                      onUndo: () => state._resetCategory(category),
+                      onSave: () => state._saveCategory(category),
+                    ),
+                  ),
+                )
+              : const SizedBox(width: double.infinity),
+        ),
       ],
     );
   }
@@ -338,12 +435,7 @@ class _MobileSettingsCategoryPage extends StatelessWidget {
                     maxWidth: settingsPageMaxWidth,
                   ),
                   child: Padding(
-                    padding: const EdgeInsets.fromLTRB(
-                      AppTokens.space16,
-                      AppTokens.space12,
-                      AppTokens.space16,
-                      AppTokens.space16,
-                    ),
+                    padding: const EdgeInsets.fromLTRB(16, 20, 16, 20),
                     child: _CategoryDetailView(
                       category: category,
                       state: state,
@@ -429,11 +521,14 @@ class _SettingsShell extends StatelessWidget {
           ),
           const SizedBox(width: AppTokens.space16),
           Expanded(
-            child: _CategoryDetailView(
-              category: current,
-              state: state,
-              strings: strings,
-              credentialState: credentialState,
+            child: AppEntrance(
+              identity: current,
+              child: _CategoryDetailView(
+                category: current,
+                state: state,
+                strings: strings,
+                credentialState: credentialState,
+              ),
             ),
           ),
         ],
@@ -441,19 +536,25 @@ class _SettingsShell extends StatelessWidget {
     }
     final current = selected;
     if (current == null) {
-      return _SettingsRoot(
-        categories: categories,
-        summaryFor: (category) => state._categorySummary(category, strings),
-        statusListenable: state._statusViewNotifier,
-        onSelect: onSelect,
+      return AppEntrance(
+        identity: 'root',
+        child: _SettingsRoot(
+          categories: categories,
+          summaryFor: (category) => state._categorySummary(category, strings),
+          statusListenable: state._statusViewNotifier,
+          onSelect: onSelect,
+        ),
       );
     }
-    return _CategoryDetailView(
-      category: current,
-      state: state,
-      strings: strings,
-      credentialState: credentialState,
-      onBack: onBack,
+    return AppEntrance(
+      identity: current,
+      child: _CategoryDetailView(
+        category: current,
+        state: state,
+        strings: strings,
+        credentialState: credentialState,
+        onBack: onBack,
+      ),
     );
   }
 }

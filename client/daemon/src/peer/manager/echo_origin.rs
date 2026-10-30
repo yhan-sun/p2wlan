@@ -76,7 +76,7 @@ impl PeerManager {
             .clone()
             .try_read_owned()
             .map_err(|_| Contended(CreditLock::Connections))?;
-        let membership = match self.peer_membership.try_lock() {
+        let membership = match self.peer_membership.try_read() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {

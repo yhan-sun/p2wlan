@@ -1,10 +1,14 @@
 import 'package:flutter/material.dart';
 
+import 'app_motion.dart';
+
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/navigation_model.dart';
 import '../../app/p2wlan_colors.dart';
 import '../../core/state/status_store.dart';
+import '../../core/presentation/network_overview.dart';
+import '../network_overview_presentation.dart';
 import 'status_badge.dart';
 
 /// Compact desktop and medium non-desktop navigation.
@@ -169,10 +173,12 @@ class _NavRailItem extends StatelessWidget {
       label: label,
       onTap: onTap,
     );
-    if (iconOnly) {
-      return Tooltip(message: label, child: item);
-    }
-    return item;
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: label,
+      child: Tooltip(message: label, excludeFromSemantics: true, child: item),
+    );
   }
 }
 
@@ -208,8 +214,8 @@ class _RailItemSurface extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: AppTokens.space4),
         child: AnimatedContainer(
-          duration: AppTokens.durationMedium,
-          curve: AppTokens.curveEase,
+          duration: AppMotion.feedbackDurationOf(context),
+          curve: AppMotion.curve,
           decoration: BoxDecoration(
             color: selected ? colors.selectedSurface : Colors.transparent,
             borderRadius: BorderRadius.circular(AppTokens.radiusSm),
@@ -220,46 +226,48 @@ class _RailItemSurface extends StatelessWidget {
               onTap: onTap,
               borderRadius: BorderRadius.circular(AppTokens.radiusSm),
               hoverColor: selected ? null : colors.hoverSurface,
-              child: SizedBox(
-                height: 40,
-                child: Stack(
-                  children: [
-                    if (selected)
-                      Align(
-                        alignment: Alignment.centerLeft,
-                        child: Container(
-                          width: 2,
-                          height: 18,
-                          decoration: BoxDecoration(
-                            color: theme.colorScheme.primary,
-                            borderRadius: BorderRadius.circular(2),
+              child: ExcludeSemantics(
+                child: SizedBox(
+                  height: 40,
+                  child: Stack(
+                    children: [
+                      if (selected)
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: Container(
+                            width: 2,
+                            height: 18,
+                            decoration: BoxDecoration(
+                              color: theme.colorScheme.primary,
+                              borderRadius: BorderRadius.circular(2),
+                            ),
                           ),
                         ),
-                      ),
-                    if (iconOnly)
-                      Center(child: Icon(icon, size: 19, color: foreground))
-                    else
-                      Padding(
-                        padding: const EdgeInsets.only(
-                          left: AppTokens.space12,
-                          right: AppTokens.space8,
-                        ),
-                        child: Row(
-                          children: [
-                            Icon(icon, size: 19, color: foreground),
-                            const SizedBox(width: AppTokens.space10),
-                            Expanded(
-                              child: Text(
-                                label,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: labelStyle,
+                      if (iconOnly)
+                        Center(child: Icon(icon, size: 19, color: foreground))
+                      else
+                        Padding(
+                          padding: const EdgeInsets.only(
+                            left: AppTokens.space12,
+                            right: AppTokens.space8,
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(icon, size: 19, color: foreground),
+                              const SizedBox(width: AppTokens.space10),
+                              Expanded(
+                                child: Text(
+                                  label,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: labelStyle,
+                                ),
                               ),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
-                      ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -285,7 +293,7 @@ class _CompactRailStatus extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return AnimatedBuilder(
-      animation: statusStore,
+      animation: Listenable.merge([statusStore, statusStore.parallelRooms]),
       builder: (context, _) {
         final (tone, label, detail) = _status(strings, statusStore);
         final colors = P2WlanColors.of(context);
@@ -305,8 +313,10 @@ class _CompactRailStatus extends StatelessWidget {
               strings.openTroubleshooting,
               '$label · $detail',
             ].join(': '),
+            excludeFromSemantics: true,
             child: Semantics(
               label: '$label, $detail',
+              hint: strings.openTroubleshooting,
               button: true,
               child: Material(
                 type: MaterialType.transparency,
@@ -327,30 +337,7 @@ class _CompactRailStatus extends StatelessWidget {
   }
 
   (StatusTone, String, String) _status(AppStrings strings, StatusStore store) {
-    if (!store.daemonReachable || store.snapshot == null) {
-      return (
-        StatusTone.neutral,
-        strings.shellStatusOffline,
-        strings.shellStatusOfflineDetail,
-      );
-    }
-    if (store.snapshotStale) {
-      return (StatusTone.warn, strings.stale, strings.shellStatusStaleDetail);
-    }
-    final health = store.snapshot!.health.status.toLowerCase();
-    if (health == 'healthy') {
-      final online = store.snapshot!.peers.where((p) => p.online).length;
-      return (
-        StatusTone.good,
-        strings.shellStatusHealthy,
-        strings.shellPeersOnline(online),
-      );
-    }
-    return (
-      StatusTone.warn,
-      strings.shellStatusAttention,
-      strings.needsAttention,
-    );
+    return networkOverviewStatus(strings, NetworkOverview.read(store));
   }
 }
 

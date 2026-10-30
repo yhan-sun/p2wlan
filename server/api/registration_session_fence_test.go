@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -48,6 +49,10 @@ func (l *observedRegistrationSessionLocker) Lock(_ string) func() {
 	l.mu.Unlock()
 	l.serial.Lock()
 	return l.serial.Unlock
+}
+
+func (l *observedRegistrationSessionLocker) LockContext(_ context.Context, deviceID string) (func(), error) {
+	return l.Lock(deviceID), nil
 }
 
 func newRegistrationSessionFixture(t *testing.T) *registrationSessionFixture {

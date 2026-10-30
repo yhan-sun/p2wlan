@@ -156,27 +156,29 @@ export function ConnectionDrawer({
         : exact.isError ? <ErrorBlock error={exact.error} />
           : <div className="connection-empty-inline" role="status">{tr('该连接观测已不存在，请关闭详情并刷新列表。')}</div>
         : <><div className="connection-state-hero">
-        <PathBadge connection={current} />
-        <FreshnessBadge connection={current} />
+        <div><PathBadge connection={current} /><FreshnessBadge connection={current} /></div>
+        <Link className="button secondary compact" to={`/connections?${graphScope}`} state={resourceOrigin}>{tr('在拓扑中定位')}</Link>
       </div>
+      <dl className="connection-detail-metrics">
+        <div><dt>{tr('验证 RTT')}</dt><dd>{current.last_validation_rtt_ms === undefined ? '—' : `${current.last_validation_rtt_ms} ms`}</dd></div>
+        <div><dt>{tr('Path age')}</dt><dd>{formatMilliseconds(current.path_age_ms)}</dd></div>
+        <div><dt>{tr('Last observed')}</dt><dd>{formatAgo(current.received_at)}</dd></div>
+      </dl>
       {!current.fresh && <div className="connection-stale-note">
         {tr("这是守护进程最后一次权威上报的路径，不代表当前仍处于活动连接。")}</div>}
+      <h3 className="connection-detail-heading">{tr('反向观测')}</h3>
       <section className="connection-direction-comparison" aria-label={tr('双向观测对照')}>
-        <div><strong>{tr('当前方向')}</strong><span>{current.reporting_device_name} → {current.remote_device_name}</span><span><PathBadge connection={current} /> <FreshnessBadge connection={current} /></span><small>{tr('恢复状态')}：{current.recovery_state || tr('未上报')}</small><small>{tr('服务端接收于')} {formatDate(current.received_at)}</small></div>
-        <div><strong>{tr('反向观测')}</strong><span>{current.remote_device_name} → {current.reporting_device_name}</span>
+        <div><strong>{current.remote_device_name} → {current.reporting_device_name}</strong>
           {reverseConnection ? <><span><PathBadge connection={reverseConnection} /> <FreshnessBadge connection={reverseConnection} /></span><small>{tr('恢复状态')}：{reverseConnection.recovery_state || tr('未上报')}</small><small>{tr('服务端接收于')} {formatDate(reverseConnection.received_at)}</small><button type="button" className="button secondary compact" onClick={reverseDirection}>{tr('查看反向详情')}</button></>
             : <span>{tr(reverse.fetchStatus === 'paused' ? '反向观测更新已暂停' : reverse.isPending ? '正在读取反向观测…' : reverse.error ? '无法读取反向观测' : '没有反向观测；不等同于路径断开。')}</span>}
         </div>
       </section>
       {(reverse.error || reverse.fetchStatus === 'paused') && <QueryStatus queries={[reverse]} />}
-      <div className="connection-detail-actions"><Link className="button secondary compact" to={`/connections?${graphScope}`} state={resourceOrigin}>{tr('在拓扑中定位')}</Link></div>
+      <h3 className="connection-detail-heading">{tr('连接信息')}</h3>
       <dl className="connection-detail-list">
         <div><dt>{tr("From")}</dt><dd><Link to={deviceConnectionsHref(current.reporting_device_id)} state={nextOrigin}>{current.reporting_device_name}</Link><small><Link to={`/accounts/${encodeURIComponent(current.reporting_user_id)}`} state={nextOrigin}>{current.reporting_username}</Link></small></dd></div>
         <div><dt>{tr("To")}</dt><dd><Link to={deviceConnectionsHref(current.remote_device_id)} state={nextOrigin}>{current.remote_device_name}</Link><small><Link to={`/accounts/${encodeURIComponent(current.remote_user_id)}`} state={nextOrigin}>{current.remote_username}</Link></small></dd></div>
         <div><dt>{tr("Network")}</dt><dd><Link to={`/relationships?${new URLSearchParams({ network_id: current.network_id === 'default' ? `personal:${current.reporting_user_id}` : current.network_id, account_id: current.reporting_user_id })}`} state={nextOrigin}>{current.network_name}</Link></dd></div>
-        <div><dt>{tr("验证 RTT")}</dt><dd>{current.last_validation_rtt_ms === undefined ? '—' : `${current.last_validation_rtt_ms} ms`}</dd></div>
-        <div><dt>{tr("Path age")}</dt><dd>{formatMilliseconds(current.path_age_ms)}</dd></div>
-        <div><dt>{tr("Last observed")}</dt><dd>{formatAgo(current.received_at)}</dd></div>
         <div><dt>{tr("Lifecycle")}</dt><dd title={current.lifecycle}>{lifecycleLabel(current.lifecycle, getLocale())}</dd></div>
         <div><dt>{tr("Previous path")}</dt><dd>{pathLabel(current.previous_path)}</dd></div>
         <div><dt>{tr("Reason")}</dt><dd title={current.transition_reason}>{reasonLabel(current.transition_reason)}</dd></div>

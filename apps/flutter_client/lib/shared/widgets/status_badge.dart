@@ -20,6 +20,7 @@ class StatusBadge extends StatelessWidget {
     final (bg, border, text, dot) = _colors(context);
     return Semantics(
       label: label,
+      excludeSemantics: true,
       child: Container(
         constraints: const BoxConstraints(minHeight: 24, maxWidth: 200),
         padding: const EdgeInsets.symmetric(

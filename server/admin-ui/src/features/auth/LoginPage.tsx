@@ -1,4 +1,4 @@
-import { ArrowRight, CircleCheck, Eye, EyeOff, KeyRound, ShieldCheck, Waypoints } from 'lucide-react'
+import { ArrowRight, CircleCheck, Eye, EyeOff, KeyRound, Waypoints } from 'lucide-react'
 import { type FormEvent, useEffect, useRef, useState } from 'react'
 import { LanguageSwitch, ThemeSwitch } from '../../ConsolePreferences'
 import { ApiError, setAdminToken, verifyAdminToken } from '../../api'
@@ -51,20 +51,15 @@ export function LoginPage({ onSuccess }: { onSuccess: () => void }) {
   }
 
   return <main className="login-page-v2">
-    <section className="login-brand-side">
-      <div className="brand-lockup large"><div className="brand-symbol"><Waypoints size={22} /></div><div><strong>{tr("P2WLAN")}</strong><span>{tr("Control")}</span></div></div>
-      <div className="login-brand-copy"><span className="eyebrow-v2">{tr("SELF-HOSTED CONTROL PLANE")}</span><h1>{tr("资源关系和真实路径，")}<br />{tr("各自说清楚。")}</h1><p>{tr("控制面资源关系与守护进程权威连接观测分开呈现，保持只读运维边界。")}</p></div>
-      <div className="login-security"><ShieldCheck size={17} /><span>{tr("管理权限与用户 JWT / 设备凭据完全隔离")}</span></div>
-    </section>
     <section className="login-form-side">
       <form className="login-card-v2" onSubmit={submit} aria-busy={submitting}>
-        <div className="login-language-row"><span>{tr('界面语言')}</span><div className="login-appearance-controls"><ThemeSwitch /><LanguageSwitch /></div></div>
-        <div className="mobile-brand"><div className="brand-symbol"><Waypoints size={20} /></div><strong>{tr("P2WLAN Control")}</strong></div>
-        <span className="eyebrow-v2">{tr("ADMIN CONSOLE")}</span>
-        <h2>{tr("登录控制台")}</h2>
-        <p>{tr("输入部署时配置的 ")}<code>{tr("CONTROL_ADMIN_TOKEN")}</code>{tr("。")}</p>
+        <div className="login-language-row"><span className="sr-only">{tr('界面语言')}</span><div className="login-appearance-controls"><ThemeSwitch /><LanguageSwitch /></div></div>
+        <div className="login-brand"><div className="brand-symbol"><Waypoints size={24} /></div><strong>P2WLAN <span>Control</span></strong></div>
+        <h1>{tr("登录控制台")}</h1>
+        <p>{tr("使用管理员令牌，查看资源与连接状态。")}</p>
         <label htmlFor="admin-token">{tr("管理员令牌")}</label>
-        <div className="input-with-icon"><KeyRound size={16} /><input id="admin-token" type={tokenVisible ? "text" : "password"} readOnly={submitting} aria-invalid={invalidToken} aria-describedby="admin-token-error" spellCheck={false} value={token} onChange={(event) => { setToken(event.target.value); setError('') }} placeholder={tr("至少 32 个字符")} autoComplete="current-password" autoFocus /><button type="button" className="token-visibility-button" aria-label={tr(tokenVisible ? "隐藏令牌" : "显示令牌")} aria-pressed={tokenVisible} onClick={() => setTokenVisible((value) => !value)}>{tokenVisible ? <EyeOff size={16} /> : <Eye size={16} />}</button></div>
+        <div className="input-with-icon"><KeyRound size={16} /><input id="admin-token" type={tokenVisible ? "text" : "password"} readOnly={submitting} aria-invalid={invalidToken} aria-describedby="admin-token-help admin-token-error" spellCheck={false} value={token} onChange={(event) => { setToken(event.target.value); setError('') }} placeholder={tr("至少 32 个字符")} autoComplete="current-password" autoFocus /><button type="button" className="token-visibility-button" aria-label={tr(tokenVisible ? "隐藏令牌" : "显示令牌")} aria-pressed={tokenVisible} onClick={() => setTokenVisible((value) => !value)}>{tokenVisible ? <EyeOff size={16} /> : <Eye size={16} />}</button></div>
+        <p id="admin-token-help" className="login-token-help">{tr("输入部署时配置的 ")}<code>CONTROL_ADMIN_TOKEN</code>{tr("。")}</p>
         <div id="admin-token-error" role="status" aria-live="polite" className={`login-error ${error ? 'visible' : ''}`}>{tr(error) || ' '}</div>
         <button className="button primary login-button" type="submit" disabled={submitting}>{submitting ? <><div className="spinner light" />{tr("验证中…")}</> : <>{tr("进入控制台")}<ArrowRight size={16} /></>}</button>
         <div className="session-note"><CircleCheck size={14} />{tr("令牌仅保存在当前标签页会话中")}</div>

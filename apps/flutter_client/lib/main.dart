@@ -11,6 +11,7 @@ import 'app/desktop_window_operations.dart';
 import 'app/p2wlan_app.dart';
 import 'core/capabilities/platform_capabilities.dart';
 import 'core/platform/desktop_startup_registration.dart';
+import 'core/traffic/traffic_history_store.dart';
 
 Future<void> main() async {
   writeDesktopTrayLifecycleTrace('main.ensureInitialized.begin');
@@ -35,6 +36,7 @@ Future<void> main() async {
   writeDesktopTrayLifecycleTrace('runApp.begin');
   runApp(
     P2WlanApp(
+      trafficHistoryStore: TrafficHistoryStore(),
       roomLinks: roomLinks,
       enableDesktopTray: enableFlutterTray,
       enableDesktopTaskbarStatus: _supportsDesktopHost && !enableFlutterTray,

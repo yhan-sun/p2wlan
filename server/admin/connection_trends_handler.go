@@ -10,6 +10,8 @@ import (
 
 // connectionTrends handles GET /admin/api/v1/connection-trends.
 func (s *Server) connectionTrends(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := adminReadRequestContext(r)
+	defer cancel()
 	windowHours, err := parseOptionalAdminInt(r.URL.Query().Get("window_hours"))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid window_hours"})
@@ -17,6 +19,7 @@ func (s *Server) connectionTrends(w http.ResponseWriter, r *http.Request) {
 	}
 
 	value, err := s.store.AdminConnectionTrends(database.AdminConnectionTrendsFilter{
+		Context:     ctx,
 		NetworkID:   strings.TrimSpace(r.URL.Query().Get("network_id")),
 		WindowHours: windowHours,
 	})

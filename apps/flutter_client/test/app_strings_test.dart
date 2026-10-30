@@ -107,8 +107,8 @@ void main() {
   group('plural handling (English)', () {
     test('device count uses singular for 1', () {
       final en = AppStrings.fromCode('en');
-      expect(en.deviceCountSummary(1, 1), '1 device · 1 online');
-      expect(en.deviceCountSummary(2, 1), '2 devices · 1 online');
+      expect(en.deviceCountSummary(1, 1), '1 other device · 1 online');
+      expect(en.deviceCountSummary(2, 1), '2 other devices · 1 online');
       expect(en.devicesNeedPathReview(1), '1 device needs path review');
       expect(en.devicesNeedPathReview(2), '2 devices need path review');
       expect(en.shellPeersOnline(1), '1 device online');
@@ -117,8 +117,8 @@ void main() {
 
     test('Chinese does not inflect', () {
       final zh = AppStrings.fromCode('zh-Hans');
-      expect(zh.deviceCountSummary(1, 1), '1 台设备 · 1 在线');
-      expect(zh.deviceCountSummary(2, 1), '2 台设备 · 1 在线');
+      expect(zh.deviceCountSummary(1, 1), '其他设备 1 台 · 1 在线');
+      expect(zh.deviceCountSummary(2, 1), '其他设备 2 台 · 1 在线');
       expect(zh.devicesNeedPathReview(1), '1 台设备的连接路径需要检查');
     });
   });

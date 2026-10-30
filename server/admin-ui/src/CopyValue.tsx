@@ -22,7 +22,7 @@ export function CopyValue({ value, label = '复制', compact = false }: { value:
     }
   }
   return <span className="copy-value">
-    <button type="button" className={`copy-value-button${compact ? ' compact-copy' : ''}`} onClick={() => { void copy() }} disabled={!value} aria-label={tr(label)} title={tr(status === 'copied' ? '已复制' : label)}>
+    <button type="button" className={`copy-value-button${compact ? ' compact-copy' : ''}`} data-copy-state={status} onClick={() => { void copy() }} disabled={!value} aria-label={tr(label)} title={tr(status === 'copied' ? '已复制' : label)}>
       {status === 'copied' ? <Check size={14} aria-hidden /> : <Copy size={14} aria-hidden />}
       {!compact && <span>{tr(status === 'copied' ? '已复制' : label)}</span>}
     </button>

@@ -10,6 +10,7 @@ import '../app/navigation_model.dart';
 import '../app/p2wlan_colors.dart';
 import '../core/capabilities/platform_capabilities.dart';
 import '../core/models/diagnostics_models.dart';
+import '../core/presentation/network_overview.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
 import '../core/update/update_models.dart';
@@ -21,7 +22,9 @@ import '../features/rooms/rooms_page.dart';
 import '../features/settings/settings_page.dart';
 import '../features/update/update_banner.dart';
 import '../shared/layout/app_breakpoints.dart';
+import '../shared/network_overview_presentation.dart';
 import '../shared/widgets/app_nav_rail.dart';
+import '../shared/widgets/app_motion.dart';
 import '../shared/widgets/desktop_sidebar.dart';
 import '../shared/widgets/status_badge.dart';
 import '../shared/widgets/windows_window_controls.dart';
@@ -32,6 +35,7 @@ class P2WlanShell extends StatefulWidget {
     required this.settingsStore,
     required this.statusStore,
     this.onLogout,
+    this.onReauthenticate,
     this.roomInvitation,
     this.onRoomInvitationHandled,
     this.capabilities,
@@ -44,6 +48,7 @@ class P2WlanShell extends StatefulWidget {
   final SettingsStore settingsStore;
   final StatusStore statusStore;
   final VoidCallback? onLogout;
+  final VoidCallback? onReauthenticate;
   final Uri? roomInvitation;
   final VoidCallback? onRoomInvitationHandled;
 
@@ -60,8 +65,6 @@ class P2WlanShell extends StatefulWidget {
 }
 
 class _P2WlanShellState extends State<P2WlanShell> {
-  static const _sectionFadeDuration = Duration(milliseconds: 150);
-
   var _section = P2WlanSection.home;
 
   /// Home previews hand the selected peer to the Devices page. Keeping only
@@ -216,11 +219,23 @@ class _P2WlanShellState extends State<P2WlanShell> {
     // desktop because they have no footer.
     final showStatusBadge = !hasSidebarFooter && _section != P2WlanSection.home;
     return AppBar(
-      toolbarHeight: _usesMacosChrome ? 36 : null,
+      toolbarHeight: _usesMacosChrome ? 32 : null,
+      backgroundColor: isMobileLayout
+          ? null
+          : Theme.of(context).scaffoldBackgroundColor,
       leading: _usesMacosChrome ? const SizedBox.shrink() : null,
       leadingWidth: _usesMacosChrome ? 76 : null,
-      title: isMobileLayout ? Text(_appBarTitle(strings)) : null,
-      centerTitle: false,
+      title: isMobileLayout
+          ? Text(_appBarTitle(strings))
+          : Text(
+              strings.appName,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+      centerTitle: !isMobileLayout && _usesMacosChrome,
       flexibleSpace: _canDragWindowFromAppBar
           ? const DragToMoveArea(child: SizedBox.expand())
           : null,
@@ -252,11 +267,14 @@ class _P2WlanShellState extends State<P2WlanShell> {
       P2WlanSection.home => DashboardPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
-        showHeader: false,
+        showHeader: showPageHeader,
         capabilities: widget.capabilities,
         onOpenDevices: () => _select(P2WlanSection.devices),
         onOpenPeer: _openPeerFromHome,
         onOpenTroubleshooting: () => _select(P2WlanSection.troubleshooting),
+        onOpenRooms: () => _select(P2WlanSection.interconnect),
+        onOpenRoom: _openRoom,
+        onReauthenticate: widget.onReauthenticate,
       ),
       P2WlanSection.devices => NodesPage(
         settingsStore: widget.settingsStore,
@@ -266,6 +284,8 @@ class _P2WlanShellState extends State<P2WlanShell> {
         initialPeerId: _pendingPeerId,
         onInitialPeerOpened: _consumePendingPeer,
         onPeerDetailsClosed: _handlePeerDetailsClosed,
+        onOpenRooms: () => _select(P2WlanSection.interconnect),
+        onOpenRoom: _openRoom,
       ),
       P2WlanSection.troubleshooting => DiagnosticsPage(
         settingsStore: widget.settingsStore,
@@ -274,12 +294,16 @@ class _P2WlanShellState extends State<P2WlanShell> {
         showHeader: showPageHeader,
         onOpenDevices: () => _select(P2WlanSection.devices),
         onOpenSettings: () => _select(P2WlanSection.settings),
+        onReauthenticate: widget.onReauthenticate,
+        onOpenRooms: () => _select(P2WlanSection.interconnect),
+        onOpenRoom: _openRoom,
       ),
       P2WlanSection.interconnect => RoomsPage(
         initialInvitation: widget.roomInvitation,
         initialRoomId: _selectedRoomId,
         onRoomSelected: (id) => _selectedRoomId = id,
         onInvitationHandled: widget.onRoomInvitationHandled,
+        onReauthenticate: widget.onReauthenticate,
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         capabilities: widget.capabilities,
@@ -292,20 +316,19 @@ class _P2WlanShellState extends State<P2WlanShell> {
         controller: _settingsController,
         capabilities: widget.capabilities,
         onLogout: widget.onLogout,
+        onReauthenticate: widget.onReauthenticate == null
+            ? null
+            : _requestReauthentication,
         onDirtyChanged: (dirty) => _settingsDirty = dirty,
         updateService: widget.updateService,
         showHeader: showPageHeader,
       ),
     };
-    return AnimatedSwitcher(
-      duration: MediaQuery.disableAnimationsOf(context)
-          ? Duration.zero
-          : _sectionFadeDuration,
-      switchInCurve: Curves.easeOut,
-      switchOutCurve: Curves.easeIn,
-      child: KeyedSubtree(
-        key: ValueKey((_section, widget.statusStore.sessionRevision)),
-        child: page,
+    final identity = (_section, widget.statusStore.sessionRevision);
+    return SizedBox.expand(
+      child: AppEntrance(
+        identity: identity,
+        child: KeyedSubtree(key: ValueKey(identity), child: page),
       ),
     );
   }
@@ -347,6 +370,38 @@ class _P2WlanShellState extends State<P2WlanShell> {
       _section = P2WlanSection.devices;
       _lastPrimarySection = P2WlanSection.devices;
     });
+  }
+
+  void _openRoom(String roomId) {
+    _selectedRoomId = roomId;
+    _select(P2WlanSection.interconnect);
+  }
+
+  Future<void> _requestReauthentication() async {
+    final onReauthenticate = widget.onReauthenticate;
+    if (onReauthenticate == null) return;
+    if (_settingsDirty) {
+      final strings = AppStringsScope.of(context);
+      final discard = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(strings.discardSettingsTitle),
+          content: Text(strings.discardSettingsBody),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: Text(strings.continueEditing),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: Text(strings.discardChanges),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || discard != true) return;
+    }
+    onReauthenticate();
   }
 
   void _consumePendingPeer() {
@@ -548,10 +603,12 @@ class _ShellStatusActions extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return AnimatedBuilder(
-      animation: statusStore,
+      animation: Listenable.merge([statusStore, statusStore.parallelRooms]),
       builder: (context, _) {
-        final label = _statusLabel(strings);
-        final tone = _statusTone();
+        final (tone, label, _) = networkOverviewStatus(
+          strings,
+          NetworkOverview.read(statusStore),
+        );
         return Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -584,30 +641,11 @@ class _ShellStatusActions extends StatelessWidget {
                         ),
                       ),
                     )
-                  : const Icon(Icons.refresh),
+                  : const Icon(Icons.refresh_rounded, size: 19),
             ),
           ],
         );
       },
     );
-  }
-
-  String _statusLabel(AppStrings strings) {
-    if (statusStore.daemonBusy) return strings.daemonWorking;
-    if (statusStore.snapshotStale) return strings.stale;
-    if (!statusStore.daemonReachable) return strings.offline;
-    final health = statusStore.snapshot?.health.status;
-    if (health == null || health.isEmpty) return strings.degraded;
-    return strings.healthStatusLabel(health);
-  }
-
-  StatusTone _statusTone() {
-    if (statusStore.snapshotStale) return StatusTone.warn;
-    if (!statusStore.daemonReachable) return StatusTone.neutral;
-    return switch (statusStore.snapshot?.health.status.toLowerCase()) {
-      'healthy' => StatusTone.good,
-      'degraded' => StatusTone.warn,
-      _ => StatusTone.warn,
-    };
   }
 }

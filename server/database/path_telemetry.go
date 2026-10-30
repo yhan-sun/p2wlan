@@ -10,9 +10,10 @@ import (
 )
 
 const (
-	PathTelemetrySchemaVersion      = 1
-	MaxTransitionsPerPair           = 50
-	MaxPathTelemetryValidationRTTMS = 24 * 60 * 60 * 1000
+	PathTelemetrySchemaVersion        = 1
+	MaxTransitionsPerPair             = 50
+	MaxPathTelemetryBatchObservations = 32
+	MaxPathTelemetryValidationRTTMS   = 24 * 60 * 60 * 1000
 )
 
 var (
@@ -74,7 +75,7 @@ var validTransitionReasons = map[string]struct{}{
 	"relay_transport_ready":           {},
 	"relay_peer_confirmed":            {},
 	"relay_business_usable":           {},
-	"relay_health_observed":            {},
+	"relay_health_observed":           {},
 	"relay_transport_lost":            {},
 	"relay_path_failed":               {},
 	"direct_probe_started":            {},
@@ -218,6 +219,7 @@ type existingPathObservation struct {
 	Lifecycle             string
 	CurrentPath           sql.NullString
 	TransitionReason      string
+	ObservedAt            int64
 }
 
 // RecordPathObservations validates and persists path telemetry observations from an
@@ -234,48 +236,46 @@ func (db *DB) RecordPathObservations(
 		return nil, errors.New("reporting_device_id and network_id are required")
 	}
 
-	// 1. Verify reporting device belongs to network_id
-	var reportingExists int
-	err := db.QueryRow(
-		`SELECT COUNT(*) FROM devices WHERE id = ? AND network_id = ?`,
-		reportingDeviceID, networkID,
-	).Scan(&reportingExists)
-	if err != nil {
-		return nil, fmt.Errorf("validating reporting device: %w", err)
-	}
-	if reportingExists == 0 {
-		return nil, ErrInvalidReportingDevice
+	if len(observations) > MaxPathTelemetryBatchObservations {
+		return nil, errors.New("path telemetry batch exceeds observation limit")
 	}
 
-	summary := &PathTelemetryIngestSummary{
-		Total: len(observations),
-	}
-	if len(observations) == 0 {
-		return summary, nil
-	}
-
-	now := time.Now().Unix()
-
-	tx, err := db.Begin()
+	// Registration and room authorization share the same write transaction as
+	// persistence. A callback may have crossed a registration/revocation boundary
+	// after the WebSocket hub or HTTP middleware checked its identity.
+	tx, err := db.beginRoomWrite()
 	if err != nil {
 		return nil, fmt.Errorf("begin telemetry tx: %w", err)
 	}
 	defer tx.Rollback()
+	var currentSequence, currentIncarnation int64
+	err = tx.QueryRow(`SELECT registration_seq, registration_incarnation FROM devices WHERE id = ? AND network_id = ?`, reportingDeviceID, networkID).Scan(&currentSequence, &currentIncarnation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrInvalidReportingDevice
+	}
+	if err != nil {
+		return nil, fmt.Errorf("validating reporting device: %w", err)
+	}
+	if registrationSeq != currentSequence {
+		return nil, &RegistrationSessionConflictError{CurrentSequence: currentSequence, CurrentIncarnation: currentIncarnation}
+	}
+	summary := &PathTelemetryIngestSummary{Total: len(observations)}
+	now := time.Now().Unix()
 
 	for _, obs := range observations {
 		remoteID := obs.RemoteDeviceID
-		if remoteID == "" || remoteID == reportingDeviceID {
+		if remoteID == "" || remoteID == reportingDeviceID || (obs.NetworkID != "" && obs.NetworkID != networkID) {
 			summary.Rejected++
 			continue
 		}
 
-		// Verify remote device exists in the same network
-		var remoteExists int
-		err := tx.QueryRow(
-			`SELECT COUNT(*) FROM devices WHERE id = ? AND network_id = ?`,
-			remoteID, networkID,
-		).Scan(&remoteExists)
-		if err != nil || remoteExists == 0 {
+		// Apply the same account isolation and room membership/device policy as
+		// actual peer signaling, rather than accepting every device in a network.
+		var allowed bool
+		if err := tx.QueryRow(devicesMayCommunicateSQL, reportingDeviceID, remoteID).Scan(&allowed); err != nil {
+			return nil, fmt.Errorf("validating remote communication permission: %w", err)
+		}
+		if !allowed {
 			summary.Rejected++
 			continue
 		}
@@ -293,7 +293,7 @@ func (db *DB) RecordPathObservations(
 		row := tx.QueryRow(
 			`SELECT registration_seq, observation_revision, network_generation,
 			        peer_session_generation, remote_candidate_epoch, lifecycle,
-			        current_path, transition_reason
+			        current_path, transition_reason, observed_at
 			 FROM peer_path_observations
 			 WHERE reporting_device_id = ? AND remote_device_id = ? AND network_id = ?`,
 			reportingDeviceID, remoteID, networkID,
@@ -307,6 +307,7 @@ func (db *DB) RecordPathObservations(
 			&existing.Lifecycle,
 			&existing.CurrentPath,
 			&existing.TransitionReason,
+			&existing.ObservedAt,
 		); scanErr == nil {
 			exists = true
 		} else if !errors.Is(scanErr, sql.ErrNoRows) {
@@ -345,6 +346,21 @@ func (db *DB) RecordPathObservations(
 								continue
 							}
 							if obs.ObservationRevision == existing.ObservationRevision {
+								samePath := currPath == nil && !existing.CurrentPath.Valid || currPath != nil && existing.CurrentPath.Valid && *currPath == existing.CurrentPath.String
+								if !samePath || lifecycle != existing.Lifecycle || obsReason != existing.TransitionReason {
+									summary.Rejected++
+									continue
+								}
+								// An unchanged committed path can be sampled again. Renew its
+								// lease only with a later sampling time, without manufacturing
+								// transitions or trend samples. Raw replays do not renew it.
+								if obs.ObservedAt > existing.ObservedAt {
+									_, err := tx.Exec(`UPDATE peer_path_observations SET received_at=?,observed_at=?,path_age_ms=?,last_handshake_age_ms=?,last_validation_rtt_ms=?
+ WHERE reporting_device_id=? AND remote_device_id=? AND network_id=?`, now, obs.ObservedAt, obs.PathAgeMS, obs.LastHandshakeAgeMS, validationRTT, reportingDeviceID, remoteID, networkID)
+									if err != nil {
+										return nil, fmt.Errorf("renew path observation lease: %w", err)
+									}
+								}
 								summary.Duplicate++
 								continue
 							}

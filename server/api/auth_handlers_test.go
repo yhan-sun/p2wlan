@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/yhan-sun/p2wlan/server/auth"
@@ -48,6 +49,17 @@ func TestLoginAcceptsEmailAndAccountUsername(t *testing.T) {
 	if code, body := login(map[string]string{"identifier": "pyu", "password": "password123"}); code != http.StatusOK || body["token"] == "" {
 		t.Fatalf("identifier login failed: code=%d body=%v", code, body)
 	}
+	if code, body := login(map[string]string{"email": "PYU@EXAMPLE.TEST", "password": "password123"}); code != http.StatusOK || body["token"] == "" {
+		t.Fatalf("uppercase email login failed: code=%d body=%v", code, body)
+	}
+	if _, err := db.UpdateUsername(user.ID, "My@Name"); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"email", "identifier"} {
+		if code, body := login(map[string]string{key: "My@Name", "password": "password123"}); code != http.StatusOK || body["token"] == "" {
+			t.Fatalf("case-sensitive username containing @ failed: key=%s code=%d body=%v", key, code, body)
+		}
+	}
 }
 
 func TestLoginStorageFailureDoesNotReportInvalidPassword(t *testing.T) {
@@ -71,5 +83,35 @@ func TestLoginStorageFailureDoesNotReportInvalidPassword(t *testing.T) {
 	}
 	if body["error_code"] != "authentication_unavailable" {
 		t.Fatal("storage outage missing stable reason code")
+	}
+}
+
+func TestRegisterValidatesBcryptPasswordByteLimit(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "password-limit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := NewServer(auth.NewService("test-secret", db), nil, db)
+	for _, tc := range []struct {
+		name, password string
+		status         int
+	}{
+		{"ascii-limit", strings.Repeat("a", 72), http.StatusOK},
+		{"ascii-too-long", strings.Repeat("a", 73), http.StatusBadRequest},
+		{"unicode-limit", strings.Repeat("密", 24), http.StatusOK},
+		{"unicode-too-long", strings.Repeat("密", 25), http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(map[string]string{"email": tc.name + "@example.test", "password": tc.password})
+			w := httptest.NewRecorder()
+			s.Register(w, httptest.NewRequest(http.MethodPost, "/api/v1/register", bytes.NewReader(body)))
+			if w.Code != tc.status {
+				t.Fatalf("HTTP %d, want %d: %s", w.Code, tc.status, w.Body.String())
+			}
+			if tc.status == http.StatusBadRequest && !strings.Contains(w.Body.String(), "72") {
+				t.Fatalf("password boundary missing from error: %s", w.Body.String())
+			}
+		})
 	}
 }

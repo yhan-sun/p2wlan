@@ -312,7 +312,7 @@ impl PeerManager {
             conn.reset_for_peer_session();
             let published_generation = self
                 .peer_membership
-                .lock()
+                .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .publish(node_id, conn.online, true);
             if let Some(peer_session_generation) = published_generation {

@@ -135,6 +135,8 @@ type RelayStatsSnapshot struct {
 }
 
 type AuthFailureSourceSnapshot struct {
+	// Overflow aggregates new sources while the fixed source table is full.
+	Overflow        bool   `json:"overflow,omitempty"`
 	SourceKey       string `json:"source_key"`
 	Failures        uint64 `json:"failures"`
 	RateLimited     uint64 `json:"rate_limited"`

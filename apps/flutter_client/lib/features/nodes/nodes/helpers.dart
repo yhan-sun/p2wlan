@@ -3,7 +3,7 @@ part of '../nodes_page.dart';
 bool _peerNeedsAttention(PeerSnapshot peer) {
   if (_peerIsOffline(peer)) return false;
   if (peer.lastError != null) return true;
-  return peer.online && (peer.path == 'probing' || peer.path == 'direct_trial');
+  return peer.online && !peer.isDirectVerified && !peer.isRelayVerified;
 }
 
 bool _peerIsOffline(PeerSnapshot peer) =>
@@ -12,7 +12,7 @@ bool _peerIsOffline(PeerSnapshot peer) =>
 bool _canRunSpeedTest(PeerSnapshot peer) =>
     peer.online &&
     peer.activePath == 'direct' &&
-    peer.path == 'direct' &&
+    peer.isDirectVerified &&
     peer.virtualIp.trim().isNotEmpty;
 
 String _speedTestUnavailableMessage(AppStrings strings) => strings.isZh
@@ -61,6 +61,7 @@ String _rowPathLabel(AppStrings strings, PeerSnapshot peer) {
 Color _rowStatusColor(BuildContext context, PeerSnapshot peer) {
   final c = P2WlanColors.of(context);
   if (_peerIsOffline(peer)) return c.offline;
+  if (!peer.isDirectVerified && !peer.isRelayVerified) return c.probing;
   return switch (peer.path) {
     'direct' => c.direct,
     'relay' => c.relay,
@@ -85,39 +86,48 @@ bool _filterMatches(_NodeFilter filter, PeerSnapshot peer) {
   return switch (filter) {
     _NodeFilter.all => true,
     _NodeFilter.online => peer.online && !_peerIsOffline(peer),
-    _NodeFilter.direct => peer.path == 'direct',
-    _NodeFilter.relay => peer.path == 'relay',
+    _NodeFilter.direct => peer.isDirectVerified,
+    _NodeFilter.relay => peer.isRelayVerified,
     _NodeFilter.attention => _peerNeedsAttention(peer),
     _NodeFilter.offline => _peerIsOffline(peer),
   };
 }
 
-List<PeerSnapshot> _applySearch(List<PeerSnapshot> peers, String query) {
+List<NetworkPeerSnapshot> _applySearch(
+  List<NetworkPeerSnapshot> peers,
+  String query,
+) {
   final trimmed = query.trim().toLowerCase();
   if (trimmed.isEmpty) return peers;
   return peers
       .where(
         (peer) =>
-            peer.displayName.toLowerCase().contains(trimmed) ||
-            peer.virtualIp.toLowerCase().contains(trimmed) ||
-            peer.nodeId.toLowerCase().contains(trimmed),
+            peer.peer.displayName.toLowerCase().contains(trimmed) ||
+            peer.peer.virtualIp.toLowerCase().contains(trimmed) ||
+            peer.peer.nodeId.toLowerCase().contains(trimmed) ||
+            (peer.roomName?.toLowerCase().contains(trimmed) ?? false),
       )
       .toList(growable: false);
 }
 
-List<PeerSnapshot> _applySort(List<PeerSnapshot> peers, _NodeSort sort) {
+List<NetworkPeerSnapshot> _applySort(
+  List<NetworkPeerSnapshot> peers,
+  _NodeSort sort,
+) {
   final sorted = [...peers];
   switch (sort) {
     case _NodeSort.recommended:
-      // The input is already the StatusStore's online-first lifecycle order.
-      // Keeping this branch a no-op is what prevents live path/latency updates
-      // from moving rows. Name and latency remain explicit, user-selected
-      // sorts.
-      break;
+      // Scopes each retain their owner's stable order. Partition the combined
+      // catalog once so a cached/offline row in one room cannot precede a
+      // current online row in another; RTT changes never reorder either set.
+      return [
+        ...sorted.where((item) => item.online),
+        ...sorted.where((item) => !item.online),
+      ];
     case _NodeSort.name:
-      sorted.sort(_compareByName);
+      sorted.sort((a, b) => _compareByName(a.peer, b.peer));
     case _NodeSort.latency:
-      sorted.sort(_compareByLatency);
+      sorted.sort((a, b) => _compareByLatency(a.peer, b.peer));
   }
   return sorted;
 }
@@ -149,4 +159,11 @@ int _filterCount(List<PeerSnapshot> peers, _NodeFilter filter) {
     if (_filterMatches(filter, peer)) count += 1;
   }
   return count;
+}
+
+/// Cached room catalogs remain inspectable, but cannot satisfy a live filter.
+bool _networkFilterMatches(_NodeFilter filter, NetworkPeerSnapshot item) {
+  if (filter == _NodeFilter.all) return true;
+  if (!item.current) return filter == _NodeFilter.attention;
+  return _filterMatches(filter, item.peer);
 }

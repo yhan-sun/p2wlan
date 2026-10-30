@@ -9,13 +9,14 @@ import {
   type Edge,
   type Node,
 } from '@xyflow/react'
-import { CircleAlert, Expand, Eye, EyeOff, Info, MonitorSmartphone, Shrink } from 'lucide-react'
-import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { CircleAlert, Expand, Eye, EyeOff, Info, Shrink } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { getFlowAriaLabelConfig, tr, useLocale } from '../../i18n'
 import { TopologyViewport } from '../../shared/TopologyViewport'
 import type { AdminConnection } from '../../types'
 import { useOverlay } from '../../useOverlay'
 import type { ConnectionIdentity } from './connectionNavigation'
+import { ErrorBlock, LoadingBlock } from './connectionPresentation'
 
 const NODE_WIDTH = 220
 const NODE_HEIGHT = 76
@@ -31,6 +32,11 @@ interface ConnectionTopologyProps {
   onIsolateSelected?: () => void
   selected?: ConnectionIdentity | null
   directionOnly?: boolean
+  loading?: boolean
+  offline?: boolean
+  error?: unknown
+  onRetry?: () => void
+  fullscreenStatus?: ReactNode
 }
 
 interface DeviceNodeData {
@@ -113,7 +119,6 @@ function buildGraph(connections: AdminConnection[], locale: string, onSelect: (c
       },
       data: {
         label: <div className="connection-node">
-          <span className="connection-node-icon"><MonitorSmartphone size={17} /></span>
           <span className="connection-node-copy">
             <strong>{device.name}</strong>
             <small>{device.username} · {locale === 'zh-CN'
@@ -125,10 +130,10 @@ function buildGraph(connections: AdminConnection[], locale: string, onSelect: (c
       style: {
         width: NODE_WIDTH,
         height: NODE_HEIGHT,
-        borderRadius: 10,
+        borderRadius: 6,
         border: '1px solid var(--topology-neutral-border, #d7dde6)',
         background: 'var(--topology-node-surface, #fff)',
-        boxShadow: '0 4px 16px rgba(15, 23, 42, .06)',
+        boxShadow: 'none',
         padding: 0,
       },
       draggable: false,
@@ -200,9 +205,15 @@ export function ConnectionTopology({
   onIsolateSelected,
   selected,
   directionOnly = false,
+  loading = false,
+  offline = false,
+  error,
+  onRetry,
+  fullscreenStatus,
 }: ConnectionTopologyProps) {
   const [fullscreen, setFullscreen] = useState(false)
-  const [legendOpen, setLegendOpen] = useState(false)
+  const surfaceRef = useRef<HTMLDivElement>(null)
+  const [legendOpen, setLegendOpen] = useState(true)
   const locale = useLocale()
   const [narrow, setNarrow] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 650px)').matches)
   const [showCanvas, setShowCanvas] = useState(false)
@@ -227,15 +238,19 @@ export function ConnectionTopology({
     : connections
   const graph = useMemo(() => buildGraph(visibleConnections, locale, onSelect, selected), [visibleConnections, locale, onSelect, selected])
   const noPath = visibleConnections.filter((connection) => !connection.current_path)
+  const noPathList = noPath.length > 0 && <details className={`connection-no-path${fullscreen ? ' fullscreen-no-path' : ''}`} open={!fullscreen}>
+    <summary>{tr('无路径观测')} · {noPath.length}</summary>
+    <p>{tr('设备保留在图中；没有已提交路径的方向不绘制连接边。')}</p>
+    <div className="connection-neighbor-list">{noPath.map((connection) => <button key={connectionKey(connection)} onClick={() => onSelect(connection)}><strong>{connection.reporting_device_name} → {connection.remote_device_name}</strong><span>{tr(connection.freshness)}</span></button>)}</div>
+  </details>
   const listMode = narrow && !showCanvas && !fullscreen
   const selectedVisible = !selected || connections.some((connection) => connectionKey(connection) === connectionKey(selected))
 
   const activeConnectionCount = visibleConnections.filter((connection) => Boolean(connection.current_path)).length
 
-  useOverlay(fullscreen && graph.nodes.length > 0, () => setFullscreen(false))
-  useEffect(() => {
-    if (connections.length === 0) setFullscreen(false)
-  }, [connections.length])
+  // The surface owns fullscreen across requests, including first-time filters
+  // that have no cache entry yet. Empty results still need a usable Exit action.
+  useOverlay(fullscreen, () => setFullscreen(false), { modalRef: surfaceRef })
 
   return <div className="connection-topology-workspace">
     {selected && onClearSelection && <div className="connection-focus-note"><span>{tr('当前定位')}：{devices.find((device) => device.id === selected.reporting_device_id)?.name || selected.reporting_device_id} → {devices.find((device) => device.id === selected.remote_device_id)?.name || selected.remote_device_id}</span><button type="button" className="button secondary compact" onClick={onClearSelection}>{tr('清除定位')}</button></div>}
@@ -244,21 +259,25 @@ export function ConnectionTopology({
       <label>{tr('设备一跳视图')}<select className="select-field" value={activeDevice} onChange={(event) => { setFocusDevice(event.target.value); onClearSelection?.(); }}>{activeDevice && !devices.some((device) => device.id === activeDevice) && <option value={activeDevice}>{activeDevice}</option>}{devices.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}</select></label>
       <button className="button secondary compact" onClick={() => setShowCanvas((value) => !value)}>{tr(showCanvas ? '查看方向清单' : '打开连接图')}</button>
     </div>}
-    <div className={`connection-topology ${fullscreen ? 'fullscreen' : ''} ${listMode ? 'list-mode' : ''}`}>
+    <div ref={surfaceRef} role={fullscreen ? 'dialog' : undefined} aria-modal={fullscreen ? true : undefined} aria-label={fullscreen ? tr('全屏连接拓扑') : undefined} tabIndex={fullscreen ? -1 : undefined} className={`connection-topology ${fullscreen ? 'fullscreen' : ''} ${listMode ? 'list-mode' : ''}`}>
     <div className="connection-topology-head">
-      <div><strong>{networkName}</strong><span>{activeConnectionCount} {tr("条单向路径观测")}{partial ? ` · ${tr('当前视图已截断')}` : ''}</span></div>
+      <div><strong>{networkName}</strong><span>{loading || offline || error ? '—' : activeConnectionCount} {tr("条单向路径观测")}{partial ? ` · ${tr('当前视图已截断')}` : ''}</span></div>
       <div>
         <button className={`topology-filter-button ${showStale ? 'active' : ''}`} onClick={() => onShowStaleChange(!showStale)} aria-pressed={showStale} aria-label={tr('显示过期观测')}>
-          {showStale ? <Eye size={15} /> : <EyeOff size={15} />}{tr("Stale")}</button>
+          {showStale ? <Eye size={15} /> : <EyeOff size={15} />}{tr('过期观测')}</button>
         <button className={`topology-filter-button connection-legend-toggle ${legendOpen ? 'active' : ''}`} onClick={() => setLegendOpen((value) => !value)} aria-expanded={legendOpen} aria-controls="connection-topology-legend"><Info size={15} />{tr('图例')}</button>
-        <button className="icon-button connection-topology-fullscreen-button" disabled={graph.nodes.length === 0} onClick={() => setFullscreen((value) => !value)} aria-label={tr(fullscreen ? '退出全屏' : '全屏')}>
+        <button data-fullscreen-toggle className="icon-button connection-topology-fullscreen-button" disabled={!fullscreen && graph.nodes.length === 0} onClick={() => setFullscreen((value) => !value)} aria-label={tr(fullscreen ? '退出全屏' : '全屏')}>
           {fullscreen ? <Shrink size={16} /> : <Expand size={16} />}
         </button>
       </div>
     </div>
-    {connections.length === 0 ? <div className="connection-topology-empty">
+    {fullscreen && fullscreenStatus && <div className="connection-topology-status">{fullscreenStatus}</div>}
+    {offline ? <div className="connection-topology-empty" role="status">{tr('浏览器当前离线，无法访问控制面。网络恢复后会自动重新请求。')}</div>
+      : loading ? <LoadingBlock label={tr('正在读取权威连接拓扑…')} />
+      : error ? <div className="connection-topology-empty"><ErrorBlock error={error} />{onRetry && <button type="button" className="button secondary compact" onClick={onRetry}>{tr('重试')}</button>}</div>
+      : connections.length === 0 ? <div className="connection-topology-empty">
       <CircleAlert size={18} />
-      <div><strong>{tr("暂无可展示的路径观测")}</strong><span>{tr("只有守护进程权威上报且 current_path 非空的观测才会生成连接边；无路径观测仍保留在列表中用于诊断。")}</span></div>
+      <div><strong>{tr("暂无可展示的路径观测")}</strong><span>{tr('调整筛选，或等待设备上报连接路径。')}</span></div>
     </div> : listMode ? <div className="connection-neighbor-list">{visibleConnections.map((connection) => <button key={connectionKey(connection)} onClick={() => onSelect(connection)} className={selected && connectionKey(selected) === connectionKey(connection) ? 'active' : ''}>
       <strong>{connection.reporting_device_name} → {connection.remote_device_name}</strong>
       <span>{pathLabel(connection.current_path)} · {tr(connection.freshness)}</span>
@@ -291,16 +310,13 @@ export function ConnectionTopology({
         nodeColor={() => '#cbd5e1'}
       />}
     </ReactFlow>}
+    {fullscreen && noPathList}
     <div className="connection-topology-legend" id="connection-topology-legend" aria-label={tr('图例')} hidden={!legendOpen}>
       <span><i className="connection-legend-line direct" />{tr("Direct")}</span>
       <span><i className="connection-legend-line relay" />{tr("Relay")}</span>
       {showStale && <span><i className="connection-legend-line stale" />{tr("Stale")}</span>}
     </div>
     </div>
-    {noPath.length > 0 && !fullscreen && !listMode && <details className="connection-no-path" open>
-      <summary>{tr('无路径观测')} · {noPath.length}</summary>
-      <p>{tr('设备保留在图中；没有已提交路径的方向不绘制连接边。')}</p>
-      <div className="connection-neighbor-list">{noPath.map((connection) => <button key={connectionKey(connection)} onClick={() => onSelect(connection)}><strong>{connection.reporting_device_name} → {connection.remote_device_name}</strong><span>{tr(connection.freshness)}</span></button>)}</div>
-    </details>}
+    {!fullscreen && !listMode && noPathList}
   </div>
 }

@@ -3,10 +3,13 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+
 import 'package:p2wlan_flutter_client/app/p2wlan_app.dart';
 import 'package:p2wlan_flutter_client/app/app_strings.dart';
+import 'package:p2wlan_flutter_client/app/app_theme.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/capabilities/platform_capabilities.dart';
+import 'package:p2wlan_flutter_client/core/capabilities/permission_preflight.dart';
 import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
@@ -74,6 +77,7 @@ class _OfflineDiagnosticsApi implements DiagnosticsApi {
 
 /// A diagnostics API that reports the daemon as already running.
 class _RunningDiagnosticsApi implements DiagnosticsApi {
+  int healthChecks = 0;
   @override
   void cancelSpeedTest() {}
 
@@ -81,7 +85,10 @@ class _RunningDiagnosticsApi implements DiagnosticsApi {
   DiagnosticsApiException? healthFailureFor(String diagnosticsUrl) => null;
 
   @override
-  Future<bool> fetchHealth(String diagnosticsUrl) async => true;
+  Future<bool> fetchHealth(String diagnosticsUrl) async {
+    healthChecks++;
+    return true;
+  }
 
   @override
   Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {
@@ -196,6 +203,16 @@ class _ReadyDiagnosticsApi extends _OfflineDiagnosticsApi {
       conflictCount: 0,
       entries: [],
     );
+  }
+}
+
+class _DiscoverDiagnosticsApi extends _ReadyDiagnosticsApi {
+  @override
+  Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {
+    final source = await super.fetchStatus(diagnosticsUrl);
+    final raw = Map<String, dynamic>.from(source.raw);
+    raw['peers'] = [];
+    return DiagnosticsSnapshot.fromJson(raw);
   }
 }
 
@@ -369,6 +386,123 @@ void main() {
 
     status.dispose();
   });
+
+  testWidgets(
+    'IP waiting shows elapsed time, recovery actions and bounded timer',
+    (tester) async {
+      final settings = await _makeSettings(tester, false);
+      final api = _RunningDiagnosticsApi();
+      final status = _makeStatus(settings, api: api);
+      addTearDown(status.dispose);
+      addTearDown(settings.dispose);
+      await tester.runAsync(status.refresh);
+      var serverActions = 0;
+      var loginActions = 0;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AppStringsScope(
+            strings: AppStrings.fromCode('en'),
+            child: OnboardingPage(
+              settingsStore: settings,
+              statusStore: status,
+              capabilities: PlatformCapabilities.fromPlatform('macos'),
+              permissionCheck: () async => const PermissionPreflight(
+                platform: 'macos',
+                state: PermissionPreflightState.satisfied,
+                canCreateTun: true,
+                canModifyRoutes: true,
+                elevationSupported: true,
+                reasonCode: 'test_permission_satisfied',
+                message: '',
+                checks: [],
+              ),
+              onOpenConnectionSettings: () => serverActions++,
+              onReauthenticate: () => loginActions++,
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      expect(find.text('Local service is running'), findsOneWidget);
+      expect(find.textContaining('0:00 elapsed'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 31));
+      expect(find.textContaining('0:31 elapsed'), findsOneWidget);
+      expect(find.textContaining('This is taking longer'), findsOneWidget);
+      final checks = api.healthChecks;
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('onboarding-recheck')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('onboarding-recheck')));
+      await tester.pumpAndSettle();
+      expect(api.healthChecks, greaterThan(checks));
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('onboarding-connection-settings')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey('onboarding-connection-settings')),
+      );
+      await tester.tap(find.byKey(const ValueKey('onboarding-reauthenticate')));
+      expect(serverActions, 1);
+      expect(loginActions, 1);
+      await tester.pump(const Duration(minutes: 10));
+      expect(find.textContaining('5:00+ elapsed'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox.shrink());
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'small-screen discovery actions fit large English text and remain usable',
+    (tester) async {
+      final settings = await _makeSettings(tester, false);
+      final status = _makeStatus(settings, api: _DiscoverDiagnosticsApi());
+      addTearDown(settings.dispose);
+      addTearDown(status.dispose);
+      await tester.binding.setSurfaceSize(const Size(320, 740));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.runAsync(status.refresh);
+      var completions = 0;
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.lightTheme,
+          builder: (context, child) => MediaQuery(
+            data: MediaQuery.of(context)
+                .copyWith(textScaler: const TextScaler.linear(1.5)),
+            child: child!,
+          ),
+          home: AppStringsScope(
+            strings: AppStrings.fromCode('en'),
+            child: OnboardingPage(
+              settingsStore: settings,
+              statusStore: status,
+              capabilities: PlatformCapabilities.fromPlatform('macos'),
+              onCompleted: () => completions++,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final skip = find.text(AppStrings.fromCode('en').onboardingSkip);
+      final finish = find.text(AppStrings.fromCode('en').onboardingFinish);
+      await tester.ensureVisible(skip);
+      await tester.pumpAndSettle();
+      expect(tester.getTopLeft(skip).dx, greaterThanOrEqualTo(0));
+      expect(tester.getBottomRight(skip).dx, lessThanOrEqualTo(320));
+      expect(tester.getBottomRight(finish).dx, lessThanOrEqualTo(320));
+      expect(tester.takeException(), isNull);
+      await tester.tap(skip);
+      for (var index = 0; index < 30 && completions == 0; index++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 10)),
+        );
+        await tester.pump();
+      }
+      expect(completions, 1);
+      expect(settings.settings.onboardingCompleted, isTrue);
+    },
+  );
 
   testWidgets('P2WlanApp shows onboarding when not yet completed', (
     tester,

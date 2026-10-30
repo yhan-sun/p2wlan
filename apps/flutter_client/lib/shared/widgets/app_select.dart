@@ -6,6 +6,7 @@ import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
 import '../layout/app_breakpoints.dart';
+import 'app_motion.dart';
 
 /// A typed option rendered by [AppSelect].
 @immutable
@@ -547,7 +548,8 @@ class _AppSelectSheet<T> extends StatelessWidget {
                               ),
                               const SizedBox(width: AppTokens.space12),
                               AnimatedContainer(
-                                duration: AppTokens.durationFast,
+                                duration: AppMotion.feedbackDurationOf(context),
+                                curve: AppMotion.curve,
                                 width: 24,
                                 height: 24,
                                 alignment: Alignment.center,

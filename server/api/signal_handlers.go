@@ -478,6 +478,9 @@ func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 	waitMS := boundedSignalWaitMS(r)
 	deadline := time.Now().Add(time.Duration(waitMS) * time.Millisecond)
 	for {
+		if !resumeDeviceRegistrationSession(w, r) {
+			return
+		}
 		version := s.signalNotifier.version(nodeID)
 		var signals []database.Signal
 		var err error
@@ -487,6 +490,7 @@ func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 		} else {
 			signals, err = s.db.ListAndDeleteSignals(nodeID)
 		}
+		pauseDeviceRegistrationSession(r)
 		if err != nil {
 			http.Error(w, `{"error":"failed to list signals"}`, http.StatusInternalServerError)
 			return

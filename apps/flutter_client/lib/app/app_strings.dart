@@ -49,7 +49,7 @@ class AppStrings {
   String get shellStatusAttention => isZh ? '网络异常' : 'Network issue';
   String get shellStatusOffline => isZh ? '当前离线' : 'Offline';
   String get shellStatusOfflineDetail =>
-      isZh ? '无法连接本地服务' : 'Cannot reach local service';
+      isZh ? '本机网络尚未连接' : 'Local network not connected';
   String get shellStatusStaleDetail =>
       isZh ? '刷新查看最新状态' : 'Refresh to see latest status';
   String shellPeersOnline(int count) => isZh
@@ -123,9 +123,11 @@ class AppStrings {
       isZh ? '你的设备已加入 P2WLAN 网络' : 'Your device is on the P2WLAN network';
   String get virtualIpLabel => isZh ? '虚拟 IP 地址' : 'Virtual IP address';
   String get homeLoading => isZh ? '正在获取网络状态…' : 'Fetching network status…';
-  String get homeStoppedTitle => isZh ? 'P2WLAN 未运行' : 'P2WLAN is not running';
-  String get homeStoppedDetail =>
-      isZh ? '启动后即可加入虚拟网络。' : 'Start it to join the virtual network.';
+  String get homeStoppedTitle =>
+      isZh ? '准备连接你的设备' : 'Bring your devices together';
+  String get homeStoppedDetail => isZh
+      ? '启动本机网络服务，让这台设备加入虚拟网络。'
+      : 'Start the local network service to bring this device onto your virtual network.';
   String get homeUnavailableTitle =>
       isZh ? '无法连接 P2WLAN' : 'Cannot reach P2WLAN';
   String get homeUnavailableDetail => isZh
@@ -134,8 +136,8 @@ class AppStrings {
   String get mobileModeBadge => isZh ? '移动端' : 'Mobile';
   String get mobileModeTitle => isZh ? '移动端管理模式' : 'Mobile management mode';
   String get mobileModeDetail => isZh
-      ? 'Android 当前用于查看和管理网络、设备。本机不启动桌面 daemon；需要本地 VPN 节点时，请使用已支持的桌面端。'
-      : 'Android is used to view and manage the network and devices. It does not start the desktop daemon locally; use a supported desktop node when this device needs a local VPN tunnel.';
+      ? '此平台用于通过房间查看和管理远端设备，本机不能建立 VPN 隧道。需要本机接入虚拟网络时，请使用受支持的桌面端或 Android 客户端。'
+      : 'View and manage remote devices through rooms. This platform does not start the desktop daemon or create a local VPN tunnel; use a supported desktop or Android client to join the virtual network locally.';
   String get mobileModeOpenDevices => isZh ? '查看设备' : 'View devices';
   String get statusNormal => isZh ? '正常' : 'Normal';
   String get notRunning => isZh ? '未运行' : 'Not running';
@@ -296,18 +298,19 @@ class AppStrings {
   String get healthEndpointOffline =>
       isZh ? '健康端点不可达' : 'Health endpoint offline';
   String get overviewHealthyTitle =>
-      isZh ? 'P2WLAN 运行正常' : 'P2WLAN is running normally';
-  String get overviewHealthyDetail =>
-      isZh ? '当前没有发现需要处理的问题。' : 'No issues found that need your attention.';
+      isZh ? '本机默认连接运行正常' : 'Default local connection is healthy';
+  String get overviewHealthyDetail => isZh
+      ? '默认本机服务未报告异常。具体应用的连通性仍需通过虚拟 IP 验证。'
+      : 'The default local service reports no issues. Verify application connectivity using the virtual IP.';
   String get overviewAttentionTitle =>
-      isZh ? 'P2WLAN 需要检查' : 'P2WLAN needs attention';
+      isZh ? '本机默认连接需要检查' : 'Default local connection needs attention';
   String get overviewAttentionDetail =>
       isZh ? '部分网络功能当前可能受影响。' : 'Some network features may be affected.';
   String get overviewUnavailableTitle =>
       isZh ? '暂时无法获取诊断状态' : 'Diagnostics unavailable';
   String get overviewUnavailableDetail => isZh
-      ? '无法读取 P2WLAN 当前运行状态，请稍后重试。'
-      : 'Unable to read the current P2WLAN status. Please try again.';
+      ? '无法读取本机默认连接的状态。请确认已启动该连接，或重新检查。'
+      : 'Unable to read the default local connection. Check that it is started, or try again.';
   String get overviewStaleTitle =>
       isZh ? '诊断数据已过期' : 'Diagnostics data is stale';
   String get overviewStaleDetail => isZh
@@ -403,8 +406,8 @@ class AppStrings {
   String get recentDaemonLogs => isZh ? '最近 daemon 日志' : 'Recent daemon logs';
 
   String get nodesSubtitle => isZh
-      ? '查看本机和网络中的其他设备，管理名称、IP 与连接方式。'
-      : 'View this device and other devices in the network, including names, IPs, and paths.';
+      ? '查看设备连接状态；房间成员可在房间内查看。'
+      : 'Connection status for your devices. View room members in Rooms.';
   String get noPeers => isZh
       ? '当前没有发现其他设备。'
       : 'No other devices are present in the current snapshot.';
@@ -434,13 +437,14 @@ class AppStrings {
   String get sortByName => isZh ? '名称' : 'Name';
   String get sortByLatency => isZh ? '本端 RTT' : 'Local RTT';
   String deviceCountSummary(int total, int online) => isZh
-      ? '$total 台设备 · $online 在线'
+      ? '其他设备 $total 台 · $online 在线'
       : total == 1
-      ? '1 device · $online online'
-      : '$total devices · $online online';
+      ? '1 other device · $online online'
+      : '$total other devices · $online online';
   String get clearSearch => isZh ? '清除搜索' : 'Clear search';
   String get clearFilter => isZh ? '清除筛选' : 'Clear filters';
-  String get noPeersTitle => isZh ? '还没有其他设备' : 'No other devices yet';
+  String get noPeersTitle =>
+      isZh ? '当前连接中暂无其他设备' : 'No other devices in this connection';
   String get noPeersBody => isZh
       ? '当其他设备加入 P2WLAN 后，它们会出现在这里。'
       : 'When another device joins P2WLAN, it will appear here.';
@@ -1092,7 +1096,7 @@ class AppStrings {
     return switch (sectionName) {
       'home' => home,
       'devices' => devices,
-      'interconnect' => isZh ? '互联' : 'Interconnect',
+      'interconnect' => isZh ? '房间' : 'Rooms',
       'troubleshooting' => troubleshooting,
       'settings' => settings,
       _ => sectionName,

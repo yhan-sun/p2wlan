@@ -14,8 +14,8 @@ export function SystemPage() {
   if (error && (!overview.data || !runtime.data)) return <ErrorBlock error={error} />
   if (!runtime.data || !overview.data) return <ErrorBlock error={new Error('控制面未返回完整的运行状态快照。')} />
   return <div className="page-stack">
-    <QueryStatus queries={[runtime, overview]} />
     <PageHeader title={tr("控制面运行健康")} description={<> {tr("这里只展示控制面进程与数据库能直接确认的事实；Relay TLS、systemd、SQLite 完整性和备份请在部署主机运行 ")}<code>{tr("p2wlan-server doctor")}</code>{tr("。")} </>} actions={<><span className={`badge ${!refreshInterval || runtime.fetchStatus === 'paused' || runtime.error ? 'warning' : 'success'} large`}><span />{tr(!refreshInterval || runtime.fetchStatus === 'paused' || runtime.error ? '缓存快照' : '运行中')}</span></>} />
+    <QueryStatus queries={[runtime, overview]} />
     <section className="system-grid">
       <Panel title={tr("进程")} subtitle={tr("构建与启动信息")}>
         <div className="system-hero"><div className="system-hero-icon"><Server size={26} /></div><div><span>{tr("UPTIME")}</span><strong>{formatDuration(runtime.data.uptime_seconds)}</strong></div></div>

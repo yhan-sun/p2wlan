@@ -7,8 +7,13 @@
 //! payloads are strictly forbidden and never serialized.
 
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::super::path_observability::PathObservabilitySnapshot;
+/// Complete signaling JSON budget, matching Go signaling.MaxClientMessageBytes.
+/// HTTP uses the same batches and therefore fits this limit too.
+pub const MAX_PATH_TELEMETRY_FRAME_BYTES: usize = 64 << 10;
+
+use super::super::path_observability::{PathObservabilitySnapshot, PATH_TRANSITION_EVENT_LIMIT};
 use super::super::types::NetworkPath;
 
 /// Bounded transition history item sent in wire telemetry.
@@ -30,6 +35,9 @@ pub struct PathTransitionTeleItem {
 pub struct PathTelemetryObservation {
     pub remote_device_id: String,
     pub network_id: String,
+    pub lifecycle: String,
+    /// Sampling wall clock in Unix seconds, separate from local monotonic path age.
+    pub observed_at: i64,
     pub current_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_path: Option<String>,
@@ -122,7 +130,7 @@ pub fn observation_from_snapshot(
     let transitions = snapshot
         .transitions
         .iter()
-        .take(32)
+        .take(PATH_TRANSITION_EVENT_LIMIT)
         .map(|t| PathTransitionTeleItem {
             revision: t.revision,
             event_kind: t.event_kind.clone(),
@@ -137,6 +145,11 @@ pub fn observation_from_snapshot(
     PathTelemetryObservation {
         remote_device_id: remote_device_id.to_string(),
         network_id: network_id.to_string(),
+        lifecycle: snapshot.lifecycle.clone(),
+        observed_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs().min(i64::MAX as u64) as i64)
+            .unwrap_or(0),
         current_path: path_to_wire(snapshot.current_path),
         previous_path: opt_path_to_wire(snapshot.previous_path),
         transition_reason: snapshot.transition_reason.clone(),

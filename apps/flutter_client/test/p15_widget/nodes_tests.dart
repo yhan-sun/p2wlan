@@ -62,7 +62,7 @@ void _registerNodesTests() {
     expect(find.byKey(const Key('nodes-filter-button')), findsOneWidget);
     expect(find.byKey(const Key('nodes-sort-button')), findsOneWidget);
     expect(find.byType(ChoiceChip), findsNothing);
-    expect(find.text('2 devices · 2 online'), findsOneWidget);
+    expect(find.text('2 other devices · 2 online'), findsOneWidget);
 
     // Continuous list: no group headers, judgment columns only.
     expect(find.text('direct-laptop'), findsOneWidget);
@@ -118,7 +118,11 @@ void _registerNodesTests() {
     expect(find.byKey(const Key('nodes-search-field')), findsOneWidget);
     expect(
       tester.getSize(find.byKey(const Key('node-row-peer-direct-001'))).height,
-      lessThan(64),
+      lessThan(100),
+    );
+    expect(
+      tester.widget<Text>(find.text('direct-laptop')).style!.fontSize,
+      greaterThanOrEqualTo(14),
     );
     // No inspector on mobile, no overflow menu on mobile rows.
     expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
@@ -255,8 +259,15 @@ void _registerNodesTests() {
     // Offline wins: the cover never carries a stale Direct/Relay claim or a
     // fabricated latency.
     expect(find.text('Offline'), findsNWidgets(2));
-    // Each offline row has unknown speed and latency.
-    expect(find.text('—'), findsNWidgets(6));
+    // Offline rows omit traffic and latency placeholders entirely.
+    for (final id in ['offline-errored-001', 'offline-plain-002']) {
+      final row = find.byKey(Key('node-row-$id'));
+      expect(find.descendant(of: row, matching: find.text('—')), findsNothing);
+      expect(
+        find.descendant(of: row, matching: find.textContaining('KB/s')),
+        findsNothing,
+      );
+    }
     expect(find.text('Direct'), findsOneWidget);
     expect(find.text('Relay'), findsOneWidget);
     expect(find.text('10 ms'), findsNothing);
@@ -278,7 +289,10 @@ void _registerNodesTests() {
       find.text('no direct probe ACK after 320 background UDP retry probes'),
       findsNothing,
     );
-    await tester.tap(find.byKey(const Key('nodes-issue-details-toggle')));
+    final issueDetails = find.byKey(const Key('nodes-issue-details-toggle'));
+    await tester.ensureVisible(issueDetails);
+    await tester.pumpAndSettle();
+    await tester.tap(issueDetails);
     await tester.pumpAndSettle();
     expect(
       find.text('no direct probe ACK after 320 background UDP retry probes'),
@@ -315,7 +329,10 @@ void _registerNodesTests() {
 
     await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Remove device').last);
+    final removeAction = find.text('Remove device').last;
+    await tester.ensureVisible(removeAction);
+    await tester.pumpAndSettle();
+    await tester.tap(removeAction);
     await tester.pumpAndSettle();
 
     expect(find.byType(AlertDialog), findsOneWidget);
@@ -370,7 +387,10 @@ void _registerNodesTests() {
     expect(find.text('1.0.0'), findsNothing);
     expect(find.text('State'), findsNothing);
 
-    await tester.tap(find.byKey(const Key('nodes-advanced-toggle')));
+    final advanced = find.byKey(const Key('nodes-advanced-toggle'));
+    await tester.ensureVisible(advanced);
+    await tester.pumpAndSettle();
+    await tester.tap(advanced);
     await tester.pumpAndSettle();
     expect(find.text('Node ID'), findsOneWidget);
     expect(find.text('Version'), findsOneWidget);
@@ -996,7 +1016,10 @@ void _registerNodesTests() {
     expect(detailText('Node ID'), findsNothing);
 
     // Expanding Advanced reveals the technical metadata.
-    await tester.tap(find.byKey(const Key('nodes-advanced-toggle')));
+    final advanced = find.byKey(const Key('nodes-advanced-toggle'));
+    await tester.ensureVisible(advanced);
+    await tester.pumpAndSettle();
+    await tester.tap(advanced);
     await tester.pumpAndSettle();
     expect(detailText('Node ID'), findsOneWidget);
     expect(detailText('Version'), findsOneWidget);
@@ -1118,7 +1141,7 @@ void _registerNodesTests() {
     );
     await tester.pump();
     expect(find.text('This device'), findsOneWidget);
-    expect(find.text('No other devices yet'), findsOneWidget);
+    expect(find.text('No other devices in this connection'), findsOneWidget);
     expect(find.text('No devices found'), findsNothing);
 
     // Search with no matches.
@@ -1424,7 +1447,7 @@ void _registerNodesTests() {
     // Roster online-ness is authoritative even before a usable path is
     // verified. Summary and the Online filter must agree without presenting
     // the peer as offline.
-    expect(find.text('2 devices · 2 online'), findsOneWidget);
+    expect(find.text('2 other devices · 2 online'), findsOneWidget);
 
     await tester.tap(find.byKey(const Key('nodes-filter-button')));
     await tester.pumpAndSettle();
@@ -1459,10 +1482,18 @@ void _registerNodesTests() {
       ),
     );
 
-    // Last-known list stays; the header hint flags staleness.
+    // Last-known rows and the local identity all carry the stale state.
     expect(find.text('direct-laptop'), findsOneWidget);
     expect(find.text('relay-nas'), findsOneWidget);
-    expect(find.text('Stale'), findsOneWidget);
+    expect(find.text('Stale'), findsNWidgets(4));
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('nodes-local-row')),
+        matching: find.text('Stale'),
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('2 other devices · 0 online'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

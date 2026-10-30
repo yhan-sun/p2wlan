@@ -57,3 +57,20 @@ List<dynamic> _list(dynamic value) {
 List<String> _stringList(dynamic value) {
   return _list(value).map((item) => item.toString()).toList(growable: false);
 }
+
+/// Counters are whole, non-negative quantities. Missing or malformed values
+/// must remain distinguishable from an explicitly reported zero.
+int? _counterOrNull(dynamic value) {
+  if (value is int) return value >= 0 ? value : null;
+  if (value is String) {
+    final parsed = int.tryParse(value);
+    return parsed != null && parsed >= 0 ? parsed : null;
+  }
+  if (value is num &&
+      value.isFinite &&
+      value >= 0 &&
+      value == value.roundToDouble()) {
+    return value.toInt();
+  }
+  return null;
+}

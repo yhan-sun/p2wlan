@@ -24,9 +24,8 @@ type Server struct {
 	relayRevocationFeedToken string
 	signalNotifier           *signalNotifier
 	// registrationSessionLocks serializes a device's registration with its
-	// device-token control actions.  The database performs the final conditional
-	// update for lease-changing operations; this lock covers complex signal and
-	// WebSocket actions that span multiple queries in this server process.
+	// device-token control actions. Locks cover short state operations and are
+	// released before request/response network I/O or idle signal polling.
 	registrationSessionLocks registrationSessionLocker
 }
 

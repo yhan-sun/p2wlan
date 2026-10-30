@@ -90,8 +90,7 @@ func (s *RelayServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	// Stats() also serves internal diagnostics and includes bounded, hashed
 	// authentication-source details.  Do not expose even those source
 	// identifiers through the unauthenticated metrics endpoint.
-	snapshot := s.Stats()
-	snapshot.AuthFailureSources = nil
+	snapshot := s.statsSnapshot()
 	if err := json.NewEncoder(w).Encode(snapshot); err != nil {
 		log.Printf("relay metrics encode failed: %v", err)
 	}

@@ -270,31 +270,28 @@ class RoomApi {
     } catch (_) {
       if (response.statusCode >= 200 && response.statusCode < 300) rethrow;
     }
+    if (response.statusCode == HttpStatus.unauthorized) {
+      throw const RoomException('登录状态已失效，请重新登录', code: 'auth_expired');
+    }
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw RoomException(
-        switch (json['error_code']) {
-          'room_device_blocked' => '此设备已被禁止连接该房间，请解除限制后重试',
-          'room_device_pending' => '此设备正在等待房主审批，请批准后在本机重新连接',
-          'room_device_paused' => '此设备已被远程断开，请在本机手动连接',
-          'room_exists' => '每个账号最多创建一个房间',
-          'room_join' => '无法加入：房间号、密码或邀请无效，房间已锁定，或账号已被封禁',
-          'room_access' => '无权操作该房间，或你已不再是成员',
-          'room_invalid' => '输入无效，请检查名称、密码、IP 或邀请设置',
-          'room_ip_conflict' => '该 IP 无法分配，请检查网段或选择未占用的地址',
-          'room_device_state_conflict' => '此设备状态已变化，申请可能已被处理，请查看最新状态',
-          'room_invite_limit' => '有效邀请已达上限，请先撤销不再使用的邀请',
-          'room_conflict' => '操作与当前房间状态冲突，请刷新后重试',
-          'room_exhausted' => '服务器没有可用子网或房间 IP，请联系管理员',
-          'room_rate_limit' => '加入尝试过于频繁，请一分钟后重试',
-          _ when response.statusCode == 401 => '登录状态已失效，请重新登录',
-          _ when response.statusCode == 404 || response.statusCode == 426 =>
-            '当前服务器不支持好友房间，请升级服务器',
-          _ => '房间操作失败，请刷新后确认状态',
-        },
-        code:
-            json['error_code'] as String? ??
-            (response.statusCode == 401 ? 'auth_expired' : null),
-      );
+      throw RoomException(switch (json['error_code']) {
+        'room_device_blocked' => '此设备已被禁止连接该房间，请解除限制后重试',
+        'room_device_pending' => '此设备正在等待房主审批，请批准后在本机重新连接',
+        'room_device_paused' => '此设备已被远程断开，请在本机手动连接',
+        'room_exists' => '每个账号最多创建一个房间',
+        'room_join' => '无法加入：房间号、密码或邀请无效，房间已锁定，或账号已被封禁',
+        'room_access' => '无权操作该房间，或你已不再是成员',
+        'room_invalid' => '输入无效，请检查名称、密码、IP 或邀请设置',
+        'room_ip_conflict' => '该 IP 无法分配，请检查网段或选择未占用的地址',
+        'room_device_state_conflict' => '此设备状态已变化，申请可能已被处理，请查看最新状态',
+        'room_invite_limit' => '有效邀请已达上限，请先撤销不再使用的邀请',
+        'room_conflict' => '操作与当前房间状态冲突，请刷新后重试',
+        'room_exhausted' => '服务器没有可用子网或房间 IP，请联系管理员',
+        'room_rate_limit' => '加入尝试过于频繁，请一分钟后重试',
+        _ when response.statusCode == 404 || response.statusCode == 426 =>
+          '当前服务器不支持好友房间，请升级服务器',
+        _ => '房间操作失败，请刷新后确认状态',
+      }, code: json['error_code'] as String?);
     }
     return json;
   }

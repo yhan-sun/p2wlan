@@ -34,6 +34,8 @@ class _AccountSection extends StatelessWidget {
                 email: state.widget.settingsStore.settings.accountEmail,
                 username: state.widget.settingsStore.settings.accountUsername,
                 onProfileLoaded: state._rememberAccountProfile,
+                controller: state._usernameController,
+                controlApi: state._controlApi,
               )
             else if (state.widget.settingsStore.settings.accountEmail
                     .trim()
@@ -46,6 +48,18 @@ class _AccountSection extends StatelessWidget {
                 username: state.widget.settingsStore.settings.accountUsername,
                 strings: strings,
               ),
+            if (state.widget.onReauthenticate != null) ...[
+              Align(
+                alignment: Alignment.centerLeft,
+                child: OutlinedButton.icon(
+                  key: const ValueKey('settings-reauthenticate'),
+                  onPressed: saving ? null : state.widget.onReauthenticate,
+                  icon: const Icon(Icons.login_rounded, size: 18),
+                  label: Text(strings.isZh ? '重新登录' : 'Sign in again'),
+                ),
+              ),
+              const SizedBox(height: AppTokens.space12),
+            ],
             _PreferenceRow(
               label: strings.credentialSectionTitle,
               subtitle: credentialState,
@@ -77,6 +91,10 @@ class _AccountSection extends StatelessWidget {
           children: [
             _SettingsField(
               controller: state._controlServerController,
+              focusNode: state._focusFor(state._controlServerController),
+              errorText: state._fieldErrors[state._controlServerController],
+              onChanged: (_) =>
+                  state._clearFieldError(state._controlServerController),
               label: strings.controlServer,
               helper: strings.controlServerHelper,
               keyboardType: TextInputType.url,
@@ -85,6 +103,10 @@ class _AccountSection extends StatelessWidget {
             const SizedBox(height: 16),
             _SettingsField(
               controller: state._networkIdController,
+              focusNode: state._focusFor(state._networkIdController),
+              errorText: state._fieldErrors[state._networkIdController],
+              onChanged: (_) =>
+                  state._clearFieldError(state._networkIdController),
               label: strings.networkId,
               helper: strings.networkIdHelper,
               textInputAction: TextInputAction.next,
@@ -92,6 +114,10 @@ class _AccountSection extends StatelessWidget {
             const SizedBox(height: 16),
             _SettingsField(
               controller: state._virtualIpController,
+              focusNode: state._focusFor(state._virtualIpController),
+              errorText: state._fieldErrors[state._virtualIpController],
+              onChanged: (_) =>
+                  state._clearFieldError(state._virtualIpController),
               label: strings.requestedVirtualIp,
               helper: strings.requestedVirtualIpHelperSettings,
               textInputAction: TextInputAction.done,

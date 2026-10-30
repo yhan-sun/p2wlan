@@ -12,13 +12,32 @@ async fn manager_with_two_peers() -> Arc<PeerManager> {
 }
 
 #[tokio::test]
+async fn original_capability_qualification_shares_membership_readers() {
+    let manager = manager_with_two_peers().await;
+    let life = manager.peer_session_generation_sync("cap-a").unwrap();
+    manager.mark_dplpmtud_capable_sync("cap-a", life);
+    let membership = manager.peer_membership.read().unwrap();
+    assert_eq!(
+        manager.try_peer_dplpmtud_capability("cap-a"),
+        PeerDplpmtudCapability::Supported
+    );
+    assert!(manager.peer_membership.try_read().is_ok());
+    assert!(matches!(
+        manager.peer_membership.try_write(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    drop(membership);
+    assert!(manager.peer_membership.try_write().is_ok());
+}
+
+#[tokio::test]
 async fn original_capability_gate_refuses_contention_and_releases_membership() {
     let manager = manager_with_two_peers().await;
     let life = manager.peer_session_generation_sync("cap-a").unwrap();
     manager.mark_dplpmtud_capable_sync("cap-a", life);
     let publication = manager.dplpmtud_capability.gate.lock().unwrap();
     let outcome = manager.try_peer_dplpmtud_capability("cap-a");
-    let membership_released = manager.peer_membership.try_lock().is_ok();
+    let membership_released = manager.peer_membership.try_write().is_ok();
     drop(publication);
     assert_eq!(outcome, PeerDplpmtudCapability::Contended);
     assert!(
@@ -29,7 +48,7 @@ async fn original_capability_gate_refuses_contention_and_releases_membership() {
         manager.try_peer_dplpmtud_capability("cap-a"),
         PeerDplpmtudCapability::Supported
     );
-    let membership = manager.peer_membership.lock().unwrap();
+    let membership = manager.peer_membership.write().unwrap();
     let outcome = manager.try_peer_dplpmtud_capability("cap-a");
     let publication_released = manager.dplpmtud_capability.gate.try_lock().is_ok();
     drop(membership);
@@ -149,7 +168,7 @@ async fn capability_unlocked_copy_rechecks_rotated_membership_before_any_publica
         }
         let receiver = manager.dplpmtud_capability.sender.subscribe();
         let original = manager.dplpmtud_capability.sender.borrow().clone();
-        let mut membership = manager.peer_membership.lock().unwrap();
+        let mut membership = manager.peer_membership.write().unwrap();
         let worker = std::thread::spawn({
             let manager = manager.clone();
             move || manager.mark_dplpmtud_capable_sync("cap-a", old)
@@ -170,7 +189,7 @@ async fn capability_unlocked_copy_rechecks_rotated_membership_before_any_publica
             manager.try_peer_dplpmtud_capability("cap-a"),
             PeerDplpmtudCapability::Unsupported
         );
-        assert!(manager.peer_membership.try_lock().is_ok());
+        assert!(manager.peer_membership.try_write().is_ok());
         assert!(manager.dplpmtud_capability.gate.try_lock().is_ok());
     }
 }
@@ -187,7 +206,7 @@ async fn capability_unlocked_copy_prunes_only_against_original_current_membershi
     manager.add_peer(&third).await;
     let third_life = manager.peer_session_generation_sync("cap-c").unwrap();
     let receiver = manager.dplpmtud_capability.sender.subscribe();
-    let mut membership = manager.peer_membership.lock().unwrap();
+    let mut membership = manager.peer_membership.write().unwrap();
     let worker = std::thread::spawn({
         let manager = manager.clone();
         move || manager.mark_dplpmtud_capable_sync("cap-c", third_life)
@@ -211,6 +230,6 @@ async fn capability_unlocked_copy_prunes_only_against_original_current_membershi
         manager.try_peer_dplpmtud_capability("cap-b"),
         PeerDplpmtudCapability::Unknown
     );
-    assert!(manager.peer_membership.try_lock().is_ok());
+    assert!(manager.peer_membership.try_write().is_ok());
     assert!(manager.dplpmtud_capability.gate.try_lock().is_ok());
 }

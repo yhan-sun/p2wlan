@@ -16,6 +16,7 @@ import '../rooms/room_profiles.dart';
 import '../rooms/room_api.dart';
 
 part 'status_store_session.dart';
+part 'status_store_configuration.dart';
 
 class StatusStore extends ChangeNotifier {
   StatusStore({
@@ -53,6 +54,9 @@ class StatusStore extends ChangeNotifier {
            ) {
     _lastDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
     _lastAccountSession = accountSessionKey(settingsStore.settings);
+    _committedPrimaryConfiguration = _primaryLaunchConfiguration(
+      settingsStore.settings,
+    );
     settingsStore.applySessionChange = _applyAccountChange;
     settingsStore.addListener(_handleSettingsChanged);
   }
@@ -133,6 +137,8 @@ class StatusStore extends ChangeNotifier {
   String? _speedTestPeerVirtualIp;
   DateTime? _speedTestStartedAt;
   var _peerTrafficSamples = <String, _PeerTrafficSample>{};
+  _PeerTrafficOwner? _peerTrafficOwner;
+  int? _peerTrafficUptimeMs;
   var _peerTransferRatesBytesPerSecond = <String, int>{};
   var _peerDirectionalTransferRates = <String, PeerTransferRate>{};
   final _peerOrder = <String, int>{};
@@ -144,8 +150,13 @@ class StatusStore extends ChangeNotifier {
   late String _lastAccountSession;
   bool _sessionChanging = false;
   bool _accountRequiresRestart = false;
+  late _PrimaryLaunchConfiguration _committedPrimaryConfiguration;
+  _PrimaryLaunchConfiguration? _appliedPrimaryConfiguration;
+  bool _primaryConfigurationPending = false;
+  _PrimaryStartWitness? _primaryStartWitness;
 
   int get sessionRevision => _refreshGeneration;
+  bool get primaryConfigurationPending => _primaryConfigurationPending;
   DiagnosticsSnapshot? get snapshot => _snapshot;
   bool get healthReachable => _healthReachable;
   bool get daemonReachable => _healthReachable || _snapshot != null;
@@ -631,8 +642,7 @@ class StatusStore extends ChangeNotifier {
             _snapshot != null &&
             _consecutiveHealthFailures < _automaticHealthFailureThreshold) {
           _snapshotStale = true;
-          _peerTransferRatesBytesPerSecond.clear();
-          _peerDirectionalTransferRates.clear();
+          _clearPeerTrafficSampling();
         } else {
           _clearSnapshot();
         }
@@ -691,6 +701,9 @@ class StatusStore extends ChangeNotifier {
                   snapshot.processId ||
               daemonTransition.oldIdentity.daemonRuntimeIncarnation !=
                   snapshot.runtimeIncarnation) {
+            // A replacement runtime does not prove which configuration it
+            // received. Only this owner's successful start can confirm that.
+            _appliedPrimaryConfiguration = null;
             _eventLoopFuture = null;
             if (_snapshot != null) cancelSpeedTest();
           }
@@ -698,6 +711,7 @@ class StatusStore extends ChangeNotifier {
         _updatePeerTrafficRates(snapshot, fetchedAt, throttle: throttleMetrics);
         recordPeerPresence(snapshot.peers);
         _snapshot = snapshot;
+        _primaryStartWitness?.observe(snapshot, generation);
         _routeHealthy = routeHealthy;
         if (routeVerifiedAt != null) _lastRouteVerificationAt = routeVerifiedAt;
         _lastError = null;
@@ -763,13 +777,19 @@ class StatusStore extends ChangeNotifier {
   void _clearSnapshot() {
     _snapshot = null;
     _snapshotStale = false;
-    _peerTrafficSamples = <String, _PeerTrafficSample>{};
-    _peerTransferRatesBytesPerSecond = <String, int>{};
-    _peerDirectionalTransferRates = <String, PeerTransferRate>{};
-    _lastPeerTrafficSampleAt = null;
+    _clearPeerTrafficSampling();
     _staleTimer?.cancel();
     _staleTimer = null;
     _lastRouteVerificationAt = null;
+  }
+
+  void _clearPeerTrafficSampling() {
+    _peerTrafficSamples = <String, _PeerTrafficSample>{};
+    _peerTrafficOwner = null;
+    _peerTrafficUptimeMs = null;
+    _peerTransferRatesBytesPerSecond = <String, int>{};
+    _peerDirectionalTransferRates = <String, PeerTransferRate>{};
+    _lastPeerTrafficSampleAt = null;
   }
 
   bool _shouldVerifyRoutes(DateTime now) {
@@ -783,6 +803,63 @@ class StatusStore extends ChangeNotifier {
     DateTime fetchedAt, {
     required bool throttle,
   }) {
+    // A successful HTTP response can still contain a cached or incomplete
+    // catalog. Never use it as a rate baseline, including inside the throttle.
+    if (snapshot.peerSnapshotStale ||
+        snapshot.capturedRevision != snapshot.revision ||
+        snapshot.stats.totalPeers != snapshot.peers.length) {
+      _clearPeerTrafficSampling();
+      return;
+    }
+    final owner = (
+      processId: snapshot.processId,
+      runtimeIncarnation: snapshot.runtimeIncarnation,
+      nodeId: snapshot.nodeId,
+      networkId: snapshot.networkId,
+      networkGeneration: snapshot.networkGeneration,
+    );
+    final previousUptime = _peerTrafficUptimeMs;
+    final restarted =
+        previousUptime != null &&
+        previousUptime > 0 &&
+        snapshot.uptimeMs > 0 &&
+        snapshot.uptimeMs < previousUptime;
+    if (_snapshotStale || owner != _peerTrafficOwner || restarted) {
+      _clearPeerTrafficSampling();
+    }
+    _peerTrafficOwner = owner;
+    _peerTrafficUptimeMs = snapshot.uptimeMs;
+
+    final eligible = <String, PeerSnapshot>{};
+    for (final peer in snapshot.peers) {
+      final nodeId = peer.nodeId.trim();
+      final sent = peer.reportedBytesSent;
+      final received = peer.reportedBytesReceived;
+      if (nodeId.isEmpty ||
+          !peer.online ||
+          peer.path == 'offline' ||
+          sent == null ||
+          received == null ||
+          sent < 0 ||
+          received < 0) {
+        continue;
+      }
+      eligible[nodeId] = peer;
+    }
+    _peerTrafficSamples.removeWhere((nodeId, sample) {
+      final peer = eligible[nodeId];
+      return peer == null ||
+          sample.identity != _peerTrafficIdentity(peer) ||
+          peer.reportedBytesSent! < sample.bytesSent ||
+          peer.reportedBytesReceived! < sample.bytesReceived;
+    });
+    _peerTransferRatesBytesPerSecond.removeWhere(
+      (nodeId, _) => !_peerTrafficSamples.containsKey(nodeId),
+    );
+    _peerDirectionalTransferRates.removeWhere(
+      (nodeId, _) => !_peerTrafficSamples.containsKey(nodeId),
+    );
+
     final lastSampleAt = _lastPeerTrafficSampleAt;
     if (throttle &&
         lastSampleAt != null &&
@@ -792,16 +869,18 @@ class StatusStore extends ChangeNotifier {
     final nextSamples = <String, _PeerTrafficSample>{};
     final nextRates = <String, int>{};
     final nextDirectionalRates = <String, PeerTransferRate>{};
-    for (final peer in snapshot.peers) {
-      final nodeId = peer.nodeId.trim();
-      if (nodeId.isEmpty) continue;
+    for (final entry in eligible.entries) {
+      final nodeId = entry.key;
+      final peer = entry.value;
+      final sent = peer.reportedBytesSent!;
+      final received = peer.reportedBytesReceived!;
       final previous = _peerTrafficSamples[nodeId];
       if (previous != null) {
         final elapsedMicros = fetchedAt
             .difference(previous.fetchedAt)
             .inMicroseconds;
-        final sentDelta = peer.bytesSent - previous.bytesSent;
-        final receivedDelta = peer.bytesReceived - previous.bytesReceived;
+        final sentDelta = sent - previous.bytesSent;
+        final receivedDelta = received - previous.bytesReceived;
         if (elapsedMicros > 0 && sentDelta >= 0 && receivedDelta >= 0) {
           final uploadBytesPerSecond =
               (sentDelta * Duration.microsecondsPerSecond / elapsedMicros)
@@ -817,8 +896,9 @@ class StatusStore extends ChangeNotifier {
         }
       }
       nextSamples[nodeId] = _PeerTrafficSample(
-        bytesSent: peer.bytesSent,
-        bytesReceived: peer.bytesReceived,
+        identity: _peerTrafficIdentity(peer),
+        bytesSent: sent,
+        bytesReceived: received,
         fetchedAt: fetchedAt,
       );
     }
@@ -835,6 +915,7 @@ class StatusStore extends ChangeNotifier {
     _staleTimer = Timer(maxSnapshotAge, () {
       if (_disposed || _snapshot == null || _snapshotStale) return;
       _snapshotStale = true;
+      _clearPeerTrafficSampling();
       notifyListeners();
     });
   }
@@ -942,32 +1023,58 @@ class StatusStore extends ChangeNotifier {
         message: 'All networks are shutting down.',
       );
     }
-    return _runDaemonCommand(() async {
-      int? vpnSettingsRevision;
-      try {
-        vpnSettingsRevision =
-            await settingsStore.ensureVpnEngineSettingsSnapshot();
-      } catch (_) {
-        return const DaemonCommandResult(
-          ok: false,
-          message: '无法发布 Harmony VPN 配置，已拒绝启动。',
+    final launchSettings = settingsStore.settings;
+    final revision = _refreshGeneration;
+    final witness = _PrimaryStartWitness(revision);
+    bool acceptsOwner() =>
+        !_disposed &&
+        revision == _refreshGeneration &&
+        launchSettings.diagnosticsUrl ==
+            settingsStore.settings.diagnosticsUrl &&
+        accountSessionKey(launchSettings) ==
+            accountSessionKey(settingsStore.settings);
+    try {
+      final result = await _runDaemonCommand(() async {
+        int? vpnSettingsRevision;
+        try {
+          vpnSettingsRevision = await settingsStore
+              .ensureVpnEngineSettingsSnapshot();
+        } catch (_) {
+          return const DaemonCommandResult(
+            ok: false,
+            message: '无法发布 Harmony VPN 配置，已拒绝启动。',
+          );
+        }
+        if (!acceptsOwner() ||
+            !identical(launchSettings, settingsStore.settings)) {
+          return const DaemonCommandResult(
+            ok: false,
+            message: '启动期间配置已变化，请重试。',
+          );
+        }
+        final started = await daemonController.start(
+          launchSettings,
+          vpnSettingsRevision: vpnSettingsRevision,
         );
+        if (started.ok && acceptsOwner()) {
+          _accountRequiresRestart = false;
+          _primaryStartWitness = witness;
+        }
+        return started;
+      }, settlePeerCatalog: true);
+      if (result.ok && acceptsOwner() && witness.matches(_snapshot)) {
+        _confirmPrimaryConfiguration(launchSettings);
       }
-      final result = await daemonController.start(
-        settingsStore.settings,
-        vpnSettingsRevision: vpnSettingsRevision,
-      );
-      if (result.ok) _accountRequiresRestart = false;
       return result;
-    }, settlePeerCatalog: true);
+    } finally {
+      if (identical(_primaryStartWitness, witness)) _primaryStartWitness = null;
+    }
   }
 
   Future<DaemonCommandResult> stopDaemon() {
     cancelSpeedTest();
     return _runDaemonCommand(() {
-      final primaryFuture = daemonController.stop(
-        settingsStore.settings.diagnosticsUrl,
-      );
+      final primaryFuture = _stopPrimaryRuntime();
       if (!parallelRooms.hasSessions) {
         return primaryFuture;
       }
@@ -989,9 +1096,7 @@ class StatusStore extends ChangeNotifier {
 
   Future<DaemonCommandResult> stopPrimaryDaemon() {
     cancelSpeedTest();
-    return _runDaemonCommand(
-      () => daemonController.stop(settingsStore.settings.diagnosticsUrl),
-    );
+    return _runDaemonCommand(_stopPrimaryRuntime);
   }
 
   Future<void> runSpeedTest(PeerSnapshot peer) async {
@@ -1170,6 +1275,12 @@ class StatusStore extends ChangeNotifier {
   void _handleSettingsChanged() {
     final nextSession = accountSessionKey(settingsStore.settings);
     final accountChanged = nextSession != _lastAccountSession;
+    final nextDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
+    final ownerChanged =
+        accountChanged || nextDiagnosticsUrl != _lastDiagnosticsUrl;
+    final pendingChanged = _observePrimaryConfiguration(
+      ownerChanged: ownerChanged,
+    );
     if (accountChanged) {
       _lastAccountSession = nextSession;
       _accountRequiresRestart = settingsStore.settings.authToken
@@ -1178,8 +1289,10 @@ class StatusStore extends ChangeNotifier {
       unawaited(parallelRooms.credentialsChanged());
       _clearAccountHistory();
     }
-    final nextDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
-    if (!accountChanged && nextDiagnosticsUrl == _lastDiagnosticsUrl) return;
+    if (!ownerChanged) {
+      if (pendingChanged) notifyListeners();
+      return;
+    }
     _lastDiagnosticsUrl = nextDiagnosticsUrl;
     _refreshGeneration += 1;
     cancelSpeedTest();
@@ -1228,13 +1341,28 @@ class PeerTransferRate {
   final int downloadBytesPerSecond;
 }
 
+typedef _PeerTrafficOwner = ({
+  int? processId,
+  int? runtimeIncarnation,
+  String nodeId,
+  String networkId,
+  int networkGeneration,
+});
+
+(String, int?) _peerTrafficIdentity(PeerSnapshot peer) => (
+  peer.virtualIp,
+  peer.pathObservability.networkEpoch?.peerSessionGeneration,
+);
+
 class _PeerTrafficSample {
   const _PeerTrafficSample({
+    required this.identity,
     required this.bytesSent,
     required this.bytesReceived,
     required this.fetchedAt,
   });
 
+  final (String, int?) identity;
   final int bytesSent;
   final int bytesReceived;
   final DateTime fetchedAt;

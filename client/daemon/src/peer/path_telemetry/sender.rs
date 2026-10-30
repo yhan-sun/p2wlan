@@ -11,7 +11,7 @@ use std::time::Duration;
 use reqwest::Client;
 use tracing::{debug, warn};
 
-use super::hub::{PathTelemetryHub, DEFAULT_BATCH_OBSERVATIONS};
+use super::hub::{PathTelemetryHub, PathTelemetrySendFailure, DEFAULT_BATCH_OBSERVATIONS};
 use crate::error::{DaemonError, Result};
 
 pub const TELEMETRY_HTTP_PATH: &str = "/api/v1/telemetry/paths";
@@ -60,6 +60,12 @@ impl PathTelemetrySender {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn with_http_client(mut self, client: Client) -> Self {
+        self.http = client;
+        self
+    }
+
     /// Check if telemetry endpoint is supported by the server.
     pub fn is_supported(&self) -> bool {
         self.telemetry_supported.load(Ordering::Acquire)
@@ -71,13 +77,11 @@ impl PathTelemetrySender {
             return Ok(0);
         }
 
-        let observations = self.hub.drain_dirty(DEFAULT_BATCH_OBSERVATIONS);
-        if observations.is_empty() {
+        let Some(frame) = self.hub.drain_bounded_frame(DEFAULT_BATCH_OBSERVATIONS) else {
             return Ok(0);
-        }
-
-        let count = observations.len();
-        let payload = self.hub.build_payload(observations);
+        };
+        let payload = frame.payload;
+        let count = payload.observations.len();
         let url = format!("{}{}", self.base_url, TELEMETRY_HTTP_PATH);
 
         let mut req = self.http.post(&url).bearer_auth(&self.token).json(&payload);
@@ -90,8 +94,14 @@ impl PathTelemetrySender {
         let res = match req.send().await {
             Ok(res) => res,
             Err(err) => {
-                self.hub.record_send_failure();
-                debug!("Path telemetry HTTP transmission failed: {err}");
+                let reason = if err.is_timeout() {
+                    PathTelemetrySendFailure::Timeout
+                } else {
+                    PathTelemetrySendFailure::Transport
+                };
+                self.hub.record_delivery_failure(reason);
+                self.hub.retry_observations(&payload.observations);
+                debug!(reason_code = ?reason, "Path telemetry HTTP transmission failed: {err}");
                 return Err(DaemonError::ControlPlane(format!(
                     "telemetry post failed: {err}"
                 )));
@@ -106,7 +116,9 @@ impl PathTelemetrySender {
         }
 
         if !res.status().is_success() {
-            self.hub.record_send_failure();
+            self.hub
+                .record_delivery_failure(PathTelemetrySendFailure::HttpStatus);
+            self.hub.retry_observations(&payload.observations);
             let status = res.status();
             let text = res.text().await.unwrap_or_default();
             warn!("Path telemetry HTTP post returned status {status}: {text}");
@@ -115,7 +127,7 @@ impl PathTelemetrySender {
             )));
         }
 
-        self.hub.record_sent_batch(count);
+        self.hub.record_delivery_success(&payload.observations);
         self.hub.record_ack(payload.sent_at);
         Ok(count)
     }

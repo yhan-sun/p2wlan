@@ -4,6 +4,47 @@ import '../../core/api/control_api.dart';
 import '../../app/app_strings.dart';
 import '../../shared/widgets/app_notice.dart';
 
+/// Owns the username draft across category navigation. The server profile is
+/// the saved baseline; the text controller remains the only editable value.
+class UsernameSettingsController extends ChangeNotifier {
+  UsernameSettingsController({String username = ''})
+    : _savedUsername = username.trim(),
+      text = TextEditingController(text: username.trim()) {
+    text.addListener(notifyListeners);
+  }
+
+  final TextEditingController text;
+  String _savedUsername;
+  (String, String)? _account;
+
+  bool get isDirty => text.text.trim() != _savedUsername;
+
+  void _bindAccount(String server, String token, String username) {
+    final account = (server.trim(), token);
+    if (_account != null && _account != account) {
+      _acceptSaved(username, preserveDraft: false);
+    }
+    _account = account;
+  }
+
+  void _acceptSaved(String username, {bool preserveDraft = true}) {
+    final hadDraft = isDirty;
+    _savedUsername = username.trim();
+    if ((!preserveDraft || !hadDraft) && text.text != _savedUsername) {
+      text.text = _savedUsername;
+    } else {
+      notifyListeners();
+    }
+  }
+
+  @override
+  void dispose() {
+    text.removeListener(notifyListeners);
+    text.dispose();
+    super.dispose();
+  }
+}
+
 /// Usernames are account display names, independent of login email and devices.
 class UsernameSettings extends StatefulWidget {
   const UsernameSettings({
@@ -13,47 +54,79 @@ class UsernameSettings extends StatefulWidget {
     this.email = '',
     this.username = '',
     this.onProfileLoaded,
+    this.controller,
+    this.controlApi,
   });
   final String server;
   final String token;
   final String email;
   final String username;
   final ValueChanged<AccountProfile>? onProfileLoaded;
+  final UsernameSettingsController? controller;
+  final ControlApi? controlApi;
   @override
   State<UsernameSettings> createState() => _UsernameSettingsState();
 }
 
 class _UsernameSettingsState extends State<UsernameSettings> {
-  final _api = ControlApi();
-  final _name = TextEditingController();
+  late final ControlApi _api;
+  late final bool _ownsApi;
+  late UsernameSettingsController _controller;
+  late bool _ownsController;
+  TextEditingController get _name => _controller.text;
   bool _busy = true;
   bool _loaded = false;
   String? _error;
   String? _saved;
   late String _email;
+  var _requestRevision = 0;
 
   @override
   void initState() {
     super.initState();
+    _ownsApi = widget.controlApi == null;
+    _api = widget.controlApi ?? ControlApi();
+    _attachController();
     _email = widget.email.trim();
-    _name.text = widget.username.trim();
     _loaded = _name.text.isNotEmpty;
     _load();
+  }
+
+  void _attachController() {
+    _ownsController = widget.controller == null;
+    _controller =
+        widget.controller ??
+        UsernameSettingsController(username: widget.username);
+    _controller._bindAccount(widget.server, widget.token, widget.username);
   }
 
   @override
   void didUpdateWidget(covariant UsernameSettings oldWidget) {
     super.didUpdateWidget(oldWidget);
+    final accountChanged =
+        oldWidget.server != widget.server || oldWidget.token != widget.token;
+    if (oldWidget.controller != widget.controller) {
+      if (_ownsController) _controller.dispose();
+      _attachController();
+    } else {
+      _controller._bindAccount(widget.server, widget.token, widget.username);
+    }
     final nextEmail = widget.email.trim();
-    if (nextEmail.isNotEmpty && nextEmail != _email) _email = nextEmail;
+    if (accountChanged || nextEmail.isNotEmpty) _email = nextEmail;
     final nextUsername = widget.username.trim();
-    if (nextUsername.isNotEmpty && nextUsername != _name.text.trim()) {
-      _name.text = nextUsername;
+    if (nextUsername != oldWidget.username.trim()) {
+      _controller._acceptSaved(nextUsername);
       _loaded = true;
+    }
+    if (accountChanged) {
+      _saved = null;
+      _loaded = _name.text.isNotEmpty;
+      _load();
     }
   }
 
   Future<void> _load() async {
+    final revision = ++_requestRevision;
     setState(() {
       _busy = true;
       _error = null;
@@ -63,22 +136,25 @@ class _UsernameSettingsState extends State<UsernameSettings> {
         controlServer: widget.server,
         authToken: widget.token,
       );
-      if (!mounted) return;
+      if (!mounted || revision != _requestRevision) return;
       _email = profile.email.isEmpty ? _email : profile.email;
-      _name.text = profile.username;
+      _controller._acceptSaved(profile.username);
       _loaded = true;
       widget.onProfileLoaded?.call(profile);
     } catch (_) {
-      if (mounted) {
+      if (mounted && revision == _requestRevision) {
         _error = AppStringsScope.of(context).settingsUsernameLoadError;
         showAppNotice(context, content: Text(_error!));
       }
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted && revision == _requestRevision) {
+        setState(() => _busy = false);
+      }
     }
   }
 
   Future<void> _save() async {
+    final revision = ++_requestRevision;
     setState(() {
       _busy = true;
       _error = null;
@@ -90,25 +166,27 @@ class _UsernameSettingsState extends State<UsernameSettings> {
         authToken: widget.token,
         username: _name.text,
       );
-      if (!mounted) return;
+      if (!mounted || revision != _requestRevision) return;
       _email = profile.email.isEmpty ? _email : profile.email;
-      _name.text = profile.username;
+      _controller._acceptSaved(profile.username, preserveDraft: false);
       widget.onProfileLoaded?.call(profile);
       _saved = AppStringsScope.of(context).settingsUsernameSaved;
     } on ControlApiException catch (error) {
-      if (mounted) {
+      if (mounted && revision == _requestRevision) {
         _error = error.message;
         showAppNotice(context, content: Text(error.message));
       }
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted && revision == _requestRevision) {
+        setState(() => _busy = false);
+      }
     }
   }
 
   @override
   void dispose() {
-    _api.close();
-    _name.dispose();
+    if (_ownsApi) _api.close();
+    if (_ownsController) _controller.dispose();
     super.dispose();
   }
 

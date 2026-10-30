@@ -74,15 +74,17 @@ func TestSendQueueFullBackpressure(t *testing.T) {
 		id:        "bob",
 		networkID: "",
 		conn:      dstServer,
-		send:      make(chan []byte, 1),
+		send:      make(chan queuedFrame, 1),
 		done:      make(chan struct{}),
 	}
 	h.register(dst, "", "bob")
 	// Occupy the only slot; the next frame must take the deterministic 4008
 	// path without relying on whether a writer goroutine happened to run.
-	dst.send <- []byte("already queued")
+	dst.send <- queuedFrame{data: []byte("already queued")}
 
-	code, message := h.forward("", "alice", "bob", []byte("payload"), 65535)
+	src := &peer{done: make(chan struct{})}
+	h.register(src, "", "alice")
+	code, message := h.forward(src, "bob", []byte("payload"), 65535)
 	if code != 4008 {
 		t.Fatalf("forward code = %d, want 4008 (message=%q)", code, message)
 	}

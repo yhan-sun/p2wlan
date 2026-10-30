@@ -24,22 +24,26 @@ import '../../core/state/status_store.dart';
 import '../../core/update/update_models.dart';
 import '../../core/update/update_service.dart';
 import '../../shared/widgets/app_back_button.dart';
+import '../../shared/widgets/app_motion.dart';
 import '../../shared/widgets/app_select.dart';
 
 part 'settings_page/categories.dart';
 part 'settings_page/common.dart';
 part 'settings_page/layout.dart';
+part 'settings_page/interaction.dart';
 part 'settings_page/general.dart';
 part 'settings_page/account.dart';
 part 'settings_page/application.dart';
 part 'settings_page/advanced.dart';
 part 'settings_page/developer.dart';
 part 'settings_page/actions.dart';
+part 'settings_page/validation.dart';
 
 typedef _SettingsStatusProjection = ({
   bool daemonBusy,
   bool daemonReachable,
   bool refreshActivityVisible,
+  bool primaryConfigurationPending,
   String daemonBuildSignature,
 });
 
@@ -71,6 +75,7 @@ class SettingsPage extends StatefulWidget {
     this.controlApi,
     this.updateService,
     this.onLogout,
+    this.onReauthenticate,
     this.onDirtyChanged,
     this.controller,
     this.startupRegistration,
@@ -85,7 +90,7 @@ class SettingsPage extends StatefulWidget {
   final PlatformCapabilities? capabilities;
 
   /// Optional auth client override used by tests and embedded shells. When
-  /// omitted, the page owns a short-lived client for support-log uploads.
+  /// omitted, the page owns a client for account profiles and support logs.
   final ControlApi? controlApi;
 
   /// Optional update service override used by tests. Production callers can
@@ -93,6 +98,7 @@ class SettingsPage extends StatefulWidget {
   final UpdateService? updateService;
 
   final VoidCallback? onLogout;
+  final VoidCallback? onReauthenticate;
 
   /// Notifies the host shell when the page transitions between clean and dirty
   /// (any category has unsaved drafts). The shell uses this to guard against
@@ -129,13 +135,25 @@ class _SettingsPageState extends State<SettingsPage> {
   late final TextEditingController _udpBindController;
   late final TextEditingController _udpAdvertiseController;
   late final TextEditingController _relayServersController;
+  late final UsernameSettingsController _usernameController;
+
+  final _fieldErrors = <TextEditingController, String>{};
+  final _fieldFocus = <TextEditingController, FocusNode>{};
+  FocusNode _focusFor(TextEditingController controller) =>
+      _fieldFocus.putIfAbsent(controller, () => FocusNode());
+
+  void _clearFieldError(TextEditingController controller) {
+    if (_fieldErrors.containsKey(controller)) {
+      _updateState(() => _fieldErrors.remove(controller));
+    }
+  }
 
   String? _diagnosticsError;
   String? _formError;
   SettingsCategory? _formErrorCategory;
   var _saving = false;
+  SettingsCategory? _savingCategory;
   var _socketPool = defaultSocketPool;
-  var _restartRequired = false;
   var _closeBehavior = defaultCloseBehavior;
   var _showTokenField = false;
   var _uploadingLogs = false;
@@ -204,6 +222,9 @@ class _SettingsPageState extends State<SettingsPage> {
     _statusViewNotifier = ValueNotifier(_statusProjection(widget.statusStore));
     widget.statusStore.addListener(_onStatusChanged);
     final settings = widget.settingsStore.settings;
+    _usernameController = UsernameSettingsController(
+      username: settings.accountUsername,
+    )..addListener(_notifyDirty);
     _diagnosticsUrlController = TextEditingController(
       text: settings.diagnosticsUrl,
     );
@@ -281,6 +302,7 @@ class _SettingsPageState extends State<SettingsPage> {
       daemonBusy: store.daemonBusy,
       daemonReachable: store.daemonReachable,
       refreshActivityVisible: store.refreshActivityVisible,
+      primaryConfigurationPending: store.primaryConfigurationPending,
       daemonBuildSignature: build == null
           ? ''
           : [
@@ -314,6 +336,10 @@ class _SettingsPageState extends State<SettingsPage> {
   /// True when any visible category has unsaved drafts (excludes immediate-save
   /// language/theme which never count as dirty).
   bool get _anyCategoryDirty {
+    // Keep the leave guard active through persistence and the subsequent
+    // status refresh, until the category's save operation has completed.
+    if (_savingCategory != null) return true;
+    if (_usernameController.isDirty) return true;
     for (final category in _visibleCategories) {
       if (_categoryDirty(category)) return true;
     }
@@ -341,6 +367,9 @@ class _SettingsPageState extends State<SettingsPage> {
     ]) {
       controller.removeListener(_onDraftChanged);
     }
+    for (final focus in _fieldFocus.values) {
+      focus.dispose();
+    }
     _diagnosticsUrlController.dispose();
     _controlServerController.dispose();
     _authTokenController.dispose();
@@ -353,6 +382,8 @@ class _SettingsPageState extends State<SettingsPage> {
     _udpBindController.dispose();
     _udpAdvertiseController.dispose();
     _relayServersController.dispose();
+    _usernameController.removeListener(_notifyDirty);
+    _usernameController.dispose();
     _detailViewNotifier.dispose();
     _statusViewNotifier.dispose();
     super.dispose();
@@ -370,7 +401,8 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _openMobileCategory(SettingsCategory category) async {
     await Navigator.of(context, rootNavigator: true).push<void>(
-      MaterialPageRoute<void>(
+      _SettingsCategoryRoute(
+        duration: AppMotion.durationOf(context),
         settings: RouteSettings(name: '/settings/${category.name}'),
         builder: (_) =>
             _MobileSettingsCategoryPage(category: category, state: this),
@@ -451,16 +483,16 @@ class _SettingsPageState extends State<SettingsPage> {
     return LayoutBuilder(
       builder: (context, constraints) {
         _lastLayoutWidth = constraints.maxWidth;
-        final isNarrow = constraints.maxWidth < 520;
+        final isNarrow = constraints.maxWidth < 480;
         final layout = constraints.maxWidth >= _settingsLayoutBreakpoint
             ? _SettingsLayout.expanded
             : _SettingsLayout.rootDetail;
         return Padding(
-          padding: const EdgeInsets.fromLTRB(
-            AppTokens.space16,
-            AppTokens.space12,
-            AppTokens.space16,
-            AppTokens.space16,
+          padding: EdgeInsets.fromLTRB(
+            isNarrow ? 16 : 28,
+            isNarrow ? 20 : 24,
+            isNarrow ? 16 : 28,
+            20,
           ),
           child: Center(
             child: ConstrainedBox(
@@ -470,38 +502,34 @@ class _SettingsPageState extends State<SettingsPage> {
                 children: [
                   if (widget.showHeader) ...[
                     Align(
-                      alignment: isNarrow
-                          ? Alignment.center
-                          : Alignment.centerLeft,
+                      alignment: Alignment.centerLeft,
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: isNarrow
-                            ? CrossAxisAlignment.center
-                            : CrossAxisAlignment.start,
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
                             strings.settings,
                             style: TextStyle(
-                              fontSize: 22,
-                              fontWeight: FontWeight.w600,
+                              fontSize: isNarrow ? 22 : 24,
+                              height: 1.25,
+                              fontWeight: FontWeight.w700,
                               color: theme.colorScheme.onSurface,
                             ),
                           ),
-                          const SizedBox(height: 3),
+                          const SizedBox(height: 6),
                           Text(
                             strings.settingsSubtitle,
-                            textAlign: isNarrow
-                                ? TextAlign.center
-                                : TextAlign.left,
+                            textAlign: TextAlign.left,
                             style: TextStyle(
-                              fontSize: 13,
+                              fontSize: 14,
+                              height: 1.45,
                               color: theme.colorScheme.onSurfaceVariant,
                             ),
                           ),
                         ],
                       ),
                     ),
-                    const SizedBox(height: AppTokens.space16),
+                    const SizedBox(height: AppTokens.space20),
                   ],
                   Expanded(
                     child: _SettingsShell(

@@ -6,6 +6,9 @@ Future<_Stores> _pumpSettings(
   required _FakeDiagnosticsApi api,
   PlatformCapabilities? capabilities,
   VoidCallback? onLogout,
+  VoidCallback? onReauthenticate,
+  ValueChanged<bool>? onDirtyChanged,
+  SecureTokenRepository? tokenRepository,
   UpdateService? updateService,
   Size physicalSize = const Size(800, 2400),
 }) async {
@@ -13,19 +16,20 @@ Future<_Stores> _pumpSettings(
   tester.view.devicePixelRatio = 1;
   addTearDown(tester.view.resetPhysicalSize);
   addTearDown(tester.view.resetDevicePixelRatio);
-  final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+  final stores = (await tester.runAsync(
+    () => _makeStores(api: api, tokenRepository: tokenRepository),
+  ))!;
   addTearDown(stores.dispose);
-  await tester.pumpWidget(
-    _TestApp(
-      child: SettingsPage(
-        settingsStore: stores.settingsStore,
-        statusStore: stores.statusStore,
-        capabilities: capabilities,
-        onLogout: onLogout,
-        updateService: updateService,
-      ),
-    ),
+  final page = SettingsPage(
+    settingsStore: stores.settingsStore,
+    statusStore: stores.statusStore,
+    capabilities: capabilities,
+    onLogout: onLogout,
+    onReauthenticate: onReauthenticate,
+    onDirtyChanged: onDirtyChanged,
+    updateService: updateService,
   );
+  await tester.pumpWidget(_TestApp(child: page));
   await tester.pumpAndSettle();
   return stores;
 }
@@ -74,8 +78,7 @@ Future<void> _waitFor(WidgetTester tester, bool Function() condition) async {
 }
 
 /// Waits until the immediate-save dropdown at [key] is enabled again, i.e. the
-/// previous language/theme persistence fully completed (the in-memory value is
-/// set synchronously, before the async disk write finishes).
+/// previous language/theme persistence and its UI feedback fully completed.
 Future<void> _waitForSaveComplete(WidgetTester tester, Key key) async {
   for (var attempt = 0; attempt < 30; attempt += 1) {
     final widget = tester.widget(find.byKey(key));
@@ -258,19 +261,63 @@ void _registerSettingsTests() {
     await tester.tap(find.text('Change credential'));
     await tester.pump();
     // The revealed token field is empty; save with nothing else changed would
-    // be a no-op, so also touch the control server to create a real draft.
-    await tester.enterText(
-      _settingsTextField('Control server'),
-      'https://ctrl.example',
-    );
+    // be a no-op, so edit the network while retaining the credential's server.
+    await tester.enterText(_settingsTextField('Network ID'), 'test-network');
     await tester.pump();
     await _tapSave(tester);
-    await _waitFor(tester, () => !stores.statusStore.refreshing);
+    await _waitFor(
+      tester,
+      () => find.byKey(const Key('settings-save-button')).evaluate().isEmpty,
+    );
 
+    expect(stores.settingsStore.settings.networkId, 'test-network');
     expect(stores.settingsStore.settings.authToken, 'kept-token');
     expect(find.text('Securely saved'), findsOneWidget);
     expect(find.textContaining('kept-token'), findsNothing);
   });
+
+  testWidgets(
+    'Server change requires an explicit new credential before saving',
+    (tester) async {
+      final stores = await _pumpSettings(
+        tester,
+        api: _FakeDiagnosticsApi(health: false),
+      );
+      await tester.runAsync(
+        () => stores.settingsStore.updateSettings(
+          stores.settingsStore.settings.copyWith(authToken: 'original-token'),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await _openCategory(tester, 'Account & Connection');
+      await tester.enterText(
+        _settingsTextField('Control server'),
+        'https://new.example.com',
+      );
+      await tester.pump();
+      await _tapSave(tester);
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Sign in to the new server'), findsOneWidget);
+      expect(
+        stores.settingsStore.settings.controlServer,
+        'https://control.example.com',
+      );
+      expect(stores.settingsStore.settings.authToken, 'original-token');
+      expect(
+        await tester.runAsync(stores.tokenRepository.read),
+        'original-token',
+      );
+      expect(
+        tester
+            .widget<TextField>(_settingsTextField('Control server'))
+            .controller!
+            .text,
+        'https://new.example.com',
+      );
+      expect(find.byKey(const Key('settings-save-button')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('Settings exposes Sign out only when a handler is provided', (
     tester,
@@ -392,10 +439,7 @@ void _registerSettingsTests() {
     expect(stores.statusStore.daemonReachable, isTrue);
 
     await _openCategory(tester, 'Account & Connection');
-    await tester.enterText(
-      _settingsTextField('Control server'),
-      'https://ctrl.example',
-    );
+    await tester.enterText(_settingsTextField('Network ID'), 'mobile-network');
     await tester.pump();
     await _tapSave(tester);
     await _waitFor(
@@ -432,8 +476,8 @@ void _registerSettingsTests() {
       tester,
       () => stores.settingsStore.settings.themeMode == 'dark',
     );
-    // The store value is set synchronously before persistence finishes; wait
-    // until the save completes (the dropdown re-enables) before the next edit.
+    // Wait for persistence and UI feedback (the dropdown re-enables) before
+    // starting another preference edit.
     await _waitForSaveComplete(
       tester,
       const ValueKey('settings-language-select'),

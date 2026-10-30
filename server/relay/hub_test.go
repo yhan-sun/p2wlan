@@ -14,7 +14,7 @@ func TestHubRegisterNewestWinsClosesOldConnection(t *testing.T) {
 
 	oldServer, oldClient := net.Pipe()
 	defer oldClient.Close()
-	oldPeer := &peer{id: "node-1", networkID: "net-1", deviceID: "dev-1", conn: oldServer, send: make(chan []byte, 8), done: make(chan struct{})}
+	oldPeer := &peer{id: "node-1", networkID: "net-1", deviceID: "dev-1", conn: oldServer, send: make(chan queuedFrame, 8), done: make(chan struct{})}
 	h.register(oldPeer, "net-1", "node-1")
 	if h.count() != 1 {
 		t.Fatalf("expected 1 peer after first register, got %d", h.count())
@@ -22,7 +22,7 @@ func TestHubRegisterNewestWinsClosesOldConnection(t *testing.T) {
 
 	newServer, newClient := net.Pipe()
 	defer newClient.Close()
-	newPeer := &peer{id: "node-1", networkID: "net-1", deviceID: "dev-1", conn: newServer, send: make(chan []byte, 8), done: make(chan struct{})}
+	newPeer := &peer{id: "node-1", networkID: "net-1", deviceID: "dev-1", conn: newServer, send: make(chan queuedFrame, 8), done: make(chan struct{})}
 	h.register(newPeer, "net-1", "node-1")
 
 	// The old connection is closed by the register.
@@ -54,7 +54,7 @@ func TestHubUnregisterThenRegisterIsFresh(t *testing.T) {
 	h := newHub()
 	server, client := net.Pipe()
 	defer client.Close()
-	p := &peer{id: "node-2", networkID: "net-1", deviceID: "dev-2", conn: server, send: make(chan []byte, 8), done: make(chan struct{})}
+	p := &peer{id: "node-2", networkID: "net-1", deviceID: "dev-2", conn: server, send: make(chan queuedFrame, 8), done: make(chan struct{})}
 	h.register(p, "net-1", "node-2")
 	h.unregister(p)
 	if h.lookup("net-1", "node-2") != nil {
@@ -69,7 +69,7 @@ func TestHubLegacyPeerUnregistersWithEmptyNetworkID(t *testing.T) {
 	h := newHub()
 	server, client := net.Pipe()
 	defer client.Close()
-	p := &peer{id: "legacy-node", conn: server, send: make(chan []byte, 8), done: make(chan struct{})}
+	p := &peer{id: "legacy-node", conn: server, send: make(chan queuedFrame, 8), done: make(chan struct{})}
 	h.register(p, "", "legacy-node")
 	if h.lookup("", "legacy-node") != p {
 		t.Fatal("expected the legacy peer to be registered under the empty network key")

@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/app_theme.dart';
 import 'package:p2wlan_flutter_client/app/app_tokens.dart';
@@ -62,7 +63,7 @@ void main() {
 
     test('light primary matches the approved UI reference', () {
       expect(AppTokens.colorAccent, const Color(0xFF2563EB));
-      expect(AppTokens.colorBg, const Color(0xFFF6F7F8));
+      expect(AppTokens.colorBg, const Color(0xFFF5F7FB));
       expect(AppTokens.colorSurface, const Color(0xFFFFFFFF));
     });
 
@@ -189,4 +190,185 @@ void main() {
       expect(_hueDistance(lightHue, darkHue), lessThan(20));
     });
   });
+
+  for (final theme in [AppTheme.lightTheme, AppTheme.darkTheme]) {
+    final mode = theme.brightness.name;
+    testWidgets('$mode buttons support Tab, Enter and visible focus', (
+      tester,
+    ) async {
+      final nodes = List.generate(5, (_) => FocusNode());
+      for (final node in nodes) {
+        addTearDown(node.dispose);
+      }
+      final activated = <int>[];
+      final buttons = <Widget>[
+        FilledButton(
+          key: const Key('filled'),
+          focusNode: nodes[0],
+          onPressed: () => activated.add(0),
+          child: const Text('Save'),
+        ),
+        OutlinedButton(
+          key: const Key('outlined'),
+          focusNode: nodes[1],
+          onPressed: () => activated.add(1),
+          child: const Text('Configure'),
+        ),
+        TextButton(
+          key: const Key('text'),
+          focusNode: nodes[2],
+          onPressed: () => activated.add(2),
+          child: const Text('Cancel'),
+        ),
+        IconButton(
+          key: const Key('icon'),
+          focusNode: nodes[3],
+          onPressed: () => activated.add(3),
+          tooltip: 'Refresh',
+          icon: const Icon(Icons.refresh),
+        ),
+      ];
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: theme,
+          home: Scaffold(
+            body: Column(
+              children: [
+                Row(children: buttons),
+                const Row(
+                  children: [
+                    FilledButton(onPressed: null, child: Text('Disabled save')),
+                    OutlinedButton(
+                      onPressed: null,
+                      child: Text('Disabled outline'),
+                    ),
+                    TextButton(onPressed: null, child: Text('Disabled text')),
+                    IconButton(onPressed: null, icon: Icon(Icons.block)),
+                  ],
+                ),
+                TextButton(
+                  focusNode: nodes[4],
+                  onPressed: () => activated.add(4),
+                  child: const Text('After disabled buttons'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      for (var index = 0; index < 4; index += 1) {
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.pumpAndSettle();
+        expect(nodes[index].hasFocus, isTrue);
+        final target = find.byKey(
+          Key(['filled', 'outlined', 'text', 'icon'][index]),
+        );
+        final material = tester.widget<Material>(
+          find.descendant(of: target, matching: find.byType(Material)).first,
+        );
+        final side = (material.shape! as OutlinedBorder).side;
+        expect(side.width, 2);
+        expect(
+          _contrast(
+            side.color,
+            index == 0 ? theme.colorScheme.primary : theme.colorScheme.surface,
+          ),
+          greaterThanOrEqualTo(3),
+        );
+        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+        await tester.pumpAndSettle();
+        expect(activated, List.generate(index + 1, (value) => value));
+      }
+      await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+      await tester.pumpAndSettle();
+      expect(nodes[4].hasFocus, isTrue);
+      for (final text in [
+        'Disabled save',
+        'Disabled outline',
+        'Disabled text',
+      ]) {
+        await tester.tap(find.text(text));
+      }
+      expect(activated, [0, 1, 2, 3]);
+      expect(
+        tester.getSize(find.byKey(const Key('text'))).height,
+        greaterThanOrEqualTo(44),
+      );
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('$mode button theme preserves a local style override', (
+      tester,
+    ) async {
+      final focus = FocusNode();
+      addTearDown(focus.dispose);
+      final customColor = theme.colorScheme.error;
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: theme,
+          home: Scaffold(
+            body: OutlinedButton(
+              focusNode: focus,
+              onPressed: () {},
+              style: OutlinedButton.styleFrom(
+                foregroundColor: customColor,
+                side: BorderSide(color: customColor, width: 3),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                ),
+              ),
+              child: const Text('Custom action'),
+            ),
+          ),
+        ),
+      );
+      focus.requestFocus();
+      await tester.pumpAndSettle();
+      final material = tester.widget<Material>(
+        find
+            .descendant(
+              of: find.byType(OutlinedButton),
+              matching: find.byType(Material),
+            )
+            .first,
+      );
+      final shape = material.shape! as RoundedRectangleBorder;
+      expect(shape.side, BorderSide(color: customColor, width: 3));
+      expect(shape.borderRadius, BorderRadius.circular(20));
+      expect(tester.takeException(), isNull);
+    });
+
+    test(
+      '$mode text buttons share geometry and disabled feedback stays quiet',
+      () {
+        final text = theme.textButtonTheme.style!;
+        expect(text.minimumSize!.resolve({}), const Size(44, 44));
+        expect(
+          text.padding!.resolve({}),
+          const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        );
+        expect(
+          (text.shape!.resolve({})! as RoundedRectangleBorder).borderRadius,
+          BorderRadius.circular(8),
+        );
+        expect(text.textStyle!.resolve({})!.fontSize, 14);
+        expect(text.textStyle!.resolve({})!.fontWeight, FontWeight.w600);
+        for (final style in [
+          theme.filledButtonTheme.style!,
+          theme.outlinedButtonTheme.style!,
+          text,
+          theme.iconButtonTheme.style!,
+        ]) {
+          const disabled = {
+            WidgetState.disabled,
+            WidgetState.focused,
+            WidgetState.hovered,
+          };
+          expect(style.side!.resolve(disabled)!.width, lessThan(2));
+          expect(style.overlayColor!.resolve(disabled), Colors.transparent);
+        }
+      },
+    );
+  }
 }

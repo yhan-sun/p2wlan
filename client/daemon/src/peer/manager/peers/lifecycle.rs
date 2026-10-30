@@ -581,7 +581,7 @@ impl PeerManager {
             || old_online != info.online;
         let published_generation = self
             .peer_membership
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .publish(&info.node_id, info.online, rotate_peer_session);
         if let Some(peer_session_generation) = published_generation {
@@ -689,7 +689,7 @@ impl PeerManager {
             }
             let peer_session_generation = self
                 .peer_membership
-                .lock()
+                .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .generation(node_id);
             if let (Some(conn), Some(peer_session_generation)) =
@@ -707,7 +707,7 @@ impl PeerManager {
             // the old connection as present, even though physical map cleanup
             // follows immediately under the same writer.
             self.peer_membership
-                .lock()
+                .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(node_id);
             if let Some(removed) = conns.remove(node_id) {

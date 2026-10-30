@@ -17,6 +17,10 @@ class _GeneralSection extends StatelessWidget {
           children: [
             _SettingsField(
               controller: state._deviceNameController,
+              focusNode: state._focusFor(state._deviceNameController),
+              errorText: state._fieldErrors[state._deviceNameController],
+              onChanged: (_) =>
+                  state._clearFieldError(state._deviceNameController),
               label: strings.deviceName,
               helper: strings.deviceNameHelper,
               textInputAction: TextInputAction.done,
@@ -61,7 +65,11 @@ class _GeneralSection extends StatelessWidget {
             const SizedBox(height: 4),
             Text(
               strings.themeModeHelper,
-              style: Theme.of(context).textTheme.bodySmall,
+              style: TextStyle(
+                fontSize: 12,
+                height: 1.45,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 12),
             LayoutBuilder(
@@ -90,6 +98,13 @@ class _GeneralSection extends StatelessWidget {
                   key: const ValueKey('settings-theme-select'),
                   direction: vertical ? Axis.vertical : Axis.horizontal,
                   expandedInsets: vertical ? null : EdgeInsets.zero,
+                  style: ButtonStyle(
+                    shape: WidgetStatePropertyAll(
+                      RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                  ),
                   showSelectedIcon: false,
                   segments: [
                     for (final option in options)
