@@ -221,7 +221,10 @@ class _FakeDaemonController extends DaemonController {
   _FakeDaemonController() : super(diagnosticsApi: DiagnosticsApi());
 
   @override
-  Future<DaemonCommandResult> start(AppSettings settings, {int? vpnSettingsRevision}) async {
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) async {
     return const DaemonCommandResult(ok: true, message: 'started');
   }
 

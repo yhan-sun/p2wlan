@@ -138,7 +138,10 @@ class _Controller extends DaemonController {
   Completer<DaemonCommandResult>? startGate;
 
   @override
-  Future<DaemonCommandResult> start(AppSettings settings, {int? vpnSettingsRevision}) async {
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) async {
     if (throwOnStart) throw StateError('SocketException SECRET');
     return startGate?.future ?? Future.value(result);
   }

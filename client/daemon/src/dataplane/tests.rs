@@ -60,7 +60,10 @@ async fn tun_worker_does_not_report_readiness_when_first_read_fails() {
         .expect("closed TUN read did not fail promptly")
         .expect("dataplane task panicked");
     assert!(result.is_err(), "closed TUN read must fail startup");
-    assert!(ready_rx.await.is_err(), "failed first read must not report ready");
+    assert!(
+        ready_rx.await.is_err(),
+        "failed first read must not report ready"
+    );
 }
 
 #[tokio::test]

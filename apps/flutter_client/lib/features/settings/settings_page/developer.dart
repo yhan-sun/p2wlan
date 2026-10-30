@@ -255,9 +255,7 @@ class _DeveloperSection extends StatelessWidget {
                 if (vpnEngineStatus != null) ...[
                   _SettingsValue(
                     label: strings.vpnEngineStatusLabel,
-                    value: strings.vpnEngineStatusValue(
-                      vpnEngineStatus.status,
-                    ),
+                    value: strings.vpnEngineStatusValue(vpnEngineStatus.status),
                   ),
                   _SettingsValue(
                     label: strings.vpnEngineRevisionLabel,

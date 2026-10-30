@@ -182,7 +182,7 @@ impl OhosVpnRouteConfirmation {
         let mut normalized_routes = BTreeSet::new();
         for cidr in routes {
             let normalized = normalize_cidr(&cidr)
-                .ok_or_else(|| crate::DaemonError::OhosRouteConfirmationInvalid { cidr })?;
+                .ok_or(crate::DaemonError::OhosRouteConfirmationInvalid { cidr })?;
             normalized_routes.insert(normalized);
         }
         Ok(Self {
@@ -254,6 +254,7 @@ impl OhosRouteAuthority {
         })
     }
 
+    #[cfg(any(target_env = "ohos", test))]
     fn state_for(&self, cidr: &str) -> (RouteState, bool) {
         let Some(normalized) = normalize_cidr(cidr) else {
             return (RouteState::Unknown, false);

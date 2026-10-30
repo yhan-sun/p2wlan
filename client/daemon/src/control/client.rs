@@ -269,14 +269,13 @@ impl ControlClient {
             // managed network does not have this room-specific access gate.
             Self::request_room_device_access(&http, config).await?;
         }
-        let (node_id, virtual_ip, cidr, relays, _, _, _) =
-            register_device_with_authoritative_cidr(
-                &http,
-                &normalize_http_base_url(&config.control.server_url),
-                &config.control.auth_token,
-                config,
-            )
-            .await?;
+        let (node_id, virtual_ip, cidr, relays, _, _, _) = register_device_with_authoritative_cidr(
+            &http,
+            &normalize_http_base_url(&config.control.server_url),
+            &config.control.auth_token,
+            config,
+        )
+        .await?;
         let (virtual_ip, cidr, netmask) = validated_vpn_network(&virtual_ip, &cidr)?;
         if config.network.network_id.starts_with("room-") {
             let address = virtual_ip

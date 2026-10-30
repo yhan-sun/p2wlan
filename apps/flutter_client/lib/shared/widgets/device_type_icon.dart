@@ -34,14 +34,17 @@ IconData peerDeviceIcon(PeerSnapshot peer) {
 }
 
 IconData localDeviceIcon(BuildContext context) {
+  // OH-Flutter adds an enum member that the upstream Flutter SDK does not have.
+  if (defaultTargetPlatform.name == 'ohos') {
+    return MediaQuery.sizeOf(context).shortestSide <
+            AppBreakpoints.compactMaxWidth
+        ? Icons.smartphone_rounded
+        : Icons.laptop_mac_rounded;
+  }
   return switch (defaultTargetPlatform) {
     TargetPlatform.android ||
     TargetPlatform.iOS ||
     TargetPlatform.fuchsia => Icons.smartphone_rounded,
-    TargetPlatform.ohos =>
-      MediaQuery.sizeOf(context).shortestSide < AppBreakpoints.compactMaxWidth
-          ? Icons.smartphone_rounded
-          : Icons.laptop_mac_rounded,
     _ => Icons.laptop_mac_rounded,
   };
 }

@@ -171,13 +171,14 @@ class AppSelect<T> extends StatelessWidget {
 
   bool _usesMobileSheet(BuildContext context) {
     if (kIsWeb) return false;
-    final isMobilePlatform = switch (defaultTargetPlatform) {
-      TargetPlatform.android ||
-      TargetPlatform.iOS ||
-      TargetPlatform.fuchsia ||
-      TargetPlatform.ohos => true,
-      _ => false,
-    };
+    final isMobilePlatform =
+        defaultTargetPlatform.name == 'ohos' ||
+        switch (defaultTargetPlatform) {
+          TargetPlatform.android ||
+          TargetPlatform.iOS ||
+          TargetPlatform.fuchsia => true,
+          _ => false,
+        };
     if (!isMobilePlatform) return false;
     // Stay touch-first when a phone rotates: width alone would turn an
     // 844x390 handset into a desktop popover. Shortest-side is stable across

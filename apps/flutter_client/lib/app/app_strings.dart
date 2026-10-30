@@ -603,18 +603,12 @@ class AppStrings {
       isZh ? 'Native ABI 版本' : 'Native ABI version';
   String get settingsVpnEngineStatus =>
       isZh ? '读取 VPN 引擎状态' : 'Read VPN engine status';
-  String get settingsVpnEngineStatusLoading =>
-      isZh ? '读取中...' : 'Reading...';
+  String get settingsVpnEngineStatusLoading => isZh ? '读取中...' : 'Reading...';
   String vpnEngineStatusFailed(String code) =>
-      isZh
-      ? 'VPN 引擎状态不可用：$code'
-      : 'VPN engine status unavailable: $code';
-  String get vpnEngineStatusLabel =>
-      isZh ? 'VPN 引擎状态' : 'VPN engine status';
-  String get vpnEngineRevisionLabel =>
-      isZh ? '状态版本' : 'Status revision';
-  String get vpnEngineGenerationLabel =>
-      isZh ? '引擎代际' : 'Engine generation';
+      isZh ? 'VPN 引擎状态不可用：$code' : 'VPN engine status unavailable: $code';
+  String get vpnEngineStatusLabel => isZh ? 'VPN 引擎状态' : 'VPN engine status';
+  String get vpnEngineRevisionLabel => isZh ? '状态版本' : 'Status revision';
+  String get vpnEngineGenerationLabel => isZh ? '引擎代际' : 'Engine generation';
   String get vpnEngineUpdatedAtLabel => isZh ? '状态时间' : 'Status time';
   String get vpnEngineCodeLabel => isZh ? '状态代码' : 'Status code';
   String vpnEngineStatusValue(String value) => switch (value) {

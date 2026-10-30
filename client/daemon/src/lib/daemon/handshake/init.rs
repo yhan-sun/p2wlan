@@ -50,9 +50,10 @@ impl Daemon {
             let fd = self.ohos_tun_fd.take().ok_or_else(|| {
                 DaemonError::Network("HarmonyOS VPN Extension TUN fd was not supplied".to_string())
             })?;
-            let tun = crate::os_request_capture::SystemTun::from_owned_fd(fd, &config).map_err(|e| {
-                DaemonError::Network(format!("failed to attach HarmonyOS VPN TUN: {e}"))
-            })?;
+            let tun =
+                crate::os_request_capture::SystemTun::from_owned_fd(fd, &config).map_err(|e| {
+                    DaemonError::Network(format!("failed to attach HarmonyOS VPN TUN: {e}"))
+                })?;
             info!(
                 "HarmonyOS VPN TUN {} is attached at logical address {} MTU {}",
                 tun.name(),

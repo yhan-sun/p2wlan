@@ -158,7 +158,7 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
-    debugDefaultTargetPlatformOverride = TargetPlatform.ohos;
+    debugDefaultTargetPlatformOverride = TargetPlatform.values.byName('ohos');
     try {
       await tester.pumpWidget(
         MaterialApp(
@@ -199,5 +199,5 @@ void main() {
     } finally {
       debugDefaultTargetPlatformOverride = null;
     }
-  });
+  }, skip: !TargetPlatform.values.any((platform) => platform.name == 'ohos'));
 }
