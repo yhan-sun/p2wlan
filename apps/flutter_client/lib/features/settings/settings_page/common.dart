@@ -479,8 +479,13 @@ class _SaveBar extends StatelessWidget {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
                 : const Icon(Icons.save_outlined, size: 16),
-            label: Text(
-              busy ? (strings.isZh ? '保存中…' : 'Saving…') : strings.saveChanges,
+            label: IndexedStack(
+              index: busy ? 1 : 0,
+              alignment: Alignment.center,
+              children: [
+                Text(strings.saveChanges),
+                Text(strings.isZh ? '保存中…' : 'Saving…'),
+              ],
             ),
           );
           final undo = TextButton(
@@ -503,6 +508,7 @@ class _SaveBar extends StatelessWidget {
           }
           final actions = Row(
             mainAxisSize: MainAxisSize.min,
+            mainAxisAlignment: MainAxisAlignment.end,
             children: [undo, const SizedBox(width: 8), save],
           );
           if (constraints.maxWidth < 620) {

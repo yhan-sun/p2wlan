@@ -16,8 +16,8 @@ class _ConnectionDetails extends StatelessWidget {
         '${strings.componentControlServer}$separator${_controlStatusLabel(strings, snapshot)}',
       if (overlayTone == StatusTone.bad || overlayTone == StatusTone.warn)
         '${strings.componentOverlayRoute}$separator${_overlayLabel(strings, overlayTone!)}',
-      if (counts.total > 0 && counts.direct + counts.relay < counts.total)
-        '${strings.componentPeerConnectivity}$separator${counts.direct + counts.relay} / ${counts.total}',
+      if (counts.online > 0 && counts.direct + counts.relay < counts.online)
+        '${strings.componentPeerConnectivity}$separator${counts.direct + counts.relay} / ${counts.online}',
     ];
     if (issues.isEmpty && snapshot.health.status.toLowerCase() != 'healthy') {
       issues.add(strings.isZh ? '连接状态需要检查' : 'Connection needs review');
@@ -28,6 +28,7 @@ class _ConnectionDetails extends StatelessWidget {
     );
     return ExpansionTile(
       key: const Key('home-connection-details'),
+      expansionAnimationStyle: AppMotion.expansionStyleOf(context),
       tilePadding: const EdgeInsets.symmetric(horizontal: AppTokens.space16),
       childrenPadding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
       minTileHeight: 64,
@@ -99,10 +100,10 @@ class _NetworkComponentsSection extends StatelessWidget {
         ),
       _ComponentRow(
         label: strings.componentPeerConnectivity,
-        value: '${counts.direct + counts.relay} / ${counts.total}',
-        tone: counts.total == 0
+        value: '${counts.direct + counts.relay} / ${counts.online}',
+        tone: counts.online == 0
             ? StatusTone.neutral
-            : counts.direct + counts.relay == counts.total
+            : counts.direct + counts.relay == counts.online
             ? StatusTone.good
             : StatusTone.warn,
       ),

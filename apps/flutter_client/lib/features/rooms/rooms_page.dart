@@ -12,6 +12,7 @@ import '../../core/models/diagnostics_models.dart';
 import '../../app/app_strings.dart';
 import '../../app/p2wlan_colors.dart';
 import '../../app/app_tokens.dart';
+import '../../shared/widgets/app_motion.dart';
 import '../../shared/widgets/status_badge.dart';
 import 'room_join_dialog.dart';
 import '../nodes/nodes_page.dart';
@@ -1109,8 +1110,9 @@ class _RoomsPageState extends State<RoomsPage> {
     final snapshot = _roomSnapshot(room);
     final colors = P2WlanColors.of(context);
     return _surfaceCard(
-      child: InkWell(
+      child: _RoomActionSurface(
         key: ValueKey('room-card-${room.id}'),
+        label: '查看房间 ${room.name}',
         onTap: _busy ? null : () => _selectRoom(room.id),
         child: Padding(
           padding: const EdgeInsets.all(16),
@@ -1747,10 +1749,12 @@ class _RoomsPageState extends State<RoomsPage> {
     final pathWidget = Text(pathLabel);
     final dataLabel = _deviceDataLabel(device, snapshot);
     final dataWidget = Text(dataLabel);
-    final content = InkWell(
+    final content = _RoomActionSurface(
       key: ValueKey(
         'room-device-${device['id'] ?? device['public_key'] ?? ip}',
       ),
+      label: interactive ? '查看设备 ${device['device_name'] ?? '设备'}' : null,
+      borderRadius: withinList ? BorderRadius.zero : null,
       onTap: interactive ? () => _showRoomDeviceDetails(room, device) : null,
       child: Padding(
         padding: EdgeInsets.symmetric(
@@ -2016,6 +2020,7 @@ class _RoomsPageState extends State<RoomsPage> {
         connection != null ||
         widget.settingsStore.settings.networkId == room.id;
     final palette = P2WlanColors.of(context);
+    final expansionMotion = AppMotion.expansionStyleOf(context);
     final actions = Wrap(
       spacing: 8,
       runSpacing: 8,
@@ -2158,6 +2163,8 @@ class _RoomsPageState extends State<RoomsPage> {
         const SizedBox(height: 12),
         _deviceList(roster),
         ExpansionTile(
+          key: ValueKey('room-connection-options-${room.id}'),
+          expansionAnimationStyle: expansionMotion,
           title: const Text('连接与自动连接'),
           children: [
             ListTile(
@@ -2193,6 +2200,8 @@ class _RoomsPageState extends State<RoomsPage> {
           ),
         const SizedBox(height: 12),
         ExpansionTile(
+          key: ValueKey('room-members-${room.id}'),
+          expansionAnimationStyle: expansionMotion,
           title: Text(
             '${room.isOwner ? '成员管理' : '房间成员'} · ${roster.members.length}',
           ),
@@ -2225,6 +2234,8 @@ class _RoomsPageState extends State<RoomsPage> {
         ),
         if (room.isOwner)
           ExpansionTile(
+            key: ValueKey('room-settings-${room.id}'),
+            expansionAnimationStyle: expansionMotion,
             title: const Text('房间设置'),
             children: [
               ...[
@@ -2287,6 +2298,8 @@ class _RoomsPageState extends State<RoomsPage> {
           ),
         if (room.isOwner)
           ExpansionTile(
+            key: ValueKey('room-invites-${room.id}'),
+            expansionAnimationStyle: expansionMotion,
             title: const Text('邀请管理'),
             children: [
               if (_invitesError != null)
@@ -2433,22 +2446,27 @@ class _RoomsPageState extends State<RoomsPage> {
   Widget _overviewHeader() => LayoutBuilder(
     builder: (context, constraints) {
       final owned = _rooms.where((room) => room.isOwner).firstOrNull;
-      final actions = Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        children: [
-          FilledButton.icon(
+      final createAction =
+          (owned == null ? FilledButton.icon : OutlinedButton.icon)(
             onPressed: _serverActionsBusy || _loading || owned != null
                 ? null
                 : _create,
             icon: const Icon(Icons.add_rounded),
             label: const Text('创建房间'),
-          ),
-          OutlinedButton.icon(
+          );
+      final joinAction =
+          (owned == null ? OutlinedButton.icon : FilledButton.icon)(
             onPressed: _serverActionsBusy ? null : () => _join(),
             icon: const Icon(Icons.meeting_room_outlined),
             label: const Text('加入房间'),
-          ),
+          );
+      final actions = Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          if (owned != null) joinAction,
+          createAction,
+          if (owned == null) joinAction,
         ],
       );
       final title = Text(
@@ -2614,36 +2632,86 @@ class _RoomsPageState extends State<RoomsPage> {
                           child: Semantics(
                             liveRegion: true,
                             child: Card(
-                              color: Theme.of(context)
-                                  .colorScheme
-                                  .errorContainer,
+                              elevation: 0,
+                              margin: EdgeInsets.zero,
+                              color: P2WlanColors.of(context).dangerSurface,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(
+                                  AppTokens.radiusLg,
+                                ),
+                                side: BorderSide(
+                                  color: P2WlanColors.of(context).dangerBorder,
+                                ),
+                              ),
                               child: Padding(
                                 padding: const EdgeInsets.all(16),
-                                child: Row(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const Icon(Icons.error_outline),
-                                    const SizedBox(width: 12),
-                                    Expanded(
-                                      child: Text(_operationError ?? _error!),
-                                    ),
-                                    if (_error != null)
-                                      IconButton(
-                                        tooltip: '重试加载房间列表',
-                                        onPressed: _busy || _refreshing
-                                            ? null
-                                            : () => _refresh(),
-                                        icon: const Icon(Icons.refresh_rounded),
-                                      ),
-                                    IconButton(
-                                      tooltip: '关闭提示',
-                                      onPressed: () => setState(() {
-                                        _operationError = null;
-                                        _error = null;
-                                      }),
-                                      icon: const Icon(Icons.close),
-                                    ),
-                                  ],
+                                child: LayoutBuilder(
+                                  builder: (context, constraints) {
+                                    final message = Row(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Icon(
+                                          Icons.error_outline,
+                                          color: P2WlanColors.of(context)
+                                              .dangerText,
+                                        ),
+                                        const SizedBox(width: 12),
+                                        Expanded(
+                                          child: Text(
+                                            _operationError ?? _error!,
+                                          ),
+                                        ),
+                                      ],
+                                    );
+                                    final actions = Wrap(
+                                      children: [
+                                        if (_error != null)
+                                          IconButton(
+                                            tooltip: '重试加载房间列表',
+                                            onPressed: _busy || _refreshing
+                                                ? null
+                                                : () => _refresh(),
+                                            icon: const Icon(
+                                              Icons.refresh_rounded,
+                                            ),
+                                          ),
+                                        IconButton(
+                                          tooltip: '关闭提示',
+                                          onPressed: () => setState(() {
+                                            _operationError = null;
+                                            _error = null;
+                                          }),
+                                          icon: const Icon(Icons.close),
+                                        ),
+                                      ],
+                                    );
+                                    if (constraints.maxWidth < 420 ||
+                                        MediaQuery.textScalerOf(context)
+                                                .scale(14) >=
+                                            20) {
+                                      return Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.stretch,
+                                        children: [
+                                          message,
+                                          const SizedBox(height: 8),
+                                          Align(
+                                            alignment: Alignment.centerRight,
+                                            child: actions,
+                                          ),
+                                        ],
+                                      );
+                                    }
+                                    return Row(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Expanded(child: message),
+                                        actions,
+                                      ],
+                                    );
+                                  },
                                 ),
                               ),
                             ),
@@ -2671,6 +2739,58 @@ class _RoomsPageState extends State<RoomsPage> {
       ),
     ),
   );
+}
+
+/// Uses InkWell's focus owner, so nested actions retain their own activation.
+class _RoomActionSurface extends StatelessWidget {
+  const _RoomActionSurface({
+    super.key,
+    required this.child,
+    required this.onTap,
+    this.label,
+    this.borderRadius,
+  });
+
+  final Widget child;
+  final VoidCallback? onTap;
+  final String? label;
+  final BorderRadius? borderRadius;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = P2WlanColors.of(context);
+    final radius = borderRadius ?? BorderRadius.circular(AppTokens.radiusLg);
+    final reducedMotion = MediaQuery.disableAnimationsOf(context);
+    final duration = AppMotion.feedbackDurationOf(context);
+    return Semantics(
+      button: onTap != null,
+      label: label,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: radius,
+        hoverColor: palette.hoverSurface,
+        focusColor: palette.selectedSurface,
+        hoverDuration: duration,
+        splashFactory: reducedMotion ? NoSplash.splashFactory : null,
+        child: Builder(
+          builder: (context) => AnimatedContainer(
+            duration: duration,
+            curve: AppMotion.curve,
+            foregroundDecoration: BoxDecoration(
+              borderRadius: radius,
+              border: Border.all(
+                color: Focus.of(context).hasPrimaryFocus
+                    ? Theme.of(context).colorScheme.primary
+                    : Colors.transparent,
+                width: 2,
+              ),
+            ),
+            child: child,
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _RoomField {

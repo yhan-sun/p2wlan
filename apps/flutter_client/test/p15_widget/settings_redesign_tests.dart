@@ -439,7 +439,7 @@ void _registerSettingsRedesignTests() {
     await stores.statusStore.refresh();
     await _openCategory(tester, 'Advanced Network');
     await tester.enterText(_settingsTextField('MTU'), '1302');
-    await tester.pump();
+    await tester.pumpAndSettle();
     expect(
       find.text(AppStrings.fromCode('en').settingsReconnectImpact),
       findsOneWidget,

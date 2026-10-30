@@ -137,8 +137,8 @@ class _NetworkHero extends StatelessWidget {
                   key: const Key('home-connection-heading'),
                   style: TextStyle(
                     color: theme.colorScheme.onSurface,
-                    fontSize: 18,
-                    fontWeight: FontWeight.w700,
+                    fontSize: 17,
+                    fontWeight: FontWeight.w600,
                     height: 1.35,
                   ),
                 ),
@@ -355,8 +355,8 @@ class _HeroSurface extends StatelessWidget {
   }
 }
 
-/// Virtual IP with tap-to-copy (tooltip + lightweight snackbar).
-class _VirtualIpBlock extends StatelessWidget {
+/// Virtual IP with a stable copy target and bounded inline confirmation.
+class _VirtualIpBlock extends StatefulWidget {
   const _VirtualIpBlock({
     required this.virtualIp,
     this.showStop = false,
@@ -368,6 +368,32 @@ class _VirtualIpBlock extends StatelessWidget {
   final bool showStop;
   final bool daemonBusy;
   final Future<void> Function()? onStopDaemon;
+
+  @override
+  State<_VirtualIpBlock> createState() => _VirtualIpBlockState();
+}
+
+class _VirtualIpBlockState extends State<_VirtualIpBlock> {
+  Timer? _resetCopy;
+  var _copied = false;
+  var _copyRevision = 0;
+
+  @override
+  void didUpdateWidget(covariant _VirtualIpBlock oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.virtualIp != widget.virtualIp) {
+      _copyRevision++;
+      _resetCopy?.cancel();
+      _copied = false;
+    }
+  }
+
+  @override
+  void dispose() {
+    _copyRevision++;
+    _resetCopy?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -386,7 +412,7 @@ class _VirtualIpBlock extends StatelessWidget {
               style: TextStyle(
                 color: theme.colorScheme.onSurfaceVariant,
                 fontSize: 12,
-                fontWeight: FontWeight.w700,
+                fontWeight: FontWeight.w600,
                 height: 1.2,
               ),
             ),
@@ -395,60 +421,91 @@ class _VirtualIpBlock extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
                 Expanded(
-                  child: Tooltip(
-                    message: strings.copyVirtualIp,
-                    child: InkWell(
-                      key: const Key('home-virtual-ip'),
-                      onTap: () => _copy(context, strings),
-                      borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 2),
-                        child: Row(
-                          children: [
-                            Flexible(
-                              child: FittedBox(
-                                fit: BoxFit.scaleDown,
-                                alignment: Alignment.centerLeft,
-                                child: Text(
-                                  dash(virtualIp),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    color: theme.colorScheme.onSurface,
-                                    fontSize: 26,
-                                    fontWeight: FontWeight.w700,
-                                    height: 1.1,
-                                    fontFeatures: AppTokens.tabularFontFeatures,
+                  child: Semantics(
+                    key: const Key('home-virtual-ip-feedback'),
+                    button: true,
+                    liveRegion: _copied,
+                    label: strings.copyVirtualIp,
+                    value: _copied ? strings.copied : null,
+                    child: Tooltip(
+                      excludeFromSemantics: true,
+                      message: _copied ? strings.copied : strings.copyVirtualIp,
+                      child: Material(
+                        type: MaterialType.transparency,
+                        child: InkWell(
+                          key: const Key('home-virtual-ip'),
+                          onTap: _copy,
+                          borderRadius: BorderRadius.circular(
+                            AppTokens.radiusSm,
+                          ),
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(minHeight: 44),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 4),
+                              child: Row(
+                                children: [
+                                  Flexible(
+                                    child: FittedBox(
+                                      fit: BoxFit.scaleDown,
+                                      alignment: Alignment.centerLeft,
+                                      child: Text(
+                                        dash(widget.virtualIp),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          color: theme.colorScheme.onSurface,
+                                          fontSize: 28,
+                                          fontWeight: FontWeight.w600,
+                                          height: 1.1,
+                                          fontFeatures:
+                                              AppTokens.tabularFontFeatures,
+                                        ),
+                                      ),
+                                    ),
                                   ),
-                                ),
+                                  const SizedBox(width: AppTokens.space8),
+                                  AnimatedSwitcher(
+                                    duration: AppMotion.feedbackDurationOf(
+                                      context,
+                                    ),
+                                    child: Icon(
+                                      _copied
+                                          ? Icons.check_rounded
+                                          : Icons.copy_rounded,
+                                      key: ValueKey(_copied),
+                                      size: 17,
+                                      color: _copied
+                                          ? P2WlanColors.of(context).successText
+                                          : theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
-                            const SizedBox(width: AppTokens.space8),
-                            Icon(
-                              Icons.copy_rounded,
-                              size: 15,
-                              color: theme.colorScheme.onSurfaceVariant,
-                            ),
-                          ],
+                          ),
                         ),
                       ),
                     ),
                   ),
                 ),
-                if (!stackStop && showStop && onStopDaemon != null) ...[
+                if (!stackStop &&
+                    widget.showStop &&
+                    widget.onStopDaemon != null) ...[
                   const SizedBox(width: AppTokens.space8),
                   _StopDaemonButton(
-                    daemonBusy: daemonBusy,
-                    onStopDaemon: onStopDaemon!,
+                    daemonBusy: widget.daemonBusy,
+                    onStopDaemon: widget.onStopDaemon!,
                   ),
                 ],
               ],
             ),
-            if (stackStop && showStop && onStopDaemon != null) ...[
+            if (stackStop &&
+                widget.showStop &&
+                widget.onStopDaemon != null) ...[
               const SizedBox(height: AppTokens.space12),
               _StopDaemonButton(
-                daemonBusy: daemonBusy,
-                onStopDaemon: onStopDaemon!,
+                daemonBusy: widget.daemonBusy,
+                onStopDaemon: widget.onStopDaemon!,
               ),
             ],
           ],
@@ -457,10 +514,27 @@ class _VirtualIpBlock extends StatelessWidget {
     );
   }
 
-  Future<void> _copy(BuildContext context, AppStrings strings) async {
-    await Clipboard.setData(ClipboardData(text: virtualIp));
-    if (!context.mounted) return;
-    showAppNotice(context, content: Text(strings.copied));
+  Future<void> _copy() async {
+    final revision = ++_copyRevision;
+    try {
+      await Clipboard.setData(ClipboardData(text: widget.virtualIp));
+    } on PlatformException {
+      if (!mounted || revision != _copyRevision) return;
+      _resetCopy?.cancel();
+      setState(() => _copied = false);
+      final strings = AppStringsScope.of(context);
+      showAppNotice(
+        context,
+        content: Text(strings.isZh ? '复制失败，请重试' : 'Copy failed. Try again.'),
+      );
+      return;
+    }
+    if (!mounted || revision != _copyRevision) return;
+    _resetCopy?.cancel();
+    setState(() => _copied = true);
+    _resetCopy = Timer(const Duration(milliseconds: 1600), () {
+      if (mounted) setState(() => _copied = false);
+    });
   }
 }
 
@@ -651,7 +725,7 @@ class _MetricCell extends StatelessWidget {
               style: TextStyle(
                 color: theme.colorScheme.onSurface,
                 fontSize: 20,
-                fontWeight: FontWeight.w700,
+                fontWeight: FontWeight.w600,
                 height: 1.1,
                 fontFeatures: AppTokens.tabularFontFeatures,
               ),

@@ -89,65 +89,61 @@ class _SettingsCategoryCard extends StatelessWidget {
       container: true,
       button: true,
       onTap: onTap,
-      child: _SettingsSurface(
-        padding: EdgeInsets.zero,
-        child: InkWell(
-          key: ValueKey('settings-category-card-${category.name}'),
-          excludeFromSemantics: true,
-          borderRadius: BorderRadius.circular(12),
-          onTap: onTap,
-          child: ConstrainedBox(
-            constraints: BoxConstraints(minHeight: spacious ? 140 : 112),
-            child: Padding(
-              padding: EdgeInsets.all(spacious ? 20 : 16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      _SettingsCategoryIcon(category),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          category.label(strings),
-                          style: TextStyle(
-                            fontSize: 15,
-                            height: 1.3,
-                            fontWeight: FontWeight.w600,
-                            color: theme.colorScheme.onSurface,
-                          ),
+      child: _SettingsTapSurface(
+        interactionKey: ValueKey('settings-category-card-${category.name}'),
+        outlined: true,
+        onTap: onTap,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: spacious ? 140 : 112),
+          child: Padding(
+            padding: EdgeInsets.all(spacious ? 20 : 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    _SettingsCategoryIcon(category),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        category.label(strings),
+                        style: TextStyle(
+                          fontSize: 15,
+                          height: 1.3,
+                          fontWeight: FontWeight.w600,
+                          color: theme.colorScheme.onSurface,
                         ),
                       ),
-                      const SizedBox(width: 8),
-                      Icon(
-                        Icons.chevron_right_rounded,
-                        size: 20,
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  Text(
-                    subtitle,
-                    style: TextStyle(
-                      fontSize: 12,
-                      height: 1.45,
+                    ),
+                    const SizedBox(width: 8),
+                    Icon(
+                      Icons.chevron_right_rounded,
+                      size: 20,
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  subtitle,
+                  style: TextStyle(
+                    fontSize: 12,
+                    height: 1.45,
+                    color: theme.colorScheme.onSurfaceVariant,
                   ),
-                  const SizedBox(height: 10),
-                  Text(
-                    summary,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 13,
-                      height: 1.3,
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  summary,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    height: 1.3,
+                    color: theme.colorScheme.onSurfaceVariant,
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
         ),
@@ -220,60 +216,51 @@ class _CategoryRailItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final colors = P2WlanColors.of(context);
     return Padding(
       padding: const EdgeInsets.symmetric(
         vertical: 1,
         horizontal: AppTokens.space6,
       ),
       child: Semantics(
+        container: true,
         selected: selected,
         button: true,
-        child: MouseRegion(
-          cursor: SystemMouseCursors.click,
-          child: InkWell(
-            onTap: onTap,
-            borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-            child: AnimatedContainer(
-              duration: AppTokens.durationFast,
-              curve: AppTokens.curveEase,
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppTokens.space12,
-                vertical: AppTokens.space10,
-              ),
-              decoration: BoxDecoration(
-                color: selected ? colors.selectedSurface : Colors.transparent,
-                borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      label,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: selected
-                            ? FontWeight.w600
-                            : FontWeight.w500,
-                        color: selected
-                            ? theme.colorScheme.primary
-                            : theme.colorScheme.onSurfaceVariant,
-                      ),
+        onTap: onTap,
+        child: _SettingsTapSurface(
+          onTap: onTap,
+          selected: selected,
+          radius: AppTokens.radiusMd,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+              horizontal: AppTokens.space12,
+              vertical: AppTokens.space10,
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    label,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+                      color: selected
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
-                  if (selected)
-                    Container(
-                      width: 3,
-                      height: 14,
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.primary,
-                        borderRadius: BorderRadius.circular(2),
-                      ),
+                ),
+                if (selected)
+                  Container(
+                    width: 3,
+                    height: 14,
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.primary,
+                      borderRadius: BorderRadius.circular(2),
                     ),
-                ],
-              ),
+                  ),
+              ],
             ),
           ),
         ),
@@ -353,21 +340,33 @@ class _CategoryDetailView extends StatelessWidget {
             ],
           ),
         ),
-        if (dirty)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(2, AppTokens.space10, 2, 2),
-            child: AnimatedBuilder(
-              animation: state._statusViewNotifier,
-              builder: (context, _) => _SaveBar(
-                busy: state._saving,
-                restartRequired:
-                    state.widget.statusStore.primaryConfigurationPending ||
-                    state._draftNeedsRestart(category),
-                onUndo: () => state._resetCategory(category),
-                onSave: () => state._saveCategory(category),
-              ),
-            ),
-          ),
+        _SettingsSaveSlot(
+          key: const Key('settings-save-slot'),
+          child: dirty
+              ? Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                    2,
+                    AppTokens.space10,
+                    2,
+                    2,
+                  ),
+                  child: AnimatedBuilder(
+                    animation: state._statusViewNotifier,
+                    builder: (context, _) => _SaveBar(
+                      busy: state._saving,
+                      restartRequired:
+                          state
+                              .widget
+                              .statusStore
+                              .primaryConfigurationPending ||
+                          state._draftNeedsRestart(category),
+                      onUndo: () => state._resetCategory(category),
+                      onSave: () => state._saveCategory(category),
+                    ),
+                  ),
+                )
+              : const SizedBox(width: double.infinity),
+        ),
       ],
     );
   }
@@ -522,11 +521,14 @@ class _SettingsShell extends StatelessWidget {
           ),
           const SizedBox(width: AppTokens.space16),
           Expanded(
-            child: _CategoryDetailView(
-              category: current,
-              state: state,
-              strings: strings,
-              credentialState: credentialState,
+            child: AppEntrance(
+              identity: current,
+              child: _CategoryDetailView(
+                category: current,
+                state: state,
+                strings: strings,
+                credentialState: credentialState,
+              ),
             ),
           ),
         ],
@@ -534,19 +536,25 @@ class _SettingsShell extends StatelessWidget {
     }
     final current = selected;
     if (current == null) {
-      return _SettingsRoot(
-        categories: categories,
-        summaryFor: (category) => state._categorySummary(category, strings),
-        statusListenable: state._statusViewNotifier,
-        onSelect: onSelect,
+      return AppEntrance(
+        identity: 'root',
+        child: _SettingsRoot(
+          categories: categories,
+          summaryFor: (category) => state._categorySummary(category, strings),
+          statusListenable: state._statusViewNotifier,
+          onSelect: onSelect,
+        ),
       );
     }
-    return _CategoryDetailView(
-      category: current,
-      state: state,
-      strings: strings,
-      credentialState: credentialState,
-      onBack: onBack,
+    return AppEntrance(
+      identity: current,
+      child: _CategoryDetailView(
+        category: current,
+        state: state,
+        strings: strings,
+        credentialState: credentialState,
+        onBack: onBack,
+      ),
     );
   }
 }

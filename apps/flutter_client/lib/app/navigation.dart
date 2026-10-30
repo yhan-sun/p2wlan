@@ -24,6 +24,7 @@ import '../features/update/update_banner.dart';
 import '../shared/layout/app_breakpoints.dart';
 import '../shared/network_overview_presentation.dart';
 import '../shared/widgets/app_nav_rail.dart';
+import '../shared/widgets/app_motion.dart';
 import '../shared/widgets/desktop_sidebar.dart';
 import '../shared/widgets/status_badge.dart';
 import '../shared/widgets/windows_window_controls.dart';
@@ -64,8 +65,6 @@ class P2WlanShell extends StatefulWidget {
 }
 
 class _P2WlanShellState extends State<P2WlanShell> {
-  static const _sectionFadeDuration = Duration(milliseconds: 150);
-
   var _section = P2WlanSection.home;
 
   /// Home previews hand the selected peer to the Devices page. Keeping only
@@ -323,15 +322,11 @@ class _P2WlanShellState extends State<P2WlanShell> {
         showHeader: showPageHeader,
       ),
     };
-    return AnimatedSwitcher(
-      duration: MediaQuery.disableAnimationsOf(context)
-          ? Duration.zero
-          : _sectionFadeDuration,
-      switchInCurve: Curves.easeOut,
-      switchOutCurve: Curves.easeIn,
-      child: KeyedSubtree(
-        key: ValueKey((_section, widget.statusStore.sessionRevision)),
-        child: page,
+    final identity = (_section, widget.statusStore.sessionRevision);
+    return SizedBox.expand(
+      child: AppEntrance(
+        identity: identity,
+        child: KeyedSubtree(key: ValueKey(identity), child: page),
       ),
     );
   }

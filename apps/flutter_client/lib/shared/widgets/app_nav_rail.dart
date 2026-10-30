@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'app_motion.dart';
+
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/navigation_model.dart';
@@ -212,8 +214,8 @@ class _RailItemSurface extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: AppTokens.space4),
         child: AnimatedContainer(
-          duration: AppTokens.durationMedium,
-          curve: AppTokens.curveEase,
+          duration: AppMotion.feedbackDurationOf(context),
+          curve: AppMotion.curve,
           decoration: BoxDecoration(
             color: selected ? colors.selectedSurface : Colors.transparent,
             borderRadius: BorderRadius.circular(AppTokens.radiusSm),

@@ -23,11 +23,13 @@ import '../../core/state/status_store.dart';
 import '../../core/update/update_models.dart';
 import '../../core/update/update_service.dart';
 import '../../shared/widgets/app_back_button.dart';
+import '../../shared/widgets/app_motion.dart';
 import '../../shared/widgets/app_select.dart';
 
 part 'settings_page/categories.dart';
 part 'settings_page/common.dart';
 part 'settings_page/layout.dart';
+part 'settings_page/interaction.dart';
 part 'settings_page/general.dart';
 part 'settings_page/account.dart';
 part 'settings_page/application.dart';
@@ -392,7 +394,8 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _openMobileCategory(SettingsCategory category) async {
     await Navigator.of(context, rootNavigator: true).push<void>(
-      MaterialPageRoute<void>(
+      _SettingsCategoryRoute(
+        duration: AppMotion.durationOf(context),
         settings: RouteSettings(name: '/settings/${category.name}'),
         builder: (_) =>
             _MobileSettingsCategoryPage(category: category, state: this),

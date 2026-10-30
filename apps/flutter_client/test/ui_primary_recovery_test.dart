@@ -221,6 +221,8 @@ void main() {
       await tester.pump();
       final save = find.byKey(const Key('settings-save-button'));
       await tester.ensureVisible(save);
+      await tester.pumpAndSettle();
+      expect(save.hitTestable(), findsOneWidget);
       await tester.tap(save);
       await _waitFor(
         tester,

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' show PointerDeviceKind, SemanticsAction, Tristate;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -38,6 +39,7 @@ part 'p15_widget/dashboard_tests.dart';
 part 'p15_widget/settings_tests.dart';
 part 'p15_widget/settings_phase6_tests.dart';
 part 'p15_widget/settings_redesign_tests.dart';
+part 'p15_widget/settings_motion_tests.dart';
 part 'p15_widget/nodes_tests.dart';
 part 'p15_widget/nodes_shell_tests.dart';
 part 'p15_widget/network_tests.dart';
@@ -55,6 +57,7 @@ void main() {
   _registerSettingsTests();
   _registerSettingsPhase6Tests();
   _registerSettingsRedesignTests();
+  _registerSettingsMotionTests();
   _registerNodesTests();
   _registerNodesShellTests();
   _registerNetworkTests();

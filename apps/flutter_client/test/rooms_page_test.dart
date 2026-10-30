@@ -302,6 +302,7 @@ void main() {
     )?
     onStores,
     double textScale = 1,
+    bool disableAnimations = false,
     void Function(_FakeRoomApi)? configureApi,
     void Function(VoidCallback)? onStatusPulse,
   }) async {
@@ -374,8 +375,10 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         builder: (context, child) => MediaQuery(
-          data: MediaQuery.of(context)
-              .copyWith(textScaler: TextScaler.linear(textScale)),
+          data: MediaQuery.of(context).copyWith(
+            textScaler: TextScaler.linear(textScale),
+            disableAnimations: disableAnimations,
+          ),
           child: child!,
         ),
         home: shell
@@ -1408,9 +1411,15 @@ void main() {
       expect(find.textContaining('每个账号可创建一个房间'), findsOneWidget);
       expect(
         tester
-            .widget<FilledButton>(find.widgetWithText(FilledButton, '创建房间'))
+            .widget<OutlinedButton>(find.widgetWithText(OutlinedButton, '创建房间'))
             .onPressed,
         isNull,
+      );
+      final join = find.widgetWithText(FilledButton, '加入房间');
+      expect(tester.widget<FilledButton>(join).onPressed, isNotNull);
+      expect(
+        tester.getTopLeft(join).dx,
+        lessThan(tester.getTopLeft(find.text('创建房间')).dx),
       );
       await tester.tap(find.text('管理我的房间'));
       await tester.pumpAndSettle();
@@ -1439,6 +1448,130 @@ void main() {
       await tester.pumpAndSettle();
       expect(connected.stopCalls, 1);
       expect(find.text('连接本机'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  for (final key in [LogicalKeyboardKey.enter, LogicalKeyboardKey.space]) {
+    testWidgets('room card shows focus and opens with ${key.keyLabel}', (
+      tester,
+    ) async {
+      await pump(tester, enterRoom: false);
+      final card = find.byKey(const ValueKey('room-card-$_roomId'));
+      final indicator = find
+          .descendant(of: card, matching: find.byType(AnimatedContainer))
+          .first;
+      Focus.of(tester.element(indicator)).requestFocus();
+      await tester.pumpAndSettle();
+      final decoration =
+          tester.widget<AnimatedContainer>(indicator).foregroundDecoration!
+              as BoxDecoration;
+      expect(
+        (decoration.border! as Border).top.color,
+        Theme.of(tester.element(card)).colorScheme.primary,
+      );
+      await tester.sendKeyEvent(key);
+      await tester.pumpAndSettle();
+      expect(find.text('设备与连接 · 1'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+  }
+
+  testWidgets(
+    'Tab reaches the card connection action without activating the card',
+    (tester) async {
+      _RoomRuntime.instances.clear();
+      await pump(tester, enterRoom: false, canConnect: true);
+      final card = find.byKey(const ValueKey('room-card-$_roomId'));
+      final indicator = find
+          .descendant(of: card, matching: find.byType(AnimatedContainer))
+          .first;
+      Focus.of(tester.element(indicator)).requestFocus();
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+      await tester.pumpAndSettle();
+      final action = find.byKey(
+        const ValueKey('room-card-connection-$_roomId'),
+      );
+      final label = find.descendant(of: action, matching: find.text('连接本机'));
+      expect(Focus.of(tester.element(label)).hasPrimaryFocus, isTrue);
+      final decoration =
+          tester.widget<AnimatedContainer>(indicator).foregroundDecoration!
+              as BoxDecoration;
+      expect((decoration.border! as Border).top.color, Colors.transparent);
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pumpAndSettle();
+      expect(
+        _RoomRuntime.instances.where((runtime) => runtime.startCalls == 1),
+        hasLength(1),
+      );
+      expect(find.text('断开本机'), findsOneWidget);
+      expect(find.textContaining('设备与连接'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets('reduced motion reveals and collapses room options immediately', (
+    tester,
+  ) async {
+    await pump(tester, disableAnimations: true);
+    final members = find.byKey(const ValueKey('room-members-$_roomId'));
+    await tester.ensureVisible(find.text('成员管理 · 2'));
+    await tester.pump();
+    await tester.tap(find.text('成员管理 · 2'));
+    await tester.pump();
+    expect(
+      find.descendant(of: members, matching: find.text('房主')),
+      findsOneWidget,
+    );
+    expect(
+      tester.widget<ExpansionTile>(members).expansionAnimationStyle!.duration,
+      Duration.zero,
+    );
+    final row = find.byKey(const ValueKey('room-device-device-1'));
+    final indicator = find
+        .descendant(of: row, matching: find.byType(AnimatedContainer))
+        .first;
+    expect(tester.widget<AnimatedContainer>(indicator).duration, Duration.zero);
+    await tester.tap(find.text('成员管理 · 2'));
+    await tester.pump();
+    expect(
+      find.descendant(of: members, matching: find.text('房主')),
+      findsNothing,
+    );
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets(
+    'large-text room errors keep recovery actions below the message',
+    (tester) async {
+      tester.view.physicalSize = const Size(360, 1000);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      const message = '网络暂时不可用。请检查控制服务器地址、网络连接与账号状态，然后重试加载房间列表。';
+      final api = await pump(
+        tester,
+        enterRoom: false,
+        textScale: 2,
+        configureApi: (api) => api.listError = message,
+      );
+      final retry = find.byTooltip('重试加载房间列表');
+      expect(tester.getSize(find.text(message)).width, greaterThan(220));
+      expect(
+        tester.getTopLeft(retry).dy,
+        greaterThan(tester.getBottomLeft(find.text(message)).dy),
+      );
+      api.listError = null;
+      await tester.ensureVisible(retry);
+      await tester.tap(retry);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('room-card-$_roomId')), findsOneWidget);
+      expect(find.text(message), findsNothing);
+      expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
     },
   );

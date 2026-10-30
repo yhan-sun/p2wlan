@@ -43,11 +43,53 @@ class _ManualCommandCard extends StatefulWidget {
 }
 
 class _ManualCommandCardState extends State<_ManualCommandCard> {
+  final _commandKey = GlobalKey();
   var _expanded = false;
 
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
+    final command = KeyedSubtree(
+      key: _commandKey,
+      child: _expanded
+          ? Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    strings.manualLaunchCommandBody,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: AppTokens.colorConsoleText,
+                      height: 1.35,
+                    ),
+                  ),
+                  const SizedBox(height: AppTokens.space10),
+                  SelectableText(
+                    widget.command,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      height: 1.35,
+                      color: AppTokens.colorConsoleText,
+                      fontFeatures: AppTokens.tabularFontFeatures,
+                    ),
+                  ),
+                  const SizedBox(height: AppTokens.space8),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      key: const Key('home-manual-command-copy'),
+                      onPressed: () => _copy(context, strings),
+                      icon: const Icon(Icons.copy_rounded, size: 16),
+                      label: Text(strings.copyLaunchCommand),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          : const SizedBox(width: double.infinity),
+    );
     return DecoratedBox(
       decoration: BoxDecoration(
         color: AppTokens.colorConsoleBg,
@@ -97,49 +139,15 @@ class _ManualCommandCardState extends State<_ManualCommandCard> {
                 ),
               ],
             ),
-            AnimatedSize(
-              duration: AppTokens.durationMedium,
-              curve: AppTokens.curveEase,
-              alignment: Alignment.topCenter,
-              child: _expanded
-                  ? Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            strings.manualLaunchCommandBody,
-                            style: const TextStyle(
-                              fontSize: 12,
-                              color: AppTokens.colorConsoleText,
-                              height: 1.35,
-                            ),
-                          ),
-                          const SizedBox(height: AppTokens.space10),
-                          SelectableText(
-                            widget.command,
-                            style: const TextStyle(
-                              fontSize: 12,
-                              height: 1.35,
-                              color: AppTokens.colorConsoleText,
-                              fontFeatures: AppTokens.tabularFontFeatures,
-                            ),
-                          ),
-                          const SizedBox(height: AppTokens.space8),
-                          Align(
-                            alignment: Alignment.centerRight,
-                            child: TextButton.icon(
-                              key: const Key('home-manual-command-copy'),
-                              onPressed: () => _copy(context, strings),
-                              icon: const Icon(Icons.copy_rounded, size: 16),
-                              label: Text(strings.copyLaunchCommand),
-                            ),
-                          ),
-                        ],
-                      ),
-                    )
-                  : const SizedBox(width: double.infinity),
-            ),
+            if (MediaQuery.disableAnimationsOf(context))
+              command
+            else
+              AnimatedSize(
+                duration: AppMotion.durationOf(context),
+                curve: AppMotion.curve,
+                alignment: Alignment.topCenter,
+                child: command,
+              ),
           ],
         ),
       ),

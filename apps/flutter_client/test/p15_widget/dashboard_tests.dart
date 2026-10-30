@@ -1,12 +1,259 @@
 part of '../p15_widget_test.dart';
 
 void _registerDashboardTests() {
+  testWidgets(
+    'Home manual command keeps selection and copy focus across reduced motion',
+    (tester) async {
+      tester.view.physicalSize = const Size(800, 1200);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(
+        tester.platformDispatcher.clearAccessibilityFeaturesTestValue,
+      );
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures(disableAnimations: true);
+      final api = _FakeDiagnosticsApi(health: false);
+      final stores = (await tester.runAsync(
+        () => _makeStores(api: api, daemonController: _ManualLaunchDaemon(api)),
+      ))!;
+      addTearDown(stores.dispose);
+      await stores.statusStore.startDaemon();
+      String? copied;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+            if (call.method == 'Clipboard.setData') {
+              copied = (call.arguments as Map)['text'] as String;
+            }
+            return null;
+          });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(SystemChannels.platform, null),
+      );
+      await tester.pumpWidget(
+        _TestApp(
+          child: DashboardPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+            capabilities: PlatformCapabilities.fromPlatform('linux'),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final toggle = find.byKey(const Key('home-manual-command-toggle'));
+      final copy = find.byKey(const Key('home-manual-command-copy'));
+      final command = find.byWidgetPredicate(
+        (widget) =>
+            widget is SelectableText &&
+            widget.data == _ManualLaunchDaemon.command,
+      );
+      await tester.ensureVisible(toggle);
+      await tester.pump();
+      await tester.tap(toggle);
+      await tester.pump();
+      expect(command, findsOneWidget);
+      expect(copy.hitTestable(), findsOneWidget);
+      await tester.tap(toggle);
+      await tester.pump();
+      expect(command, findsNothing);
+      expect(copy, findsNothing);
+      expect(tester.takeException(), isNull);
+
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures();
+      await tester.pump();
+      await tester.tap(toggle);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 40));
+      final editable = find.descendant(
+        of: command,
+        matching: find.byType(EditableText),
+      );
+      final editableState = tester.state(editable);
+      final editor = tester.widget<EditableText>(editable);
+      const selection = TextSelection(baseOffset: 0, extentOffset: 6);
+      editor.focusNode.requestFocus();
+      editor.controller.selection = selection;
+      await tester.pump();
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures(disableAnimations: true);
+      await tester.pump();
+      expect(tester.state(editable), same(editableState));
+      expect(editor.focusNode.hasPrimaryFocus, isTrue);
+      expect(editor.controller.selection, selection);
+      final copyState = tester.state(copy);
+      final copyFocus = Focus.of(
+        tester.element(
+          find
+              .descendant(of: copy, matching: find.byType(GestureDetector))
+              .first,
+        ),
+      );
+      copyFocus.requestFocus();
+      await tester.pump();
+      for (final reduced in [false, true]) {
+        tester.platformDispatcher.accessibilityFeaturesTestValue =
+            FakeAccessibilityFeatures(disableAnimations: reduced);
+        await tester.pump();
+        expect(copyFocus.hasPrimaryFocus, isTrue);
+        expect(tester.state(copy), same(copyState));
+        expect(tester.state(editable), same(editableState));
+        expect(editor.controller.selection, selection);
+        expect(tester.takeException(), isNull);
+      }
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pumpAndSettle();
+      expect(copied, _ManualLaunchDaemon.command);
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures();
+      await tester.pump();
+      await tester.tap(toggle);
+      await tester.pump();
+      expect(command, findsNothing);
+      expect(copy, findsNothing);
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures(disableAnimations: true);
+      await tester.pump();
+      expect(command, findsNothing);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
   test('formats peer throughput in KB/s, MB/s, and GB/s', () {
     expect(formatTransferRate(null), '—');
     expect(formatTransferRate(1024), '1 KB/s');
     expect(formatTransferRate(1024 * 1024), '1 MB/s');
     expect(formatTransferRate(1024 * 1024 * 1024), '1 GB/s');
   });
+
+  for (final probing in [false, true]) {
+    testWidgets(
+      'Home only warns for unconfirmed online paths (probing: $probing)',
+      (tester) async {
+        final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+        final peers = _fourPeerFixtures();
+        final snapshot = _snapshotWithPeers(base, [
+          peers[0],
+          if (probing) peers[2],
+          peers[3],
+        ]);
+        final stores = (await tester.runAsync(
+          () => _makeStores(
+            api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+          ),
+        ))!;
+        addTearDown(stores.dispose);
+        await stores.statusStore.refresh();
+        await tester.pumpWidget(
+          _TestApp(
+            child: DashboardPage(
+              settingsStore: stores.settingsStore,
+              statusStore: stores.statusStore,
+            ),
+          ),
+        );
+        final summary = tester.widget<Text>(
+          find.byKey(const Key('home-connection-details-summary')),
+        );
+        expect(
+          summary.data,
+          probing ? 'Device connectivity: 1 / 2' : 'Control server · Normal',
+        );
+        await _expandHomeConnectionDetails(tester);
+        expect(find.text(probing ? '1 / 2' : '1 / 1'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  for (final outcome in ['success', 'changed address', 'disposed', 'failure']) {
+    testWidgets(
+      'Home copy feedback handles $outcome without stale confirmation',
+      (tester) async {
+        final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+        final api = _FakeDiagnosticsApi(health: true, snapshot: base);
+        final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+        addTearDown(stores.dispose);
+        final completion = Completer<Object?>();
+        String? copied;
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+              if (call.method == 'Clipboard.setData') {
+                copied = (call.arguments as Map)['text'] as String;
+                return completion.future;
+              }
+              return null;
+            });
+        addTearDown(
+          () => TestDefaultBinaryMessengerBinding
+              .instance
+              .defaultBinaryMessenger
+              .setMockMethodCallHandler(SystemChannels.platform, null),
+        );
+        await stores.statusStore.refresh();
+        await tester.pumpWidget(
+          _TestApp(
+            child: DashboardPage(
+              settingsStore: stores.settingsStore,
+              statusStore: stores.statusStore,
+            ),
+          ),
+        );
+        final copy = find.byKey(const Key('home-virtual-ip'));
+        final confirmation = find.descendant(
+          of: copy,
+          matching: find.byIcon(Icons.check_rounded),
+        );
+        expect(tester.getSize(copy).height, greaterThanOrEqualTo(44));
+        await tester.tap(copy);
+        await tester.pump();
+        expect(copied, base.virtualIp);
+        expect(confirmation, findsNothing);
+        if (outcome == 'changed address') {
+          final raw = jsonDecode(jsonEncode(base.raw)) as Map<String, dynamic>;
+          raw['virtual_ip'] = '10.20.0.50';
+          api.snapshot = DiagnosticsSnapshot.fromJson(raw);
+          await stores.statusStore.refresh();
+          await tester.pump();
+        } else if (outcome == 'disposed') {
+          await tester.pumpWidget(const SizedBox.shrink());
+        }
+        if (outcome == 'failure') {
+          completion.completeError(
+            PlatformException(code: 'clipboard_unavailable'),
+          );
+        } else {
+          completion.complete(null);
+        }
+        await tester.pumpAndSettle();
+        if (outcome == 'success') {
+          expect(confirmation, findsOneWidget);
+          final semantics = tester.ensureSemantics();
+          final node = tester.getSemantics(
+            find.byKey(const Key('home-virtual-ip-feedback')),
+          );
+          expect(node.value, 'Copied');
+          expect(node.label, contains('Copy virtual IP'));
+          semantics.dispose();
+          await tester.pump(const Duration(milliseconds: 1600));
+          await tester.pumpAndSettle();
+          expect(confirmation, findsNothing);
+        } else {
+          expect(confirmation, findsNothing);
+          if (outcome == 'changed address') {
+            expect(find.text('10.20.0.50'), findsOneWidget);
+          }
+          if (outcome == 'failure') {
+            expect(find.text('Copy failed. Try again.'), findsOneWidget);
+          }
+        }
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
 
   testWidgets('Home renders stopped state with start action', (tester) async {
     final stores = (await tester.runAsync(
@@ -1584,4 +1831,17 @@ Future<void> _expandHomeConnectionDetails(WidgetTester tester) async {
   await tester.pumpAndSettle();
   await tester.tap(heading);
   await tester.pumpAndSettle();
+}
+
+class _ManualLaunchDaemon extends _FakeDaemonController {
+  _ManualLaunchDaemon(super.api);
+  static const command = 'sudo p2pnet-daemon --config ./demo.json';
+
+  @override
+  Future<DaemonCommandResult> start(AppSettings settings) async =>
+      const DaemonCommandResult(
+        ok: false,
+        message: 'Use the manual launch command.',
+        manualCommand: command,
+      );
 }
