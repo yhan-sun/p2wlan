@@ -1,5 +1,4 @@
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Component, Path};
 
 const MAX_SETTINGS_SNAPSHOT_BYTES: usize = 64 * 1024;
 
@@ -449,12 +448,14 @@ fn validate_text(value: &str, min_bytes: usize, max_bytes: usize) -> Result<(), 
 
 fn validate_identity_path(value: &str) -> Result<(), &'static str> {
     validate_text(value, 1, 4096)?;
-    let path = Path::new(value);
-    if !path.is_absolute()
-        || path.file_name().and_then(|name| name.to_str()) != Some("vpn-engine-identity-v1.bin")
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    // This DTO describes an OHOS path even when host tests run on Windows.
+    // Host Path semantics would reject valid Unix roots or accept drive paths.
+    if !value.starts_with('/')
+        || value.contains('\\')
+        || value.rsplit('/').next() != Some("vpn-engine-identity-v1.bin")
+        || value
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
     {
         return Err("invalid_request");
     }
@@ -606,6 +607,22 @@ mod tests {
     #[test]
     fn accepts_valid_managed_snapshot() {
         assert!(request().validate(1, 1).is_ok());
+    }
+
+    #[test]
+    fn identity_paths_use_ohos_syntax_on_every_host() {
+        assert!(validate_identity_path("/app/files/p2wlan/vpn-engine-identity-v1.bin").is_ok());
+        for invalid in [
+            "app/files/vpn-engine-identity-v1.bin",
+            "C:/app/files/vpn-engine-identity-v1.bin",
+            "C:\\app\\files\\vpn-engine-identity-v1.bin",
+            "/app/files/../vpn-engine-identity-v1.bin",
+            "/app/files/./vpn-engine-identity-v1.bin",
+            "/app/files\\p2wlan/vpn-engine-identity-v1.bin",
+            "/app/files/identity.bin",
+        ] {
+            assert_eq!(validate_identity_path(invalid), Err("invalid_request"));
+        }
     }
 
     #[test]
