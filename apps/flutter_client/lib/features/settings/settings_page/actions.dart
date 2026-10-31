@@ -1,6 +1,52 @@
 part of '../settings_page.dart';
 
 extension _SettingsPageActions on _SettingsPageState {
+  Future<void> _queryVpnEngineStatus() async {
+    if (_vpnEngineStatusLoading) return;
+    _updateState(() {
+      _vpnEngineStatusLoading = true;
+      _vpnEngineStatus = null;
+      _vpnEngineStatusError = null;
+    });
+    try {
+      final status = await queryVpnEngineStatus();
+      if (!mounted) return;
+      _updateState(() => _vpnEngineStatus = status);
+    } on VpnEngineStatusException catch (error) {
+      if (!mounted) return;
+      _updateState(() => _vpnEngineStatusError = error.code);
+    } catch (_) {
+      if (!mounted) return;
+      _updateState(
+        () => _vpnEngineStatusError = 'VPN_ENGINE_STATUS_QUERY_FAILED',
+      );
+    } finally {
+      if (mounted) _updateState(() => _vpnEngineStatusLoading = false);
+    }
+  }
+
+  Future<void> _queryNativeBuildInfo() async {
+    if (_nativeBuildInfoLoading) return;
+    _updateState(() {
+      _nativeBuildInfoLoading = true;
+      _nativeBuildInfo = null;
+      _nativeBuildInfoError = null;
+    });
+    try {
+      final info = await queryNativeBuildInfo();
+      if (!mounted) return;
+      _updateState(() => _nativeBuildInfo = info);
+    } on NativeBuildInfoException catch (error) {
+      if (!mounted) return;
+      _updateState(() => _nativeBuildInfoError = error.code);
+    } catch (_) {
+      if (!mounted) return;
+      _updateState(() => _nativeBuildInfoError = 'NATIVE_QUERY_FAILED');
+    } finally {
+      if (mounted) _updateState(() => _nativeBuildInfoLoading = false);
+    }
+  }
+
   /// Whether the given category currently has edits that differ from the
   /// persisted values. Language / theme are immediate-save and never count as
   /// dirty. Values are normalized (trimmed, int MTU, normalized pool/behavior)

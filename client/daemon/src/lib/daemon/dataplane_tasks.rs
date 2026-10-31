@@ -4,6 +4,7 @@ impl Daemon {
         tun: Option<crate::os_request_capture::SystemTun>,
         network_inbound_rx: crate::dataplane_resources::EncryptedRxReceiver,
         capture_setup: Option<crate::os_request_capture::CaptureSetup>,
+        tun_worker_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<()> {
         let local_sources = if self.config.network.network_id.starts_with("room-") {
             tokio::task::spawn_blocking(|| {
@@ -95,7 +96,13 @@ impl Daemon {
                 .await;
 
             self.task_manager
-                .spawn_result("dataplane", true, async move { dataplane.run().await })
+                .spawn_result("dataplane", true, async move {
+                    if let Some(ready) = tun_worker_ready {
+                        dataplane.run_with_tun_worker_ready(ready).await
+                    } else {
+                        dataplane.run().await
+                    }
+                })
                 .await;
         } else if self.config.network.validate_overlay {
             // Independent validation harness: drive a real encrypted overlay

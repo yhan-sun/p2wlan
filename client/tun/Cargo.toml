@@ -16,9 +16,8 @@ async-trait = "0.1"
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = { workspace = true }
 
-# Linux creates the device with ioctl; Android receives an already-established
-# fd from VpnService and therefore does not need nix.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Native Linux creates the device with ioctl; OHOS uses an established fd.
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
 nix = { version = "0.29", features = ["net", "ioctl", "fs"] }
 
 # Windows specific

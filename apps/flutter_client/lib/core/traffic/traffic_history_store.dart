@@ -7,7 +7,7 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 
 import '../models/diagnostics_models.dart';
-import '../platform/android_platform.dart';
+import '../platform/native_platform.dart';
 import '../presentation/network_overview.dart';
 import '../presentation/traffic_statistics.dart';
 import '../rooms/room_api.dart';
@@ -589,7 +589,7 @@ Future<void> _atomicWrite(File file, String content) async {
 
 Future<File> _defaultFile() async {
   Directory? directory;
-  if (Platform.isAndroid) {
+  if (usesNativeApplicationSupportDirectory) {
     directory = await resolveApplicationSupportDirectory();
   } else {
     final home = Platform.environment['HOME'];

@@ -590,6 +590,36 @@ class AppStrings {
   String get settingsBuildDetailsHint => isZh
       ? '提交号、构建标识与运行环境'
       : 'Commits, build identifiers, and runtime details';
+  String get settingsNativeBuildInfo =>
+      isZh ? '读取 Native 构建信息' : 'Read native build info';
+  String get settingsNativeBuildInfoLoading => isZh ? '读取中...' : 'Reading...';
+  String nativeBuildInfoFailed(String code) =>
+      isZh ? 'Native 构建信息读取失败：$code' : 'Native build info failed: $code';
+  String get nativeEngineVersionLabel =>
+      isZh ? 'Native 引擎版本' : 'Native engine version';
+  String get nativeTargetLabel => isZh ? 'Native 目标' : 'Native target';
+  String get nativeArchLabel => isZh ? 'Native 架构' : 'Native architecture';
+  String get nativeAbiVersionLabel =>
+      isZh ? 'Native ABI 版本' : 'Native ABI version';
+  String get settingsVpnEngineStatus =>
+      isZh ? '读取 VPN 引擎状态' : 'Read VPN engine status';
+  String get settingsVpnEngineStatusLoading => isZh ? '读取中...' : 'Reading...';
+  String vpnEngineStatusFailed(String code) =>
+      isZh ? 'VPN 引擎状态不可用：$code' : 'VPN engine status unavailable: $code';
+  String get vpnEngineStatusLabel => isZh ? 'VPN 引擎状态' : 'VPN engine status';
+  String get vpnEngineRevisionLabel => isZh ? '状态版本' : 'Status revision';
+  String get vpnEngineGenerationLabel => isZh ? '引擎代际' : 'Engine generation';
+  String get vpnEngineUpdatedAtLabel => isZh ? '状态时间' : 'Status time';
+  String get vpnEngineCodeLabel => isZh ? '状态代码' : 'Status code';
+  String vpnEngineStatusValue(String value) => switch (value) {
+    'starting' => isZh ? '启动中' : 'Starting',
+    'ready' => isZh ? '已就绪' : 'Ready',
+    'stopping' => isZh ? '停止中' : 'Stopping',
+    'stopped' => isZh ? '已停止' : 'Stopped',
+    'draining' => isZh ? '正在收尾' : 'Draining',
+    'failed' => isZh ? '失败' : 'Failed',
+    _ => isZh ? '未知' : 'Unknown',
+  };
   String get settingsCopyDetails => isZh ? '复制全部详情' : 'Copy all details';
   String get settingsUndo => isZh ? '撤销修改' : 'Undo changes';
   String get settingsReconnectImpact => isZh

@@ -1838,10 +1838,12 @@ class _ManualLaunchDaemon extends _FakeDaemonController {
   static const command = 'sudo p2pnet-daemon --config ./demo.json';
 
   @override
-  Future<DaemonCommandResult> start(AppSettings settings) async =>
-      const DaemonCommandResult(
-        ok: false,
-        message: 'Use the manual launch command.',
-        manualCommand: command,
-      );
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) async => const DaemonCommandResult(
+    ok: false,
+    message: 'Use the manual launch command.',
+    manualCommand: command,
+  );
 }

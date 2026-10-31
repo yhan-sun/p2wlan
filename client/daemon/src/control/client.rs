@@ -48,6 +48,71 @@ pub(crate) fn hard_hard_a0_control_stage(
     );
 }
 
+fn validated_vpn_network(virtual_ip: &str, cidr: &str) -> Result<(String, String, String)> {
+    let address = virtual_ip
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| DaemonError::Network("invalid VPN address assignment".into()))?;
+    let (network_text, prefix_text) = cidr
+        .split_once('/')
+        .ok_or_else(|| DaemonError::Network("invalid VPN CIDR assignment".into()))?;
+    let network = network_text
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| DaemonError::Network("invalid VPN CIDR assignment".into()))?;
+    let prefix = prefix_text
+        .parse::<u8>()
+        .ok()
+        .filter(|prefix| *prefix <= 32)
+        .ok_or_else(|| DaemonError::Network("invalid VPN CIDR assignment".into()))?;
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    if u32::from(address) & mask != u32::from(network) & mask
+        || u32::from(network) != u32::from(network) & mask
+    {
+        return Err(DaemonError::Network(
+            "VPN address does not match its assigned CIDR".into(),
+        ));
+    }
+    let canonical_address = address.to_string();
+    let canonical_cidr = format!("{network}/{prefix}");
+    if canonical_address != virtual_ip || canonical_cidr != cidr {
+        return Err(DaemonError::Network(
+            "VPN address assignment is not canonical".into(),
+        ));
+    }
+    Ok((
+        canonical_address,
+        canonical_cidr,
+        std::net::Ipv4Addr::from(mask).to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod vpn_network_tests {
+    use super::*;
+
+    #[test]
+    fn vpn_network_validation_returns_the_exact_netmask() {
+        assert_eq!(
+            validated_vpn_network("10.44.12.7", "10.44.12.0/24").unwrap(),
+            (
+                "10.44.12.7".to_string(),
+                "10.44.12.0/24".to_string(),
+                "255.255.255.0".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn vpn_network_validation_rejects_mismatched_and_noncanonical_assignments() {
+        assert!(validated_vpn_network("10.44.13.7", "10.44.12.0/24").is_err());
+        assert!(validated_vpn_network("10.44.12.7", "10.44.12.8/24").is_err());
+        assert!(validated_vpn_network("10.44.12.7", "10.44.12.0/024").is_err());
+    }
+}
+
 impl ControlClient {
     /// Timing from a fresh short control request; never from a long poll.
     pub(crate) fn hard_hard_timing_hint(&self) -> Option<ControlTimingHint> {
@@ -170,6 +235,67 @@ impl ControlClient {
         config.network.virtual_ip = virtual_ip;
         config.network.cidr = cidr;
         config.network.netmask = "255.255.255.0".into();
+        if !relays.is_empty() {
+            config.relay.servers = relays;
+        }
+        Ok(())
+    }
+
+    /// Resolve the authoritative VPN address and CIDR before an OS-owned VPN
+    /// interface is created. The caller stores the returned network tuple in
+    /// the settings snapshot passed to the daemon, so its route proof and
+    /// control configuration describe the same subnet.
+    pub async fn prepare_vpn_profile(config: &mut Config) -> Result<()> {
+        if config.network.network_id.starts_with("room-") && config.network.manual {
+            return Err(DaemonError::Config(
+                "room VPN profiles require authenticated registration".into(),
+            ));
+        }
+        if config.network.manual {
+            let (virtual_ip, cidr, netmask) =
+                validated_vpn_network(&config.network.virtual_ip, &config.network.cidr)?;
+            config.network.virtual_ip = virtual_ip;
+            config.network.cidr = cidr;
+            config.network.netmask = netmask;
+            return Ok(());
+        }
+        if config.control.auth_token.trim().is_empty() {
+            return Err(DaemonError::Auth("control token is required".into()));
+        }
+
+        let http = control_http_client(config.control.proxy_mode)?;
+        if config.network.network_id.starts_with("room-") {
+            // Retain the existing room approval and resume checks. A generic
+            // managed network does not have this room-specific access gate.
+            Self::request_room_device_access(&http, config).await?;
+        }
+        let (node_id, virtual_ip, cidr, relays, _, _, _) = register_device_with_authoritative_cidr(
+            &http,
+            &normalize_http_base_url(&config.control.server_url),
+            &config.control.auth_token,
+            config,
+        )
+        .await?;
+        let (virtual_ip, cidr, netmask) = validated_vpn_network(&virtual_ip, &cidr)?;
+        if config.network.network_id.starts_with("room-") {
+            let address = virtual_ip
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| DaemonError::Network("invalid room address".into()))?;
+            let octets = address.octets();
+            if octets[0] != 10
+                || octets[1] != 21
+                || !(1..=254).contains(&octets[3])
+                || cidr != format!("10.21.{}.0/24", octets[2])
+            {
+                return Err(DaemonError::Network(
+                    "invalid room subnet assignment".into(),
+                ));
+            }
+        }
+        config.node.node_id = node_id;
+        config.network.virtual_ip = virtual_ip;
+        config.network.cidr = cidr;
+        config.network.netmask = netmask;
         if !relays.is_empty() {
             config.relay.servers = relays;
         }

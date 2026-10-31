@@ -30,9 +30,8 @@ impl RouteManager {
     pub fn remove_cidr_route(&self, _cidr: &str) {}
 }
 
-/// Android installs the overlay route atomically as part of
-/// `VpnService.Builder`. The daemon must not invoke shell route commands or
-/// report the route as unknown after the VPN service has handed us its fd.
+/// Android installs overlay routes as part of `VpnService.Builder`. Its
+/// route intent is available to this process when the fd is handed over.
 #[cfg(target_os = "android")]
 impl RouteManager {
     pub fn add_cidr_route(&self, cidr: &str) -> crate::Result<()> {
@@ -66,9 +65,6 @@ impl RouteManager {
             state: if self.owns_cidr(cidr) {
                 RouteState::Installed
             } else {
-                // The add operation is called immediately after the Android
-                // service establishes the route. This branch is retained for
-                // diagnostics during an early startup failure.
                 RouteState::Missing
             },
             owned: self.owns_cidr(cidr),
@@ -83,4 +79,52 @@ impl RouteManager {
                 .retain(|owned| *owned != route);
         }
     }
+}
+
+/// HarmonyOS route operations must be backed by the exact immutable route
+/// snapshot from the current successful `VpnConnection.create(config)`.
+/// Route additions/removals require destroying and recreating that VPN.
+#[cfg(target_env = "ohos")]
+impl RouteManager {
+    pub fn add_cidr_route(&self, cidr: &str) -> crate::Result<()> {
+        let authority = self
+            .ohos_route_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let authority = authority
+            .as_ref()
+            .ok_or(crate::DaemonError::OhosRouteConfirmationMissing)?;
+        authority.ensure_configured(cidr)
+    }
+
+    pub fn cleanup(&self) {
+        *self
+            .ohos_route_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    pub fn describe_overlay_route(&self, cidr: &str) -> RouteObservation {
+        let expected_interface = self.interface();
+        let authority = self
+            .ohos_route_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (state, owned) = authority
+            .as_ref()
+            .map(|authority| authority.state_for(cidr))
+            .unwrap_or((RouteState::Unknown, false));
+        RouteObservation {
+            cidr: cidr.to_string(),
+            expected_interface: expected_interface.clone(),
+            actual_interface: (state == RouteState::Installed).then_some(expected_interface),
+            state,
+            owned,
+        }
+    }
+
+    /// Harmony route configuration is part of the VPN create call and cannot
+    /// be removed from this process. Keep the confirmation immutable until
+    /// cleanup destroys the current route authority.
+    pub fn remove_cidr_route(&self, _cidr: &str) {}
 }

@@ -26,6 +26,47 @@ fn peer(node_id: &str, virtual_ip: &str) -> PeerInfo {
 }
 
 #[tokio::test]
+async fn tun_worker_readiness_is_reported_after_idle_read_is_polled() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("http://ctrl.test", "default").unwrap(),
+    ));
+    let (tun, _controller) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+    let (mut dataplane, _outbound_rx) = DataPlane::new(tun, peers);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move { dataplane.run_with_tun_worker_ready(ready_tx).await });
+
+    timeout(Duration::from_secs(1), ready_rx)
+        .await
+        .expect("TUN worker did not poll its idle read")
+        .expect("TUN readiness sender closed");
+    assert!(!task.is_finished(), "idle TUN read should remain active");
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn tun_worker_does_not_report_readiness_when_first_read_fails() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("http://ctrl.test", "default").unwrap(),
+    ));
+    let (mut tun, _controller) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+    tun.close();
+    let (mut dataplane, _outbound_rx) = DataPlane::new(tun, peers);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move { dataplane.run_with_tun_worker_ready(ready_tx).await });
+
+    let result = timeout(Duration::from_secs(1), task)
+        .await
+        .expect("closed TUN read did not fail promptly")
+        .expect("dataplane task panicked");
+    assert!(result.is_err(), "closed TUN read must fail startup");
+    assert!(
+        ready_rx.await.is_err(),
+        "failed first read must not report ready"
+    );
+}
+
+#[tokio::test]
 async fn routes_tun_packet_to_peer_by_virtual_ip() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("http://ctrl.test", "default").unwrap(),

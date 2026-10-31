@@ -149,6 +149,24 @@ void main() {
       expect(launched.toString(), _releaseUrl('v0.1.164'));
     });
 
+    test('does not call an unsupported external URL plugin', () async {
+      var launched = false;
+      final service = UpdateService(
+        transport: _FakeTransport(_release('v0.1.164')),
+        launcher: (_) async {
+          launched = true;
+          return true;
+        },
+        canOpenExternalUrls: false,
+        currentAppVersion: '0.1.163',
+      );
+      final result = await service.check();
+
+      expect(result.update, isNotNull);
+      expect(await service.openRelease(result.update!), isFalse);
+      expect(launched, isFalse);
+    });
+
     test('revalidates a forged release URL before opening', () async {
       var launched = false;
       final service = UpdateService(

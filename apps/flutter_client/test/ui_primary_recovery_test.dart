@@ -58,7 +58,10 @@ class _Controller extends DaemonController {
   int starts = 0;
   int stops = 0;
   @override
-  Future<DaemonCommandResult> start(AppSettings settings) async {
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) async {
     starts++;
     return const DaemonCommandResult(ok: true, message: '');
   }
