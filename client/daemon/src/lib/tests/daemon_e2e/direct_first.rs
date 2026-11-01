@@ -131,18 +131,26 @@ async fn retired_direct_first_deadline_cannot_release_replacement_peer() {
 /// A warm, authenticated Relay must not steal the first application payload.
 #[tokio::test]
 async fn direct_first_queued_business_uses_direct_without_relay_prelude() {
-    run_direct_first_queued_business_case(true).await;
+    run_direct_first_queued_business_case(true, "127.0.0.1:0").await;
+}
+
+/// An IPv6 physical endpoint carries the original IPv4 overlay packet through
+/// the production queue, encryption and UDP handoff. This loopback control does
+/// not claim Android VPN routing, OpenWrt forwarding or a measured path MTU.
+#[tokio::test]
+async fn direct_first_ipv4_business_uses_ipv6_udp_without_relay_prelude() {
+    run_direct_first_queued_business_case(true, "[::1]:0").await;
 }
 
 #[tokio::test]
 async fn direct_first_queued_business_falls_back_only_after_its_bounded_window() {
-    run_direct_first_queued_business_case(false).await;
+    run_direct_first_queued_business_case(false, "127.0.0.1:0").await;
 }
 
-async fn run_direct_first_queued_business_case(establish_direct: bool) {
+async fn run_direct_first_queued_business_case(establish_direct: bool, remote_bind_addr: &str) {
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
-    let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sink = tokio::net::UdpSocket::bind(remote_bind_addr).await.unwrap();
     let endpoint = sink.local_addr().unwrap();
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
     let startup = RelayStartupWait {
@@ -170,6 +178,12 @@ async fn run_direct_first_queued_business_case(establish_direct: bool) {
     let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap();
+    let expected_source = if endpoint.is_ipv6() {
+        udp.ipv6_local_addr()
+            .expect("the mixed-family control requires an IPv6 UDP socket")
+    } else {
+        udp.local_addr().unwrap()
+    };
     let (relay, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
         .await
         .unwrap();
@@ -210,6 +224,9 @@ async fn run_direct_first_queued_business_case(establish_direct: bool) {
         1,
         &[1, 2, 3, 4],
     );
+    let parsed = Ipv4Packet::new(&packet).unwrap();
+    assert_eq!(parsed.src_addr(), "10.20.0.1".parse::<Ipv4Addr>().unwrap());
+    assert_eq!(parsed.dst_addr(), "10.20.0.2".parse::<Ipv4Addr>().unwrap());
     dataplane_tx
         .send(OutboundPacket {
             room_authorization: None,
@@ -264,10 +281,11 @@ async fn run_direct_first_queued_business_case(establish_direct: bool) {
     // Inject the existing authoritative validation commit; no application
     // packet has ever arrived in the reverse direction or through Relay.
     peers.record_direct_success("node-b", Some(endpoint)).await;
-    let (len, _) = tokio::time::timeout(Duration::from_secs(2), sink.recv_from(&mut buf))
+    let (len, source) = tokio::time::timeout(Duration::from_secs(2), sink.recv_from(&mut buf))
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(source, expected_source);
     assert_eq!(
         remote_session.decrypt_from_bytes(&buf[..len]).unwrap(),
         packet
