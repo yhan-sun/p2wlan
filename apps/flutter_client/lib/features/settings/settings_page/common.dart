@@ -186,57 +186,42 @@ class _SettingsSurface extends StatelessWidget {
 
 /// A category page title ("← General" on root/detail, plain on desktop).
 class _DetailHeader extends StatelessWidget {
-  const _DetailHeader({required this.title, this.onBack, this.subtitle});
+  const _DetailHeader({required this.title, this.onBack});
+
+  static const leadingExtent = AppTokens.minTouchTarget + AppTokens.space8;
 
   final String title;
-  final String? subtitle;
   final VoidCallback? onBack;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final strings = AppStringsScope.of(context);
-    final leading = onBack == null
-        ? null
-        : IconButton(
-            tooltip: strings.back,
-            icon: const Icon(Icons.arrow_back_rounded),
-            onPressed: onBack,
-          );
-    final titleRow = Row(
+    return Row(
       children: [
-        ?leading,
-        Expanded(
-          child: Text(
-            title,
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.w700,
-              color: theme.colorScheme.onSurface,
+        if (onBack != null) ...[
+          SizedBox.square(
+            dimension: AppTokens.minTouchTarget,
+            child: AppBackButton(
+              key: const Key('settings-category-back'),
+              onPressed: onBack,
             ),
           ),
-        ),
-      ],
-    );
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        titleRow,
-        if (subtitle != null && subtitle!.isNotEmpty) ...[
-          const SizedBox(height: 3),
-          Padding(
-            padding: EdgeInsets.only(left: onBack == null ? 2 : 12),
+          const SizedBox(width: AppTokens.space8),
+        ],
+        Expanded(
+          child: Semantics(
+            header: true,
             child: Text(
-              subtitle!,
+              title,
               style: TextStyle(
-                fontSize: 12,
+                fontSize: 16,
                 height: 1.3,
-                color: theme.colorScheme.onSurfaceVariant,
+                fontWeight: FontWeight.w600,
+                color: theme.colorScheme.onSurface,
               ),
             ),
           ),
-        ],
-        const SizedBox(height: AppTokens.space10),
+        ),
       ],
     );
   }

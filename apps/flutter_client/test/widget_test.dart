@@ -87,7 +87,7 @@ void main() {
     // detail is open; narrower root-detail layouts expose a back button first.
     final categoryRail = find.byKey(const Key('settings-category-rail'));
     if (categoryRail.evaluate().isEmpty) {
-      await tester.tap(find.byIcon(Icons.arrow_back_rounded));
+      await tester.tap(find.byKey(const Key('settings-category-back')));
       await tester.pump(const Duration(milliseconds: 250));
     }
     final developer = categoryRail.evaluate().isEmpty
@@ -306,13 +306,13 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.byType(SettingsPage), findsOneWidget);
-    expect(find.byIcon(Icons.arrow_back_rounded), findsOneWidget);
+    expect(find.byKey(const Key('settings-category-back')), findsOneWidget);
 
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
 
     expect(find.byType(SettingsPage), findsOneWidget);
-    expect(find.byIcon(Icons.arrow_back_rounded), findsNothing);
+    expect(find.byKey(const Key('settings-category-back')), findsNothing);
     expect(find.text('通用'), findsOneWidget);
 
     await tester.binding.handlePopRoute();
