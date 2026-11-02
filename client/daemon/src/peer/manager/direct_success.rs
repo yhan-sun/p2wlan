@@ -572,10 +572,14 @@ impl PeerManager {
             generation,
             local_endpoint,
             None,
+            false,
         )
         .await
     }
 
+    // `is_consent_ack` comes only from the original matched pending probe;
+    // an RTT or ordinary successful probe does not imply consent.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_direct_probe_success_with_latency_for_generation_and_local_endpoint_for_remote_epoch(
         &self,
         node_id: &str,
@@ -584,6 +588,7 @@ impl PeerManager {
         generation: u64,
         local_endpoint: Option<SocketAddr>,
         expected_remote_candidate_epoch: Option<u64>,
+        is_consent_ack: bool,
     ) -> bool {
         if generation != self.current_network_generation().await {
             return false;
@@ -592,6 +597,7 @@ impl PeerManager {
             return false;
         };
         let mut record_ack_feedback = false;
+        let mut consent_ack_detail = None;
         let retain_relay_for_slow_probe;
         let pair_success = {
             let mut conns = self.connections.write().await;
@@ -792,8 +798,41 @@ impl PeerManager {
                     format!("received inbound UDP probe from {endpoint}"),
                 );
             }
+            if is_consent_ack && !retain_relay_for_slow_probe {
+                if let Some(latency) = latency {
+                    let detail = format!(
+                        "received direct UDP consent ACK from {endpoint} rtt={}ms local_endpoint={}",
+                        latency.as_millis(),
+                        format_log_endpoint(local_endpoint)
+                    );
+                    // This accepted ACK and its health sample share the actual
+                    // connection writer. Later feedback waits or cancellation
+                    // cannot separate them, and diagnostics never reacquire it.
+                    conn.record_direct_event(
+                        generation,
+                        "consent_ack_received",
+                        Some(endpoint),
+                        Some(1),
+                        None,
+                        detail.clone(),
+                    );
+                    consent_ack_detail = Some(detail);
+                }
+            }
             pair_success
         };
+        if let Some(detail) = consent_ack_detail {
+            self.emit_direct_traversal_debug(
+                node_id,
+                generation,
+                "consent_ack_received",
+                Some(endpoint),
+                None,
+                Some(1),
+                None,
+                &detail,
+            );
+        }
         if record_ack_feedback {
             self.record_recovery_ack_feedback(node_id, endpoint).await;
         }

@@ -1052,6 +1052,14 @@ impl PeerManager {
         self.connections.write().await
     }
 
+    /// Pause existing post-ACK feedback after its connection-health commit.
+    #[cfg(test)]
+    pub(crate) async fn hold_recovery_ack_feedback_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, RecoveryEpochState>> {
+        self.recovery_epochs.write().await
+    }
+
     #[cfg(test)]
     pub(crate) async fn hold_local_nat_profile_writer_for_test(
         &self,

@@ -855,12 +855,17 @@ async fn stale_probe_result_cannot_promote_reused_endpoint_after_remote_handover
             manager.current_network_generation_sync(),
             None,
             Some(retired_remote_epoch),
+            true,
         )
         .await);
     drop(epoch_guard);
 
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_ne!(connection.state, ConnectionState::Direct);
+    assert!(!connection
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "consent_ack_received"));
 }
 
 #[tokio::test]

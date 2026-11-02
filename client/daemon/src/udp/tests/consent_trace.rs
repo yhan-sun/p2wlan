@@ -5,20 +5,28 @@ use std::task::Poll;
 use tokio::time::{timeout_at, Instant as TokioInstant};
 
 async fn fixture() -> (UdpTransport, UdpSocket, Arc<ConsentTrace>, PendingProbe) {
+    fixture_with_reachable_peer(true).await
+}
+
+async fn fixture_with_reachable_peer(
+    reachable: bool,
+) -> (UdpTransport, UdpSocket, Arc<ConsentTrace>, PendingProbe) {
     let peers = peer_manager();
     let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let endpoint = remote.local_addr().unwrap();
     peers
         .add_peer(&peer("peer-b", "10.20.0.2", Some(endpoint)))
         .await;
-    peers
-        .record_direct_probe_success_with_latency(
-            "peer-b",
-            endpoint,
-            Some(Duration::from_millis(5)),
-        )
-        .await;
-    peers.record_direct_success("peer-b", Some(endpoint)).await;
+    if reachable {
+        peers
+            .record_direct_probe_success_with_latency(
+                "peer-b",
+                endpoint,
+                Some(Duration::from_millis(5)),
+            )
+            .await;
+        peers.record_direct_success("peer-b", Some(endpoint)).await;
+    }
     let mut udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap();
@@ -44,7 +52,7 @@ async fn fixture() -> (UdpTransport, UdpSocket, Arc<ConsentTrace>, PendingProbe)
         accepts_legacy_ack: true,
         socket_epoch: 0,
         cleanup_epoch: udp.peer_probe_cleanup_epoch("peer-b").await,
-        direct_commit_seq: peers.direct_commit_seq_sync("peer-b").unwrap(),
+        direct_commit_seq: peers.direct_commit_seq_sync("peer-b").unwrap_or(0),
     };
     (udp, remote, trace, pending)
 }
@@ -109,6 +117,13 @@ fn stages(trace: &ConsentTrace, nonce: ProbeNonce) -> Vec<ConsentStage> {
         .filter(|event| event.nonce == nonce)
         .map(|event| event.stage)
         .collect()
+}
+
+fn consent_ack_count(conn: &crate::peer::PeerConnection) -> usize {
+    conn.direct_events
+        .iter()
+        .filter(|event| event.stage == "consent_ack_received")
+        .count()
 }
 
 #[tokio::test]
@@ -207,6 +222,8 @@ async fn consent_trace_real_ack_commits_once_and_duplicate_or_missing_nonce_cann
     )
     .await;
     let after = udp.peers.get_connection("peer-b").await.unwrap();
+    assert_eq!(consent_ack_count(&before), 0);
+    assert_eq!(consent_ack_count(&after), 1);
     assert_eq!(
         after.direct_health.success_count,
         before.direct_health.success_count + 1
@@ -239,6 +256,96 @@ async fn consent_trace_real_ack_commits_once_and_duplicate_or_missing_nonce_cann
 }
 
 #[tokio::test]
+async fn consent_ack_event_survives_cancellation_after_original_health_commit() {
+    let end = TokioInstant::now() + Duration::from_secs(2);
+    let (udp, remote, trace, pending) = fixture_with_reachable_peer(false).await;
+    let nonce = [0x45; 8];
+    let endpoint = remote.local_addr().unwrap();
+    let generation = pending.generation;
+    let before = udp.peers.get_connection("peer-b").await.unwrap();
+    udp.pending_probes.lock().await.insert(nonce, pending);
+    // The original ACK commits the first reachable pair, then waits for this
+    // existing feedback writer. No new production hook or scheduling sleep.
+    let feedback = udp.peers.hold_recovery_ack_feedback_for_test().await;
+    let connections = udp.peers.connection_map_for_test();
+    let (tx, _rx) = mpsc::channel::<ReceivedEncryptedPacket>(1);
+    let (shutdown, mut stop) = watch::channel(false);
+    let mut reader =
+        Box::pin(udp.run_inbound_socket_inner(0, udp.socket.clone(), tx, Some(&mut stop), None));
+    let ack = build_punch_ack(nonce);
+    let sent_at = Instant::now();
+    assert_eq!(
+        remote
+            .send_to(&ack, udp.local_addr().unwrap())
+            .await
+            .unwrap(),
+        ack.len()
+    );
+    let committed = timeout_at(
+        end,
+        poll_fn(|cx| {
+            assert!(reader.as_mut().poll(cx).is_pending());
+            let current = connections
+                .try_read()
+                .expect("health writer must be released");
+            let conn = current.get("peer-b").unwrap();
+            if conn.direct_health.success_count == before.direct_health.success_count + 1 {
+                Poll::Ready(conn.clone())
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("original health commit must precede the held feedback writer");
+    assert!(!stages(&trace, nonce).contains(&ConsentStage::HealthCommitted));
+    assert!(!udp.pending_probes.lock().await.contains_key(&nonce));
+    assert_eq!(consent_ack_count(&committed), 1);
+    let event = committed
+        .direct_events
+        .iter()
+        .find(|e| e.stage == "consent_ack_received")
+        .unwrap();
+    assert_eq!(event.endpoint, Some(endpoint));
+    assert_eq!(event.network_generation, generation);
+    assert!(event.recorded_at >= sent_at && event.recorded_at <= Instant::now());
+    drop(reader); // Cancel before the original handler can finish feedback.
+    drop(shutdown);
+    drop(feedback);
+    let after = udp.peers.get_connection("peer-b").await.unwrap();
+    assert_eq!(
+        after.direct_health.success_count,
+        committed.direct_health.success_count
+    );
+    assert_eq!(consent_ack_count(&after), 1);
+}
+
+#[tokio::test]
+async fn ordinary_matched_probe_ack_cannot_create_consent_event() {
+    let end = TokioInstant::now() + Duration::from_secs(2);
+    let (udp, remote, trace, mut pending) = fixture().await;
+    pending.purpose = PendingProbePurpose::ConnectivityCheck;
+    let nonce = [0x46; 8];
+    let before = udp.peers.get_connection("peer-b").await.unwrap();
+    udp.pending_probes.lock().await.insert(nonce, pending);
+    receive_ack(
+        &udp,
+        &remote,
+        nonce,
+        &trace,
+        ConsentStage::HealthCommitted,
+        end,
+    )
+    .await;
+    let after = udp.peers.get_connection("peer-b").await.unwrap();
+    assert_eq!(
+        after.direct_health.success_count,
+        before.direct_health.success_count + 1
+    );
+    assert_eq!(consent_ack_count(&after), 0);
+}
+
+#[tokio::test]
 async fn consent_trace_expired_real_ack_retires_nonce_without_health_commit() {
     let end = TokioInstant::now() + Duration::from_secs(2);
     let (udp, remote, trace, mut pending) = fixture().await;
@@ -262,6 +369,7 @@ async fn consent_trace_expired_real_ack_retires_nonce_without_health_commit() {
     );
     assert!(!udp.pending_probes.lock().await.contains_key(&nonce));
     let after = udp.peers.get_connection("peer-b").await.unwrap();
+    assert_eq!(consent_ack_count(&after), 0);
     assert_eq!(
         after.direct_health.success_count,
         before.direct_health.success_count
@@ -306,6 +414,7 @@ async fn consent_trace_real_ack_fences_all_seven_pending_identity_mismatches() {
         );
         assert!(udp.pending_probes.lock().await.contains_key(&nonce));
         let after = udp.peers.get_connection("peer-b").await.unwrap();
+        assert_eq!(consent_ack_count(&after), 0);
         assert_eq!(
             after.direct_health.success_count,
             before.direct_health.success_count
