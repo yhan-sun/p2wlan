@@ -87,10 +87,10 @@ void _registerSettingsPhase6Tests() {
     expect(find.text('Control server'), findsOneWidget);
     expect(find.text('Network ID'), findsOneWidget);
     expect(find.text('Authentication'), findsOneWidget);
-    expect(find.byIcon(Icons.arrow_back_rounded), findsOneWidget);
+    expect(find.byKey(const Key('settings-category-back')), findsOneWidget);
 
     // Return to the root.
-    await tester.tap(find.byIcon(Icons.arrow_back_rounded));
+    await tester.tap(find.byKey(const Key('settings-category-back')));
     await tester.pumpAndSettle();
     expect(find.text('General'), findsOneWidget);
     expect(find.text('Control server'), findsNothing);

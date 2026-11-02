@@ -42,8 +42,8 @@ Finder _settingsTextField(String label) => find.byWidgetPredicate(
 /// (taps the root row) and on the desktop rail layout (taps the sidebar item).
 /// If a detail is already open it returns to the root first.
 Future<void> _openCategory(WidgetTester tester, String label) async {
-  if (find.byIcon(Icons.arrow_back_rounded).evaluate().isNotEmpty) {
-    await tester.tap(find.byIcon(Icons.arrow_back_rounded));
+  if (find.byKey(const Key('settings-category-back')).evaluate().isNotEmpty) {
+    await tester.tap(find.byKey(const Key('settings-category-back')));
     await tester.pumpAndSettle();
   }
   final rail = find.byKey(const Key('settings-category-rail'));

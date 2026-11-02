@@ -26,6 +26,7 @@ import '../../core/update/update_service.dart';
 import '../../shared/widgets/app_back_button.dart';
 import '../../shared/widgets/app_motion.dart';
 import '../../shared/widgets/app_select.dart';
+import '../../shared/widgets/page_heading.dart';
 
 part 'settings_page/categories.dart';
 part 'settings_page/common.dart';
@@ -476,7 +477,6 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Widget _buildBody(AppStrings strings) {
-    final theme = Theme.of(context);
     final credentialState = _describeCredential(strings);
     final categories = _visibleCategories;
     final selected = _normalizeSelection(categories);
@@ -501,35 +501,12 @@ class _SettingsPageState extends State<SettingsPage> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   if (widget.showHeader) ...[
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            strings.settings,
-                            style: TextStyle(
-                              fontSize: isNarrow ? 22 : 24,
-                              height: 1.25,
-                              fontWeight: FontWeight.w700,
-                              color: theme.colorScheme.onSurface,
-                            ),
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            strings.settingsSubtitle,
-                            textAlign: TextAlign.left,
-                            style: TextStyle(
-                              fontSize: 14,
-                              height: 1.45,
-                              color: theme.colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                        ],
-                      ),
+                    PageHeading(
+                      title: strings.settings,
+                      subtitle: strings.settingsSubtitle,
+                      compact: isNarrow,
                     ),
-                    const SizedBox(height: AppTokens.space20),
+                    const SizedBox(height: AppTokens.space16),
                   ],
                   Expanded(
                     child: _SettingsShell(

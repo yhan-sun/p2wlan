@@ -47,6 +47,7 @@ part 'p15_widget/settings_tests.dart';
 part 'p15_widget/settings_phase6_tests.dart';
 part 'p15_widget/settings_redesign_tests.dart';
 part 'p15_widget/settings_motion_tests.dart';
+part 'p15_widget/settings_navigation_regression_tests.dart';
 part 'p15_widget/nodes_tests.dart';
 part 'p15_widget/nodes_detail_tests.dart';
 part 'p15_widget/nodes_shell_tests.dart';
@@ -67,6 +68,7 @@ void main() {
   _registerSettingsPhase6Tests();
   _registerSettingsRedesignTests();
   _registerSettingsMotionTests();
+  _registerSettingsNavigationRegressionTests();
   _registerNodesTests();
   _registerNodesDetailTests();
   _registerNodesShellTests();

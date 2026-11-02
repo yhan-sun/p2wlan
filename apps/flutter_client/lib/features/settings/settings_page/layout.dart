@@ -305,20 +305,40 @@ class _CategoryDetailView extends StatelessWidget {
     final dirty =
         state._categoryDirty(category) || state._savingCategory == category;
     final content = _categoryContent(category, state, strings, credentialState);
+    final subtitle = _categorySubtitle(category, strings);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        if (showHeader)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(2, 2, 2, AppTokens.space8),
+            child: _DetailHeader(
+              title: category.label(strings),
+              onBack: onBack,
+            ),
+          ),
         Expanded(
           child: ListView(
             key: PageStorageKey('settings-${category.name}'),
             keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
             padding: const EdgeInsets.fromLTRB(2, 2, 2, 16),
             children: [
-              if (showHeader)
-                _DetailHeader(
-                  title: category.label(strings),
-                  onBack: onBack,
-                  subtitle: _categorySubtitle(category, strings),
+              // Keep Back reachable while long descriptions and forms scroll,
+              // including short windows with accessibility text scaling.
+              if (showHeader && subtitle != null && subtitle.isNotEmpty)
+                Padding(
+                  padding: EdgeInsetsDirectional.only(
+                    start: onBack == null ? 0 : _DetailHeader.leadingExtent,
+                    bottom: AppTokens.space12,
+                  ),
+                  child: Text(
+                    subtitle,
+                    style: TextStyle(
+                      fontSize: 12,
+                      height: 1.45,
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
                 ),
               if (state._formErrorCategory == category &&
                   state._formError != null) ...[
