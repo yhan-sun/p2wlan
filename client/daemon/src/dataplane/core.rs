@@ -513,24 +513,27 @@ where
         use std::future::Future;
 
         let started = std::time::Instant::now();
-        let mut read = Box::pin(self.tun.read(buf));
-        let n = std::future::poll_fn(|context| {
-            let polled = read.as_mut().poll(context);
-            let worker_entered = match &polled {
-                std::task::Poll::Pending => true,
-                std::task::Poll::Ready(Ok(bytes_read)) => *bytes_read > 0,
-                std::task::Poll::Ready(Err(_)) => false,
-            };
-            if worker_entered {
-                if let Some(ready) = tun_worker_ready.take() {
-                    let _ = ready.send(());
+        let n = if tun_worker_ready.is_some() {
+            let mut read = std::pin::pin!(self.tun.read(buf));
+            std::future::poll_fn(|context| {
+                let polled = read.as_mut().poll(context);
+                let worker_entered = match &polled {
+                    std::task::Poll::Pending => true,
+                    std::task::Poll::Ready(Ok(bytes_read)) => *bytes_read > 0,
+                    std::task::Poll::Ready(Err(_)) => false,
+                };
+                if worker_entered {
+                    if let Some(ready) = tun_worker_ready.take() {
+                        let _ = ready.send(());
+                    }
                 }
-            }
-            polled
-        })
-        .await
+                polled
+            })
+            .await
+        } else {
+            self.tun.read(buf).await
+        }
         .map_err(|e| DaemonError::Network(format!("TUN read failed: {e}")))?;
-        drop(read);
 
         // Take this exact completed read before any resolve/ACL/route await.
         let context = if n == 0 {
