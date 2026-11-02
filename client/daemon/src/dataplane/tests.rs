@@ -80,7 +80,10 @@ async fn tun_worker_readiness_ignores_empty_read_then_reports_nonempty_read() {
     controller.inject(Vec::new()).await.unwrap();
     let (packet, ..) = dataplane.read_packet(&mut buf, &mut ready).await.unwrap();
     assert!(packet.is_empty());
-    assert!(ready.is_some(), "an empty read must retain startup readiness");
+    assert!(
+        ready.is_some(),
+        "an empty read must retain startup readiness"
+    );
     assert_eq!(
         ready_rx.try_recv(),
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
