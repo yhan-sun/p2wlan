@@ -1,0 +1,20 @@
+# Harmony build output and machine-specific configuration
+.hvigor/
+oh_modules/
+node_modules/
+build/
+entry/build/
+entry/libs/
+entry/oh_modules/
+entry/src/main/ets/plugins/GeneratedPluginRegistrant.ets
+entry/src/main/resources/rawfile/flutter_assets/
+entry/src/main/cpp/types/libentry/
+local.properties
+oh-package-lock.json5
+*.hap
+*.hsp
+.idea/
+
+package.json
+package-lock.json
+entry/src/main/resources/rawfile/buildinfo.json5

@@ -56,6 +56,7 @@ void _registerTrafficTests() {
         await settings.load();
         await settings.updateSettings(
           settings.settings.copyWith(
+            deviceName: 'Traffic history test device',
             authToken: _trafficToken('traffic-member'),
             controlServer: 'https://control.example',
             languageCode: 'en',

@@ -8,8 +8,8 @@
 //      actually available at runtime (e.g. no admin elevation, TUN disabled).
 //
 // Pages must NOT branch on `Platform.isX` everywhere; they read this model.
-// On non-desktop platforms (mobile/web) the local-daemon/TUN capabilities are
-// off by default, so the UI never shows a fake "start daemon" button.
+// Mobile platforms expose local VPN control only when their native bridge is
+// implemented; remote management remains independent of local VPN support.
 import 'dart:io' show Platform;
 
 class PlatformCapabilities {
@@ -23,6 +23,9 @@ class PlatformCapabilities {
     required this.canUseSystemTray,
     required this.canActAsLocalVpnNode,
     required this.canManageRemoteDevices,
+    this.canReceiveRoomLinks = false,
+    this.canOpenExternalUrls = false,
+    this.canReadNativeBuildInfo = false,
   });
 
   /// Desktop/local can start, stop, restart the local daemon.
@@ -52,11 +55,20 @@ class PlatformCapabilities {
   /// Can manage remote devices / control plane (account, networks, peers).
   final bool canManageRemoteDevices;
 
+  /// The `app_links` plugin has a registered implementation on this platform.
+  final bool canReceiveRoomLinks;
+
+  /// The `url_launcher` plugin has a registered implementation on this platform.
+  final bool canOpenExternalUrls;
+
+  /// The OHOS host registers the read-only native engine build-info method.
+  final bool canReadNativeBuildInfo;
+
   /// Baseline capabilities for a normalized OS name.
   ///
-  /// `os` is one of `windows`, `macos`, `linux`, `android`, `ios`, `fuchsia`,
-  /// `web`. Android uses the native VpnService bridge; iOS and web remain
-  /// remote-management-only.
+  /// Platform names include windows, macos, linux, android, ios, fuchsia,
+  /// ohos, and web. Android uses the native VpnService bridge. OHOS permits
+  /// remote management, native build info, and native VPN lifecycle control.
   factory PlatformCapabilities.fromPlatform(String os) {
     switch (os) {
       case 'windows':
@@ -72,6 +84,8 @@ class PlatformCapabilities {
           canUseSystemTray: true,
           canActAsLocalVpnNode: true,
           canManageRemoteDevices: true,
+          canReceiveRoomLinks: true,
+          canOpenExternalUrls: true,
         );
       case 'android':
         return const PlatformCapabilities(
@@ -84,8 +98,23 @@ class PlatformCapabilities {
           canUseSystemTray: false,
           canActAsLocalVpnNode: true,
           canManageRemoteDevices: true,
+          canReceiveRoomLinks: true,
+          canOpenExternalUrls: true,
         );
       case 'ios':
+        return const PlatformCapabilities(
+          canControlLocalDaemon: false,
+          canRequestElevation: false,
+          canVerifyRoutes: false,
+          canRepairRoutes: false,
+          canOpenLocalLogs: false,
+          canCreateSupportBundle: false,
+          canUseSystemTray: false,
+          canActAsLocalVpnNode: false,
+          canManageRemoteDevices: true,
+          canReceiveRoomLinks: true,
+          canOpenExternalUrls: true,
+        );
       case 'fuchsia':
         return const PlatformCapabilities(
           canControlLocalDaemon: false,
@@ -97,8 +126,38 @@ class PlatformCapabilities {
           canUseSystemTray: false,
           canActAsLocalVpnNode: false,
           canManageRemoteDevices: true,
+          canReceiveRoomLinks: false,
+          canOpenExternalUrls: false,
+        );
+      case 'ohos':
+        return const PlatformCapabilities(
+          canControlLocalDaemon: true,
+          canRequestElevation: false,
+          canVerifyRoutes: false,
+          canRepairRoutes: false,
+          canOpenLocalLogs: false,
+          canCreateSupportBundle: false,
+          canUseSystemTray: false,
+          canActAsLocalVpnNode: true,
+          canManageRemoteDevices: true,
+          canReceiveRoomLinks: false,
+          canOpenExternalUrls: false,
+          canReadNativeBuildInfo: true,
         );
       case 'web':
+        return const PlatformCapabilities(
+          canControlLocalDaemon: false,
+          canRequestElevation: false,
+          canVerifyRoutes: false,
+          canRepairRoutes: false,
+          canOpenLocalLogs: false,
+          canCreateSupportBundle: false,
+          canUseSystemTray: false,
+          canActAsLocalVpnNode: false,
+          canManageRemoteDevices: true,
+          canReceiveRoomLinks: true,
+          canOpenExternalUrls: true,
+        );
       default:
         return const PlatformCapabilities(
           canControlLocalDaemon: false,
@@ -110,6 +169,8 @@ class PlatformCapabilities {
           canUseSystemTray: false,
           canActAsLocalVpnNode: false,
           canManageRemoteDevices: true,
+          canReceiveRoomLinks: false,
+          canOpenExternalUrls: false,
         );
     }
   }
@@ -139,6 +200,9 @@ class PlatformCapabilities {
       canActAsLocalVpnNode:
           canActAsLocalVpnNode && !off('canActAsLocalVpnNode'),
       canManageRemoteDevices: canManageRemoteDevices,
+      canReceiveRoomLinks: canReceiveRoomLinks,
+      canOpenExternalUrls: canOpenExternalUrls,
+      canReadNativeBuildInfo: canReadNativeBuildInfo,
     );
   }
 }
@@ -153,7 +217,8 @@ String _currentOs() {
         os == 'linux' ||
         os == 'android' ||
         os == 'ios' ||
-        os == 'fuchsia') {
+        os == 'fuchsia' ||
+        os == 'ohos') {
       return os;
     }
     return 'web';

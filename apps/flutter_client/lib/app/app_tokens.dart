@@ -145,6 +145,7 @@ abstract final class AppTokens {
     TargetPlatform.windows => 'Segoe UI',
     TargetPlatform.macOS || TargetPlatform.iOS => 'SF Pro Text',
     TargetPlatform.android || TargetPlatform.fuchsia => 'Roboto',
-    TargetPlatform.linux => 'Noto Sans',
+    // Covers Linux and additional platforms supplied by SDK ports.
+    _ => 'Noto Sans',
   };
 }

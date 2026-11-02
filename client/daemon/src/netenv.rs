@@ -19,7 +19,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
 use std::process::Command;
 
 /// Proxy / TUN-capture environment verdict.
@@ -263,7 +266,10 @@ pub fn parse_route_get_interface(output: &str) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
 fn parse_route_get_gateway(output: &str) -> Option<String> {
     output
         .lines()
@@ -317,7 +323,10 @@ fn parse_route_default_path(output: &str) -> Option<(String, Option<String>)> {
     None
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
 fn parse_physical_default_path(output: &str) -> Option<(String, Option<String>)> {
     output.lines().find_map(|line| {
         let trimmed = line.trim();
@@ -347,7 +356,10 @@ fn is_candidate_route_iface_token(token: &str) -> bool {
 }
 
 /// Best-effort default-route egress interface.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
 pub fn default_route_interface() -> Option<String> {
     // Prefer `route -n get default` (macOS/BSD) because it also works for
     // rootless users; fall back to `ip route show default`.
@@ -374,13 +386,19 @@ pub fn default_route_interface() -> Option<String> {
     None
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "ohos"))
+)))]
 pub fn default_route_interface() -> Option<String> {
     None
 }
 
 /// Best-effort route path (`interface`, `gateway`) for a concrete destination.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
 fn route_path_for_destination(destination: &str) -> Option<(String, Option<String>)> {
     if cfg!(target_os = "macos") {
         let output = Command::new("route")
@@ -414,7 +432,10 @@ fn route_path_for_destination(destination: &str) -> Option<(String, Option<Strin
     Some((interface, gateway))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "ohos"))
+)))]
 fn route_path_for_destination(_destination: &str) -> Option<(String, Option<String>)> {
     None
 }
@@ -439,7 +460,7 @@ fn physical_route_path_from_default(
             return Some(path);
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     if let Ok(output) = Command::new("ip")
         .args(["route", "show", "default"])
         .output()
@@ -726,7 +747,10 @@ default            10.0.0.1           UGScg           utun3
         );
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "ohos"))
+    ))]
     #[test]
     fn physical_default_parser_skips_split_tun_route() {
         let output = "default 10.0.0.1 UGScg utun23\n\
@@ -737,7 +761,10 @@ default 192.168.0.1 UGScg en5\n";
         );
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "ohos"))
+    ))]
     #[test]
     fn physical_selection_rejects_own_excluded_tun() {
         let output = "default 10.0.0.1 UGScg utun9\n\

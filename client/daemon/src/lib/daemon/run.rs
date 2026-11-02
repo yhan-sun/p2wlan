@@ -1,6 +1,11 @@
 impl Daemon {
     /// Run the daemon main loop.
     pub async fn run(&mut self) -> Result<()> {
+        #[cfg(target_env = "ohos")]
+        if self.ohos_startup_ready.is_none() {
+            self.route_manager.cleanup();
+            return Err(DaemonError::OhosStartupReadyNotBound);
+        }
         // Explicit diagnostic descriptors are validated before any new worker
         // starts. No environment setting means no control fd, task or wait.
         let os_capture_setup = crate::os_request_capture::CaptureSetup::from_env(&self.peers)
@@ -539,8 +544,30 @@ impl Daemon {
                     .await;
             }
         }
-        self.spawn_dataplane_tasks(tun, network_inbound_rx, os_capture_setup)
-            .await?;
+        #[cfg(target_env = "ohos")]
+        let (tun_worker_ready_tx, tun_worker_ready_rx) = tokio::sync::oneshot::channel();
+        #[cfg(target_env = "ohos")]
+        let tun_worker_ready_tx = Some(tun_worker_ready_tx);
+        #[cfg(not(target_env = "ohos"))]
+        let tun_worker_ready_tx = None;
+        self.spawn_dataplane_tasks(
+            tun,
+            network_inbound_rx,
+            os_capture_setup,
+            tun_worker_ready_tx,
+        )
+        .await?;
+
+        #[cfg(target_env = "ohos")]
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), tun_worker_ready_rx).await,
+            Ok(Ok(()))
+        ) {
+            error!("[startup] HarmonyOS TUN worker did not register its first read");
+            self.task_manager.shutdown_all(Duration::from_secs(1)).await;
+            self.route_manager.cleanup();
+            return Err(DaemonError::OhosTunWorkerNotReady);
+        }
 
         let local_candidate_sources = self.local_candidate_sources.clone();
         if direct_workers_enabled {
@@ -623,8 +650,6 @@ impl Daemon {
             )
             .await;
 
-        info!("[startup] ready");
-
         // On Android, the JNI thread acknowledges the daemon launch as soon
         // as the runtime handle is installed so the VpnService can remain
         // responsive. Report the separate, meaningful readiness transition
@@ -639,12 +664,63 @@ impl Daemon {
             info!("Android daemon startup completed; VPN dataplane is ready");
         }
 
+        #[cfg(target_env = "ohos")]
+        let ohos_startup_ready = {
+            const REQUIRED_STARTUP_TASKS: [&str; 4] = [
+                "dataplane",
+                "wireguard-inbound",
+                "wireguard-outbound",
+                "network-outbound",
+            ];
+            let task_statuses = self.task_manager.task_statuses().await;
+            let failed_task = REQUIRED_STARTUP_TASKS
+                .iter()
+                .find(|required| {
+                    !task_statuses.iter().any(|status| {
+                        status.name.as_str() == **required
+                            && status.running
+                            && status.error.is_none()
+                    })
+                })
+                .copied();
+            if let Some(task) = failed_task {
+                error!("[startup] required HarmonyOS task is not running: {task}");
+                self.task_manager.shutdown_all(Duration::from_secs(1)).await;
+                self.route_manager.cleanup();
+                return Err(DaemonError::OhosStartupTaskNotReady {
+                    task: task.to_string(),
+                });
+            }
+            if *self.shutdown_rx.borrow() {
+                self.task_manager.shutdown_all(Duration::from_secs(1)).await;
+                self.route_manager.cleanup();
+                return Err(DaemonError::OhosTunWorkerNotReady);
+            }
+            let Some(ready) = self.ohos_startup_ready.take() else {
+                self.task_manager.shutdown_all(Duration::from_secs(1)).await;
+                self.route_manager.cleanup();
+                return Err(DaemonError::OhosStartupReadyNotBound);
+            };
+            ready
+        };
+
         // Signal leasing is gated until this point so an offer/answer cannot
         // be held by the server while startup is still constructing the
         // daemon's control-event consumer.  Mark the edge immediately before
         // entering the consumer loop; any queued roster events are then
         // drained in order and the first signal is applied without lease HOL.
         self.control.mark_event_loop_ready();
+
+        #[cfg(target_env = "ohos")]
+        if ohos_startup_ready.send(()).is_err() {
+            self.task_manager.shutdown_all(Duration::from_secs(1)).await;
+            self.route_manager.cleanup();
+            return Err(DaemonError::OhosStartupReadyReceiverClosed);
+        } else {
+            info!("HarmonyOS daemon startup completed; TUN worker and core tasks are ready");
+        }
+
+        info!("[startup] ready");
         self.run_control_event_loop(&mut relay_started, network_inbound_tx.clone())
             .await;
 

@@ -26,6 +26,115 @@ fn peer(node_id: &str, virtual_ip: &str) -> PeerInfo {
 }
 
 #[tokio::test]
+async fn tun_worker_readiness_is_reported_after_idle_read_is_polled() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("http://ctrl.test", "default").unwrap(),
+    ));
+    let (tun, _controller) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+    let (mut dataplane, _outbound_rx) = DataPlane::new(tun, peers);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move { dataplane.run_with_tun_worker_ready(ready_tx).await });
+
+    timeout(Duration::from_secs(1), ready_rx)
+        .await
+        .expect("TUN worker did not poll its idle read")
+        .expect("TUN readiness sender closed");
+    assert!(!task.is_finished(), "idle TUN read should remain active");
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn tun_worker_does_not_report_readiness_when_first_read_fails() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("http://ctrl.test", "default").unwrap(),
+    ));
+    let (mut tun, _controller) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+    tun.close();
+    let (mut dataplane, _outbound_rx) = DataPlane::new(tun, peers);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move { dataplane.run_with_tun_worker_ready(ready_tx).await });
+
+    let result = timeout(Duration::from_secs(1), task)
+        .await
+        .expect("closed TUN read did not fail promptly")
+        .expect("dataplane task panicked");
+    assert!(result.is_err(), "closed TUN read must fail startup");
+    assert!(
+        ready_rx.await.is_err(),
+        "failed first read must not report ready"
+    );
+}
+
+#[tokio::test]
+async fn tun_worker_readiness_ignores_empty_read_then_reports_nonempty_read() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("http://ctrl.test", "default").unwrap(),
+    ));
+    let (tun, controller) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+    let (mut dataplane, _outbound_rx) = DataPlane::new(tun, peers);
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    let mut ready = Some(ready_tx);
+    let mut buf = [0; 64];
+
+    controller.inject(Vec::new()).await.unwrap();
+    let (packet, ..) = dataplane.read_packet(&mut buf, &mut ready).await.unwrap();
+    assert!(packet.is_empty());
+    assert!(
+        ready.is_some(),
+        "an empty read must retain startup readiness"
+    );
+    assert_eq!(
+        ready_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    );
+
+    let packet = vec![0x45, 1, 2, 3];
+    controller.inject(packet.clone()).await.unwrap();
+    let (read, ..) = dataplane.read_packet(&mut buf, &mut ready).await.unwrap();
+    assert_eq!(read, packet);
+    assert!(ready.is_none());
+    assert_eq!(ready_rx.try_recv(), Ok(()));
+}
+
+#[tokio::test]
+async fn tun_worker_readiness_survives_read_cancellation_without_losing_next_packet() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("http://ctrl.test", "default").unwrap(),
+    ));
+    let (tun, controller) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+    let (mut dataplane, _outbound_rx) = DataPlane::new(tun, peers);
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    let mut ready = Some(ready_tx);
+    let mut buf = [0; 64];
+
+    // Cancelling before the first poll cannot claim that a worker entered.
+    drop(dataplane.read_packet(&mut buf, &mut ready));
+    assert!(ready.is_some());
+    assert_eq!(
+        ready_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    );
+    {
+        let mut read = std::pin::pin!(dataplane.read_packet(&mut buf, &mut ready));
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(read.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Dropping the pending read models another select branch winning.
+    }
+    assert!(ready.is_none(), "readiness is consumed by the first poll");
+    assert_eq!(ready_rx.try_recv(), Ok(()));
+
+    let packet = vec![0x45, 4, 5, 6];
+    controller.inject(packet.clone()).await.unwrap();
+    let (read, ..) = dataplane.read_packet(&mut buf, &mut ready).await.unwrap();
+    assert_eq!(read, packet);
+    assert!(ready.is_none());
+}
+
+#[tokio::test]
 async fn routes_tun_packet_to_peer_by_virtual_ip() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("http://ctrl.test", "default").unwrap(),

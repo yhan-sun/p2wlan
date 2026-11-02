@@ -38,11 +38,27 @@ void main() {
       expect(c.canManageRemoteDevices, isTrue, reason: 'remote mgmt allowed');
     });
 
+    test('OHOS enables local VPN lifecycle through the Extension bridge', () {
+      final c = PlatformCapabilities.fromPlatform('ohos');
+      expect(c.canControlLocalDaemon, isTrue);
+      expect(c.canRequestElevation, isFalse);
+      expect(c.canVerifyRoutes, isFalse);
+      expect(c.canRepairRoutes, isFalse);
+      expect(c.canOpenLocalLogs, isFalse);
+      expect(c.canUseSystemTray, isFalse);
+      expect(c.canActAsLocalVpnNode, isTrue);
+      expect(c.canManageRemoteDevices, isTrue);
+      expect(c.canReceiveRoomLinks, isFalse);
+      expect(c.canOpenExternalUrls, isFalse);
+      expect(c.canReadNativeBuildInfo, isTrue);
+    });
+
     test('web is remote-management only', () {
       final c = PlatformCapabilities.fromPlatform('web');
       expect(c.canControlLocalDaemon, isFalse);
       expect(c.canActAsLocalVpnNode, isFalse);
       expect(c.canManageRemoteDevices, isTrue);
+      expect(c.canReadNativeBuildInfo, isFalse);
     });
   });
 

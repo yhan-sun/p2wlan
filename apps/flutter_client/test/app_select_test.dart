@@ -149,4 +149,55 @@ void main() {
       debugDefaultTargetPlatformOverride = null;
     }
   });
+
+  testWidgets('OHOS uses touch selection on phone and a popover on 2in1', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    debugDefaultTargetPlatformOverride = TargetPlatform.values.byName('ohos');
+    try {
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.lightTheme,
+          home: Scaffold(
+            body: Center(
+              child: AppSelect<String>(
+                key: const ValueKey('ohos-select'),
+                menuTitle: 'Theme mode',
+                value: 'system',
+                options: const [
+                  AppSelectOption(value: 'system', label: 'Follow system'),
+                  AppSelectOption(value: 'dark', label: 'Dark'),
+                ],
+                onChanged: (_) {},
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.byType(OutlinedButton));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('app-select-mobile-sheet')), findsOneWidget);
+      expect(
+        tester.getSize(find.byType(OutlinedButton)).height,
+        greaterThanOrEqualTo(AppTokens.minTouchTarget),
+      );
+
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      tester.view.physicalSize = const Size(1280, 800);
+      await tester.pump();
+      await tester.tap(find.byType(OutlinedButton));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('app-select-mobile-sheet')), findsNothing);
+      expect(tester.takeException(), isNull);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  }, skip: !TargetPlatform.values.any((platform) => platform.name == 'ohos'));
 }

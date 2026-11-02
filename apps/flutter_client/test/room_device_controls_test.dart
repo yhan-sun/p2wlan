@@ -101,7 +101,10 @@ class Daemon extends DaemonController {
         'node_id': 'local',
       };
   @override
-  Future<DaemonCommandResult> start(AppSettings settings) async {
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) async {
     starts++;
     running = true;
     return const DaemonCommandResult(ok: true, message: 'start');

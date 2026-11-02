@@ -167,7 +167,7 @@ async fn test_real_wintun_device() {
 }
 
 /// Test creating a real TUN device (requires root).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[tokio::test]
 #[ignore = "Requires root privileges"]
 async fn test_real_linux_tun_device() {

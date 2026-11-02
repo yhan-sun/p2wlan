@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl RouteManager {
     pub fn add_cidr_route(&self, cidr: &str) -> crate::Result<()> {
         if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {

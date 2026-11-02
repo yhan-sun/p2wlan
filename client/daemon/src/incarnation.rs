@@ -142,6 +142,12 @@ pub fn discard_prepared_boot_incarnation(config: &Config) {
         return;
     };
 
+    discard_prepared_boot_incarnation_at(config_path);
+}
+
+/// Discard a pre-daemon reservation by its canonical config path. This is for
+/// platform bridges that retain the profile path but do not own a `Config`.
+pub fn discard_prepared_boot_incarnation_at(config_path: &Path) {
     let discarded = prepared_boot_incarnations()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

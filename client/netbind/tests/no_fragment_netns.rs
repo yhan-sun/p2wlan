@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", not(target_env = "ohos")))]
 
 use std::env;
 use std::fs;

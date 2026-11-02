@@ -1,0 +1,10 @@
+{
+  "app": {
+    "bundleName": "com.p2wlan.client",
+    "vendor": "P2WLAN",
+    "versionCode": 168,
+    "versionName": "0.1.168",
+    "icon": "$media:app_icon",
+    "label": "$string:app_name"
+  }
+}

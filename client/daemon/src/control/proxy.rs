@@ -65,6 +65,16 @@ fn build_control_http_client(
     server_url: Option<&str>,
     outbound_interface: Option<&str>,
 ) -> Result<reqwest::Client> {
+    #[cfg(target_env = "ohos")]
+    if mode == ControlProxyMode::Direct
+        && server_url.is_some_and(|url| !control_server_is_local(url))
+        && outbound_interface.is_some()
+    {
+        return Err(DaemonError::ControlPlane(
+            "binding the control socket to a named interface is unsupported on HarmonyOS".into(),
+        ));
+    }
+
     let builder = reqwest::Client::builder();
 
     // `reqwest::ClientBuilder::interface` is unavailable on Windows. Keep
@@ -76,7 +86,7 @@ fn build_control_http_client(
         target_os = "fuchsia",
         target_os = "illumos",
         target_os = "ios",
-        target_os = "linux",
+        all(target_os = "linux", not(target_env = "ohos")),
         target_os = "macos",
         target_os = "solaris",
         target_os = "tvos",
@@ -100,7 +110,7 @@ fn build_control_http_client(
         target_os = "fuchsia",
         target_os = "illumos",
         target_os = "ios",
-        target_os = "linux",
+        all(target_os = "linux", not(target_env = "ohos")),
         target_os = "macos",
         target_os = "solaris",
         target_os = "tvos",

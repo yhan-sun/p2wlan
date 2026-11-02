@@ -1035,7 +1035,27 @@ class StatusStore extends ChangeNotifier {
             accountSessionKey(settingsStore.settings);
     try {
       final result = await _runDaemonCommand(() async {
-        final started = await daemonController.start(launchSettings);
+        int? vpnSettingsRevision;
+        try {
+          vpnSettingsRevision = await settingsStore
+              .ensureVpnEngineSettingsSnapshot();
+        } catch (_) {
+          return const DaemonCommandResult(
+            ok: false,
+            message: '无法发布 Harmony VPN 配置，已拒绝启动。',
+          );
+        }
+        if (!acceptsOwner() ||
+            !identical(launchSettings, settingsStore.settings)) {
+          return const DaemonCommandResult(
+            ok: false,
+            message: '启动期间配置已变化，请重试。',
+          );
+        }
+        final started = await daemonController.start(
+          launchSettings,
+          vpnSettingsRevision: vpnSettingsRevision,
+        );
         if (started.ok && acceptsOwner()) {
           _accountRequiresRestart = false;
           _primaryStartWitness = witness;

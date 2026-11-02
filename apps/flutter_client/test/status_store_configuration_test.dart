@@ -327,7 +327,10 @@ class _Controller extends DaemonController {
   Completer<void>? startEntered;
   Completer<void>? releaseStart;
   @override
-  Future<DaemonCommandResult> start(AppSettings settings) async {
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) async {
     launched.add(settings);
     if (startEntered?.isCompleted == false) startEntered!.complete();
     await releaseStart?.future;

@@ -39,6 +39,44 @@ pub(super) async fn register_device(
     Option<u64>,
     super::PeerCapabilities,
 )> {
+    register_device_with_cidr_policy(http, base_url, token, config, false).await
+}
+
+/// Register a device while requiring the server to provide the overlay CIDR.
+/// VPN platforms that must build the OS tunnel before the daemon starts cannot
+/// safely fill a missing CIDR with a client default.
+pub(super) async fn register_device_with_authoritative_cidr(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    config: &Config,
+) -> Result<(
+    String,
+    String,
+    String,
+    Vec<String>,
+    Vec<RelayCatalogEntry>,
+    Option<u64>,
+    super::PeerCapabilities,
+)> {
+    register_device_with_cidr_policy(http, base_url, token, config, true).await
+}
+
+async fn register_device_with_cidr_policy(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    config: &Config,
+    require_authoritative_cidr: bool,
+) -> Result<(
+    String,
+    String,
+    String,
+    Vec<String>,
+    Vec<RelayCatalogEntry>,
+    Option<u64>,
+    super::PeerCapabilities,
+)> {
     let res = http
         .post(format!("{base_url}/api/v1/devices"))
         .timeout(CONTROL_REQUEST_TIMEOUT)
@@ -79,7 +117,15 @@ pub(super) async fn register_device(
     let virtual_ip = body
         .virtual_ip
         .ok_or_else(|| DaemonError::ControlPlane("register response missing virtual_ip".into()))?;
-    let cidr = body.cidr.unwrap_or_else(|| "10.20.0.0/16".to_string());
+    let cidr = match body.cidr {
+        Some(cidr) => cidr,
+        None if require_authoritative_cidr => {
+            return Err(DaemonError::ControlPlane(
+                "register response missing authoritative cidr".into(),
+            ));
+        }
+        None => "10.20.0.0/16".to_string(),
+    };
     let local_incarnation = crate::incarnation::local_incarnation();
     // Old servers omit both fields.  Once either lifecycle field is present,
     // accepting a partial response would make this daemon publish unauthenticated

@@ -11,6 +11,7 @@ members = [
     "client/desktop-host",
     "client/tray",
     "client/android-native",
+    "client/harmony-native",
 ]
 resolver = "2"
 

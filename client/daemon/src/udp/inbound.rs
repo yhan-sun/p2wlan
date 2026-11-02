@@ -1271,6 +1271,7 @@ impl UdpTransport {
                                         generation,
                                         local_endpoint,
                                         Some(pending.remote_candidate_epoch),
+                                        purpose == PendingProbePurpose::ConsentCheck,
                                 )
                                 .await;
                             if accepted {
@@ -1315,22 +1316,6 @@ impl UdpTransport {
                                             format_optional_endpoint(local_endpoint),
                                             latency.as_millis(),
                                         ),
-                                        )
-                                        .await;
-                                }
-                                if purpose == PendingProbePurpose::ConsentCheck {
-                                    self.peers
-                                        .record_direct_event(
-                                            &identity.source_node_id,
-                                            "consent_ack_received",
-                                            Some(source),
-                                            Some(1),
-                                            None,
-                                            format!(
-                                                "received direct UDP consent ACK from {source} rtt={}ms local_endpoint={}",
-                                                latency.as_millis(),
-                                                format_optional_endpoint(local_endpoint)
-                                            ),
                                         )
                                         .await;
                                 }

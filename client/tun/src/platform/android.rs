@@ -1,10 +1,7 @@
-//! Android TUN device backed by an fd established by `VpnService.Builder`.
+//! VPN TUN device backed by an fd established by the platform VPN API.
 //!
-//! Android does not allow an application to create a kernel TUN interface in
-//! the same way as Linux. The Java/Kotlin `VpnService` owns route/address
-//! setup and passes the non-blocking fd returned by `establish()` to Rust.
-//! The fd carries raw IP packets because the builder is configured without
-//! packet-information or Ethernet headers.
+//! Android and HarmonyOS create the interface through their VPN service or
+//! extension, then hand its fd to Rust. The fd carries raw IP packets.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -23,14 +20,14 @@ use crate::config::InterfaceConfig;
 use crate::error::{Error, Result};
 use crate::interface::VirtualInterface;
 
-/// Selects the Android VPN TUN read implementation.
+/// Selects the VPN TUN read implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AndroidTunMode {
     /// The default implementation: Tokio waits for readiness on a nonblocking
     /// fd and performs the read/write in the daemon task.
     #[default]
     AsyncFd,
-    /// The experiment implementation: Android supplies a blocking fd and a
+    /// The experiment implementation: the platform supplies a blocking fd and a
     /// bounded reader/writer pair owns the blocking syscalls on dedicated
     /// threads. It can be removed independently if the A/B data does not
     /// justify it.
@@ -45,7 +42,7 @@ impl FromStr for AndroidTunMode {
             "async_fd" | "async" => Ok(Self::AsyncFd),
             "dedicated_blocking" | "blocking" => Ok(Self::DedicatedBlocking),
             other => Err(format!(
-                "unsupported Android TUN mode {other:?}; expected async_fd or dedicated_blocking"
+                "unsupported VPN TUN mode {other:?}; expected async_fd or dedicated_blocking"
             )),
         }
     }
@@ -81,7 +78,7 @@ impl DedicatedBlockingTun {
 
         let reader_stop = Arc::clone(&stop);
         let reader_thread = match thread::Builder::new()
-            .name("p2wlan-android-tun-reader".to_string())
+            .name("p2wlan-vpn-tun-reader".to_string())
             .spawn(move || Self::reader_loop(reader_fd, read_tx, reader_stop))
         {
             Ok(thread) => thread,
@@ -90,7 +87,7 @@ impl DedicatedBlockingTun {
 
         let writer_stop = Arc::clone(&stop);
         let writer_thread = match thread::Builder::new()
-            .name("p2wlan-android-tun-writer".to_string())
+            .name("p2wlan-vpn-tun-writer".to_string())
             .spawn(move || Self::writer_loop(writer_fd, write_rx, writer_stop))
         {
             Ok(thread) => thread,
@@ -126,7 +123,7 @@ impl DedicatedBlockingTun {
                 if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
-                        "Android VPN TUN fd was closed",
+                        "VPN TUN fd was closed",
                     ));
                 }
                 return Ok(descriptor.revents & events != 0);
@@ -172,7 +169,7 @@ impl DedicatedBlockingTun {
             if result == 0 {
                 let _ = read_tx.blocking_send(Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "Android VPN TUN returned EOF",
+                    "VPN TUN returned EOF",
                 )));
                 break;
             }
@@ -197,7 +194,7 @@ impl DedicatedBlockingTun {
             if stop.load(Ordering::Acquire) {
                 let _ = request.response.send(Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "Android VPN TUN writer stopped",
+                    "VPN TUN writer stopped",
                 )));
                 break;
             }
@@ -216,7 +213,7 @@ impl DedicatedBlockingTun {
                 },
                 Ok(false) => Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "Android VPN TUN writer stopped",
+                    "VPN TUN writer stopped",
                 )),
                 Err(error) => Err(error),
             };
@@ -233,7 +230,7 @@ impl DedicatedBlockingTun {
                 if packet.len() > buf.len() {
                     return Err(Error::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Android VPN TUN packet exceeds read buffer",
+                        "VPN TUN packet exceeds read buffer",
                     )));
                 }
                 buf[..packet.len()].copy_from_slice(&packet);
@@ -286,13 +283,13 @@ enum AndroidTunIo {
     Dedicated(DedicatedBlockingTun),
 }
 
-/// A raw-IP Android VPN interface supplied by `VpnService`.
+/// A raw-IP VPN interface supplied by the platform VPN service.
 pub struct AndroidTun {
     io: AndroidTunIo,
     name: String,
     mtu: u32,
     /// This is the daemon's logical overlay address. It may differ from the
-    /// provisional address used while Android establishes the VPN before a
+    /// provisional address used while the platform establishes the VPN before a
     /// managed control-plane registration returns the final VIP.
     address: String,
     is_up: bool,
@@ -307,7 +304,7 @@ impl AndroidTun {
         Self::from_raw_fd_with_mode(fd, config, AndroidTunMode::AsyncFd)
     }
 
-    /// Wrap an Android VPN fd using the selected read/write experiment mode.
+    /// Wrap a platform VPN fd using the selected read/write mode.
     pub fn from_raw_fd_with_mode(
         fd: i32,
         config: &InterfaceConfig,
@@ -315,13 +312,48 @@ impl AndroidTun {
     ) -> Result<Self> {
         if fd < 0 {
             return Err(Error::Platform(format!(
-                "Android VPN returned an invalid TUN fd: {fd}"
+                "VPN service returned an invalid TUN fd: {fd}"
             )));
         }
 
-        // Safety: the Android VPN service transfers ownership of this valid fd
-        // to Rust exactly once via detachFd().
+        // Safety: the platform VPN service transfers ownership of this valid
+        // fd to Rust exactly once.
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Self::from_owned_fd_with_mode(owned_fd, config, mode)
+    }
+
+    /// Adopt an already-owned VPN descriptor without converting through a
+    /// raw fd. Harmony's native bridge supplies a duplicate; the system-owned
+    /// descriptor stays with `VpnConnection`.
+    pub fn from_owned_fd(fd: OwnedFd, config: &InterfaceConfig) -> Result<Self> {
+        Self::from_owned_fd_with_mode(fd, config, AndroidTunMode::AsyncFd)
+    }
+
+    /// Adopt a descriptor only when the platform has already marked it
+    /// nonblocking. Harmony's fd contract is not device-verified, so this path
+    /// fails closed instead of changing file-status flags on a `dup()` that
+    /// shares the VPN descriptor's open-file description.
+    pub fn from_owned_fd_if_nonblocking(
+        owned_fd: OwnedFd,
+        config: &InterfaceConfig,
+    ) -> Result<Self> {
+        let owned_fd = super::fd::validate_ohos_vpn_fd(owned_fd)?;
+        let io = AndroidTunIo::Async(AsyncFd::new(owned_fd)?);
+        Ok(Self {
+            io,
+            name: config.name.clone(),
+            mtu: config.mtu,
+            address: config.address.to_string(),
+            is_up: true,
+        })
+    }
+
+    /// Adopt an owned descriptor using the selected read/write mode.
+    pub fn from_owned_fd_with_mode(
+        owned_fd: OwnedFd,
+        config: &InterfaceConfig,
+        mode: AndroidTunMode,
+    ) -> Result<Self> {
         let io = match mode {
             AndroidTunMode::AsyncFd => {
                 let raw_fd = owned_fd.as_raw_fd();
@@ -332,6 +364,15 @@ impl AndroidTun {
                     }
                     if libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
                         return Err(Error::Io(io::Error::last_os_error()));
+                    }
+                    let verified = libc::fcntl(raw_fd, libc::F_GETFL, 0);
+                    if verified < 0 {
+                        return Err(Error::Io(io::Error::last_os_error()));
+                    }
+                    if verified & libc::O_NONBLOCK == 0 {
+                        return Err(Error::Platform(
+                            "VPN TUN fd did not retain nonblocking mode".to_string(),
+                        ));
                     }
                 }
                 // SAFETY: the descriptor is owned exclusively by `owned_fd` and is
@@ -350,6 +391,15 @@ impl AndroidTun {
                     if libc::fcntl(raw_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0 {
                         return Err(Error::Io(io::Error::last_os_error()));
                     }
+                    let verified = libc::fcntl(raw_fd, libc::F_GETFL, 0);
+                    if verified < 0 {
+                        return Err(Error::Io(io::Error::last_os_error()));
+                    }
+                    if verified & libc::O_NONBLOCK != 0 {
+                        return Err(Error::Platform(
+                            "VPN TUN fd did not retain blocking mode".to_string(),
+                        ));
+                    }
                 }
                 AndroidTunIo::Dedicated(DedicatedBlockingTun::new(owned_fd)?)
             }
@@ -363,7 +413,7 @@ impl AndroidTun {
         })
     }
 
-    /// Android VPN interfaces are created by the platform service, not by
+    /// VPN interfaces are created by the platform service, not by
     /// opening `/dev/net/tun` from the daemon.
     pub fn create(_config: &InterfaceConfig) -> Result<Self> {
         Err(Error::Unsupported)
@@ -378,7 +428,7 @@ impl VirtualInterface for AndroidTun {
         }
         loop {
             let AndroidTunIo::Async(fd) = &mut self.io else {
-                unreachable!("dedicated Android TUN mode returned above");
+                unreachable!("dedicated VPN TUN mode returned above");
             };
             let mut guard = fd.readable().await?;
             match guard.try_io(|inner| {
@@ -403,7 +453,7 @@ impl VirtualInterface for AndroidTun {
         }
         loop {
             let AndroidTunIo::Async(fd) = &mut self.io else {
-                unreachable!("dedicated Android TUN mode returned above");
+                unreachable!("dedicated VPN TUN mode returned above");
             };
             let mut guard = fd.writable().await?;
             match guard.try_io(|inner| {
@@ -442,6 +492,6 @@ impl VirtualInterface for AndroidTun {
 impl Drop for AndroidTun {
     fn drop(&mut self) {
         self.is_up = false;
-        tracing::info!("Android VPN TUN interface {} closed", self.name);
+        tracing::info!("VPN TUN interface {} closed", self.name);
     }
 }

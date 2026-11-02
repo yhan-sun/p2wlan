@@ -507,7 +507,10 @@ class _FailingDaemonController extends DaemonController {
   _FailingDaemonController(DiagnosticsApi api) : super(diagnosticsApi: api);
 
   @override
-  Future<DaemonCommandResult> start(AppSettings settings) async {
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) async {
     return const DaemonCommandResult(
       ok: false,
       message: 'Daemon operation failed: SocketException SECRET',
@@ -551,7 +554,10 @@ class _HangingDaemonController extends DaemonController {
   final _start = Completer<DaemonCommandResult>();
 
   @override
-  Future<DaemonCommandResult> start(AppSettings settings) => _start.future;
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) => _start.future;
 
   @override
   Future<DaemonCommandResult> stop(String diagnosticsUrl) => _stop.future;

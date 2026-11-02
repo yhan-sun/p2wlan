@@ -11,7 +11,7 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 
-import '../platform/android_platform.dart';
+import '../platform/native_platform.dart';
 
 /// Platform-normalized directory the daemon writes its log and token files to.
 Directory defaultP2WlanLogDir() {
@@ -65,6 +65,12 @@ String diagnosticsAuthTokenPath() {
 /// Read the current per-process diagnostics auth token, or `null` when the
 /// daemon has not written one yet (not running, or just starting up).
 Future<String?> readDiagnosticsAuthToken() async {
+  if (Platform.operatingSystem == 'ohos') {
+    return const NativePlatformBridge(
+      operatingSystem: 'ohos',
+      channel: MethodChannel('p2wlan/platform'),
+    ).readDiagnosticsAuthToken();
+  }
   if (Platform.isAndroid) {
     try {
       final value = await const MethodChannel('p2wlan/android_vpn')

@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/models/diagnostics_models.dart';
+import '../layout/app_breakpoints.dart';
 
 /// The small leading glyph used by both Home's preview and the Devices list.
 ///
@@ -32,7 +33,14 @@ IconData peerDeviceIcon(PeerSnapshot peer) {
   };
 }
 
-IconData localDeviceIcon() {
+IconData localDeviceIcon(BuildContext context) {
+  // OH-Flutter adds an enum member that the upstream Flutter SDK does not have.
+  if (defaultTargetPlatform.name == 'ohos') {
+    return MediaQuery.sizeOf(context).shortestSide <
+            AppBreakpoints.compactMaxWidth
+        ? Icons.smartphone_rounded
+        : Icons.laptop_mac_rounded;
+  }
   return switch (defaultTargetPlatform) {
     TargetPlatform.android ||
     TargetPlatform.iOS ||

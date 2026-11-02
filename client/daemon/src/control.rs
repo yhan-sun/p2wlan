@@ -61,9 +61,10 @@ pub(crate) use http::{
 use http::{
     control_label_with_registration_seq, create_tunnel, fetch_relay_ticket_http,
     normalize_http_base_url, obtain_device_credential, poll_peers, poll_signals,
-    prepare_signal_payload, register_device, release_presence, route_aware_control_http_clients,
-    send_prepared_signal, send_signal, update_endpoint, RouteAwareControlHttpClient,
-    SignalDeliveryTracker, SignalSigningIdentity, SIGNAL_REST_PROTOCOL_VERSION,
+    prepare_signal_payload, register_device, register_device_with_authoritative_cidr,
+    release_presence, route_aware_control_http_clients, send_prepared_signal, send_signal,
+    update_endpoint, RouteAwareControlHttpClient, SignalDeliveryTracker, SignalSigningIdentity,
+    SIGNAL_REST_PROTOCOL_VERSION,
 };
 #[cfg(test)]
 use http::{register_device_payload, register_device_payload_with_incarnation};

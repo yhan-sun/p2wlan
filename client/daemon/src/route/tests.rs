@@ -3,7 +3,7 @@
 // ============================================================
 
 #[cfg(test)]
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod tests {
     use super::*;
     use std::sync::Arc;

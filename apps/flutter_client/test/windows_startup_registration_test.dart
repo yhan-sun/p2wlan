@@ -136,5 +136,14 @@ void main() {
       ),
       isFalse,
     );
+    expect(
+      shouldConnectAfterLoginStartup(
+        wasLaunchedAtLogin: true,
+        hasValidSession: true,
+        onboardingComplete: true,
+        canActAsLocalVpnNode: false,
+      ),
+      isFalse,
+    );
   });
 }

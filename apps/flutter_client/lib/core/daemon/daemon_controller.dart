@@ -10,7 +10,7 @@ import '../api/diagnostics_api.dart';
 import '../build_info.dart';
 import '../capabilities/permission_preflight.dart';
 import '../models/diagnostics_models.dart';
-import '../platform/android_platform.dart';
+import '../platform/native_platform.dart';
 import '../security/redactor.dart';
 import 'diagnostics_auth.dart';
 import 'runtime_identity.dart';
@@ -26,6 +26,7 @@ part 'daemon_controller/launch_token.dart';
 part 'daemon_controller/runtime_permissions.dart';
 part 'daemon_controller/pids.dart';
 part 'daemon_controller/android_vpn.dart';
+part 'daemon_controller/harmony_vpn.dart';
 part 'daemon_controller/startup_trace.dart';
 part 'daemon_controller/room_routes.dart';
 
@@ -159,11 +160,13 @@ class DaemonController {
   DaemonController({
     required this._diagnosticsApi,
     this.androidVpnTransport = const MethodChannelAndroidVpnTransport(),
+    HarmonyVpnTransport? harmonyVpnTransport,
     this.readMacosAdminPassword,
     this.saveMacosAdminPassword,
     this.clearMacosAdminPassword,
     this.roomInstanceId,
-  }) {
+  }) : harmonyVpnTransport =
+           harmonyVpnTransport ?? MethodChannelHarmonyVpnTransport() {
     if (roomInstanceId != null &&
         !RegExp(r'^[a-f0-9]{64}$').hasMatch(roomInstanceId!)) {
       throw ArgumentError.value(roomInstanceId, 'roomInstanceId');
@@ -185,6 +188,7 @@ class DaemonController {
   int? _authenticatedProcessId;
   int? _launchedProcessId;
   final AndroidVpnTransport androidVpnTransport;
+  final HarmonyVpnTransport harmonyVpnTransport;
 
   /// Returns the additive Android lifecycle identity when running on Android.
   /// Non-Android callers receive null without touching a platform channel.
@@ -256,7 +260,10 @@ class DaemonController {
   String get daemonLogPath =>
       '${_defaultLogDir().path}${Platform.pathSeparator}p2wlan-daemon.log';
 
-  Future<DaemonCommandResult> start(AppSettings settings) async {
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) async {
     final connectionError = settings.connectionRequirementError;
     if (connectionError != null) {
       return DaemonCommandResult(
@@ -276,6 +283,9 @@ class DaemonController {
       }
     }
     if (Platform.isAndroid) return _startAndroidVpn(settings);
+    if (Platform.operatingSystem == 'ohos') {
+      return _startHarmonyVpn(settings, vpnSettingsRevision);
+    }
     _lastDaemonBuildInfo = null;
     final startupTrace = _startupTrace = _supportsProcessControl
         ? WindowsStartupTrace(
@@ -749,6 +759,7 @@ class DaemonController {
 
   Future<DaemonCommandResult> stop(String diagnosticsUrl) async {
     if (Platform.isAndroid) return _stopAndroidVpn();
+    if (Platform.operatingSystem == 'ohos') return _stopHarmonyVpn();
     if (!_supportsProcessControl) {
       return const DaemonCommandResult(
         ok: false,

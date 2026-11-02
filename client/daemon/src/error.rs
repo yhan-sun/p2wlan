@@ -16,6 +16,69 @@ pub enum DaemonError {
     #[error("network error: {0}")]
     Network(String),
 
+    /// OHOS VPN interface identity was missing or invalid.
+    #[error("OHOS VPN identity invalid reason_code=ohos_vpn_identity_invalid")]
+    OhosVpnIdentityInvalid,
+
+    /// The route manager was already bound to a VPN identity.
+    #[error(
+        "OHOS VPN route authority already bound reason_code=ohos_route_authority_already_bound"
+    )]
+    OhosRouteAuthorityAlreadyBound,
+
+    /// The OHOS native bridge attempted to attach more than one startup waiter.
+    #[error(
+        "OHOS startup readiness waiter already bound reason_code=ohos_startup_ready_already_bound"
+    )]
+    OhosStartupReadyAlreadyBound,
+
+    /// The OHOS native bridge did not register a startup readiness receiver.
+    #[error("OHOS startup readiness waiter not bound reason_code=ohos_startup_ready_not_bound")]
+    OhosStartupReadyNotBound,
+
+    /// The supplied OHOS TUN worker failed before registering its first read.
+    #[error("OHOS TUN worker did not become ready reason_code=ohos_tun_worker_not_ready")]
+    OhosTunWorkerNotReady,
+
+    /// An essential OHOS dataplane task exited before startup readiness was published.
+    #[error(
+        "OHOS startup task is not running task={task} reason_code=ohos_startup_task_not_ready"
+    )]
+    OhosStartupTaskNotReady { task: String },
+
+    /// The native bridge stopped observing startup before the daemon became ready.
+    #[error(
+        "OHOS startup readiness receiver closed reason_code=ohos_startup_ready_receiver_closed"
+    )]
+    OhosStartupReadyReceiverClosed,
+
+    /// A CIDR supplied as an OHOS VPN route confirmation is malformed.
+    #[error(
+        "OHOS VPN route confirmation contains invalid CIDR reason_code=ohos_route_confirmation_invalid cidr={cidr}"
+    )]
+    OhosRouteConfirmationInvalid { cidr: String },
+
+    /// No successful create(config) route confirmation belongs to this VPN.
+    #[error("OHOS VPN route confirmation missing reason_code=ohos_route_confirmation_missing")]
+    OhosRouteConfirmationMissing,
+
+    /// The installed route proof belongs to a replaced VPN generation.
+    #[error(
+        "OHOS VPN route proof is stale reason_code=ohos_route_confirmation_stale current_instance_id={current_instance_id} current_generation={current_generation} confirmed_instance_id={confirmed_instance_id} confirmed_generation={confirmed_generation}"
+    )]
+    OhosRouteConfirmationStale {
+        current_instance_id: String,
+        current_generation: u64,
+        confirmed_instance_id: String,
+        confirmed_generation: u64,
+    },
+
+    /// The live VPN was not configured with this exact overlay CIDR.
+    #[error(
+        "OHOS VPN route was not configured reason_code=ohos_route_not_configured cidr={cidr} generation={generation}"
+    )]
+    OhosRouteNotConfigured { cidr: String, generation: u64 },
+
     /// A UDP datagram was synchronously rejected by the local kernel with
     /// EMSGSIZE/WSAEMSGSIZE. Keeping this typed prevents normal business sends
     /// from flattening PMTU evidence into an ordinary Direct health failure.

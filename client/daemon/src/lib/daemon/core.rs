@@ -139,6 +139,13 @@ pub struct Daemon {
     /// Android's VpnService establishes the TUN before the Rust daemon starts.
     #[cfg(target_os = "android")]
     android_tun_fd: Option<std::os::fd::RawFd>,
+    /// HarmonyOS's VPN Extension establishes the vNIC and supplies its fd.
+    #[cfg(target_env = "ohos")]
+    ohos_tun_fd: Option<std::os::fd::OwnedFd>,
+    /// One-shot handoff to the same-process native bridge after the TUN
+    /// packet worker has registered its first read and core startup completes.
+    #[cfg(target_env = "ohos")]
+    ohos_startup_ready: Option<tokio::sync::oneshot::Sender<()>>,
     /// Android TUN I/O experiment selected by the VpnService request.
     #[cfg(target_os = "android")]
     android_tun_mode: AndroidTunMode,
@@ -339,6 +346,10 @@ impl Daemon {
             handshake_retry_kick_tx,
             #[cfg(target_os = "android")]
             android_tun_fd: None,
+            #[cfg(target_env = "ohos")]
+            ohos_tun_fd: None,
+            #[cfg(target_env = "ohos")]
+            ohos_startup_ready: None,
             #[cfg(target_os = "android")]
             android_tun_mode: AndroidTunMode::AsyncFd,
             #[cfg(target_os = "android")]
@@ -370,6 +381,39 @@ impl Daemon {
         daemon.android_tun_fd = Some(tun_fd);
         daemon.android_tun_mode = mode;
         daemon
+    }
+
+    /// Construct a daemon around a duplicated VPN fd and route confirmation
+    /// from the current HarmonyOS VPN extension generation. The fd ownership
+    /// transfers to the daemon and then to `OhosTun` during startup.
+    #[cfg(target_env = "ohos")]
+    pub fn new_with_ohos_tun(
+        config: Config,
+        tun_fd: std::os::fd::OwnedFd,
+        identity: route::OhosVpnIdentity,
+        route_confirmation: Option<route::OhosVpnRouteConfirmation>,
+    ) -> Result<Self> {
+        let mut daemon = Self::new(config);
+        daemon
+            .route_manager
+            .bind_ohos_vpn(identity, route_confirmation)?;
+        daemon.ohos_tun_fd = Some(tun_fd);
+        Ok(daemon)
+    }
+
+    /// Attach the readiness sender consumed by the same-process OHOS native
+    /// bridge. The daemon signals it only after the supplied TUN worker has
+    /// registered its first async read and all initial core tasks are started.
+    #[cfg(target_env = "ohos")]
+    pub fn set_ohos_startup_ready(
+        &mut self,
+        ready: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<()> {
+        if self.ohos_startup_ready.is_some() {
+            return Err(DaemonError::OhosStartupReadyAlreadyBound);
+        }
+        self.ohos_startup_ready = Some(ready);
+        Ok(())
     }
 
     /// Attach the readiness flag used by the Android JNI lifecycle. This is

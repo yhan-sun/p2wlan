@@ -159,6 +159,8 @@ class _P2WlanShellState extends State<P2WlanShell> {
             body: Column(
               children: [
                 if (widget.updateResult != null &&
+                    (widget.capabilities ?? PlatformCapabilities.current())
+                        .canOpenExternalUrls &&
                     widget.onOpenUpdate != null &&
                     widget.onDismissUpdate != null)
                   UpdateBanner(

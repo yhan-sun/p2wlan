@@ -13,6 +13,8 @@ class _DeveloperSection extends StatelessWidget {
     final daemonBuild = daemon.lastDaemonBuildInfo;
     final canControl = state._capabilities.canControlLocalDaemon;
     final updateResult = state._updateCheckResult;
+    final nativeBuildInfo = state._nativeBuildInfo;
+    final vpnEngineStatus = state._vpnEngineStatus;
     final details = <(String, String)>[
       (strings.clientBuildIdentity, clientBuild.appVersion),
       (strings.buildCommitLabel, clientBuild.gitCommit),
@@ -27,6 +29,33 @@ class _DeveloperSection extends StatelessWidget {
         (strings.buildDirtyLabel, daemonBuild.dirtyLabel),
         (strings.buildDiffHashLabel, daemonBuild.diffHash),
         (strings.buildProfileLabel, daemonBuild.profile),
+      ],
+    ];
+    final copyDetails = <(String, String)>[
+      ...details,
+      if (nativeBuildInfo != null) ...[
+        (strings.nativeEngineVersionLabel, nativeBuildInfo.engineVersion),
+        (strings.nativeTargetLabel, nativeBuildInfo.target),
+        (strings.nativeArchLabel, nativeBuildInfo.arch),
+        (strings.nativeAbiVersionLabel, nativeBuildInfo.abiVersion.toString()),
+      ],
+      if (vpnEngineStatus != null) ...[
+        (
+          strings.vpnEngineStatusLabel,
+          strings.vpnEngineStatusValue(vpnEngineStatus.status),
+        ),
+        (strings.vpnEngineRevisionLabel, vpnEngineStatus.revision.toString()),
+        if (vpnEngineStatus.identity != null)
+          (
+            strings.vpnEngineGenerationLabel,
+            vpnEngineStatus.identity!.generation.toString(),
+          ),
+        (
+          strings.vpnEngineUpdatedAtLabel,
+          vpnEngineStatus.updatedAt.toIso8601String(),
+        ),
+        if (vpnEngineStatus.code != null)
+          (strings.vpnEngineCodeLabel, vpnEngineStatus.code!),
       ],
     ];
     return Column(
@@ -70,7 +99,8 @@ class _DeveloperSection extends StatelessWidget {
                 label: strings.latestVersionLabel,
                 value: updateResult!.update!.version.tag,
               ),
-            if (updateResult?.hasUpdate == true)
+            if (updateResult?.hasUpdate == true &&
+                state._capabilities.canOpenExternalUrls)
               Align(
                 alignment: Alignment.centerLeft,
                 child: FilledButton.icon(
@@ -195,6 +225,103 @@ class _DeveloperSection extends StatelessWidget {
             shape: const Border(),
             collapsedShape: const Border(),
             children: [
+              if (state._capabilities.canReadNativeBuildInfo) ...[
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton.icon(
+                    key: const Key('settings-read-vpn-engine-status'),
+                    onPressed: state._vpnEngineStatusLoading
+                        ? null
+                        : () => state._queryVpnEngineStatus(),
+                    icon: state._vpnEngineStatusLoading
+                        ? const SizedBox.square(
+                            dimension: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.vpn_key_outlined, size: 18),
+                    label: Text(
+                      state._vpnEngineStatusLoading
+                          ? strings.settingsVpnEngineStatusLoading
+                          : strings.settingsVpnEngineStatus,
+                    ),
+                  ),
+                ),
+                if (state._vpnEngineStatusError != null)
+                  _SettingsErrorNotice(
+                    message: strings.vpnEngineStatusFailed(
+                      state._vpnEngineStatusError!,
+                    ),
+                  ),
+                if (vpnEngineStatus != null) ...[
+                  _SettingsValue(
+                    label: strings.vpnEngineStatusLabel,
+                    value: strings.vpnEngineStatusValue(vpnEngineStatus.status),
+                  ),
+                  _SettingsValue(
+                    label: strings.vpnEngineRevisionLabel,
+                    value: vpnEngineStatus.revision.toString(),
+                  ),
+                  if (vpnEngineStatus.identity != null)
+                    _SettingsValue(
+                      label: strings.vpnEngineGenerationLabel,
+                      value: vpnEngineStatus.identity!.generation.toString(),
+                    ),
+                  _SettingsValue(
+                    label: strings.vpnEngineUpdatedAtLabel,
+                    value: vpnEngineStatus.updatedAt.toIso8601String(),
+                  ),
+                  if (vpnEngineStatus.code != null)
+                    _SettingsValue(
+                      label: strings.vpnEngineCodeLabel,
+                      value: vpnEngineStatus.code!,
+                    ),
+                ],
+                const SizedBox(height: 12),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton.icon(
+                    key: const Key('settings-read-native-build-info'),
+                    onPressed: state._nativeBuildInfoLoading
+                        ? null
+                        : () => state._queryNativeBuildInfo(),
+                    icon: state._nativeBuildInfoLoading
+                        ? const SizedBox.square(
+                            dimension: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.memory_outlined, size: 18),
+                    label: Text(
+                      state._nativeBuildInfoLoading
+                          ? strings.settingsNativeBuildInfoLoading
+                          : strings.settingsNativeBuildInfo,
+                    ),
+                  ),
+                ),
+                if (state._nativeBuildInfoError != null)
+                  _SettingsErrorNotice(
+                    message: strings.nativeBuildInfoFailed(
+                      state._nativeBuildInfoError!,
+                    ),
+                  ),
+                if (nativeBuildInfo != null) ...[
+                  _SettingsValue(
+                    label: strings.nativeEngineVersionLabel,
+                    value: nativeBuildInfo.engineVersion,
+                  ),
+                  _SettingsValue(
+                    label: strings.nativeTargetLabel,
+                    value: nativeBuildInfo.target,
+                  ),
+                  _SettingsValue(
+                    label: strings.nativeArchLabel,
+                    value: nativeBuildInfo.arch,
+                  ),
+                  _SettingsValue(
+                    label: strings.nativeAbiVersionLabel,
+                    value: nativeBuildInfo.abiVersion.toString(),
+                  ),
+                ],
+              ],
               Align(
                 alignment: Alignment.centerLeft,
                 child: TextButton.icon(
@@ -202,7 +329,7 @@ class _DeveloperSection extends StatelessWidget {
                   onPressed: () async {
                     await Clipboard.setData(
                       ClipboardData(
-                        text: details
+                        text: copyDetails
                             .map((row) => '${row.$1}: ${row.$2}')
                             .join('\n'),
                       ),

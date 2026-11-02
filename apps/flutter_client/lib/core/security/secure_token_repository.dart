@@ -11,7 +11,7 @@
 
 import 'dart:io';
 
-import '../platform/android_platform.dart';
+import '../platform/native_platform.dart';
 
 abstract interface class SecureTokenRepository {
   /// Read the stored token, or `null` when none is stored.
@@ -59,7 +59,7 @@ class LocalTokenRepository implements SecureTokenRepository {
     if (override != null) return override;
     final applicationSupport = await resolveApplicationSupportDirectory();
     if (applicationSupport == null) {
-      throw StateError('Android application support directory is unavailable.');
+      throw StateError('Native application support directory is unavailable.');
     }
     return File(
       '${applicationSupport.path}${Platform.pathSeparator}$_fileName',
@@ -90,9 +90,13 @@ class LocalTokenRepository implements SecureTokenRepository {
       }
     }
 
-    // This is retained only for unsupported/sandboxed runtimes that do not
-    // expose a stable application-data directory. Android is handled above by
-    // the Context-backed application support directory.
+    if (Platform.operatingSystem == 'ohos') {
+      throw StateError('HarmonyOS application storage bridge is unavailable.');
+    }
+
+    // This is retained only for unsupported runtimes that do not expose a
+    // stable application-data directory. Android and HarmonyOS use their
+    // Context-backed application support directory.
     return Directory(
       '${Directory.systemTemp.path}${Platform.pathSeparator}p2wlan-client',
     );
@@ -127,7 +131,9 @@ class LocalTokenRepository implements SecureTokenRepository {
   @override
   Future<String?> read() async {
     try {
-      final file = Platform.isAndroid ? await _tokenFile() : _tokenFileSync();
+      final file = usesNativeApplicationSupportDirectory
+          ? await _tokenFile()
+          : _tokenFileSync();
       var source = file;
       if (!await source.exists()) {
         final legacy = _legacyAndroidTokenFile();
@@ -155,7 +161,9 @@ class LocalTokenRepository implements SecureTokenRepository {
       if (trimmed.isEmpty) {
         await clear();
       } else {
-        final file = Platform.isAndroid ? await _tokenFile() : _tokenFileSync();
+        final file = usesNativeApplicationSupportDirectory
+            ? await _tokenFile()
+            : _tokenFileSync();
         await _writeFile(file, trimmed);
       }
     } catch (_) {
@@ -168,7 +176,9 @@ class LocalTokenRepository implements SecureTokenRepository {
   @override
   Future<void> clear() async {
     try {
-      final file = Platform.isAndroid ? await _tokenFile() : _tokenFileSync();
+      final file = usesNativeApplicationSupportDirectory
+          ? await _tokenFile()
+          : _tokenFileSync();
       if (await file.exists()) await file.delete();
       final legacy = _legacyAndroidTokenFile();
       if (legacy != null && await legacy.exists()) await legacy.delete();

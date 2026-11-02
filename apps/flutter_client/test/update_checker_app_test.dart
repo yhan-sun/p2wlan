@@ -28,6 +28,7 @@ void main() {
             authToken: 'test-account-token',
             languageCode: 'en',
             onboardingCompleted: true,
+            deviceName: 'Update test device',
           ),
         );
       });

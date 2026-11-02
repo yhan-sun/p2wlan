@@ -573,7 +573,8 @@ Future<_FakeDaemonController> _pumpTestApp(WidgetTester tester) async {
     // Complete onboarding so these shell tests reach the main UI (the
     // onboarding flow is covered by onboarding_page_test.dart).
     await settingsStore.updateSettings(
-      const AppSettings(
+      settingsStore.settings.copyWith(
+        deviceName: 'Widget test device',
         controlServer: 'https://control.example.com',
         authToken: 'test-account-token',
         onboardingCompleted: true,

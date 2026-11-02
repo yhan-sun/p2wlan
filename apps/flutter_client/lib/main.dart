@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:app_links/app_links.dart';
@@ -8,13 +9,17 @@ import 'package:window_manager/window_manager.dart';
 import 'app/desktop_tray_controller.dart';
 import 'app/desktop_window_operations.dart';
 import 'app/p2wlan_app.dart';
+import 'core/capabilities/platform_capabilities.dart';
 import 'core/platform/desktop_startup_registration.dart';
 import 'core/traffic/traffic_history_store.dart';
 
 Future<void> main() async {
   writeDesktopTrayLifecycleTrace('main.ensureInitialized.begin');
   WidgetsFlutterBinding.ensureInitialized();
-  final appLinks = AppLinks();
+  final capabilities = PlatformCapabilities.current();
+  final roomLinks = capabilities.canReceiveRoomLinks
+      ? AppLinks().uriLinkStream
+      : const Stream<Uri>.empty();
   writeDesktopTrayLifecycleTrace('main.ensureInitialized.end');
   final enableFlutterTray = _enableFlutterTray;
   final launchedAtLogin = isLoginStartupInvocation(
@@ -32,7 +37,7 @@ Future<void> main() async {
   runApp(
     P2WlanApp(
       trafficHistoryStore: TrafficHistoryStore(),
-      roomLinks: appLinks.uriLinkStream,
+      roomLinks: roomLinks,
       enableDesktopTray: enableFlutterTray,
       enableDesktopTaskbarStatus: _supportsDesktopHost && !enableFlutterTray,
       connectAfterLoginStartup: _supportsDesktopHost && launchedAtLogin,

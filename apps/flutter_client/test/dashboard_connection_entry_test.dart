@@ -40,7 +40,10 @@ class _Controller extends DaemonController {
   Completer<DaemonCommandResult>? pendingStart;
 
   @override
-  Future<DaemonCommandResult> start(AppSettings settings) async {
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) async {
     starts.add(settings);
     return pendingStart?.future ??
         const DaemonCommandResult(ok: false, message: 'Fixture start refused');

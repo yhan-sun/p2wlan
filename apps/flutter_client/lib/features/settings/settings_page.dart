@@ -17,6 +17,7 @@ import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/diagnostics/session_log_bundle.dart';
 import '../../core/diagnostics/support_status_capture.dart';
 import '../../core/models/diagnostics_models.dart';
+import '../../core/platform/native_platform.dart';
 import '../../core/platform/windows_startup_registration.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -161,6 +162,12 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _immediateSaved;
   String? _immediateError;
   String? _logUploadError;
+  var _nativeBuildInfoLoading = false;
+  NativeBuildInfo? _nativeBuildInfo;
+  String? _nativeBuildInfoError;
+  var _vpnEngineStatusLoading = false;
+  VpnEngineStatusSnapshot? _vpnEngineStatus;
+  String? _vpnEngineStatusError;
 
   /// Rebuilds a full-screen mobile category route when draft-only state
   /// changes. Settings/status stores and text controllers have their own

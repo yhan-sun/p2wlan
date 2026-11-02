@@ -6,10 +6,11 @@ import 'package:flutter/foundation.dart';
 
 import '../api/diagnostics_api.dart';
 import '../models/diagnostics_models.dart';
-import '../platform/android_platform.dart';
+import '../platform/native_platform.dart';
 import '../rooms/room_profiles.dart';
 import '../security/local_config_secret.dart';
 import '../security/secure_token_repository.dart';
+import 'vpn_engine_settings_snapshot.dart';
 
 class SettingsCredentialRestoreException implements Exception {
   const SettingsCredentialRestoreException(
@@ -29,12 +30,17 @@ class SettingsCredentialRestoreException implements Exception {
 }
 
 class SettingsStore extends ChangeNotifier {
-  SettingsStore({File? settingsFile, SecureTokenRepository? tokenRepository})
-    : _settingsFileOverride = settingsFile {
+  SettingsStore({
+    File? settingsFile,
+    SecureTokenRepository? tokenRepository,
+    VpnEngineSettingsSnapshotWriter? vpnEngineSnapshotWriter,
+  }) : _settingsFileOverride = settingsFile,
+       _vpnEngineSnapshotWriterOverride = vpnEngineSnapshotWriter {
     _tokenRepository = tokenRepository ?? LocalTokenRepository();
   }
 
   final File? _settingsFileOverride;
+  final VpnEngineSettingsSnapshotWriter? _vpnEngineSnapshotWriterOverride;
   late final SecureTokenRepository _tokenRepository;
 
   Future<void> Function(
@@ -60,7 +66,7 @@ class SettingsStore extends ChangeNotifier {
   Future<void> load() async {
     AppSettings? parsedSettings;
     try {
-      final file = Platform.isAndroid
+      final file = usesNativeApplicationSupportDirectory
           ? await _settingsFile()
           : _settingsFileSync();
       _configPath = file.path;
@@ -122,6 +128,14 @@ class SettingsStore extends ChangeNotifier {
             .copyWith(authToken: (await _tokenRepository.read()) ?? '');
       }
       _lastError = null;
+      try {
+        await _publishVpnEngineSettingsSnapshot();
+      } catch (error) {
+        // Keep the Flutter shell usable for login and recovery. The extension
+        // cannot start from defaults: a missing, malformed, or stale snapshot
+        // remains a fail-closed condition for its reader.
+        _lastError = 'Failed to synchronize local engine settings: $error';
+      }
     } catch (error) {
       _lastError = 'Failed to load local settings: $error';
       // Keep the parsed legacy value in memory when secure migration fails so
@@ -361,7 +375,7 @@ class SettingsStore extends ChangeNotifier {
       throw const FormatException('管理员密码不能为空。');
     }
     await _enqueueSettingsWrite(() async {
-      final file = Platform.isAndroid
+      final file = usesNativeApplicationSupportDirectory
           ? await _settingsFile()
           : _settingsFileSync();
       final ciphertext = await LocalConfigSecret.encrypt(
@@ -411,8 +425,9 @@ class SettingsStore extends ChangeNotifier {
   Future<void> _save(AppSettings candidate) async {
     final previousToken = _settings.authToken;
     var credentialWritten = false;
+    File? committedSettingsFile;
     try {
-      final file = Platform.isAndroid
+      final file = usesNativeApplicationSupportDirectory
           ? await _settingsFile()
           : _settingsFileSync();
       _configPath = file.path;
@@ -421,8 +436,23 @@ class SettingsStore extends ChangeNotifier {
       await _tokenRepository.write(candidate.authToken);
       credentialWritten = true;
       await _writeSettingsFile(file, candidate: candidate);
+      committedSettingsFile = file;
+      if (!vpnEngineSettingsEqual(_settings, candidate)) {
+        await _publishVpnEngineSettingsSnapshot(
+          settingsFile: file,
+          candidate: candidate,
+        );
+      }
       _lastError = null;
     } catch (error) {
+      Object? settingsRestoreError;
+      if (committedSettingsFile != null) {
+        try {
+          await _writeSettingsFile(committedSettingsFile, candidate: _settings);
+        } catch (restoreError) {
+          settingsRestoreError = restoreError;
+        }
+      }
       if (credentialWritten && candidate.authToken != previousToken) {
         try {
           await _tokenRepository.write(previousToken);
@@ -442,9 +472,48 @@ class SettingsStore extends ChangeNotifier {
           throw failure;
         }
       }
+      if (settingsRestoreError != null) {
+        _lastError =
+            'Failed to save local settings and restore the previous revision.';
+        throw StateError(_lastError!);
+      }
       _lastError = 'Failed to save local settings: $error';
       rethrow;
     }
+  }
+
+  /// Ensures the exact current Harmony settings revision is published before
+  /// an Extension start request is issued.
+  Future<int?> ensureVpnEngineSettingsSnapshot() async {
+    if (Platform.operatingSystem != 'ohos') return null;
+    int? revision;
+    await _enqueueSettingsWrite(() async {
+      revision = await _publishVpnEngineSettingsSnapshot();
+    });
+    return revision;
+  }
+
+  Future<int?> _publishVpnEngineSettingsSnapshot({
+    File? settingsFile,
+    AppSettings? candidate,
+  }) async {
+    final injected = _vpnEngineSnapshotWriterOverride;
+    if (injected == null && Platform.operatingSystem != 'ohos') return null;
+
+    final settings =
+        settingsFile ??
+        (usesNativeApplicationSupportDirectory
+            ? await _settingsFile()
+            : _settingsFileSync());
+    final writer =
+        injected ??
+        FileVpnEngineSettingsSnapshotWriter(
+          file: File(
+            '${settings.parent.path}${Platform.pathSeparator}'
+            'vpn-engine-settings-v1.json',
+          ),
+        );
+    return writer.publish(candidate ?? _settings);
   }
 
   File _settingsFileSync() {
@@ -461,7 +530,7 @@ class SettingsStore extends ChangeNotifier {
     if (override != null) return override;
     final applicationSupport = await resolveApplicationSupportDirectory();
     if (applicationSupport == null) {
-      throw StateError('Android application support directory is unavailable.');
+      throw StateError('Native application support directory is unavailable.');
     }
     return File(
       '${applicationSupport.path}${Platform.pathSeparator}flutter-client-settings.json',
@@ -581,6 +650,9 @@ class SettingsStore extends ChangeNotifier {
   }
 
   Directory _configDirectorySync() {
+    if (Platform.operatingSystem == 'ohos') {
+      throw StateError('HarmonyOS application storage bridge is unavailable.');
+    }
     if (Platform.isMacOS) {
       final home = Platform.environment['HOME'];
       if (home != null && home.isNotEmpty) {
