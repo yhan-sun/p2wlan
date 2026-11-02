@@ -186,6 +186,7 @@ export default class P2wlanVpnExtensionAbility extends VpnExtensionAbility {
         return;
       }
 
+      this.requireCurrentSettingsRevision(request.settingsRevision);
       const identityStorePath = `${this.context.filesDir}/p2wlan/vpn-engine-identity-v1.bin`;
       this.state = 'network_preparing';
       this.report('VPN_NETWORK_PREPARATION_REQUESTED');
@@ -240,6 +241,9 @@ export default class P2wlanVpnExtensionAbility extends VpnExtensionAbility {
         await this.destroyVpnAfterNativeStopAsync();
         return;
       }
+      // Creating the system VPN is asynchronous. Never hand the native owner
+      // credentials or routes from a settings revision replaced during it.
+      this.requireCurrentSettingsRevision(request.settingsRevision);
 
       const identity: OhosVpnIdentityV1 = {
         instanceId: instanceId,
@@ -285,6 +289,9 @@ export default class P2wlanVpnExtensionAbility extends VpnExtensionAbility {
           'NATIVE_START_RESULT_INVALID'
         );
       }
+      // The native start can also outlive a settings change. Its fd must be
+      // drained by the catch path before the old VPN is destroyed.
+      this.requireCurrentSettingsRevision(request.settingsRevision);
       this.preflightReserved = false;
       this.state = 'running';
       this.report('ENGINE_READY');
@@ -345,6 +352,13 @@ export default class P2wlanVpnExtensionAbility extends VpnExtensionAbility {
       revision: snapshot.revision,
       settings: copied
     };
+  }
+
+  private requireCurrentSettingsRevision(expected: number): void {
+    const current = readP2wlanVpnEngineSettingsSnapshot(this.context.filesDir);
+    if (current.revision != expected) {
+      throw new P2wlanVpnSettingsSnapshotError('VPN_ENGINE_SETTINGS_SNAPSHOT_STALE');
+    }
   }
 
   private discardPreflightReservation(
@@ -571,12 +585,53 @@ export default class P2wlanVpnExtensionAbility extends VpnExtensionAbility {
         this.stopStatusHeartbeat();
         return;
       }
+      if (this.state == 'running' && !this.confirmNativeRunning()) {
+        return;
+      }
       try {
         this.publishStatus();
       } catch (_error) {
         console.info('[P2WLAN][VPN] VPN_ENGINE_STATUS_SNAPSHOT_WRITE_FAILED');
       }
     }, 5000);
+  }
+
+  private confirmNativeRunning(): boolean {
+    const nativeEngine = this.nativeEngine;
+    const identity = this.identity;
+    let code: string = 'NATIVE_ENGINE_STATUS_UNAVAILABLE';
+    if (nativeEngine != null && identity != null) {
+      try {
+        const current = nativeEngine.getVpnEngineStatusV1(identity);
+        if (current != undefined && current.status == 'ready') {
+          return true;
+        }
+        code = current != undefined && typeof current.code == 'string' &&
+          /^[a-z][a-z0-9_]{0,63}$/.test(current.code)
+          ? current.code : 'NATIVE_ENGINE_NOT_READY';
+      } catch (_error) {
+        // Query failure is not evidence that the fd owner has stopped.
+      }
+    }
+    this.state = 'stopping';
+    this.report(code);
+    if (nativeEngine != null && identity != null) {
+      try {
+        const stopped = nativeEngine.stopVpnEngineForExtensionDestroyV1(
+          identity, EXTENSION_STOP_TIMEOUT_MS
+        );
+        if (isNativeVpnStopped(stopped)) {
+          this.engineMayOwnFd = false;
+          this.destroyVpnAfterNativeStop();
+          return false;
+        }
+      } catch (_error) {
+        // Preserve the native owner until an exact, bounded stop is confirmed.
+      }
+    }
+    this.state = 'draining';
+    this.report('ENGINE_STOP_DRAINING');
+    return false;
   }
 
   private stopStatusHeartbeat(): void {

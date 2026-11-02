@@ -45,10 +45,12 @@ bash scripts/flutter_harmony.sh test --no-pub
 bash scripts/flutter_harmony.sh build hap --debug --no-pub --no-codesign --target-platform ohos-arm64
 ```
 
-停止回执的 host 竞争回归使用 Node.js 和已安装的 TypeScript 模块，在
-`apps/flutter_client/` 中运行 `node --test scripts/tests/harmony_stop_snapshot.test.cjs`。
+生命周期与停止回执的 host 竞争回归使用 Node.js 和已安装的 TypeScript 模块，在
+`apps/flutter_client/` 中运行
+`node --test scripts/tests/harmony_extension_lifecycle.test.cjs scripts/tests/harmony_stop_snapshot.test.cjs`。
 若 Node 无法解析 TypeScript，可用 `P2WLAN_TYPESCRIPT_MODULE` 指定其模块文件。
-该测试适配 SDK 文件接口，验证延迟交接、过期会话、超时和 draining；系统 VPN 仍需设备实测。
+测试适配 SDK 文件与 Native 接口，验证异步启动期间的配置替换、运行中 Native 失败、
+延迟交接、过期会话、超时和 draining；CI 会执行这些 host 契约，系统 VPN 仍需设备实测。
 
 未签名构建输出为 `build/ohos/hap/entry-default-unsigned.hap`。安装前仍需
 配置适用的调试签名。`local.properties`、SDK 插件生成的 npm 路径文件、
@@ -65,6 +67,8 @@ Rust 引擎启动时启用 `127.0.0.1:39277` 本地诊断服务，并为本次�
 Bearer 令牌，原子写入应用私有目录中的 `p2wlan-daemon.diag-auth`，权限为 `0600`。
 Flutter 经 `p2wlan/platform` 读取当前令牌后查询引擎状态；令牌不进入设置快照或日志。
 停止和启动失败会清理本次令牌；读取失败或格式错误时诊断认证保持失败。
+扩展每五秒发布状态前查询同一 Native 实例和 generation；Native 已退出或查询失败时
+停止发布就绪，先有界确认 Native 停止，再销毁系统 VPN。未确认停止时保留 draining。
 
 运行时提供 `generateVpnId()` 时使用系统 VPN ID；缺少该方法时生成本地随机 UUID，
 仅用于 Native 生命周期的实例隔离，并省略系统配置的 `vpnId`。两种路径都必须实际完成

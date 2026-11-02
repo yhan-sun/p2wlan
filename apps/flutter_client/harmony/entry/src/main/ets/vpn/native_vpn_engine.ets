@@ -84,6 +84,11 @@ export interface NativeVpnStopCompleteV1 {
   status: 'stopped';
 }
 
+export interface NativeVpnEngineStatusV1 {
+  status: 'starting' | 'ready' | 'stopping' | 'stopped' | 'failed';
+  code?: string;
+}
+
 export interface NativeVpnEngineModuleV1 {
   prepareVpnNetworkV1(request: NativeVpnNetworkRequestV1): Promise<NativeVpnNetworkResultV1>;
   discardVpnNetworkV1(identityStorePath: string): boolean;
@@ -93,6 +98,7 @@ export interface NativeVpnEngineModuleV1 {
     identity: OhosVpnIdentityV1,
     timeoutMs: number
   ): NativeVpnStopResultV1;
+  getVpnEngineStatusV1(identity: OhosVpnIdentityV1): NativeVpnEngineStatusV1;
 }
 
 interface NativeVpnEngineModuleNamespaceV1 {
@@ -122,7 +128,8 @@ export async function loadNativeVpnEngineV1(): Promise<NativeVpnEngineModuleV1> 
       typeof candidate.discardVpnNetworkV1 != 'function' ||
       typeof candidate.startVpnEngineV1 != 'function' ||
       typeof candidate.stopVpnEngineV1 != 'function' ||
-      typeof candidate.stopVpnEngineForExtensionDestroyV1 != 'function') {
+      typeof candidate.stopVpnEngineForExtensionDestroyV1 != 'function' ||
+      typeof candidate.getVpnEngineStatusV1 != 'function') {
     throw new NativeVpnAdapterError('NATIVE_VPN_API_UNAVAILABLE');
   }
   return candidate;
