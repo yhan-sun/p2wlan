@@ -18,6 +18,7 @@
     · <a href="#适用场景">适用场景</a>
     · <a href="#工作方式">工作方式</a>
     · <a href="#自托管">自托管</a>
+    · <a href="#社区交流">社区交流</a>
   </p>
 
   <p>
@@ -34,7 +35,6 @@
 <p align="center">
   <img src="assets/readme/hero.webp" width="100%" alt="P2WLAN — 让异地设备像在同一局域网中一样互联" />
 </p>
-<img width="1284" height="2289" alt="qrcode_1793870649579" src="https://github.com/user-attachments/assets/aecb8a79-dab3-46b4-8293-5ddc348b693d" />
 
 ## P2WLAN 是什么
 
@@ -340,6 +340,18 @@ Flutter 开发和发布统一使用 **Flutter 3.47.2 / Dart 3.13.2**，仓库根
 - [`server/relay/`](server/relay/) — Go Relay
 
 构建、检查与贡献约定见 [CONTRIBUTING.md](CONTRIBUTING.md)，完整文档入口见 [docs/README.md](docs/README.md)。实现细节请优先以源码、测试和 CI 为准。
+
+## 社区交流
+
+欢迎加入 QQ 群，交流使用体验、组网问题和功能建议。
+
+<p align="center">
+  <strong>P2WLAN 群 1 · 群号：616957753</strong><br />
+  <a href="assets/readme/qq-group.png">
+    <img src="assets/readme/qq-group.png" width="240" alt="P2WLAN QQ 群 1 加群二维码，群号 616957753" />
+  </a><br />
+  <sub>使用 QQ 扫码或搜索群号加入；点击图片查看原图。</sub>
+</p>
 
 ## License
 

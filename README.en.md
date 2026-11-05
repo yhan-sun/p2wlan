@@ -21,6 +21,7 @@
     · <a href="#use-cases">Use Cases</a>
     · <a href="#how-it-works">How It Works</a>
     · <a href="#self-hosting">Self-hosting</a>
+    · <a href="#community">Community</a>
   </p>
 
   <p>
@@ -340,6 +341,18 @@ Repository structure:
 - [`server/relay/`](server/relay/) — Go Relay
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build, validation, and contribution rules, and [docs/README.md](docs/README.md) for the complete documentation index. Prefer source, tests, and CI as the source of truth for implementation details.
+
+## Community
+
+Join our Chinese-language QQ group to discuss usage, networking questions, and feature ideas.
+
+<p align="center">
+  <strong>P2WLAN Group 1 · QQ group: 616957753</strong><br />
+  <a href="assets/readme/qq-group.png">
+    <img src="assets/readme/qq-group.png" width="240" alt="QR code for P2WLAN QQ Group 1, group number 616957753" />
+  </a><br />
+  <sub>Scan with QQ or search for the group number to join; click the image to view it full size.</sub>
+</p>
 
 ## License
 
