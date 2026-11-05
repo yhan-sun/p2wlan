@@ -34,6 +34,7 @@
 <p align="center">
   <img src="assets/readme/hero.webp" width="100%" alt="P2WLAN — 让异地设备像在同一局域网中一样互联" />
 </p>
+<img width="1284" height="2289" alt="qrcode_1793870649579" src="https://github.com/user-attachments/assets/aecb8a79-dab3-46b4-8293-5ddc348b693d" />
 
 ## P2WLAN 是什么
 
