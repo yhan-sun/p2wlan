@@ -5,10 +5,14 @@ class _RoomHomeOverview extends StatelessWidget {
     required this.overview,
     required this.selectedId,
     required this.trafficSection,
+    required this.statusStore,
     this.onOpenDevices,
     this.onOpenRooms,
     this.onOpenRoom,
     this.onOpenPeer,
+    this.onOpenRoomDevice,
+    this.onOpenTroubleshooting,
+    this.onReauthenticate,
   });
 
   final NetworkOverview overview;
@@ -18,6 +22,38 @@ class _RoomHomeOverview extends StatelessWidget {
   final VoidCallback? onOpenRooms;
   final ValueChanged<String>? onOpenRoom;
   final ValueChanged<PeerSnapshot>? onOpenPeer;
+  final void Function(String roomId, String deviceId)? onOpenRoomDevice;
+  final VoidCallback? onOpenTroubleshooting;
+  final VoidCallback? onReauthenticate;
+  final StatusStore statusStore;
+
+  String _issueReason(AppStrings strings, NetworkScopeSnapshot scope) {
+    final health = scope.snapshot?.health;
+    if (health?.reauthRequired == true) return strings.issueReauthRequired;
+    final message = scope.roomId == null
+        ? null
+        : statusStore.parallelRooms.sessions[scope.roomId]?.message;
+    if (message != null && message.trim().isNotEmpty) {
+      return RoomStrings(strings.isZh).runtimeText(message);
+    }
+    if (scope.state == NetworkDisplayState.stale) return strings.homeStaleNote;
+    if (health != null && !health.controlConnected) {
+      if (health.controlApiReachable && !health.deviceLeaseHealthy) {
+        return strings.issueDeviceLeaseLost;
+      }
+      return strings.issueControlDisconnected;
+    }
+    if (health?.criticalTasks.any((task) => task.error != null) == true) {
+      return strings.issueCriticalTaskDetail;
+    }
+    if (scope.snapshot?.relaySelection.lastError?.isNotEmpty == true) {
+      return strings.issueRelayDetail;
+    }
+    if (scope.state == NetworkDisplayState.attention) {
+      return strings.issueServiceStatusDetail;
+    }
+    return networkDisplayStateLabel(strings, scope.state);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -26,12 +62,42 @@ class _RoomHomeOverview extends StatelessWidget {
     final peers = [for (final scope in scopes) ...scope.peers];
     final online = peers.where((item) => item.online).toList();
     final available = peers.where((item) => item.available).length;
+    final running = scopes
+        .where((scope) => !scope.isPrimary && scope.isRunning)
+        .length;
     final (tone, label, _) = networkOverviewStatus(strings, overview);
     final selected = selectedId == null ? null : scopes.first;
-    final displayedScopes = scopes.where(
-      (scope) => !scope.isPrimary || scope.state != NetworkDisplayState.stopped,
-    );
-    final theme = Theme.of(context);
+    final selectedRoomId = selected?.roomId;
+    final VoidCallback? roomAction =
+        selectedRoomId != null && onOpenRoom != null
+        ? () => onOpenRoom!(selectedRoomId)
+        : onOpenRooms;
+    final hasRunning = scopes.any((scope) => scope.isRunning);
+    final hasRoom = scopes.any((scope) => scope.roomId != null);
+    final roomActionLabel = !hasRoom
+        ? (strings.isZh ? '查看房间' : 'View rooms')
+        : !hasRunning
+        ? (strings.isZh ? '连接房间' : 'Connect a room')
+        : selectedRoomId != null && onOpenRoom != null
+        ? (strings.isZh ? '邀请设备' : 'Invite a device')
+        : (strings.isZh ? '选择房间邀请' : 'Choose a room to invite');
+    final displayedScopes = scopes
+        .where(
+          (scope) =>
+              !scope.isPrimary || scope.state != NetworkDisplayState.stopped,
+        )
+        .toList();
+    final issues = displayedScopes.where(networkScopeNeedsAttention).toList();
+    final issue = issues.isEmpty ? null : issues.first;
+    final requiresReauth = issue?.snapshot?.health.reauthRequired == true;
+    final VoidCallback? recovery = issue == null
+        ? null
+        : requiresReauth && onReauthenticate != null
+        ? onReauthenticate
+        : issue.roomId != null && onOpenRoom != null
+        ? () => onOpenRoom!(issue.roomId!)
+        : onOpenTroubleshooting;
+    final colors = P2WlanColors.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -39,183 +105,181 @@ class _RoomHomeOverview extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Wrap(
-                alignment: WrapAlignment.spaceBetween,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                spacing: 12,
-                runSpacing: 8,
-                children: [
-                  Text(
-                    strings.homeNetworkTitle,
-                    style: const TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.w700,
+              if (issue != null)
+                _HomeIssueBanner(
+                  key: const Key('home-room-issue'),
+                  title: strings.isZh
+                      ? '${issues.length} 个网络需处理'
+                      : '${issues.length} ${issues.length == 1 ? 'network needs' : 'networks need'} attention',
+                  message:
+                      '${networkScopeLabel(strings, issue)}${strings.isZh ? '：' : ': '}${_issueReason(strings, issue)}',
+                  tone: StatusTone.warn,
+                  onOpenTroubleshooting: recovery,
+                  actionLabel: requiresReauth && onReauthenticate != null
+                      ? (strings.isZh ? '重新登录' : 'Sign in again')
+                      : issue.roomId != null && onOpenRoom != null
+                      ? (strings.isZh ? '处理此房间' : 'Resolve this room')
+                      : (strings.isZh ? '查看连接问题' : 'Review connection issues'),
+                  actionKey: const Key('home-resolve-room-issue'),
+                  primaryAction: true,
+                )
+              else
+                Wrap(
+                  alignment: WrapAlignment.spaceBetween,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: AppTokens.space12,
+                  runSpacing: AppTokens.space8,
+                  children: [
+                    StatusBadge(
+                      label: selected == null
+                          ? label
+                          : networkDisplayStateLabel(strings, selected.state),
+                      tone: selected == null
+                          ? tone
+                          : networkDisplayStateTone(selected.state),
                     ),
+                    if (roomAction != null)
+                      FilledButton.icon(
+                        key: const Key('home-room-action'),
+                        onPressed: roomAction,
+                        icon: const Icon(Icons.group_add_outlined, size: 18),
+                        label: Text(roomActionLabel),
+                      ),
+                  ],
+                ),
+              const SizedBox(height: AppTokens.space8),
+              Wrap(
+                spacing: AppTokens.space16,
+                runSpacing: AppTokens.space6,
+                children: [
+                  _RoomHomeMetric(
+                    label: strings.isZh ? '运行房间' : 'Running rooms',
+                    value: '$running',
                   ),
-                  StatusBadge(
-                    label: selected == null
-                        ? label
-                        : networkDisplayStateLabel(strings, selected.state),
-                    tone: selected == null
-                        ? tone
-                        : networkDisplayStateTone(selected.state),
+                  _RoomHomeMetric(
+                    label: strings.isZh ? '在线连接' : 'Online connections',
+                    value: '${online.length}',
+                  ),
+                  _RoomHomeMetric(
+                    label: strings.isZh ? '确认链路' : 'Confirmed paths',
+                    value: '$available',
+                    tooltip: strings.isZh ? '本机已确认的直连或中继路径；在线设备不一定已有可用路径。' : 'Direct or relay paths confirmed by this device. An online device may still be establishing a path.',
                   ),
                 ],
               ),
-              const SizedBox(height: AppTokens.space16),
-              Container(
-                padding: const EdgeInsets.all(AppTokens.space16),
-                decoration: BoxDecoration(
-                  color: P2WlanColors.of(context).surfaceMuted,
-                  borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-                ),
-                child: Row(
+              if (displayedScopes.isNotEmpty)
+                ExpansionTile(
+                  key: const Key('home-room-connections-details'),
+                  tilePadding: EdgeInsets.zero,
+                  childrenPadding: const EdgeInsets.only(top: AppTokens.space4),
+                  minTileHeight: AppTokens.minTouchTarget,
+                  dense: true,
+                  shape: const Border(),
+                  collapsedShape: const Border(),
+                  expansionAnimationStyle: AppMotion.expansionStyleOf(context),
+                  title: Text(
+                    strings.isZh ? '房间连接详情' : 'Room connection details',
+                    style: TextStyle(fontSize: 13, color: colors.textSecondary),
+                  ),
                   children: [
-                    Expanded(
-                      child: _RoomHomeMetric(
-                        label: strings.isZh ? '运行房间' : 'Running rooms',
-                        value:
-                            '${scopes.where((scope) => !scope.isPrimary && scope.isRunning).length}',
+                    for (final scope in displayedScopes)
+                      ListTile(
+                        key: Key('home-network-scope-${scope.id}'),
+                        contentPadding: EdgeInsets.zero,
+                        dense: true,
+                        title: Text(
+                          networkScopeLabel(strings, scope),
+                          style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        subtitle: Text(
+                          [
+                            if (scope.snapshot?.virtualIp.isNotEmpty == true)
+                              scope.snapshot!.virtualIp,
+                            networkDisplayStateLabel(strings, scope.state),
+                          ].join(' · '),
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                        trailing: const Icon(
+                          Icons.chevron_right_rounded,
+                          size: 20,
+                        ),
+                        onTap: scope.roomId == null
+                            ? onOpenDevices
+                            : () => onOpenRoom?.call(scope.roomId!),
                       ),
-                    ),
-                    Expanded(
-                      child: _RoomHomeMetric(
-                        label: strings.isZh ? '在线连接' : 'Online connections',
-                        value: '${online.length}',
-                      ),
-                    ),
-                    Expanded(
-                      child: _RoomHomeMetric(
-                        label: strings.isZh ? '确认链路' : 'Confirmed paths',
-                        value: '$available',
-                        tooltip: strings.isZh ? '本机已确认的直连或中继路径；在线设备不一定已有可用路径。' : 'Direct or relay paths confirmed by this device. An online device may still be establishing a path.',
-                      ),
-                    ),
                   ],
-                ),
-              ),
-              const SizedBox(height: AppTokens.space16),
-              for (final scope in displayedScopes)
-                Material(
-                  type: MaterialType.transparency,
-                  child: ListTile(
-                    key: Key('home-network-scope-${scope.id}'),
-                    contentPadding: EdgeInsets.zero,
-                    leading: Container(
-                      width: 36,
-                      height: 36,
-                      decoration: BoxDecoration(
-                        color: P2WlanColors.of(context).selectedSurface,
-                        borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-                      ),
-                      child: Icon(
-                        Icons.hub_outlined,
-                        size: 19,
-                        color: theme.colorScheme.primary,
-                      ),
-                    ),
-                    title: Text(
-                      networkScopeLabel(strings, scope),
-                      style: const TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    subtitle: Text(
-                      [
-                        if (scope.snapshot?.virtualIp.isNotEmpty == true)
-                          scope.snapshot!.virtualIp,
-                        networkDisplayStateLabel(strings, scope.state),
-                      ].join(' · '),
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                    trailing: const Icon(Icons.chevron_right_rounded, size: 20),
-                    onTap: scope.roomId == null
-                        ? onOpenDevices
-                        : () => onOpenRoom?.call(scope.roomId!),
-                  ),
-                ),
-              if (onOpenRooms != null)
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: TextButton.icon(
-                    onPressed: onOpenRooms,
-                    icon: const Icon(Icons.meeting_room_outlined, size: 18),
-                    label: Text(strings.isZh ? '管理房间' : 'Manage rooms'),
-                  ),
                 ),
             ],
           ),
         ),
         const SizedBox(height: AppTokens.space16),
-        trafficSection,
-        const SizedBox(height: AppTokens.space16),
-        _DashboardSectionSurface(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Wrap(
-                alignment: WrapAlignment.spaceBetween,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  Text(
-                    strings.devices,
-                    style: const TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  TextButton(
-                    key: const Key('home-view-all-devices'),
-                    onPressed: onOpenDevices,
-                    child: Text(strings.viewAllDevices),
-                  ),
-                ],
-              ),
-              if (online.isEmpty) ...[
-                const SizedBox(height: 8),
-                Text(
-                  strings.noDevicesOnline,
-                  style: const TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  strings.isZh ? '查看房间的连接状态，或邀请其他设备加入同一房间。' : 'Check the room connection or invite another device to the same room.',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-                if (onOpenRooms != null)
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: OutlinedButton.icon(
-                      onPressed: onOpenRooms,
-                      icon: const Icon(Icons.group_add_outlined, size: 18),
-                      label: Text(
-                        strings.isZh ? '查看房间与邀请' : 'Rooms and invitations',
+        _DashboardDetailsLayout(
+          traffic: trafficSection,
+          devices: _DashboardSectionSurface(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Wrap(
+                  alignment: WrapAlignment.spaceBetween,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    Text(
+                      strings.devices,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
                       ),
                     ),
+                    TextButton(
+                      key: const Key('home-view-all-devices'),
+                      onPressed: onOpenDevices,
+                      child: Text(strings.viewAllDevices),
+                    ),
+                  ],
+                ),
+                if (online.isEmpty) ...[
+                  const SizedBox(height: AppTokens.space8),
+                  Text(
+                    strings.noDevicesOnline,
+                    style: const TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
-              ] else
-                for (final item in online.take(5))
-                  _DeviceRow(
-                    peer: item.peer,
-                    scopeIdentity: item.identity,
-                    roomName:
-                        item.roomName ??
-                        (strings.isZh ? '当前网络' : 'Current network'),
-                    speedBytesPerSecond: item.transferBytesPerSecond,
-                    onTap: item.isPrimary
-                        ? (onOpenPeer == null
-                              ? onOpenDevices
-                              : () => onOpenPeer!(item.peer))
-                        : () => onOpenRoom?.call(item.roomId!),
+                  const SizedBox(height: AppTokens.space4),
+                  Text(
+                    strings.isZh ? '邀请其他设备加入同一房间，连接后即可在这里查看。' : 'Invite another device to the same room to see it here.',
+                    style: TextStyle(fontSize: 13, color: colors.textSecondary),
                   ),
-            ],
+                ] else
+                  for (final item in online.take(5))
+                    _DeviceRow(
+                      peer: item.peer,
+                      scopeIdentity: item.identity,
+                      roomName:
+                          item.roomName ??
+                          (strings.isZh ? '当前网络' : 'Current network'),
+                      speedBytesPerSecond: item.transferBytesPerSecond,
+                      onTap: item.isPrimary
+                          ? (onOpenPeer == null
+                                ? onOpenDevices
+                                : () => onOpenPeer!(item.peer))
+                          : () {
+                              if (onOpenRoomDevice != null) {
+                                onOpenRoomDevice!(
+                                  item.roomId!,
+                                  item.peer.nodeId,
+                                );
+                              } else {
+                                onOpenRoom?.call(item.roomId!);
+                              }
+                            },
+                    ),
+              ],
+            ),
           ),
         ),
       ],
@@ -223,6 +287,7 @@ class _RoomHomeOverview extends StatelessWidget {
   }
 }
 
+/// A compact, wrapping summary rather than a separate dashboard tile.
 class _RoomHomeMetric extends StatelessWidget {
   const _RoomHomeMetric({
     required this.label,
@@ -234,25 +299,23 @@ class _RoomHomeMetric extends StatelessWidget {
   final String? tooltip;
   @override
   Widget build(BuildContext context) {
-    final content = Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
+    final content = Wrap(
+      spacing: AppTokens.space4,
+      crossAxisAlignment: WrapCrossAlignment.center,
       children: [
         Text(
           value,
           style: const TextStyle(
-            fontSize: 28,
-            fontWeight: FontWeight.w700,
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
             fontFeatures: AppTokens.tabularFontFeatures,
           ),
         ),
-        const SizedBox(height: 4),
         Text(
           label,
           style: TextStyle(
-            fontSize: 12,
-            height: 1.4,
-            color: Theme.of(context).colorScheme.onSurfaceVariant,
+            fontSize: 13,
+            color: P2WlanColors.of(context).textSecondary,
           ),
         ),
       ],

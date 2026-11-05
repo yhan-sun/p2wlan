@@ -320,7 +320,7 @@ class _AppSelectPopoverItem<T> extends PopupMenuEntry<T> {
   final Widget child;
 
   @override
-  double get height => 48;
+  double get height => AppTokens.minTouchTarget + AppTokens.space4;
 
   @override
   bool represents(T? value) => value == this.value;
@@ -355,8 +355,10 @@ class _AppSelectPopoverItemState<T> extends State<_AppSelectPopoverItem<T>> {
             hoverColor: widget.hoverColor,
             focusColor: widget.hoverColor,
             splashColor: widget.splashColor,
-            child: SizedBox(
-              height: 44,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(
+                minHeight: AppTokens.minTouchTarget,
+              ),
               child: Padding(
                 padding: const EdgeInsets.symmetric(
                   horizontal: AppTokens.space12,
@@ -441,7 +443,10 @@ class _AppSelectSheet<T> extends StatelessWidget {
                     key: const Key('app-select-sheet-close'),
                     onPressed: () => Navigator.of(context).pop(),
                     style: TextButton.styleFrom(
-                      minimumSize: const Size(AppTokens.minTouchTarget, 44),
+                      minimumSize: const Size(
+                        AppTokens.minTouchTarget,
+                        AppTokens.minTouchTarget,
+                      ),
                       padding: const EdgeInsets.symmetric(horizontal: 12),
                       foregroundColor: theme.colorScheme.primary,
                       textStyle: const TextStyle(

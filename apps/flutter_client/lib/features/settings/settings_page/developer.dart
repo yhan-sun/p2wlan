@@ -66,7 +66,7 @@ class _DeveloperSection extends StatelessWidget {
           children: [
             _PreferenceRow(
               label: strings.settingsAppVersion,
-              value: clientBuild.appVersion,
+              value: state._clientVersionLabel(strings),
             ),
             _PreferenceRow(
               label: strings.checkForUpdates,

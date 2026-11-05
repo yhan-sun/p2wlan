@@ -239,18 +239,11 @@ void _registerSettingsRedesignTests() {
       final account = find.byKey(
         const ValueKey('settings-category-card-accountNetwork'),
       );
-      if (spec.$1.width == 800) {
-        expect(tester.getTopLeft(general).dy, tester.getTopLeft(account).dy);
-        expect(
-          tester.getTopLeft(account).dx,
-          greaterThan(tester.getTopLeft(general).dx),
-        );
-      } else {
-        expect(
-          tester.getTopLeft(account).dy,
-          greaterThan(tester.getTopLeft(general).dy),
-        );
-      }
+      expect(
+        tester.getTopLeft(account).dy,
+        greaterThan(tester.getTopLeft(general).dy),
+      );
+      expect(tester.getTopLeft(account).dx, tester.getTopLeft(general).dx);
       expect(tester.takeException(), isNull);
     });
   }
@@ -545,11 +538,11 @@ void _registerSettingsRedesignTests() {
         final account = find.byKey(
           const ValueKey('settings-category-card-accountNetwork'),
         );
-        expect(tester.getTopLeft(general).dy, tester.getTopLeft(account).dy);
         expect(
-          tester.getTopLeft(account).dx,
-          greaterThan(tester.getTopLeft(general).dx),
+          tester.getTopLeft(account).dy,
+          greaterThan(tester.getTopLeft(general).dy),
         );
+        expect(tester.getTopLeft(account).dx, tester.getTopLeft(general).dx);
         expect(find.byType(TextField), findsNothing);
         return;
       }

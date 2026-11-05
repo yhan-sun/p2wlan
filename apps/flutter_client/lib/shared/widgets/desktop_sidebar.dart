@@ -26,7 +26,7 @@ class DesktopSidebar extends StatelessWidget {
     required this.onFooterTap,
   });
 
-  static const width = 196.0;
+  static const width = 208.0;
 
   final P2WlanSection? selected;
   final AppStrings strings;
@@ -59,6 +59,7 @@ class DesktopSidebar extends StatelessWidget {
                       ),
                     for (final section in group)
                       _SidebarItem(
+                        key: ValueKey('sidebar-${section.name}'),
                         icon: section.icon,
                         label: strings.sectionLabel(section.name),
                         selected: selected == section,
@@ -130,8 +131,9 @@ class _SidebarBrandHeader extends StatelessWidget {
   }
 }
 
-class _SidebarItem extends StatelessWidget {
+class _SidebarItem extends StatefulWidget {
   const _SidebarItem({
+    super.key,
     required this.icon,
     required this.label,
     required this.selected,
@@ -144,8 +146,18 @@ class _SidebarItem extends StatelessWidget {
   final VoidCallback onTap;
 
   @override
+  State<_SidebarItem> createState() => _SidebarItemState();
+}
+
+class _SidebarItemState extends State<_SidebarItem> {
+  var _focused = false;
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final selected = widget.selected;
+    final label = widget.label;
+    final icon = widget.icon;
     final colors = P2WlanColors.of(context);
     final foreground = selected
         ? theme.colorScheme.primary
@@ -165,13 +177,21 @@ class _SidebarItem extends StatelessWidget {
             decoration: BoxDecoration(
               color: selected ? colors.selectedSurface : Colors.transparent,
               borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+              border: Border.all(
+                color: _focused
+                    ? theme.colorScheme.primary
+                    : Colors.transparent,
+                width: 2,
+              ),
             ),
             child: Material(
               type: MaterialType.transparency,
               child: MouseRegion(
                 cursor: SystemMouseCursors.click,
                 child: InkWell(
-                  onTap: onTap,
+                  onTap: widget.onTap,
+                  onFocusChange: (focused) =>
+                      setState(() => _focused = focused),
                   borderRadius: BorderRadius.circular(AppTokens.radiusMd),
                   hoverColor: selected ? null : colors.hoverSurface,
                   child: ExcludeSemantics(

@@ -174,7 +174,7 @@ class MetricTile extends StatelessWidget {
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
-                fontSize: 13,
+                fontSize: 14,
                 fontWeight: FontWeight.w600,
                 color: theme.colorScheme.onSurface,
                 fontFeatures: AppTokens.tabularFontFeatures,
@@ -187,7 +187,7 @@ class MetricTile extends StatelessWidget {
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  fontSize: 11,
+                  fontSize: 12,
                   fontWeight: FontWeight.w400,
                   color: theme.colorScheme.onSurfaceVariant,
                   fontFeatures: AppTokens.tabularFontFeatures,

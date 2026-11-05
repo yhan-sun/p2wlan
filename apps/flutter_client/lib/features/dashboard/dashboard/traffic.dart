@@ -1,5 +1,51 @@
 part of '../dashboard_page.dart';
 
+/// Disconnected Home keeps only a quiet link when saved history exists.
+class _TrafficHistoryEntry extends StatelessWidget {
+  const _TrafficHistoryEntry({
+    required this.statusStore,
+    required this.selectedId,
+  });
+  final StatusStore statusStore;
+  final String? selectedId;
+
+  @override
+  Widget build(BuildContext context) {
+    final history = TrafficHistoryScope.maybeOf(context);
+    if (history == null) return const SizedBox.shrink();
+    final scopes = _trafficScopes(
+      NetworkOverview.read(statusStore),
+      selectedId,
+    );
+    final saved = history.store.summary(
+      settings: history.settings,
+      networkId: _trafficNetworkId(scopes, selectedId, statusStore),
+    );
+    if (saved == null) return const SizedBox.shrink();
+    final strings = AppStringsScope.of(context);
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        key: const Key('home-traffic-history-entry'),
+        onPressed: () => showDialog<void>(
+          context: context,
+          builder: (_) => AppStringsScope(
+            strings: strings,
+            child: _TrafficDetailsDialog(
+              statusStore: statusStore,
+              selectedId: selectedId,
+            ),
+          ),
+        ),
+        icon: const Icon(Icons.history_rounded, size: 18),
+        label: Text(
+          '${strings.isZh ? '查看历史流量' : 'View traffic history'} · ${formatOptionalBytes(saved.counters.totalBytes)}',
+        ),
+      ),
+    );
+  }
+}
+
 class _TrafficOverviewSection extends StatelessWidget {
   const _TrafficOverviewSection({
     required this.statusStore,

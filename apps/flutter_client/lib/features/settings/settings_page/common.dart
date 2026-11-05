@@ -11,6 +11,7 @@ class _PreferenceRow extends StatelessWidget {
     this.onTap,
     this.trailing,
     this.showDivider = true,
+    this.inlineControl = false,
   });
 
   final String label;
@@ -24,6 +25,7 @@ class _PreferenceRow extends StatelessWidget {
   /// over [value].
   final Widget? trailing;
   final bool showDivider;
+  final bool inlineControl;
 
   @override
   Widget build(BuildContext context) {
@@ -95,7 +97,6 @@ class _PreferenceRow extends StatelessWidget {
 
     final content = Semantics(
       button: onTap != null,
-      label: label,
       child: InkWell(
         onTap: onTap,
         customBorder: RoundedRectangleBorder(
@@ -106,6 +107,40 @@ class _PreferenceRow extends StatelessWidget {
           padding: const EdgeInsets.symmetric(vertical: AppTokens.space12),
           child: LayoutBuilder(
             builder: (context, constraints) {
+              if (inlineControl) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    MergeSemantics(
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              label,
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                                color: theme.colorScheme.onSurface,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          trailingContent,
+                        ],
+                      ),
+                    ),
+                    if (subtitle != null && subtitle!.isNotEmpty)
+                      Text(
+                        subtitle!,
+                        style: TextStyle(
+                          fontSize: 12,
+                          height: 1.45,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                  ],
+                );
+              }
               final largeText = MediaQuery.textScalerOf(context).scale(14) > 18;
               final stack = trailing != null
                   ? constraints.maxWidth < 500 || largeText
@@ -429,31 +464,34 @@ class _SaveBar extends StatelessWidget {
       ),
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final label = Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                busy
-                    ? (strings.isZh ? '正在保存更改' : 'Saving changes')
-                    : strings.unsavedChanges,
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: theme.colorScheme.onSurface,
-                ),
-              ),
-              if (restartRequired) ...[
-                const SizedBox(height: 2),
+          final label = Semantics(
+            liveRegion: true,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
                 Text(
-                  strings.settingsReconnectImpact,
+                  busy
+                      ? (strings.isZh ? '正在保存更改' : 'Saving changes')
+                      : strings.unsavedChanges,
                   style: TextStyle(
-                    fontSize: 12,
-                    color: theme.colorScheme.onSurfaceVariant,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: theme.colorScheme.onSurface,
                   ),
                 ),
+                if (restartRequired) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    strings.settingsReconnectImpact,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
               ],
-            ],
+            ),
           );
           final save = FilledButton.icon(
             key: const Key('settings-save-button'),
@@ -529,17 +567,20 @@ class _SettingsErrorNotice extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = P2WlanColors.of(context);
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: c.dangerSurface,
-        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        border: Border.all(color: c.dangerBorder),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(AppTokens.space12),
-        child: Text(
-          message,
-          style: TextStyle(color: c.dangerText, fontSize: 13, height: 1.35),
+    return Semantics(
+      liveRegion: true,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: c.dangerSurface,
+          borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+          border: Border.all(color: c.dangerBorder),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(AppTokens.space12),
+          child: Text(
+            message,
+            style: TextStyle(color: c.dangerText, fontSize: 13, height: 1.35),
+          ),
         ),
       ),
     );
@@ -563,42 +604,46 @@ class _PendingRestartNotice extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final colors = P2WlanColors.of(context);
-    final message = Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          strings.restartRequired,
-          style: TextStyle(
-            color: colors.warningText,
-            fontSize: 13,
-            fontWeight: FontWeight.w700,
+    final message = Semantics(
+      liveRegion: true,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            strings.restartRequired,
+            style: TextStyle(
+              color: colors.warningText,
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+            ),
           ),
-        ),
-        const SizedBox(height: 3),
-        Text(
-          canRestart
-              ? strings.restartRequiredDetail
-              : strings.restartWillApplyLater,
-          style: TextStyle(
-            color: colors.warningText,
-            fontSize: 12,
-            height: 1.35,
+          const SizedBox(height: 3),
+          Text(
+            canRestart
+                ? (strings.isZh
+                      ? '重新连接会短暂中断本机默认连接。'
+                      : 'Reconnecting briefly interrupts the default local connection.')
+                : strings.restartWillApplyLater,
+            style: TextStyle(
+              color: colors.warningText,
+              fontSize: 12,
+              height: 1.35,
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
     return Container(
       decoration: BoxDecoration(
         color: colors.warningSurface,
-        border: Border.all(color: colors.warningBorder),
         borderRadius: BorderRadius.circular(AppTokens.radiusMd),
       ),
       padding: const EdgeInsets.all(AppTokens.space12),
       child: LayoutBuilder(
         builder: (context, constraints) {
           if (!canRestart) return message;
-          final action = FilledButton.icon(
+          final action = TextButton.icon(
             onPressed: busy ? null : onRestart,
             icon: busy
                 ? const SizedBox.square(
@@ -608,9 +653,10 @@ class _PendingRestartNotice extends StatelessWidget {
                 : const Icon(Icons.restart_alt_rounded, size: 17),
             label: Text(strings.restartNow),
           );
-          if (constraints.maxWidth < 540) {
+          if (constraints.maxWidth < 420 ||
+              MediaQuery.textScalerOf(context).scale(14) > 18) {
             return Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 message,
                 const SizedBox(height: AppTokens.space10),

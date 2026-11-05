@@ -21,8 +21,8 @@ abstract final class AppTokens {
 
   // Text hierarchy
   static const colorTextPrimary = Color(0xFF1B2940);
-  static const colorTextSecondary = Color(0xFF657188);
-  static const colorTextMuted = Color(0xFF8390A3);
+  static const colorTextSecondary = Color(0xFF56647A);
+  static const colorTextMuted = Color(0xFF647087);
 
   // Dark text hierarchy
   static const colorDarkTextPrimary = Color(0xFFF7F9FC);
@@ -51,12 +51,12 @@ abstract final class AppTokens {
   // Bad / Unhealthy / Actual failures
   static const colorBadBg = Color(0xFFFEF2F2);
   static const colorBadBorder = Color(0xFFFECACA);
-  static const colorBadText = Color(0xFFDC2626);
+  static const colorBadText = Color(0xFFB91C1C);
 
   // Neutral / Offline / Skipped / Idle
   static const colorNeutralBg = Color(0xFFF3F4F6);
   static const colorNeutralBorder = Color(0xFFD1D5DB);
-  static const colorNeutralText = Color(0xFF667078);
+  static const colorNeutralText = Color(0xFF647087);
 
   // Dark status tones keep semantic color visible on dark surfaces without
   // falling back to pale light-theme labels.
@@ -112,7 +112,7 @@ abstract final class AppTokens {
   static const space40 = 40.0;
 
   // Touch Targets
-  static const minTouchTarget = 44.0;
+  static const minTouchTarget = 48.0;
 
   // --- Durations & Curves ---
   static const durationFast = Duration(milliseconds: 110);

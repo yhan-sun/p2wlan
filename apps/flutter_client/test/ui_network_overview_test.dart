@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' show Tristate;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
@@ -7,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/app_strings.dart';
 import 'package:p2wlan_flutter_client/app/app_theme.dart';
 import 'package:p2wlan_flutter_client/app/navigation_model.dart';
+import 'package:p2wlan_flutter_client/app/navigation.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/capabilities/platform_capabilities.dart';
 import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
@@ -20,6 +22,7 @@ import 'package:p2wlan_flutter_client/core/state/status_store.dart';
 import 'package:p2wlan_flutter_client/features/dashboard/dashboard_page.dart';
 import 'package:p2wlan_flutter_client/features/diagnostics/diagnostics_page.dart';
 import 'package:p2wlan_flutter_client/features/nodes/nodes_page.dart';
+import 'package:p2wlan_flutter_client/features/rooms/rooms_page.dart';
 import 'package:p2wlan_flutter_client/shared/network_overview_presentation.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/app_nav_rail.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/desktop_sidebar.dart';
@@ -30,7 +33,7 @@ final _token =
     'a.${base64Url.encode(utf8.encode(jsonEncode({'user_id': 'member'})))}.b';
 
 FriendRoom _room(int number) => FriendRoom(
-  id: number == 1 ? _roomOne : _roomTwo,
+  id: 'room-${number.toString().padLeft(32, '0')}',
   code: '$number'.padLeft(8, '0'),
   name: 'Room $number',
   cidr: '10.21.$number.0/24',
@@ -88,7 +91,7 @@ class _Runtime implements RoomRuntime {
       const DaemonCommandResult(ok: true, message: '');
   @override
   Future<DiagnosticsSnapshot> status() async =>
-      _snapshot(plan.room.id, plan.room.id == _roomOne ? 1 : 2);
+      _snapshot(plan.room.id, int.parse(plan.room.cidr.split('.')[2]));
   @override
   void close() {}
 }
@@ -98,6 +101,14 @@ class _Store extends StatusStore {
     : super(diagnosticsApi: DiagnosticsApi(), enableEventPolling: false);
   DiagnosticsSnapshot? primary;
   Map<String, PeerTransferRate> directionalRates = const {};
+  var revision = 0;
+  @override
+  int get sessionRevision => revision;
+  void nextSession() {
+    revision++;
+    notifyListeners();
+  }
+
   @override
   DiagnosticsSnapshot? get snapshot => primary;
   @override
@@ -174,6 +185,483 @@ Widget _app(Widget child, {double textScale = 1}) => AppStringsScope(
 void main() {
   String? trafficText(WidgetTester tester, String key) =>
       tester.widget<Text>(find.byKey(ValueKey(key))).data;
+
+  for (final mobile in [false, true]) {
+    testWidgets(
+      'devices lead the first screen with six rooms mobile=$mobile',
+      (tester) async {
+        final size = mobile ? const Size(390, 844) : const Size(800, 628);
+        tester.view.physicalSize = size;
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        await tester.binding.setSurfaceSize(size);
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        final harness = (await tester.runAsync(() => _harness(rooms: 6)))!;
+        addTearDown(harness.dispose);
+        await tester.pumpWidget(
+          _app(
+            P2WlanShell(
+              settingsStore: harness.settings,
+              statusStore: harness.store,
+              capabilities: PlatformCapabilities.fromPlatform(
+                mobile ? 'android' : 'macos',
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(
+          mobile
+              ? find.byIcon(Icons.devices_outlined).first
+              : find.byKey(const ValueKey('sidebar-devices')),
+        );
+        await tester.pumpAndSettle();
+        final peers = NetworkOverview.read(harness.store).peers;
+        expect(
+          find.byKey(const Key('network-scope-picker')).hitTestable(),
+          findsOneWidget,
+        );
+        for (final peer in peers.take(mobile ? 2 : 3)) {
+          final row = find.byKey(Key('node-row-${peer.identity}'));
+          expect(row.hitTestable(), findsOneWidget);
+          expect(
+            tester.getRect(row).bottom,
+            lessThan(size.height - (mobile ? 64 : 0)),
+            reason:
+                'Room summaries must not push devices below the first screen',
+          );
+        }
+        expect(
+          find.byKey(Key('nodes-network-scope-room:$_roomOne')),
+          findsNothing,
+        );
+        final disclosure = find.byKey(const Key('nodes-scopes-toggle'));
+        await tester.tap(disclosure);
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(Key('nodes-network-scope-room:$_roomOne')),
+          findsOneWidget,
+        );
+        await tester.tap(disclosure);
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(Key('nodes-network-scope-room:$_roomOne')),
+          findsNothing,
+        );
+        expect(tester.takeException(), isNull);
+      },
+      variant: TargetPlatformVariant.only(
+        mobile ? TargetPlatform.android : TargetPlatform.macOS,
+      ),
+    );
+  }
+
+  testWidgets('collapsed device scope summary keeps connection transitions', (
+    tester,
+  ) async {
+    final semantics = tester.ensureSemantics();
+    try {
+      final harness = (await tester.runAsync(_harness))!;
+      addTearDown(harness.dispose);
+      harness.store.parallelRooms.session(_roomOne)!.phase =
+          RoomConnectionPhase.starting;
+      harness.store.parallelRooms.session(_roomTwo)!.phase =
+          RoomConnectionPhase.stopping;
+      await tester.pumpWidget(
+        _app(
+          NodesPage(
+            settingsStore: harness.settings,
+            statusStore: harness.store,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.text('2 rooms · 1 connecting · 1 disconnecting'),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const Key('nodes-network-scope-room:$_roomOne')),
+        findsNothing,
+      );
+      final toggle = find.byKey(const Key('nodes-scopes-toggle'));
+      expect(
+        tester
+            .getSemantics(toggle)
+            .getSemanticsData()
+            .flagsCollection
+            .isExpanded,
+        Tristate.isFalse,
+      );
+      await tester.tap(toggle);
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .getSemantics(toggle)
+            .getSemanticsData()
+            .flagsCollection
+            .isExpanded,
+        Tristate.isTrue,
+      );
+      for (final state in [
+        (_roomOne, 'Connecting'),
+        (_roomTwo, 'Disconnecting'),
+      ]) {
+        expect(
+          find.descendant(
+            of: find.byKey(Key('nodes-network-scope-room:${state.$1}')),
+            matching: find.textContaining(state.$2),
+          ),
+          findsOneWidget,
+        );
+      }
+      expect(tester.takeException(), isNull);
+    } finally {
+      semantics.dispose();
+    }
+  });
+
+  testWidgets(
+    'shell restores scope, search, filter, sort and scroll without keeping pages alive',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 500));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final harness = (await tester.runAsync(_harness))!;
+      addTearDown(harness.dispose);
+      final raw = Map<String, dynamic>.from(_snapshot('personal', 9).raw);
+      final template = Map<String, dynamic>.from(
+        (raw['peers'] as List).single as Map,
+      );
+      raw['peers'] = [
+        for (var i = 0; i < 20; i++)
+          {
+            ...template,
+            'node_id': 'peer-$i',
+            'device_name': 'Shared laptop $i',
+          },
+      ];
+      harness.store.primary = DiagnosticsSnapshot.fromJson(raw);
+      final roomRaw = Map<String, dynamic>.from(_snapshot(_roomOne, 1).raw);
+      final roomPeer = Map<String, dynamic>.from(
+        (roomRaw['peers'] as List).single as Map,
+      );
+      roomRaw['peers'] = [
+        for (var i = 0; i < 20; i++)
+          {
+            ...roomPeer,
+            'node_id': 'room-peer-$i',
+            'device_name': 'Shared laptop $i',
+          },
+      ];
+      harness.store.parallelRooms.session(_roomOne)!.snapshot =
+          DiagnosticsSnapshot.fromJson(roomRaw);
+      await tester.pumpWidget(
+        _app(
+          P2WlanShell(
+            settingsStore: harness.settings,
+            statusStore: harness.store,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      Future<void> selectScope(String name) async {
+        final picker = find.byKey(const Key('network-scope-picker'));
+        await tester.ensureVisible(picker);
+        await tester.tap(picker);
+        await tester.pumpAndSettle();
+        await tester.tap(
+          find.widgetWithText(CheckedPopupMenuItem<String>, name),
+        );
+        await tester.pumpAndSettle();
+      }
+
+      Future<void> selectPage(P2WlanSection section) async {
+        tester
+            .widget<DesktopSidebar>(find.byType(DesktopSidebar))
+            .onSelect(section);
+        await tester.pumpAndSettle();
+      }
+
+      await selectScope('Room 2');
+      final oldHomeState = tester.state(find.byType(DashboardPage));
+      final homeState = tester
+          .widget<DashboardPage>(find.byType(DashboardPage))
+          .uiState!;
+      final homeList = find
+          .descendant(
+            of: find.byType(DashboardPage),
+            matching: find.byType(ListView),
+          )
+          .first;
+      await tester.drag(homeList, const Offset(0, -180));
+      await tester.pumpAndSettle();
+      final homeOffset = homeState.scrollOffset;
+      expect(homeOffset, greaterThan(0));
+      await selectPage(P2WlanSection.devices);
+      expect(find.byType(DashboardPage), findsNothing);
+      await selectScope('Room 1');
+      final search = find.byKey(const Key('nodes-search-field'));
+      await tester.enterText(search, 'Shared');
+      for (final spec in [
+        ('nodes-filter-button', 'nodes-filter-direct'),
+        ('nodes-sort-button', 'nodes-sort-latency'),
+      ]) {
+        final menu = find.byKey(Key(spec.$1));
+        await tester.ensureVisible(menu);
+        await tester.tap(menu);
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(Key(spec.$2)));
+        await tester.pumpAndSettle();
+      }
+      final deviceState = tester
+          .widget<NodesPage>(find.byType(NodesPage))
+          .uiState!;
+      final deviceList = find
+          .descendant(
+            of: find.byType(NodesPage),
+            matching: find.byType(ListView),
+          )
+          .first;
+      await tester.drag(deviceList, const Offset(0, -180));
+      await tester.pumpAndSettle();
+      final deviceOffset = deviceState.scrollOffset;
+      expect(deviceOffset, greaterThan(0));
+      await selectPage(P2WlanSection.home);
+      expect(find.byType(NodesPage), findsNothing);
+      expect(
+        tester.state(find.byType(DashboardPage)),
+        isNot(same(oldHomeState)),
+      );
+      expect(
+        tester
+            .widget<DashboardPage>(find.byType(DashboardPage))
+            .uiState!
+            .scopeId,
+        'room:$_roomTwo',
+      );
+      final restoredList = tester.widget<ListView>(
+        find
+            .descendant(
+              of: find.byType(DashboardPage),
+              matching: find.byType(ListView),
+            )
+            .first,
+      );
+      expect(restoredList.controller!.offset, closeTo(homeOffset, 1));
+      final home = tester.widget<DashboardPage>(find.byType(DashboardPage));
+      home.onOpenRoomDevice!(_roomTwo, 'same-node');
+      await tester.pumpAndSettle();
+      final roomPage = tester.widget<RoomsPage>(find.byType(RoomsPage));
+      expect(roomPage.initialRoomId, _roomTwo);
+      expect(roomPage.initialDeviceId, 'same-node');
+      roomPage.onDeviceDetailsClosed!();
+      await tester.pumpAndSettle();
+      expect(find.byType(DashboardPage), findsOneWidget);
+      expect(
+        tester
+            .widget<DashboardPage>(find.byType(DashboardPage))
+            .uiState!
+            .scopeId,
+        'room:$_roomTwo',
+      );
+      await selectPage(P2WlanSection.devices);
+      expect(tester.widget<TextField>(search).controller!.text, 'Shared');
+      expect(deviceState.scopeId, 'room:$_roomOne');
+      expect(deviceState.filter, 'direct');
+      expect(deviceState.sort, 'latency');
+      final restoredDevices = tester.widget<ListView>(
+        find
+            .descendant(
+              of: find.byType(NodesPage),
+              matching: find.byType(ListView),
+            )
+            .first,
+      );
+      expect(restoredDevices.controller!.offset, closeTo(deviceOffset, 1));
+      tester.widget<NodesPage>(find.byType(NodesPage)).onOpenRoomDevice!(
+        _roomOne,
+        'room-peer-1',
+      );
+      await tester.pumpAndSettle();
+      tester.widget<RoomsPage>(find.byType(RoomsPage)).onDeviceDetailsClosed!();
+      await tester.pumpAndSettle();
+      expect(find.byType(NodesPage), findsOneWidget);
+      expect(
+        tester.widget<NodesPage>(find.byType(NodesPage)).uiState!.scopeId,
+        'room:$_roomOne',
+      );
+      expect(tester.widget<TextField>(search).controller!.text, 'Shared');
+      harness.store.nextSession();
+      await tester.pumpAndSettle();
+      final cleared = tester.widget<NodesPage>(find.byType(NodesPage)).uiState!;
+      expect(cleared, isNot(same(deviceState)));
+      expect(cleared.scopeId, isNull);
+      expect(cleared.query, isEmpty);
+      expect(cleared.filter, 'all');
+      expect(cleared.sort, 'recommended');
+      expect(cleared.scrollOffset, 0);
+      await tester.enterText(search, 'Previous owner');
+      final replacement = (await tester.runAsync(() => _harness(rooms: 0)))!;
+      addTearDown(replacement.dispose);
+      replacement.store.revision = harness.store.revision;
+      await tester.pumpWidget(
+        _app(
+          P2WlanShell(
+            settingsStore: replacement.settings,
+            statusStore: replacement.store,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final nextOwner = tester
+          .widget<NodesPage>(find.byType(NodesPage))
+          .uiState!;
+      expect(nextOwner, isNot(same(cleared)));
+      expect(nextOwner.query, isEmpty);
+      expect(nextOwner.scopeId, isNull);
+      expect(cleared.query, 'Previous owner');
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'mixed room overview names the issue and opens recovery for that room',
+    (tester) async {
+      final harness = (await tester.runAsync(_harness))!;
+      addTearDown(harness.dispose);
+      final failed = harness.store.parallelRooms.session(_roomTwo)!;
+      failed.phase = RoomConnectionPhase.failed;
+      failed.snapshot = null;
+      failed.message = 'System route permission was denied';
+      String? openedRoom;
+      await tester.pumpWidget(
+        _app(
+          DashboardPage(
+            settingsStore: harness.settings,
+            statusStore: harness.store,
+            onOpenRooms: () {},
+            onOpenRoom: (id) => openedRoom = id,
+          ),
+        ),
+      );
+      final status = networkOverviewStatus(
+        AppStrings.fromCode('en'),
+        NetworkOverview.read(harness.store),
+      );
+      expect(status.$2, '1 room healthy, 1 needs attention');
+      expect(find.text('1 network needs attention'), findsOneWidget);
+      expect(
+        find.textContaining('Room 2: System route permission was denied'),
+        findsOneWidget,
+      );
+      expect(find.byType(FilledButton), findsOneWidget);
+      final action = find.byKey(const Key('home-resolve-room-issue'));
+      await tester.ensureVisible(action);
+      await tester.tap(action);
+      expect(openedRoom, _roomTwo);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'connected rooms with no online peers invite devices and hide technical health reasons',
+    (tester) async {
+      final harness = (await tester.runAsync(_harness))!;
+      addTearDown(harness.dispose);
+      for (final session in harness.store.parallelRooms.sessions.values) {
+        final raw = Map<String, dynamic>.from(session.snapshot!.raw);
+        raw['peers'] = <Object>[];
+        session.snapshot = DiagnosticsSnapshot.fromJson(raw);
+      }
+      Widget home() => _app(
+        DashboardPage(
+          settingsStore: harness.settings,
+          statusStore: harness.store,
+          onOpenRooms: () {},
+          onOpenRoom: (_) {},
+        ),
+      );
+      await tester.pumpWidget(home());
+      expect(find.text('Choose a room to invite'), findsOneWidget);
+      expect(find.text('Connect a room'), findsNothing);
+      final room = harness.store.parallelRooms.session(_roomTwo)!;
+      final raw = Map<String, dynamic>.from(room.snapshot!.raw);
+      raw['health'] = {
+        'status': 'degraded',
+        'control_connected': true,
+        'reason': 'internal_path_epoch_mismatch',
+      };
+      room.snapshot = DiagnosticsSnapshot.fromJson(raw);
+      await tester.pumpWidget(home());
+      expect(find.textContaining('internal_path_epoch_mismatch'), findsNothing);
+      expect(
+        find.textContaining('The P2WLAN service reported an abnormal status.'),
+        findsWidgets,
+      );
+      expect(find.byType(FilledButton), findsOneWidget);
+    },
+  );
+
+  testWidgets('remote management Home View devices action opens Devices', (
+    tester,
+  ) async {
+    final harness = (await tester.runAsync(_harness))!;
+    addTearDown(harness.dispose);
+    var devices = 0;
+    var rooms = 0;
+    await tester.pumpWidget(
+      _app(
+        DashboardPage(
+          settingsStore: harness.settings,
+          statusStore: harness.store,
+          capabilities: PlatformCapabilities.fromPlatform('ios'),
+          onOpenDevices: () => devices++,
+          onOpenRooms: () => rooms++,
+        ),
+      ),
+    );
+    await tester.tap(find.byKey(const Key('mobile-home-open-devices')));
+    expect(devices, 1);
+    expect(rooms, 0);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'home and devices pass both room and node identity to the room detail',
+    (tester) async {
+      final harness = (await tester.runAsync(_harness))!;
+      addTearDown(harness.dispose);
+      final opened = <(String, String)>[];
+      for (final isHome in [true, false]) {
+        await tester.pumpWidget(
+          _app(
+            isHome
+                ? DashboardPage(
+                    settingsStore: harness.settings,
+                    statusStore: harness.store,
+                    onOpenRoomDevice: (room, node) => opened.add((room, node)),
+                  )
+                : NodesPage(
+                    settingsStore: harness.settings,
+                    statusStore: harness.store,
+                    onOpenRoomDevice: (room, node) => opened.add((room, node)),
+                  ),
+          ),
+        );
+        final item = NetworkOverview.read(harness.store).peers.last;
+        final row = find.byKey(
+          Key('${isHome ? 'home-device-row' : 'node-row'}-${item.identity}'),
+        );
+        await tester.ensureVisible(row);
+        await tester.pumpAndSettle();
+        await tester.tap(row);
+        await tester.pump();
+        expect(opened.last, (_roomTwo, 'same-node'));
+        expect(tester.takeException(), isNull);
+      }
+    },
+  );
 
   testWidgets(
     'home traffic deduplicates a room across owners and limits selected scope',
@@ -375,10 +863,41 @@ void main() {
           textScale: largeText ? 2 : 1,
         ),
       );
+      expect(find.text('Room 1'), findsNothing);
+      expect(find.text('Room 2'), findsNothing);
+      final roomSummary = find.byKey(
+        const Key('diagnostics-room-connections-toggle'),
+      );
+      expect(
+        tester
+            .getTopLeft(find.byKey(const Key('diagnostics-system-status')))
+            .dy,
+        lessThan(tester.getTopLeft(roomSummary).dy),
+      );
+      expect(
+        tester
+            .getTopLeft(find.byKey(const Key('diagnostics-primary-actions')))
+            .dy,
+        lessThan(tester.getTopLeft(roomSummary).dy),
+      );
+      await tester.ensureVisible(roomSummary);
+      await tester.pumpAndSettle();
+      await tester.tap(roomSummary);
+      await tester.pumpAndSettle();
       expect(find.text('Room 1'), findsOneWidget);
       expect(find.text('Room 2'), findsOneWidget);
       expect(find.text('Running'), findsOneWidget);
       expect(find.text('Connection failed'), findsOneWidget);
+      expect(
+        tester
+            .getTopLeft(find.byKey(ValueKey('diagnostics-room-$_roomTwo')))
+            .dy,
+        lessThan(
+          tester
+              .getTopLeft(find.byKey(ValueKey('diagnostics-room-$_roomOne')))
+              .dy,
+        ),
+      );
       expect(find.text('Diagnostics unavailable'), findsOneWidget);
       expect(find.text('Default local connection is healthy'), findsNothing);
       expect(find.text('Check again'), findsOneWidget);
@@ -531,10 +1050,11 @@ void main() {
     },
   );
 
-  testWidgets(
-    'home shows running rooms and routes duplicate-node rows by room identity',
-    (tester) async {
-      tester.view.physicalSize = const Size(900, 1200);
+  for (final spec in const [(1280.0, 1.0), (390.0, 1.6)]) {
+    testWidgets('home ${spec.$1} routes duplicate-node rows by room identity', (
+      tester,
+    ) async {
+      tester.view.physicalSize = Size(spec.$1, 1200);
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
@@ -551,6 +1071,7 @@ void main() {
             onOpenPeer: (_) => openedPrimaryPeer = true,
             onOpenRooms: () {},
           ),
+          textScale: spec.$2,
         ),
       );
       expect(find.text('Rooms connected'), findsOneWidget);
@@ -562,11 +1083,13 @@ void main() {
         await tester.ensureVisible(
           find.byKey(Key('home-device-row-${item.identity}')),
         );
+        await tester.pumpAndSettle();
         await tester.tap(find.byKey(Key('home-device-row-${item.identity}')));
       }
       expect(openedRooms, [_roomOne, _roomTwo]);
       expect(openedPrimaryPeer, isFalse);
       await tester.ensureVisible(find.byKey(const Key('network-scope-picker')));
+      await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('network-scope-picker')));
       await tester.pumpAndSettle();
       await tester.tap(
@@ -579,8 +1102,8 @@ void main() {
         findsOneWidget,
       );
       expect(tester.takeException(), isNull);
-    },
-  );
+    });
+  }
 
   testWidgets(
     'devices scope, search and row actions stay room-specific at large text',
@@ -814,12 +1337,12 @@ void main() {
           statusStore: harness.store,
         ),
       ]) {
-        // Match the true 800px shell after the 196px sidebar and divider.
+        // Match the shell content width after the sidebar and divider.
         await tester.pumpWidget(
           _app(
             Row(
               children: [
-                const SizedBox(width: 197),
+                const SizedBox(width: DesktopSidebar.width + 1),
                 Expanded(child: child),
               ],
             ),

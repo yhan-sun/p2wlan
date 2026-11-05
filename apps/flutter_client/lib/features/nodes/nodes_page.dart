@@ -11,6 +11,7 @@ import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
+import '../../app/session_ui_state.dart';
 import '../../core/api/control_api.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
@@ -62,6 +63,8 @@ class NodesPage extends StatefulWidget {
     this.onPeerDetailsClosed,
     this.onOpenRooms,
     this.onOpenRoom,
+    this.onOpenRoomDevice,
+    this.uiState,
   });
 
   final SettingsStore settingsStore;
@@ -89,6 +92,8 @@ class NodesPage extends StatefulWidget {
   final VoidCallback? onPeerDetailsClosed;
   final VoidCallback? onOpenRooms;
   final ValueChanged<String>? onOpenRoom;
+  final void Function(String roomId, String deviceId)? onOpenRoomDevice;
+  final DevicesUiState? uiState;
 
   @override
   State<NodesPage> createState() => _NodesPageState();
@@ -107,11 +112,27 @@ class _NodesPageState extends State<NodesPage> {
   String? _busyPeerId;
   String? _openedInitialPeerId;
   var _initialPeerOpenScheduled = false;
+  late final ScrollController _scrollController;
 
   @override
   void initState() {
     super.initState();
     _controlApi = widget.controlApi ?? ControlApi();
+    final saved = widget.uiState;
+    _selectedScopeId = saved?.scopeId;
+    _searchController.text = saved?.query ?? '';
+    _filter = _NodeFilter.values.firstWhere(
+      (value) => value.name == saved?.filter,
+      orElse: () => _NodeFilter.all,
+    );
+    _sort = _NodeSort.values.firstWhere(
+      (value) => value.name == saved?.sort,
+      orElse: () => _NodeSort.recommended,
+    );
+    _scrollController = ScrollController(
+      initialScrollOffset: saved?.scrollOffset ?? 0,
+    )..addListener(_saveUiState);
+    _searchController.addListener(_saveUiState);
     widget.statusStore.addListener(_pruneHiddenPeers);
   }
 
@@ -130,12 +151,26 @@ class _NodesPageState extends State<NodesPage> {
 
   @override
   void dispose() {
+    _saveUiState();
+    _scrollController.dispose();
     widget.statusStore.removeListener(_pruneHiddenPeers);
     _searchController.dispose();
     _searchFocusNode.dispose();
     _copyFeedbackTimer?.cancel();
     _controlApi.close();
     super.dispose();
+  }
+
+  void _saveUiState() {
+    final saved = widget.uiState;
+    if (saved == null) return;
+    saved.scopeId = _selectedScopeId;
+    saved.query = _searchController.text;
+    saved.filter = _filter.name;
+    saved.sort = _sort.name;
+    if (_scrollController.hasClients) {
+      saved.scrollOffset = _scrollController.offset;
+    }
   }
 
   void _pruneHiddenPeers() {
@@ -230,10 +265,21 @@ class _NodesPageState extends State<NodesPage> {
                     selectedId == NetworkOverview.primaryScopeId) &&
                 scopes.any((scope) => scope.isPrimary);
             return PageScaffold(
+              scrollController: _scrollController,
               title: stringsOf(context).devices,
-              subtitle: stringsOf(context).nodesSubtitle,
+              subtitle: '',
               showHeader: widget.showHeader,
               maxWidth: nodesPageMaxWidth,
+              toolbar: overview.hasRooms
+                  ? NetworkScopePicker(
+                      overview: overview,
+                      selectedId: selectedId,
+                      onChanged: (id) => setState(() {
+                        _selectedScopeId = id;
+                        _saveUiState();
+                      }),
+                    )
+                  : null,
               children: [
                 if (remoteOnly)
                   _RemoteOnlyNodesState(onOpenRooms: widget.onOpenRooms),
@@ -245,15 +291,6 @@ class _NodesPageState extends State<NodesPage> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            if (overview.hasRooms) ...[
-                              NetworkScopePicker(
-                                overview: overview,
-                                selectedId: selectedId,
-                                onChanged: (id) =>
-                                    setState(() => _selectedScopeId = id),
-                              ),
-                              const SizedBox(height: AppTokens.space12),
-                            ],
                             _NodeToolbar(
                               searchController: _searchController,
                               searchFocusNode: _searchFocusNode,
@@ -266,10 +303,14 @@ class _NodesPageState extends State<NodesPage> {
                                   .where((item) => item.online)
                                   .length,
                               scopeConnections: overview.hasRooms,
-                              onFilterChanged: (filter) =>
-                                  setState(() => _filter = filter),
-                              onSortChanged: (sort) =>
-                                  setState(() => _sort = sort),
+                              onFilterChanged: (filter) => setState(() {
+                                _filter = filter;
+                                _saveUiState();
+                              }),
+                              onSortChanged: (sort) => setState(() {
+                                _sort = sort;
+                                _saveUiState();
+                              }),
                               onQueryChanged: () => setState(() {}),
                               onClearSearch: () =>
                                   setState(_searchController.clear),
@@ -315,20 +356,19 @@ class _NodesPageState extends State<NodesPage> {
                         ),
                         const Divider(height: 1),
                       ],
-                      if (overview.hasRooms) ...[
-                        for (final scope in scopes.where(
-                          (scope) => !scope.isPrimary,
-                        ))
-                          _RoomNodeScopeSummary(
-                            scope: scope,
-                            onOpenRoom: widget.onOpenRoom,
-                          ),
-                      ],
+                      if (overview.hasRooms)
+                        _NetworkScopesSummary(
+                          scopes: scopes,
+                          selectedId: selectedId,
+                          onOpenRoom: widget.onOpenRoom,
+                        ),
                       _NodesSectionLabel(
                         showMetrics: visiblePeers.isNotEmpty,
-                        title: stringsOf(context).isZh
-                            ? '其他设备'
-                            : 'Other devices',
+                        title: overview.hasRooms
+                            ? stringsOf(context).devices
+                            : (stringsOf(context).isZh
+                                  ? '其他设备'
+                                  : 'Other devices'),
                       ),
                       if (allPeers.isEmpty)
                         _EmptyNetworkDevices(
@@ -351,7 +391,10 @@ class _NodesPageState extends State<NodesPage> {
                               : stringsOf(context).clearFilter,
                           onAction: query.trim().isNotEmpty
                               ? () => setState(_searchController.clear)
-                              : () => setState(() => _filter = _NodeFilter.all),
+                              : () => setState(() {
+                                  _filter = _NodeFilter.all;
+                                  _saveUiState();
+                                }),
                         )
                       else
                         LayoutBuilder(
@@ -387,7 +430,13 @@ class _NodesPageState extends State<NodesPage> {
   void _openNetworkPeer(NetworkPeerSnapshot item) {
     if (!item.isPrimary) {
       final roomId = item.roomId;
-      if (roomId != null) widget.onOpenRoom?.call(roomId);
+      if (roomId != null) {
+        if (widget.onOpenRoomDevice != null) {
+          widget.onOpenRoomDevice!(roomId, item.peer.nodeId);
+        } else {
+          widget.onOpenRoom?.call(roomId);
+        }
+      }
       return;
     }
     // The canonical peer dialog and all of its diagnostics remain bound to
@@ -397,7 +446,14 @@ class _NodesPageState extends State<NodesPage> {
 
   void _openPeer(PeerSnapshot peer) {
     final capabilities = widget.capabilities ?? PlatformCapabilities.current();
-    unawaited(_openPeerAndNotify(peer, mobile: !capabilities.canUseSystemTray));
+    unawaited(
+      _openPeerAndNotify(
+        peer,
+        mobile:
+            !capabilities.canUseSystemTray ||
+            MediaQuery.sizeOf(context).width < 600,
+      ),
+    );
   }
 
   Future<void> _openPeerAndNotify(

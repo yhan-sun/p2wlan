@@ -98,6 +98,78 @@ void main() {
     expect(api.username, 'Unsaved draft');
   });
 
+  testWidgets(
+    'username failures stay local and translated until editing resumes',
+    (tester) async {
+      final api = _ProfileApi()
+        ..saveError = const ControlApiException('用户名需为 1–32 个字符 SECRET');
+      addTearDown(api.close);
+      await tester.pumpWidget(
+        _testApp(
+          UsernameSettings(
+            server: 'https://example.com',
+            token: 'demo-token',
+            username: 'Original',
+            controlApi: api,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), 'A nonempty name');
+      await tester.tap(find.text('Save username'));
+      await tester.pumpAndSettle();
+      const message =
+          'Could not save your username. Check your connection or try a different name.';
+      expect(find.text(message), findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.byType(InputDecorator),
+          matching: find.text(message),
+        ),
+        findsOneWidget,
+      );
+      expect(find.textContaining('SECRET'), findsNothing);
+      await tester.pump(const Duration(seconds: 6));
+      expect(find.text(message), findsOneWidget);
+      await tester.enterText(find.byType(TextField), 'Another name');
+      await tester.pumpAndSettle();
+      expect(find.text(message), findsNothing);
+      api.saveError = null;
+      await tester.tap(find.text('Save username'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Username saved.'), findsOneWidget);
+      await tester.enterText(find.byType(TextField), 'A newer unsaved name');
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Username saved.'), findsNothing);
+    },
+  );
+
+  testWidgets('invalid username is explained before a network save', (
+    tester,
+  ) async {
+    final api = _ProfileApi();
+    addTearDown(api.close);
+    await tester.pumpWidget(
+      _testApp(
+        UsernameSettings(
+          server: 'https://example.com',
+          token: 'demo-token',
+          username: 'Original',
+          controlApi: api,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), '   ');
+    await tester.tap(find.text('Save username'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Use 1–32 characters without control characters.'),
+      findsOneWidget,
+    );
+    expect(api.saves, 0);
+  });
+
   testWidgets('new account clears its predecessor draft and ignores old save', (
     tester,
   ) async {

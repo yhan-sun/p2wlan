@@ -340,7 +340,9 @@ void _registerFinalRegressionTests() {
     await tester.pumpAndSettle();
 
     expect(
-      find.text('Could not restart the network service. Please try again.'),
+      find.text(
+        'The default local connection could not be stopped. Starting it again has not been attempted.',
+      ),
       findsOneWidget,
     );
     expect(find.textContaining('SocketException'), findsNothing);

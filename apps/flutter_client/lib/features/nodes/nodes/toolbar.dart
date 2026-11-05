@@ -38,34 +38,37 @@ class _NodeToolbar extends StatelessWidget {
     final onlineCount =
         this.onlineCount ?? _filterCount(allPeers, _NodeFilter.online);
     final colors = P2WlanColors.of(context);
-    final search = TextField(
-      key: const Key('nodes-search-field'),
-      controller: searchController,
-      focusNode: searchFocusNode,
-      onChanged: (_) => onQueryChanged(),
-      textInputAction: TextInputAction.search,
-      style: const TextStyle(fontSize: 13),
-      decoration: InputDecoration(
-        hintText: strings.searchDevicesPlaceholder,
-        prefixIcon: const Icon(Icons.search_rounded, size: 18),
-        prefixIconConstraints: const BoxConstraints(minWidth: 38),
-        suffixIcon: searchController.text.isEmpty
-            ? null
-            : IconButton(
-                key: const Key('nodes-search-clear'),
-                tooltip: strings.clearSearch,
-                onPressed: onClearSearch,
-                icon: const Icon(Icons.close_rounded, size: 17),
-              ),
-        isDense: true,
-        fillColor: colors.surfaceMuted,
-        contentPadding: const EdgeInsets.symmetric(
-          horizontal: 12,
-          vertical: 12,
-        ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          borderSide: BorderSide(color: colors.border),
+    final search = ConstrainedBox(
+      constraints: const BoxConstraints(minHeight: AppTokens.minTouchTarget),
+      child: TextField(
+        key: const Key('nodes-search-field'),
+        controller: searchController,
+        focusNode: searchFocusNode,
+        onChanged: (_) => onQueryChanged(),
+        textInputAction: TextInputAction.search,
+        style: const TextStyle(fontSize: 13),
+        decoration: InputDecoration(
+          hintText: strings.searchDevicesPlaceholder,
+          prefixIcon: const Icon(Icons.search_rounded, size: 18),
+          prefixIconConstraints: const BoxConstraints(minWidth: 38),
+          suffixIcon: searchController.text.isEmpty
+              ? null
+              : IconButton(
+                  key: const Key('nodes-search-clear'),
+                  tooltip: strings.clearSearch,
+                  onPressed: onClearSearch,
+                  icon: const Icon(Icons.close_rounded, size: 17),
+                ),
+          isDense: true,
+          fillColor: colors.surfaceMuted,
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 12,
+            vertical: 12,
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+            borderSide: BorderSide(color: colors.border),
+          ),
         ),
       ),
     );
@@ -144,7 +147,7 @@ class _NodeToolbar extends StatelessWidget {
           children: [
             search,
             const SizedBox(height: AppTokens.space8),
-            if (constraints.maxWidth >= 360 && !largeText)
+            if (constraints.maxWidth >= 320 && !largeText)
               Row(
                 children: [
                   Expanded(child: summary),
@@ -202,26 +205,32 @@ class _MenuButton<T> extends StatelessWidget {
         borderRadius: BorderRadius.circular(AppTokens.radiusLg),
         side: BorderSide(color: colors.border),
       ),
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(icon, size: 16, color: theme.colorScheme.onSurfaceVariant),
-              const SizedBox(width: AppTokens.space6),
-              Flexible(
-                child: Text(
-                  label,
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: theme.colorScheme.onSurface,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(
+          minHeight: AppTokens.minTouchTarget,
+          minWidth: AppTokens.minTouchTarget,
+        ),
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 16, color: theme.colorScheme.onSurfaceVariant),
+                const SizedBox(width: AppTokens.space6),
+                Flexible(
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: theme.colorScheme.onSurface,
+                    ),
                   ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),

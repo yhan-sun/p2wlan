@@ -173,14 +173,14 @@ void main() {
           AppTheme.lightTheme.colorScheme.onSurface,
           AppTheme.lightTheme.colorScheme.surface,
         ),
-        greaterThan(3),
+        greaterThanOrEqualTo(4.5),
       );
       expect(
         _contrast(
           AppTheme.darkTheme.colorScheme.onSurface,
           AppTheme.darkTheme.colorScheme.surface,
         ),
-        greaterThan(3),
+        greaterThanOrEqualTo(4.5),
       );
     });
 
@@ -193,6 +193,49 @@ void main() {
 
   for (final theme in [AppTheme.lightTheme, AppTheme.darkTheme]) {
     final mode = theme.brightness.name;
+    test('$mode supporting text and status labels retain AA contrast', () {
+      final palette = theme.extension<P2WlanColors>()!;
+      for (final surface in [
+        theme.scaffoldBackgroundColor,
+        palette.surface,
+        palette.surfaceElevated,
+        palette.surfaceMuted,
+      ]) {
+        for (final text in [
+          palette.textPrimary,
+          palette.textSecondary,
+          palette.textMuted,
+          palette.direct,
+          palette.relay,
+          palette.probing,
+          palette.offline,
+        ]) {
+          expect(
+            _contrast(text, surface),
+            greaterThanOrEqualTo(4.5),
+            reason: 'supporting text must remain readable on $surface',
+          );
+        }
+      }
+      final input = theme.inputDecorationTheme;
+      for (final text in [
+        input.labelStyle!.color!,
+        input.hintStyle!.color!,
+        input.helperStyle!.color!,
+        input.errorStyle!.color!,
+      ]) {
+        expect(_contrast(text, input.fillColor!), greaterThanOrEqualTo(4.5));
+      }
+      for (final (text, surface) in [
+        (palette.successText, palette.successSurface),
+        (palette.warningText, palette.warningSurface),
+        (palette.dangerText, palette.dangerSurface),
+        (palette.neutralText, palette.neutralSurface),
+      ]) {
+        expect(_contrast(text, surface), greaterThanOrEqualTo(4.5));
+      }
+    });
+
     testWidgets('$mode buttons support Tab, Enter and visible focus', (
       tester,
     ) async {
@@ -343,7 +386,7 @@ void main() {
       '$mode text buttons share geometry and disabled feedback stays quiet',
       () {
         final text = theme.textButtonTheme.style!;
-        expect(text.minimumSize!.resolve({}), const Size(44, 44));
+        expect(text.minimumSize!.resolve({}), const Size(48, 48));
         expect(
           text.padding!.resolve({}),
           const EdgeInsets.symmetric(horizontal: 12, vertical: 10),

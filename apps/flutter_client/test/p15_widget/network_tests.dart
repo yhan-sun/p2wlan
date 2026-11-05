@@ -117,6 +117,80 @@ void _registerNetworkTests() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets(
+    'failed route recheck expires the old success and retains its time',
+    (tester) async {
+      final api = _FakeDiagnosticsApi(
+        health: true,
+        snapshot: await tester.runAsync(_loadFixtureSnapshot),
+        routes: installedRoutes,
+      );
+      await pumpNetworkPage(tester, api: api);
+      final checkedAt = tester
+          .widgetList<Text>(find.byType(Text))
+          .map((text) => text.data)
+          .whereType<String>()
+          .firstWhere(
+            (value) =>
+                RegExp(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
+                    .hasMatch(value),
+          );
+      api.verifyRoutesError = Exception('SECRET');
+      await _tapVisible(tester, find.text('Check routes'));
+      expect(find.text('Installed'), findsNothing);
+      expect(find.text('Unknown (unverified)'), findsOneWidget);
+      expect(find.text('No fix needed'), findsNothing);
+      expect(find.text(checkedAt), findsOneWidget);
+      expect(
+        find.textContaining('Previous results do not confirm'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('SECRET'), findsNothing);
+      await tester.pump(const Duration(seconds: 6));
+      expect(
+        find.textContaining('Previous results do not confirm'),
+        findsOneWidget,
+      );
+      api.verifyRoutesError = null;
+      api.routes = missingRoutes;
+      await _tapVisible(tester, find.text('Check routes'));
+      expect(find.text('Missing'), findsOneWidget);
+      expect(
+        find.textContaining('Previous results do not confirm'),
+        findsNothing,
+      );
+    },
+  );
+
+  testWidgets('route result from an old account cannot replace the new check', (
+    tester,
+  ) async {
+    final api = _DeferredRouteDiagnosticsApi(
+      snapshot: (await tester.runAsync(_loadFixtureSnapshot))!,
+    );
+    final stores = await pumpNetworkPage(tester, api: api);
+    final pending = Completer<RoutesResponse>();
+    api.nextVerification = pending.future;
+    await _tapVisibleNoSettle(tester, find.text('Check routes'));
+    api.routes = missingRoutes;
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(authToken: 'replacement-token'),
+      ),
+    );
+    await tester.pumpAndSettle();
+    // The account switch deliberately requires a fresh local start before a
+    // replacement runtime may publish its route result.
+    await tester.runAsync(stores.statusStore.startDaemon);
+    await tester.pumpAndSettle();
+    await _tapVisible(tester, find.text('Check routes'));
+    pending.complete(installedRoutes);
+    await tester.pumpAndSettle();
+    expect(find.text('Missing'), findsOneWidget);
+    expect(find.text('Installed'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('verify route conflict surfaces actual interface', (
     tester,
   ) async {
@@ -157,6 +231,18 @@ void _registerNetworkTests() {
       findsOneWidget,
     );
     expect(find.text('Installed'), findsOneWidget);
+    final feedback = find
+        .ancestor(
+          of: find.text(
+            'Route repaired in place (state: installed) without restarting the daemon.',
+          ),
+          matching: find.byType(DecoratedBox),
+        )
+        .first;
+    expect(
+      (tester.widget<DecoratedBox>(feedback).decoration as BoxDecoration).color,
+      P2WlanColors.light.successSurface,
+    );
     expect(tester.takeException(), isNull);
   });
 
@@ -177,6 +263,18 @@ void _registerNetworkTests() {
     expect(
       find.text('Route was already correctly installed; no change needed.'),
       findsOneWidget,
+    );
+    final feedback = find
+        .ancestor(
+          of: find.text(
+            'Route was already correctly installed; no change needed.',
+          ),
+          matching: find.byType(DecoratedBox),
+        )
+        .first;
+    expect(
+      (tester.widget<DecoratedBox>(feedback).decoration as BoxDecoration).color,
+      P2WlanColors.light.neutralSurface,
     );
     expect(tester.takeException(), isNull);
   });
@@ -216,7 +314,9 @@ void _registerNetworkTests() {
     await tester.pumpAndSettle();
 
     expect(
-      find.text('Could not restart the network service. Please try again.'),
+      find.text(
+        'The default local connection could not be stopped. Starting it again has not been attempted.',
+      ),
       findsOneWidget,
     );
     expect(find.textContaining('SocketException'), findsNothing);
@@ -224,12 +324,44 @@ void _registerNetworkTests() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('restart start failure retries starting without stopping twice', (
+    tester,
+  ) async {
+    final api = _FakeDiagnosticsApi(
+      health: true,
+      snapshot: await tester.runAsync(_loadFixtureSnapshot),
+    );
+    final controller = _RetryNetworkDaemonController(api)..startOk = false;
+    await pumpNetworkPage(tester, api: api, daemonController: controller);
+    await _tapVisible(
+      tester,
+      find.text('Restart network service (brief disconnect)'),
+    );
+    expect(controller.stops, 1);
+    expect(controller.starts, 1);
+    expect(
+      find.text(
+        'The stop step completed, but the default local connection could not be confirmed as restarted.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('Retry starting'), findsOneWidget);
+    controller.startOk = true;
+    await _tapVisible(tester, find.text('Retry starting'));
+    expect(controller.stops, 1);
+    expect(controller.starts, 2);
+    expect(
+      find.text('Daemon restarted to reinstall overlay routes.'),
+      findsOneWidget,
+    );
+  });
+
   testWidgets('restart success reports route reinstall', (tester) async {
     final api = _FakeDiagnosticsApi(
       health: true,
       snapshot: (await tester.runAsync(_loadFixtureSnapshot)),
     );
-    await pumpNetworkPage(tester, api: api);
+    final stores = await pumpNetworkPage(tester, api: api);
 
     await _tapVisible(
       tester,
@@ -240,6 +372,16 @@ void _registerNetworkTests() {
       find.text('Daemon restarted to reinstall overlay routes.'),
       findsOneWidget,
     );
+    final feedback = find.byKey(
+      const ValueKey('local-connection-restart-feedback'),
+    );
+    expect(tester.getSize(feedback).height, lessThanOrEqualTo(52));
+    await _tapVisible(
+      tester,
+      find.byKey(const ValueKey('restart-dismiss-success')),
+    );
+    expect(feedback, findsNothing);
+    expect(stores.statusStore.healthReachable, isTrue);
     expect(tester.takeException(), isNull);
   });
 
@@ -338,6 +480,162 @@ void _registerNetworkTests() {
 
     expect(tester.takeException(), isNull);
   });
+
+  for (final scenario in ['leave', 'endpoint', 'replacement', 'disposed']) {
+    final changeOwner = scenario != 'leave';
+    testWidgets(
+      'diagnostics restart ${scenario == 'endpoint'
+          ? 'rejects a changed endpoint'
+          : scenario == 'replacement'
+          ? 'rejects a replacement owner with the same revision and endpoint'
+          : scenario == 'disposed'
+          ? 'rejects a disposed store'
+          : 'finishes on its original owner'} after leaving',
+      (tester) async {
+        final api = _FakeDiagnosticsApi(
+          health: true,
+          snapshot: await tester.runAsync(_loadFixtureSnapshot),
+        );
+        final controller = _DeferredRestartDaemonController(api);
+        final original = await pumpNetworkPage(
+          tester,
+          api: api,
+          daemonController: controller,
+        );
+        final originalUrl = original.settingsStore.settings.diagnosticsUrl;
+        await _tapVisibleNoSettle(
+          tester,
+          find.text('Restart network service (brief disconnect)'),
+        );
+        expect(controller.stops, 1);
+        expect(controller.starts, 0);
+        final replacementApi = _FakeDiagnosticsApi(health: false);
+        final replacementController = _RetryNetworkDaemonController(
+          replacementApi,
+        );
+        final replacement = (await tester.runAsync(
+          () => _makeStores(
+            api: replacementApi,
+            daemonController: replacementController,
+          ),
+        ))!;
+        addTearDown(replacement.dispose);
+        expect(
+          replacement.statusStore.sessionRevision,
+          original.statusStore.sessionRevision,
+        );
+        expect(replacement.settingsStore.settings.diagnosticsUrl, originalUrl);
+        await tester.pumpWidget(
+          _TestApp(
+            child: DiagnosticsPage(
+              key: scenario == 'replacement'
+                  ? null
+                  : const ValueKey('replacement-diagnostics'),
+              settingsStore: replacement.settingsStore,
+              statusStore: replacement.statusStore,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        if (scenario == 'endpoint') {
+          await tester.runAsync(
+            () => original.settingsStore.updateSettings(
+              original.settingsStore.settings.copyWith(
+                diagnosticsUrl: 'http://127.0.0.1:39279',
+              ),
+            ),
+          );
+        }
+        if (scenario == 'disposed') original.statusStore.dispose();
+        controller.pendingStop.complete(
+          const DaemonCommandResult(ok: true, message: 'stopped'),
+        );
+        await _waitFor(tester, () => !original.statusStore.daemonBusy);
+        await tester.pumpAndSettle();
+        expect(controller.starts, changeOwner ? 0 : 1);
+        expect(replacementController.starts, 0);
+        if (scenario == 'replacement') {
+          expect(find.text('Installed'), findsNothing);
+          expect(
+            find.byKey(const ValueKey('local-connection-restart-feedback')),
+            findsNothing,
+          );
+          expect(
+            tester
+                .widget<OutlinedButton>(
+                  find.widgetWithText(OutlinedButton, 'Check again'),
+                )
+                .onPressed,
+            isNotNull,
+          );
+        }
+        if (!changeOwner) {
+          expect(controller.startedSettings.single.diagnosticsUrl, originalUrl);
+        }
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+}
+
+class _DeferredRouteDiagnosticsApi extends _FakeDiagnosticsApi {
+  _DeferredRouteDiagnosticsApi({required DiagnosticsSnapshot snapshot})
+    : super(health: true, snapshot: snapshot);
+
+  Future<RoutesResponse>? nextVerification;
+
+  @override
+  Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) {
+    final next = nextVerification;
+    nextVerification = null;
+    return next ?? super.verifyRoutes(diagnosticsUrl);
+  }
+}
+
+class _RetryNetworkDaemonController extends _FakeDaemonController {
+  _RetryNetworkDaemonController(super.api);
+
+  bool startOk = true;
+  bool stopOk = true;
+  int starts = 0;
+  int stops = 0;
+
+  @override
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) async {
+    starts++;
+    return DaemonCommandResult(ok: startOk, message: 'test startup result');
+  }
+
+  @override
+  Future<DaemonCommandResult> stop(String diagnosticsUrl) async {
+    stops++;
+    return DaemonCommandResult(ok: stopOk, message: 'test stop result');
+  }
+}
+
+class _DeferredRestartDaemonController extends _RetryNetworkDaemonController {
+  _DeferredRestartDaemonController(super.api);
+
+  final pendingStop = Completer<DaemonCommandResult>();
+  final startedSettings = <AppSettings>[];
+
+  @override
+  Future<DaemonCommandResult> stop(String diagnosticsUrl) {
+    stops++;
+    return pendingStop.future;
+  }
+
+  @override
+  Future<DaemonCommandResult> start(
+    AppSettings settings, {
+    int? vpnSettingsRevision,
+  }) {
+    startedSettings.add(settings);
+    return super.start(settings, vpnSettingsRevision: vpnSettingsRevision);
+  }
 }
 
 /// Scrolls [finder] into view and taps it, settling the advanced sections.

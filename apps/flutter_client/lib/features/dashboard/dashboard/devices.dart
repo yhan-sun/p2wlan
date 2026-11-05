@@ -147,7 +147,9 @@ class _DeviceRow extends StatelessWidget {
         onTap: onTap,
         borderRadius: BorderRadius.circular(AppTokens.radiusMd),
         child: ConstrainedBox(
-          constraints: const BoxConstraints(minHeight: 44),
+          constraints: const BoxConstraints(
+            minHeight: AppTokens.minTouchTarget,
+          ),
           child: Padding(
             padding: const EdgeInsets.symmetric(vertical: 6),
             child: LayoutBuilder(

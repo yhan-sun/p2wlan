@@ -286,7 +286,19 @@ void main() {
       ),
     );
     expect(find.text('Checking: default local connection'), findsOneWidget);
-    await tester.tap(find.byKey(const Key('diagnostics-open-rooms')));
+    expect(find.byKey(const Key('diagnostics-open-rooms')), findsNothing);
+    final roomSummary = find.byKey(
+      const Key('diagnostics-room-connections-toggle'),
+    );
+    await tester.ensureVisible(roomSummary);
+    await tester.pumpAndSettle();
+    await tester.tap(roomSummary);
+    await tester.pumpAndSettle();
+    expect(roomRequests, 0);
+    final allRooms = find.byKey(const Key('diagnostics-open-rooms'));
+    await tester.ensureVisible(allRooms);
+    await tester.pumpAndSettle();
+    await tester.tap(allRooms);
     expect(roomRequests, 1);
     final advanced = find.byKey(const Key('diagnostics-advanced'));
     await tester.ensureVisible(advanced);

@@ -1,57 +1,43 @@
 part of '../settings_page.dart';
 
-/// Category entry points use the available width without exposing form fields.
+/// Compact two-line entry rows keep every category visible on a phone.
 class _SettingsRoot extends StatelessWidget {
   const _SettingsRoot({
     required this.categories,
     required this.summaryFor,
-    required this.statusListenable,
     required this.onSelect,
   });
 
   final List<SettingsCategory> categories;
   final String Function(SettingsCategory category) summaryFor;
-  final Listenable statusListenable;
   final ValueChanged<SettingsCategory> onSelect;
 
   @override
-  Widget build(BuildContext context) => LayoutBuilder(
-    builder: (context, constraints) {
-      final twoColumns =
-          constraints.maxWidth >= 520 &&
-          MediaQuery.textScalerOf(context).scale(14) <= 19;
-      final width = twoColumns
-          ? (constraints.maxWidth - 16) / 2
-          : constraints.maxWidth;
-      Widget cardFor(SettingsCategory category) => SizedBox(
-        width: width,
-        child: _SettingsCategoryCard(
-          category: category,
-          summary: summaryFor(category),
-          spacious: twoColumns,
-          onTap: () => onSelect(category),
-        ),
-      );
-      return ListView(
-        padding: const EdgeInsets.symmetric(vertical: 2),
-        children: [
-          Wrap(
-            spacing: 16,
-            runSpacing: twoColumns ? 16 : 12,
-            children: [
-              for (final category in categories)
-                if (category == SettingsCategory.developer)
-                  AnimatedBuilder(
-                    animation: statusListenable,
-                    builder: (context, _) => cardFor(category),
-                  )
-                else
-                  cardFor(category),
+  Widget build(BuildContext context) => ListView(
+    padding: const EdgeInsets.symmetric(vertical: 2),
+    children: [
+      _SettingsSurface(
+        padding: EdgeInsets.zero,
+        child: Column(
+          children: [
+            for (var index = 0; index < categories.length; index++) ...[
+              if (index > 0)
+                Divider(
+                  height: 1,
+                  indent: 52,
+                  endIndent: 16,
+                  color: P2WlanColors.of(context).divider,
+                ),
+              _SettingsCategoryCard(
+                category: categories[index],
+                summary: summaryFor(categories[index]),
+                onTap: () => onSelect(categories[index]),
+              ),
             ],
-          ),
-        ],
-      );
-    },
+          ],
+        ),
+      ),
+    ],
   );
 }
 
@@ -59,53 +45,37 @@ class _SettingsCategoryCard extends StatelessWidget {
   const _SettingsCategoryCard({
     required this.category,
     required this.summary,
-    required this.spacious,
     required this.onTap,
   });
   final SettingsCategory category;
   final String summary;
-  final bool spacious;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final theme = Theme.of(context);
-    final subtitle = switch (category) {
-      SettingsCategory.general =>
-        strings.isZh
-            ? '设备名称、外观与启动偏好'
-            : 'Device identity, appearance and startup',
-      SettingsCategory.accountNetwork =>
-        strings.isZh ? '账号登录、服务器与网络' : 'Account, server and network identity',
-      SettingsCategory.advancedNetwork =>
-        strings.isZh
-            ? '虚拟网卡、UDP 与中继'
-            : 'Virtual interface, UDP and relay options',
-      SettingsCategory.developer =>
-        strings.isZh ? '诊断服务、日志与版本' : 'Diagnostics, logs and client updates',
-    };
+    final largeText = MediaQuery.textScalerOf(context).scale(14) > 18;
     return Semantics(
       container: true,
       button: true,
       onTap: onTap,
       child: _SettingsTapSurface(
         interactionKey: ValueKey('settings-category-card-${category.name}'),
-        outlined: true,
         onTap: onTap,
         child: ConstrainedBox(
-          constraints: BoxConstraints(minHeight: spacious ? 140 : 112),
+          constraints: const BoxConstraints(minHeight: 76),
           child: Padding(
-            padding: EdgeInsets.all(spacious ? 20 : 16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            child: Row(
               children: [
-                Row(
-                  children: [
-                    _SettingsCategoryIcon(category),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
+                _SettingsCategoryIcon(category),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
                         category.label(strings),
                         style: TextStyle(
                           fontSize: 15,
@@ -114,34 +84,25 @@ class _SettingsCategoryCard extends StatelessWidget {
                           color: theme.colorScheme.onSurface,
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 8),
-                    Icon(
-                      Icons.chevron_right_rounded,
-                      size: 20,
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Text(
-                  subtitle,
-                  style: TextStyle(
-                    fontSize: 12,
-                    height: 1.45,
-                    color: theme.colorScheme.onSurfaceVariant,
+                      const SizedBox(height: 4),
+                      Text(
+                        summary,
+                        maxLines: largeText ? 2 : 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 13,
+                          height: 1.4,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                const SizedBox(height: 10),
-                Text(
-                  summary,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 13,
-                    height: 1.3,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
+                const SizedBox(width: 12),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  size: 20,
+                  color: theme.colorScheme.onSurfaceVariant,
                 ),
               ],
             ),
@@ -345,7 +306,33 @@ class _CategoryDetailView extends StatelessWidget {
                 _SettingsErrorNotice(message: state._formError!),
                 const SizedBox(height: AppTokens.space12),
               ],
-              if (state.widget.statusStore.primaryConfigurationPending) ...[
+              if (state._currentRestartPhase !=
+                      LocalConnectionRestartPhase.idle &&
+                  !(state._currentRestartPhase ==
+                          LocalConnectionRestartPhase.complete &&
+                      state
+                          .widget
+                          .statusStore
+                          .primaryConfigurationPending)) ...[
+                LocalConnectionRestartFeedback(
+                  phase: state._currentRestartPhase,
+                  serviceReachable: state.widget.statusStore.healthReachable,
+                  configurationPending:
+                      state.widget.statusStore.primaryConfigurationPending,
+                  busy: state._saving || state.widget.statusStore.daemonBusy,
+                  onRetry: state._restartDaemonToApply,
+                  onDismiss: () => state._updateState(
+                    () =>
+                        state._restartPhase = LocalConnectionRestartPhase.idle,
+                  ),
+                ),
+                const SizedBox(height: AppTokens.space12),
+              ],
+              if (state.widget.statusStore.primaryConfigurationPending &&
+                  (state._currentRestartPhase ==
+                          LocalConnectionRestartPhase.idle ||
+                      state._currentRestartPhase ==
+                          LocalConnectionRestartPhase.complete)) ...[
                 _PendingRestartNotice(
                   busy: state._saving || state.widget.statusStore.daemonBusy,
                   canRestart: state._capabilities.canControlLocalDaemon,
@@ -374,12 +361,7 @@ class _CategoryDetailView extends StatelessWidget {
                     animation: state._statusViewNotifier,
                     builder: (context, _) => _SaveBar(
                       busy: state._saving,
-                      restartRequired:
-                          state
-                              .widget
-                              .statusStore
-                              .primaryConfigurationPending ||
-                          state._draftNeedsRestart(category),
+                      restartRequired: state._draftNeedsRestart(category),
                       onUndo: () => state._resetCategory(category),
                       onSave: () => state._saveCategory(category),
                     ),
@@ -561,7 +543,6 @@ class _SettingsShell extends StatelessWidget {
         child: _SettingsRoot(
           categories: categories,
           summaryFor: (category) => state._categorySummary(category, strings),
-          statusListenable: state._statusViewNotifier,
           onSelect: onSelect,
         ),
       );

@@ -7,6 +7,7 @@ import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
+import '../../app/session_ui_state.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/daemon/daemon_controller.dart';
 import '../../core/models/diagnostics_models.dart';
@@ -27,6 +28,7 @@ import '../../shared/widgets/traffic_history_section.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
 import '../../shared/widgets/device_type_icon.dart';
+import '../rooms/room_strings.dart';
 
 part 'dashboard/actions.dart';
 part 'dashboard/components.dart';
@@ -53,7 +55,9 @@ class DashboardPage extends StatefulWidget {
     this.onOpenTroubleshooting,
     this.onOpenRooms,
     this.onOpenRoom,
+    this.onOpenRoomDevice,
     this.onReauthenticate,
+    this.uiState,
   });
 
   final SettingsStore settingsStore;
@@ -76,7 +80,9 @@ class DashboardPage extends StatefulWidget {
 
   final VoidCallback? onOpenRooms;
   final ValueChanged<String>? onOpenRoom;
+  final void Function(String roomId, String deviceId)? onOpenRoomDevice;
   final VoidCallback? onReauthenticate;
+  final HomeUiState? uiState;
 
   @override
   State<DashboardPage> createState() => _DashboardPageState();
@@ -84,6 +90,29 @@ class DashboardPage extends StatefulWidget {
 
 class _DashboardPageState extends State<DashboardPage> {
   String? _selectedScopeId;
+  late final ScrollController _scrollController;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedScopeId = widget.uiState?.scopeId;
+    _scrollController = ScrollController(
+      initialScrollOffset: widget.uiState?.scrollOffset ?? 0,
+    )..addListener(_rememberScroll);
+  }
+
+  void _rememberScroll() {
+    if (_scrollController.hasClients) {
+      widget.uiState?.scrollOffset = _scrollController.offset;
+    }
+  }
+
+  @override
+  void dispose() {
+    _rememberScroll();
+    _scrollController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -164,19 +193,22 @@ class _DashboardPageState extends State<DashboardPage> {
             ? widget.statusStore.lastDaemonManualCommand
             : null;
         return PageScaffold(
+          scrollController: _scrollController,
           title: strings.isZh ? '网络概览' : 'Network overview',
-          subtitle: strings.homePageSubtitle,
+          subtitle: '',
+          toolbar: capabilities.canActAsLocalVpnNode && overview.hasRooms
+              ? NetworkScopePicker(
+                  overview: overview,
+                  selectedId: selectedId,
+                  onChanged: (id) => setState(() {
+                    _selectedScopeId = id;
+                    widget.uiState?.scopeId = id;
+                  }),
+                )
+              : null,
           showHeader: widget.showHeader,
           maxWidth: dashboardPageMaxWidth,
           children: [
-            if (capabilities.canActAsLocalVpnNode && overview.hasRooms) ...[
-              NetworkScopePicker(
-                overview: overview,
-                selectedId: selectedId,
-                onChanged: (id) => setState(() => _selectedScopeId = id),
-              ),
-              const SizedBox(height: AppTokens.space8),
-            ],
             if (capabilities.canActAsLocalVpnNode && showRoomOverview)
               _RoomHomeOverview(
                 overview: overview,
@@ -189,6 +221,10 @@ class _DashboardPageState extends State<DashboardPage> {
                 onOpenRooms: widget.onOpenRooms,
                 onOpenRoom: widget.onOpenRoom,
                 onOpenPeer: widget.onOpenPeer,
+                onOpenRoomDevice: widget.onOpenRoomDevice,
+                onOpenTroubleshooting: widget.onOpenTroubleshooting,
+                onReauthenticate: widget.onReauthenticate,
+                statusStore: widget.statusStore,
               )
             else if (capabilities.canActAsLocalVpnNode)
               _NetworkHero(
@@ -204,30 +240,28 @@ class _DashboardPageState extends State<DashboardPage> {
                 onOpenRooms: widget.onOpenRooms,
                 onStartDaemon: widget.statusStore.startDaemon,
                 onStopDaemon: widget.statusStore.stopPrimaryDaemon,
+                issueBanner:
+                    issueMessage != null &&
+                        (daemonAvailable || startupFailure != null)
+                    ? _HomeIssueBanner(
+                        message: issueMessage,
+                        tone:
+                            startupFailure != null ||
+                                (!widget.statusStore.healthReachable &&
+                                    widget.statusStore.lastHealthError != null)
+                            ? StatusTone.bad
+                            : StatusTone.warn,
+                        onOpenTroubleshooting: widget.onOpenTroubleshooting,
+                        onReauthenticate:
+                            snapshot?.health.reauthRequired == true
+                            ? widget.onReauthenticate
+                            : null,
+                        primaryAction: true,
+                      )
+                    : null,
               )
             else
-              _RemoteOnlyHero(
-                onOpenDevices: widget.onOpenRooms ?? widget.onOpenDevices,
-              ),
-            if (capabilities.canActAsLocalVpnNode &&
-                !showRoomOverview &&
-                issueMessage != null &&
-                (daemonAvailable || startupFailure != null)) ...[
-              const SizedBox(height: AppTokens.space12),
-              _HomeIssueBanner(
-                message: issueMessage,
-                tone:
-                    startupFailure != null ||
-                        (!widget.statusStore.healthReachable &&
-                            widget.statusStore.lastHealthError != null)
-                    ? StatusTone.bad
-                    : StatusTone.warn,
-                onOpenTroubleshooting: widget.onOpenTroubleshooting,
-                onReauthenticate: snapshot?.health.reauthRequired == true
-                    ? widget.onReauthenticate
-                    : null,
-              ),
-            ],
+              _RemoteOnlyHero(onOpenDevices: widget.onOpenDevices),
             if (capabilities.canActAsLocalVpnNode &&
                 !showRoomOverview &&
                 snapshot == null &&
@@ -245,29 +279,37 @@ class _DashboardPageState extends State<DashboardPage> {
             ],
             if (capabilities.canActAsLocalVpnNode && !showRoomOverview) ...[
               const SizedBox(height: AppTokens.space16),
-              _TrafficOverviewSection(
-                statusStore: widget.statusStore,
-                selectedId: selectedId,
-              ),
-            ],
-            if (capabilities.canActAsLocalVpnNode &&
-                !showRoomOverview &&
-                snapshot != null) ...[
-              const SizedBox(height: AppTokens.space16),
-              _DashboardSectionSurface(
-                child: _OnlineDevicesSection(
-                  peers: overviewPeers,
-                  current: !primaryStale,
-                  peerTransferRates: peerTransferRates,
-                  onOpenDevices: widget.onOpenDevices,
-                  onOpenPeer: widget.onOpenPeer,
-                  onOpenRooms: widget.onOpenRooms,
+              if (snapshot == null)
+                _TrafficHistoryEntry(
+                  statusStore: widget.statusStore,
+                  selectedId: selectedId,
+                )
+              else
+                _DashboardDetailsLayout(
+                  devices: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _DashboardSectionSurface(
+                        child: _OnlineDevicesSection(
+                          peers: overviewPeers,
+                          current: !primaryStale,
+                          peerTransferRates: peerTransferRates,
+                          onOpenDevices: widget.onOpenDevices,
+                          onOpenPeer: widget.onOpenPeer,
+                          onOpenRooms: widget.onOpenRooms,
+                        ),
+                      ),
+                      if (!primaryStale) ...[
+                        const SizedBox(height: AppTokens.space12),
+                        _ConnectionDetails(snapshot: snapshot, counts: counts),
+                      ],
+                    ],
+                  ),
+                  traffic: _TrafficOverviewSection(
+                    statusStore: widget.statusStore,
+                    selectedId: selectedId,
+                  ),
                 ),
-              ),
-              if (!primaryStale) ...[
-                const SizedBox(height: AppTokens.space12),
-                _ConnectionDetails(snapshot: snapshot, counts: counts),
-              ],
             ],
           ],
         );

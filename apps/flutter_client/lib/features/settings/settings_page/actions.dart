@@ -255,36 +255,73 @@ extension _SettingsPageActions on _SettingsPageState {
   }
 
   Future<void> _restartDaemonToApply() async {
-    final strings = AppStrings.fromCode(
-      widget.settingsStore.settings.languageCode,
-    );
-    final sessionRevision = widget.statusStore.sessionRevision;
-    final diagnosticsUrl = widget.settingsStore.settings.diagnosticsUrl;
-    bool acceptsSession() =>
+    final statusStore = widget.statusStore;
+    final settingsStore = widget.settingsStore;
+    if (_saving || statusStore.daemonBusy) return;
+    final strings = AppStrings.fromCode(settingsStore.settings.languageCode);
+    final sessionRevision = statusStore.sessionRevision;
+    final diagnosticsUrl = settingsStore.settings.diagnosticsUrl;
+    bool acceptsOwner() =>
+        identical(widget.statusStore, statusStore) &&
+        identical(widget.settingsStore, settingsStore) &&
+        sessionRevision == statusStore.sessionRevision &&
+        diagnosticsUrl == settingsStore.settings.diagnosticsUrl;
+    bool ownsUi() =>
         mounted &&
-        sessionRevision == widget.statusStore.sessionRevision &&
-        diagnosticsUrl == widget.settingsStore.settings.diagnosticsUrl;
-    _updateState(() => _saving = true);
+        identical(widget.statusStore, statusStore) &&
+        identical(widget.settingsStore, settingsStore);
+    bool acceptsUi() => ownsUi() && acceptsOwner();
+    final retryStart =
+        _currentRestartPhase == LocalConnectionRestartPhase.startFailed;
+    var phase = retryStart
+        ? LocalConnectionRestartPhase.starting
+        : LocalConnectionRestartPhase.stopping;
+    void showPhase(LocalConnectionRestartPhase next) {
+      phase = next;
+      if (acceptsUi()) _updateState(() => _restartPhase = next);
+    }
+
+    _updateState(() {
+      _saving = true;
+      _restartOwner = (sessionRevision, diagnosticsUrl);
+      _restartPhase = phase;
+    });
     try {
-      final stopped = await widget.statusStore.stopPrimaryDaemon();
-      if (!acceptsSession()) return;
-      if (!stopped.ok) {
-        _showSnackBar(strings.tunnelRestartFailed);
-        return;
+      if (!retryStart) {
+        final stopped = await statusStore.stopPrimaryDaemon();
+        if (!acceptsOwner()) return;
+        if (!stopped.ok) {
+          showPhase(LocalConnectionRestartPhase.stopFailed);
+          return;
+        }
+        showPhase(LocalConnectionRestartPhase.starting);
       }
-      final started = await widget.statusStore.startDaemon();
-      if (!acceptsSession()) return;
+      // Leaving Settings removes its feedback surface, not the already
+      // authorized stop/start operation. Continue only on the captured owner;
+      // StatusStore also rejects a disposed owner or a concurrent command.
+      if (!acceptsOwner()) return;
+      final started = await statusStore.startDaemon();
+      if (!acceptsUi()) return;
       if (!started.ok) {
-        _showSnackBar(strings.tunnelRestartFailed);
+        showPhase(LocalConnectionRestartPhase.startFailed);
         return;
       }
+      showPhase(LocalConnectionRestartPhase.complete);
       _showSnackBar(
-        widget.statusStore.primaryConfigurationPending
+        statusStore.primaryConfigurationPending
             ? strings.settingsSavedRestartRequired
             : strings.settingsApplied,
       );
+    } catch (_) {
+      if (acceptsUi()) {
+        showPhase(
+          phase == LocalConnectionRestartPhase.stopping
+              ? LocalConnectionRestartPhase.stopFailed
+              : LocalConnectionRestartPhase.startFailed,
+        );
+      }
     } finally {
-      if (mounted) _updateState(() => _saving = false);
+      if (ownsUi()) _updateState(() => _saving = false);
     }
   }
 

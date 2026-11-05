@@ -53,6 +53,149 @@ class _EmptyNetworkDevices extends StatelessWidget {
   }
 }
 
+/// Scope detail stays available without putting the room directory before the
+/// device list. A selected room needs only its current state and local address.
+class _NetworkScopesSummary extends StatefulWidget {
+  const _NetworkScopesSummary({
+    required this.scopes,
+    required this.selectedId,
+    this.onOpenRoom,
+  });
+
+  final List<NetworkScopeSnapshot> scopes;
+  final String? selectedId;
+  final ValueChanged<String>? onOpenRoom;
+
+  @override
+  State<_NetworkScopesSummary> createState() => _NetworkScopesSummaryState();
+}
+
+class _NetworkScopesSummaryState extends State<_NetworkScopesSummary> {
+  var _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = stringsOf(context);
+    final colors = P2WlanColors.of(context);
+    final rooms = widget.scopes.where((scope) => !scope.isPrimary).toList();
+    if (rooms.isEmpty) return const SizedBox.shrink();
+    if (widget.selectedId != null && rooms.length == 1) {
+      final scope = rooms.single;
+      final text = [
+        networkDisplayStateLabel(strings, scope.state),
+        if (scope.snapshot?.virtualIp.isNotEmpty == true)
+          '${strings.isZh ? '本机 IP' : 'Local IP'} ${scope.snapshot!.virtualIp}',
+      ].join(' · ');
+      return Semantics(
+        label: networkScopeLabel(strings, scope),
+        child: InkWell(
+          key: Key('nodes-network-scope-${scope.id}'),
+          onTap: widget.onOpenRoom == null
+              ? null
+              : () => widget.onOpenRoom!(scope.roomId!),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(
+              minHeight: AppTokens.minTouchTarget,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      text,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: colors.textSecondary,
+                      ),
+                    ),
+                  ),
+                  if (widget.onOpenRoom != null)
+                    const Icon(Icons.chevron_right_rounded, size: 18),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    final attention = rooms.where(networkScopeNeedsAttention).length;
+    int count(NetworkDisplayState state) =>
+        rooms.where((scope) => scope.state == state).length;
+    final running = count(NetworkDisplayState.running);
+    final starting = count(NetworkDisplayState.starting);
+    final stopping = count(NetworkDisplayState.stopping);
+    final stopped = count(NetworkDisplayState.stopped);
+    final summary = [
+      strings.isZh ? '${rooms.length} 个房间' : '${rooms.length} rooms',
+      if (attention > 0)
+        strings.isZh ? '$attention 个需处理' : '$attention need attention',
+      if (running > 0) strings.isZh ? '$running 个运行中' : '$running running',
+      if (starting > 0)
+        strings.isZh ? '$starting 个连接中' : '$starting connecting',
+      if (stopping > 0)
+        strings.isZh ? '$stopping 个断开中' : '$stopping disconnecting',
+      if (stopped > 0) strings.isZh ? '$stopped 个未连接' : '$stopped disconnected',
+    ].join(' · ');
+    return Column(
+      key: const Key('nodes-scopes-summary'),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(left: 14, right: 6),
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final label = Text(
+                summary,
+                style: TextStyle(
+                  fontSize: 12,
+                  color: attention > 0
+                      ? colors.warningText
+                      : colors.textSecondary,
+                ),
+              );
+              final action = MergeSemantics(
+                child: Semantics(
+                  expanded: _expanded,
+                  child: TextButton.icon(
+                    key: const Key('nodes-scopes-toggle'),
+                    onPressed: () => setState(() => _expanded = !_expanded),
+                    icon: Icon(
+                      _expanded
+                          ? Icons.expand_less_rounded
+                          : Icons.expand_more_rounded,
+                      size: 18,
+                    ),
+                    label: Text(strings.isZh ? '网络详情' : 'Network details'),
+                    iconAlignment: IconAlignment.end,
+                  ),
+                ),
+              );
+              if (constraints.maxWidth < 300 ||
+                  MediaQuery.textScalerOf(context).scale(14) > 18) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [label, action],
+                );
+              }
+              return Row(
+                children: [
+                  Expanded(child: label),
+                  action,
+                ],
+              );
+            },
+          ),
+        ),
+        if (_expanded)
+          for (final scope in rooms)
+            _RoomNodeScopeSummary(scope: scope, onOpenRoom: widget.onOpenRoom),
+      ],
+    );
+  }
+}
+
 class _RoomNodeScopeSummary extends StatelessWidget {
   const _RoomNodeScopeSummary({required this.scope, this.onOpenRoom});
   final NetworkScopeSnapshot scope;

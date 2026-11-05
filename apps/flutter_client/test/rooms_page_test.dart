@@ -15,11 +15,13 @@ import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/presentation/network_overview.dart';
 import 'package:p2wlan_flutter_client/core/traffic/traffic_history_store.dart';
 import 'package:p2wlan_flutter_client/core/rooms/room_api.dart';
+import 'package:p2wlan_flutter_client/core/rooms/room_connectivity.dart';
 import 'package:p2wlan_flutter_client/core/rooms/room_profiles.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
 import 'package:p2wlan_flutter_client/features/rooms/rooms_page.dart';
+import 'package:p2wlan_flutter_client/features/rooms/room_strings.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/traffic_history_scope.dart';
 
 final _token =
@@ -48,6 +50,10 @@ class _FakeRoomApi extends RoomApi {
   bool ownerOnline = false;
   bool deviceOnline = true;
   String? joinError;
+  RoomException? createException;
+  Completer<FriendRoom>? pendingCreate;
+  List<FriendRoom>? roomListOverride;
+  Map<String, RoomRoster>? rosterOverrides;
   String? listError;
   RoomException? listException;
   RoomException? rosterException;
@@ -73,6 +79,7 @@ class _FakeRoomApi extends RoomApi {
     if (listException != null) throw listException!;
     if (listError != null) throw RoomException(listError!);
     userId = role == 'owner' ? 'owner' : 'member';
+    if (roomListOverride != null) return roomListOverride!;
     return empty
         ? []
         : [
@@ -91,6 +98,7 @@ class _FakeRoomApi extends RoomApi {
   @override
   Future<RoomRoster> roster(String room) async {
     rosterCalls++;
+    if (rosterOverrides?[room] case final roster?) return roster;
     if (rosterException != null) throw rosterException!;
     if (rosterError != null) throw RoomException(rosterError!);
     return RoomRoster.fromJson({
@@ -163,6 +171,8 @@ class _FakeRoomApi extends RoomApi {
   @override
   Future<FriendRoom> create(String name, String password) async {
     calls.add('create:$name:$password');
+    if (pendingCreate != null) return pendingCreate!.future;
+    if (createException != null) throw createException!;
     empty = false;
     return FriendRoom.fromJson(_room('owner'));
   }
@@ -318,6 +328,15 @@ DiagnosticsSnapshot _trafficSnapshot({
 }
 
 void main() {
+  Finder detailsSurface() => find
+      .ancestor(
+        of: find.byKey(const Key('nodes-detail-close')),
+        matching: find.byWidgetPredicate(
+          (widget) => widget is Dialog || widget is Scaffold,
+        ),
+      )
+      .first;
+
   Future<_FakeRoomApi> pump(
     WidgetTester tester, {
     String role = 'owner',
@@ -342,6 +361,11 @@ void main() {
     onStores,
     double textScale = 1,
     bool disableAnimations = false,
+    String languageCode = 'zh-CN',
+    String? initialRoomId,
+    String? initialDeviceId,
+    VoidCallback? onInitialDeviceOpened,
+    VoidCallback? onDeviceDetailsClosed,
     TrafficHistoryStore? history,
     void Function(_FakeRoomApi)? configureApi,
     void Function(VoidCallback)? onStatusPulse,
@@ -361,6 +385,7 @@ void main() {
           authToken: _token,
           onboardingCompleted: true,
           deviceName: '本机电脑',
+          languageCode: languageCode,
           networkId: primaryRoom ? _roomId : defaultNetworkId,
           overlayCidr: primaryRoom ? '10.21.1.0/24' : defaultOverlayCidr,
         ),
@@ -446,11 +471,20 @@ void main() {
                   canConnect ? 'linux' : 'ios',
                 ),
                 initialInvitation: invitation,
+                initialRoomId: initialRoomId,
+                initialDeviceId: initialDeviceId,
+                onInitialDeviceOpened: onInitialDeviceOpened,
+                onDeviceDetailsClosed: onDeviceDetailsClosed,
               ),
       ),
     );
     if (settleInitial) await tester.pumpAndSettle();
-    if (enterRoom && !empty && invitation == null && !shell && !primaryRoom) {
+    if (enterRoom &&
+        !empty &&
+        invitation == null &&
+        !shell &&
+        !primaryRoom &&
+        initialRoomId == null) {
       await tester.tap(find.byKey(const ValueKey('room-card-$_roomId')));
       await tester.pumpAndSettle();
     }
@@ -801,7 +835,13 @@ void main() {
     expect(find.text('18 ms'), findsNothing);
     expect(find.text('直连'), findsNothing);
     expect(find.text('状态待更新'), findsNWidgets(3));
-    expect(find.text('链路 / 数据'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const ValueKey('room-device-device-1')),
+        matching: find.text('状态待更新'),
+      ),
+      findsOneWidget,
+    );
     await tester.ensureVisible(
       find.byKey(const ValueKey('room-device-device-1')),
     );
@@ -925,7 +965,7 @@ void main() {
     },
   );
 
-  testWidgets('two room cards share the available desktop width', (
+  testWidgets('two room cards stay compact and left aligned on desktop', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(1280, 900);
@@ -950,10 +990,125 @@ void main() {
     );
     final first = find.byKey(const ValueKey('room-card-$_roomId'));
     final second = find.byKey(const ValueKey('room-card-$secondId'));
-    expect(tester.getSize(first).width, greaterThan(580));
+    expect(tester.getSize(first).width, closeTo(460, 1));
     expect(tester.getSize(first).width, tester.getSize(second).width);
     expect(tester.getTopLeft(first).dy, tester.getTopLeft(second).dy);
-    expect(tester.getTopRight(second).dx, closeTo(1252, 1));
+    expect(
+      tester.getTopLeft(second).dx - tester.getTopRight(first).dx,
+      closeTo(16, 1),
+    );
+    expect(tester.getTopRight(second).dx, lessThan(1000));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('a single room card keeps a readable width on a wide screen', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1440, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await pump(tester, enterRoom: false);
+    final card = find.byKey(const ValueKey('room-card-$_roomId'));
+    expect(tester.getSize(card).width, closeTo(460, 1));
+    expect(tester.getTopLeft(card).dx, closeTo(28, 1));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  for (final windowWidth in [1440.0, 900.0, 390.0]) {
+    testWidgets('room workspace keeps devices primary at width $windowWidth', (
+      tester,
+    ) async {
+      tester.view.physicalSize = Size(windowWidth, 1100);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await pump(tester, snapshot: _snapshot());
+      final heading = find.byKey(
+        const ValueKey('room-detail-heading-$_roomId'),
+      );
+      expect(
+        find.ancestor(of: heading, matching: find.byType(Card)),
+        findsNothing,
+      );
+      final devices = find.byKey(
+        const ValueKey('room-workspace-main-$_roomId'),
+      );
+      final statistics = find.byKey(
+        const ValueKey('room-workspace-side-$_roomId'),
+      );
+      if (windowWidth >= 1440) {
+        expect(
+          tester.getTopLeft(statistics).dx,
+          greaterThan(tester.getTopRight(devices).dx),
+        );
+        expect(
+          tester.getTopLeft(statistics).dy,
+          closeTo(tester.getTopLeft(devices).dy, 1),
+        );
+        expect(tester.getSize(statistics).width, closeTo(340, 1));
+      } else {
+        expect(
+          tester.getTopLeft(statistics).dy,
+          greaterThan(tester.getBottomLeft(devices).dy),
+        );
+        expect(
+          tester.getSize(statistics).width,
+          closeTo(tester.getSize(devices).width, 1),
+        );
+      }
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+  }
+
+  testWidgets('phone room rows separate identity, IP and link quality', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await pump(tester, snapshot: _snapshot());
+    final row = find.byKey(const ValueKey('room-device-device-1'));
+    Finder within(Finder match) => find.descendant(of: row, matching: match);
+    final name = within(find.text('好友电脑'));
+    final status = within(find.text('在线'));
+    final ip = within(find.text('10.21.1.3'));
+    final path = within(find.text('直连'));
+    final data = within(find.text('数据状态未验证'));
+    expect(tester.getTopLeft(name).dy, lessThan(tester.getTopLeft(ip).dy));
+    expect(tester.getTopLeft(status).dy, lessThan(tester.getTopLeft(ip).dy));
+    expect(tester.getTopLeft(ip).dy, lessThan(tester.getTopLeft(path).dy));
+    expect(tester.getTopLeft(data).dy, greaterThan(tester.getTopLeft(path).dy));
+    expect(DefaultTextStyle.of(tester.element(data)).style.fontSize, 12);
+    expect(within(find.byTooltip('复制 IP')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('current and saved room traffic share one statistics surface', (
+    tester,
+  ) async {
+    final history = TrafficHistoryStore(persistent: false);
+    await history.load();
+    addTearDown(history.dispose);
+    await pump(tester, history: history, snapshot: _trafficSnapshot());
+    final current = find
+        .ancestor(
+          of: find.byKey(const ValueKey('room-traffic-$_roomId-total')),
+          matching: find.byType(Card),
+        )
+        .first;
+    final saved = find
+        .ancestor(
+          of: find.byKey(const ValueKey('traffic-history-total')),
+          matching: find.byType(Card),
+        )
+        .first;
+    expect(tester.element(current), tester.element(saved));
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
@@ -1741,7 +1896,7 @@ void main() {
     await tester.tap(card);
     await tester.pumpAndSettle();
     expect(
-      find.descendant(of: find.byType(Dialog), matching: find.text('18 ms')),
+      find.descendant(of: detailsSurface(), matching: find.text('18 ms')),
       findsNothing,
     );
     await tester.pumpWidget(const SizedBox.shrink());
@@ -1825,12 +1980,14 @@ void main() {
     api.accessState = 'pending';
     await tester.pump(const Duration(seconds: 6));
     await tester.pumpAndSettle();
-    final menu = find.byTooltip('管理设备');
-    await tester.ensureVisible(menu);
+    final approve = find.byKey(
+      const ValueKey('room-approve-$_roomId-device-1'),
+    );
+    expect(approve, findsOneWidget);
+    expect(find.byType(PopupMenuItem<String>), findsNothing);
+    await tester.ensureVisible(approve);
     await tester.pumpAndSettle();
-    await tester.tap(menu);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('批准此设备'));
+    await tester.tap(approve);
     await tester.pumpAndSettle();
     expect(find.textContaining('不会自动上线'), findsOneWidget);
     await tester.tap(find.text('确认'));
@@ -1862,6 +2019,8 @@ void main() {
     tester,
   ) async {
     final api = await pump(tester, role: 'member', controls: true);
+    await tester.ensureVisible(find.text('退出房间'));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('退出房间'));
     await tester.pumpAndSettle();
     expect(find.textContaining('此账号的所有设备都会退出'), findsOneWidget);
@@ -2123,10 +2282,7 @@ void main() {
         '3.0 MB',
       );
       expect(
-        find.descendant(
-          of: find.byType(Dialog),
-          matching: find.text('1 小时 2 分钟'),
-        ),
+        find.descendant(of: detailsSurface(), matching: find.text('1 小时 2 分钟')),
         findsOneWidget,
       );
       expect(find.textContaining('本机在此网络的业务流量'), findsOneWidget);
@@ -2229,10 +2385,10 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const ValueKey('room-device-device-1')));
       await tester.pumpAndSettle();
-      expect(find.byType(Dialog), findsOneWidget);
+      expect(find.byKey(const Key('nodes-detail-close')), findsOneWidget);
       expect(find.text('设备详情'), findsOneWidget);
       expect(
-        find.descendant(of: find.byType(Dialog), matching: find.text('18 ms')),
+        find.descendant(of: detailsSurface(), matching: find.text('18 ms')),
         findsWidgets,
       );
       expect(find.byKey(const Key('nodes-detail-close')), findsOneWidget);
@@ -2254,13 +2410,10 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const ValueKey('room-device-device-1')));
       await tester.pumpAndSettle();
-      expect(find.byType(Dialog), findsOneWidget);
+      expect(find.byKey(const Key('nodes-detail-close')), findsOneWidget);
       expect(find.textContaining('当前没有可用的实时链路信息'), findsOneWidget);
       expect(
-        find.descendant(
-          of: find.byType(Dialog),
-          matching: find.text('10.21.1.3'),
-        ),
+        find.descendant(of: detailsSurface(), matching: find.text('10.21.1.3')),
         findsOneWidget,
       );
       expect(find.byType(PopupMenuButton<String>), findsNothing);
@@ -2338,7 +2491,13 @@ void main() {
     await pump(tester, snapshot: _snapshot(stale: true));
     expect(find.text('18 ms'), findsNothing);
     expect(find.text('状态待更新'), findsNWidgets(3));
-    expect(find.text('链路 / 数据'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const ValueKey('room-device-device-1')),
+        matching: find.text('状态待更新'),
+      ),
+      findsOneWidget,
+    );
     expect(find.text('直连'), findsNothing);
     expect(find.text('近期已收房间数据'), findsNothing);
     await tester.pumpWidget(const SizedBox.shrink());
@@ -2396,7 +2555,7 @@ void main() {
       expect(find.text('房间设置'), findsNothing);
       expect(
         tester.getTopLeft(find.text('退出房间')).dy,
-        lessThan(tester.getTopLeft(find.text('设备与连接 · 1')).dy),
+        greaterThan(tester.getTopLeft(find.text('设备与连接 · 1')).dy),
       );
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
@@ -2504,6 +2663,397 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
+
+  testWidgets('create failure keeps the room draft and retries in place', (
+    tester,
+  ) async {
+    final api = await pump(tester, empty: true);
+    api.createException = const RoomException(
+      'invalid room input',
+      code: 'room_invalid',
+    );
+    await tester.tap(find.text('创建房间'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const ValueKey('房间名称')), 'Retry room');
+    await tester.enterText(find.byKey(const ValueKey('房间密码')), 'password123');
+    await tester.tap(find.text('确认'));
+    await tester.pumpAndSettle();
+    final form = find.byType(AlertDialog);
+    expect(form, findsOneWidget);
+    expect(
+      find.descendant(of: form, matching: find.text('输入无效，请检查名称、密码、IP 或邀请设置')),
+      findsOneWidget,
+    );
+    TextField field(String label) => tester.widget<TextField>(
+      find.descendant(
+        of: find.byKey(ValueKey(label)),
+        matching: find.byType(TextField),
+      ),
+    );
+    expect(field('房间名称').controller!.text, 'Retry room');
+    expect(field('房间密码').controller!.text, 'password123');
+    await tester.tap(find.byTooltip('显示房间密码'));
+    await tester.pump();
+    expect(field('房间密码').obscureText, isFalse);
+    api.createException = null;
+    await tester.tap(find.text('确认'));
+    await tester.pumpAndSettle();
+    expect(find.byType(AlertDialog), findsNothing);
+    expect(api.calls.where((call) => call.startsWith('create:')).length, 2);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  for (final changePassword in [false, true]) {
+    testWidgets(
+      'room edit keeps ${changePassword ? 'password' : 'name'} after server rejection',
+      (tester) async {
+        final api = await pump(tester);
+        await tester.ensureVisible(find.text('房间设置'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('房间设置'));
+        await tester.pumpAndSettle();
+        final action = find.text(changePassword ? '更改密码' : '重命名');
+        await tester.ensureVisible(action);
+        await tester.pumpAndSettle();
+        await tester.tap(action);
+        await tester.pumpAndSettle();
+        final key = ValueKey(changePassword ? '房间密码' : '房间名称');
+        await tester.enterText(
+          find.byKey(key),
+          changePassword ? 'new-password' : 'Updated room',
+        );
+        api.mutationException = const RoomException(
+          'room conflict',
+          code: 'room_conflict',
+        );
+        await tester.tap(find.text('确认'));
+        await tester.pumpAndSettle();
+        expect(find.byType(AlertDialog), findsOneWidget);
+        final field = tester.widget<TextField>(
+          find.descendant(
+            of: find.byKey(key),
+            matching: find.byType(TextField),
+          ),
+        );
+        expect(
+          field.controller!.text,
+          changePassword ? 'new-password' : 'Updated room',
+        );
+        api.mutationException = null;
+        await tester.tap(find.text('确认'));
+        await tester.pumpAndSettle();
+        expect(find.byType(AlertDialog), findsNothing);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
+
+  testWidgets(
+    'pending create prevents duplicates and cannot close a newer route after session change',
+    (tester) async {
+      late SettingsStore settings;
+      final pending = Completer<FriendRoom>();
+      final api = await pump(
+        tester,
+        empty: true,
+        onStores: (s, _, _, _) => settings = s,
+      );
+      api.pendingCreate = pending;
+      await tester.tap(find.text('创建房间'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byKey(const ValueKey('房间名称')),
+        'Pending room',
+      );
+      await tester.enterText(find.byKey(const ValueKey('房间密码')), 'password123');
+      await tester.tap(find.text('确认'));
+      await tester.pump();
+      expect(
+        tester
+            .widget<FilledButton>(find.widgetWithText(FilledButton, '正在保存…'))
+            .onPressed,
+        isNull,
+      );
+      expect(api.calls.where((call) => call.startsWith('create:')).length, 1);
+      final navigator = Navigator.of(tester.element(find.byType(AlertDialog)));
+      unawaited(
+        navigator.push(
+          MaterialPageRoute<void>(
+            builder: (_) => const Scaffold(body: Text('New account route')),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.runAsync(
+        () => settings.updateSettings(
+          settings.settings.copyWith(authToken: 'changed-session'),
+        ),
+      );
+      pending.complete(FriendRoom.fromJson(_room('owner')));
+      await tester.pumpAndSettle();
+      expect(find.text('New account route'), findsOneWidget);
+      expect(find.text('房间已创建'), findsNothing);
+      navigator.pop();
+      await tester.pumpAndSettle();
+      expect(find.byType(AlertDialog), findsNothing);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets('room controls and join validation use English copy', (
+    tester,
+  ) async {
+    await pump(tester, empty: true, languageCode: 'en');
+    expect(find.text('Create room'), findsOneWidget);
+    expect(find.text('Join room'), findsOneWidget);
+    expect(find.byTooltip('Refresh rooms'), findsOneWidget);
+    await tester.tap(find.text('Join room'));
+    await tester.pumpAndSettle();
+    expect(find.text('Room code or invitation link'), findsOneWidget);
+    await tester.enterText(find.byKey(const ValueKey('房间号')), '123');
+    await tester.tap(find.text('Confirm'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Enter an 8-digit room code or a complete invitation link'),
+      findsOneWidget,
+    );
+    expect(find.byTooltip('Show room password'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets(
+    'English room details localize connection stages, settings and device context',
+    (tester) async {
+      await pump(tester, languageCode: 'en', snapshot: _snapshot());
+      expect(find.text('Some links established'), findsOneWidget);
+      expect(find.text('Devices and connections · 3'), findsOneWidget);
+      expect(find.text("This device's room traffic"), findsOneWidget);
+      expect(find.text('Connection and startup'), findsOneWidget);
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('room-device-device-1')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('room-device-device-1')));
+      await tester.pumpAndSettle();
+      expect(find.text('Device details'), findsOneWidget);
+      expect(find.textContaining('Room data:'), findsOneWidget);
+      expect(
+        find.textContaining('Link and receive status do not guarantee'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('房间数据：'), findsNothing);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  test(
+    'room copy localizes typed errors and leaves runtime ownership untouched',
+    () {
+      final en = RoomStrings.fromCode('en');
+      expect(
+        en.error(
+          const RoomException('server message', code: 'room_ip_conflict'),
+        ),
+        contains('Cannot assign this IP'),
+      );
+      expect(en.error(const RoomException('未知运行时错误')), isNot(contains('未知')));
+      expect(en.text('房间号 {0}', ['12345678']), 'Room code 12345678');
+      expect(
+        en.runtimeText('已达到并行房间上限 8'),
+        'Maximum parallel rooms reached: 8',
+      );
+      expect(
+        en.connectivityLabel(
+          const RoomConnectivitySummary(
+            direct: 1,
+            relay: 1,
+            pending: 0,
+            offline: 0,
+          ),
+        ),
+        'Direct and relay',
+      );
+    },
+  );
+
+  testWidgets('room device deep link resolves only inside its requested room', (
+    tester,
+  ) async {
+    const secondId = 'room-22222222222222222222222222222222';
+    var consumed = 0;
+    final firstRoom = FriendRoom.fromJson(_room('member'));
+    final secondRoom = FriendRoom.fromJson({
+      ..._room('member'),
+      'id': secondId,
+      'room_code': '22222222',
+      'name': 'Second room',
+    });
+    RoomRoster roster(FriendRoom room, String ip) => RoomRoster.fromJson({
+      'room': {
+        ..._room('member'),
+        'id': room.id,
+        'name': room.name,
+        'room_code': room.code,
+      },
+      'members': [
+        {'user_id': 'member', 'role': 'member', 'username': 'Friend'},
+      ],
+      'devices': [
+        {
+          'id': 'same-device',
+          'node_id': 'same-node',
+          'device_name': 'Shared device',
+          'virtual_ip': ip,
+          'user_id': 'member',
+          'online': false,
+        },
+      ],
+    });
+    await pump(
+      tester,
+      initialRoomId: secondId,
+      initialDeviceId: 'same-node',
+      canConnect: true,
+      onInitialDeviceOpened: () => consumed++,
+      configureApi: (api) {
+        api.roomListOverride = [firstRoom, secondRoom];
+        api.rosterOverrides = {
+          _roomId: roster(firstRoom, '10.21.1.3'),
+          secondId: roster(secondRoom, '10.21.1.4'),
+        };
+      },
+    );
+    expect(consumed, 1);
+    final details = detailsSurface();
+    expect(details, findsOneWidget);
+    expect(
+      find.descendant(
+        of: details,
+        matching: find.textContaining('Second room'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: details, matching: find.text('10.21.1.4')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: details, matching: find.text('10.21.1.3')),
+      findsNothing,
+    );
+    expect(
+      find.byKey(const Key('node-detail-speedtest-same-node')),
+      findsNothing,
+    );
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  for (final missingRoom in [false, true]) {
+    testWidgets(
+      'unavailable deep-link ${missingRoom ? 'room' : 'device'} consumes its return intent once',
+      (tester) async {
+        var consumed = 0;
+        var returns = 0;
+        var pendingReturn = true;
+        await pump(
+          tester,
+          initialRoomId: missingRoom
+              ? 'room-22222222222222222222222222222222'
+              : _roomId,
+          initialDeviceId: 'missing-device',
+          onInitialDeviceOpened: () => consumed++,
+          onDeviceDetailsClosed: () {
+            if (pendingReturn) {
+              returns++;
+              pendingReturn = false;
+            }
+          },
+        );
+        expect(consumed, 1);
+        expect(returns, 1);
+        expect(find.byKey(const Key('nodes-detail-close')), findsNothing);
+        expect(
+          find.text(missingRoom ? '该房间已不可用，请刷新房间列表。' : '该设备已不在此房间，请查看最新设备列表。'),
+          findsOneWidget,
+        );
+        if (missingRoom) {
+          await tester.tap(find.byKey(const ValueKey('room-card-$_roomId')));
+          await tester.pumpAndSettle();
+        }
+        await tester.ensureVisible(
+          find.byKey(const ValueKey('room-device-device-1')),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const ValueKey('room-device-device-1')));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const Key('nodes-detail-close')));
+        await tester.pumpAndSettle();
+        expect(returns, 1);
+        expect(consumed, 1);
+        expect(find.text('返回房间'), findsOneWidget);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
+
+  testWidgets(
+    'English room detail remains usable on a phone at 200 percent text',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await pump(
+        tester,
+        languageCode: 'en',
+        textScale: 2,
+        snapshot: _trafficSnapshot(),
+      );
+      expect(tester.takeException(), isNull);
+      final device = find.byKey(const ValueKey('room-device-device-1'));
+      await tester.ensureVisible(device);
+      await tester.pumpAndSettle();
+      await tester.tap(device);
+      await tester.pumpAndSettle();
+      expect(find.text('Device details'), findsOneWidget);
+      expect(find.byType(Dialog), findsNothing);
+      expect(tester.takeException(), isNull);
+      await tester.tap(find.byKey(const Key('nodes-detail-close')));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  for (final phoneSize in [const Size(390, 844), const Size(844, 390)]) {
+    testWidgets(
+      'phone room device details open full screen and return to the room at $phoneSize',
+      (tester) async {
+        tester.view.physicalSize = phoneSize;
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        var closed = 0;
+        await pump(
+          tester,
+          initialRoomId: _roomId,
+          initialDeviceId: 'device-1',
+          onDeviceDetailsClosed: () => closed++,
+        );
+        expect(find.byType(Dialog), findsNothing);
+        expect(find.byKey(const Key('nodes-detail-close')), findsOneWidget);
+        expect(find.text('设备详情'), findsOneWidget);
+        await tester.tap(find.byKey(const Key('nodes-detail-close')));
+        await tester.pumpAndSettle();
+        expect(closed, 1);
+        expect(find.text('返回房间'), findsOneWidget);
+        expect(find.byKey(const Key('nodes-detail-close')), findsNothing);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
 
   testWidgets('connection phase displays fine-grained status labels', (
     tester,

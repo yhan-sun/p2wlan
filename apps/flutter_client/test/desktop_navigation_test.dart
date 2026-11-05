@@ -191,10 +191,10 @@ void main() {
         );
         final paragraph = tester.renderObject<RenderParagraph>(text);
         expect(paragraph.didExceedMaxLines, isFalse, reason: label);
-        expect(tester.getRect(text).right, lessThanOrEqualTo(196));
+        expect(tester.getRect(text).right, lessThanOrEqualTo(208));
       }
       final footerRect = tester.getRect(footer);
-      expect(tester.getSize(find.byType(DesktopSidebar)).width, 196);
+      expect(tester.getSize(find.byType(DesktopSidebar)).width, 208);
       expect(footerRect.height, greaterThan(ordinaryHeight));
       expect(footerRect.bottom, lessThanOrEqualTo(628));
       final textWidgets = find.descendant(

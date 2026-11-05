@@ -173,28 +173,31 @@ class _KvRow extends StatelessWidget {
 /// Inline result banner for network actions (repair / restart success/failure).
 /// Never a modal; quiet by default, error-tinted only when something failed.
 class _NetworkMessage extends StatelessWidget {
-  const _NetworkMessage({required this.message, this.isError = false});
+  const _NetworkMessage({
+    required this.message,
+    this.tone = StatusTone.neutral,
+  });
 
   final String message;
-  final bool isError;
+  final StatusTone tone;
 
   @override
   Widget build(BuildContext context) {
-    final c = P2WlanColors.of(context);
-    final colors = isError
-        ? (bg: c.dangerSurface, border: c.dangerBorder, text: c.dangerText)
-        : (bg: c.warningSurface, border: c.warningBorder, text: c.warningText);
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: colors.bg,
-        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        border: Border.all(color: colors.border),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(AppTokens.space12),
-        child: Text(
-          message,
-          style: TextStyle(color: colors.text, fontSize: 13, height: 1.35),
+    final colors = _tonePanelColors(context, tone);
+    return Semantics(
+      liveRegion: true,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: colors.bg,
+          borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+          border: Border.all(color: colors.border),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(AppTokens.space12),
+          child: Text(
+            message,
+            style: TextStyle(color: colors.text, fontSize: 13, height: 1.35),
+          ),
         ),
       ),
     );

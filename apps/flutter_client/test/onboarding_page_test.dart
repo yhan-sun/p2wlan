@@ -218,14 +218,20 @@ class _DiscoverDiagnosticsApi extends _ReadyDiagnosticsApi {
 
 /// A daemon controller whose start/stop always succeed (no real binary needed).
 class _FakeDaemonController extends DaemonController {
-  _FakeDaemonController() : super(diagnosticsApi: DiagnosticsApi());
+  _FakeDaemonController({this.startOk = true})
+    : super(diagnosticsApi: DiagnosticsApi());
+
+  final bool startOk;
 
   @override
   Future<DaemonCommandResult> start(
     AppSettings settings, {
     int? vpnSettingsRevision,
   }) async {
-    return const DaemonCommandResult(ok: true, message: 'started');
+    return DaemonCommandResult(
+      ok: startOk,
+      message: 'test start result SECRET',
+    );
   }
 
   @override
@@ -298,6 +304,60 @@ StatusStore _makeStatus(
 );
 
 void main() {
+  testWidgets('onboarding startup failure is a persistent accessible result', (
+    tester,
+  ) async {
+    final semantics = tester.ensureSemantics();
+    try {
+      final settings = await _makeSettings(tester, false);
+      final status = _makeStatus(
+        settings,
+        daemonController: _FakeDaemonController(startOk: false),
+      );
+      addTearDown(status.dispose);
+      addTearDown(settings.dispose);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AppStringsScope(
+            strings: AppStrings.fromCode('en'),
+            child: OnboardingPage(
+              settingsStore: settings,
+              statusStore: status,
+              capabilities: PlatformCapabilities.fromPlatform('macos'),
+              permissionCheck: () async => const PermissionPreflight(
+                platform: 'macos',
+                state: PermissionPreflightState.elevationRequired,
+                canCreateTun: false,
+                canModifyRoutes: false,
+                elevationSupported: true,
+                reasonCode: 'elevation_required',
+                message: '',
+                checks: [],
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Grant & continue'));
+      await tester.pumpAndSettle();
+      final error = find.text(AppStrings.fromCode('en').onboardingStartFailed);
+      expect(error, findsOneWidget);
+      expect(
+        tester
+            .getSemantics(error)
+            .getSemanticsData()
+            .flagsCollection
+            .isLiveRegion,
+        isTrue,
+      );
+      expect(find.textContaining('SECRET'), findsNothing);
+      await tester.pump(const Duration(seconds: 6));
+      expect(error, findsOneWidget);
+    } finally {
+      semantics.dispose();
+    }
+  });
   testWidgets(
     'OnboardingPage shows the permission step from the real preflight when offline',
     (tester) async {
