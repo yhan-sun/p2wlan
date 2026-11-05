@@ -7,7 +7,6 @@ class _SettingsTapSurface extends StatefulWidget {
     required this.child,
     required this.onTap,
     this.interactionKey,
-    this.outlined = false,
     this.selected = false,
     this.radius = 12,
   });
@@ -15,7 +14,6 @@ class _SettingsTapSurface extends StatefulWidget {
   final Widget child;
   final VoidCallback onTap;
   final Key? interactionKey;
-  final bool outlined;
   final bool selected;
   final double radius;
 
@@ -35,8 +33,6 @@ class _SettingsTapSurfaceState extends State<_SettingsTapSurface> {
         ? Theme.of(context).colorScheme.primary
         : _hovered
         ? colors.borderStrong
-        : widget.outlined
-        ? colors.border
         : Colors.transparent;
     return Material(
       animationDuration: AppMotion.feedbackDurationOf(context),
@@ -44,8 +40,6 @@ class _SettingsTapSurfaceState extends State<_SettingsTapSurface> {
           ? colors.selectedSurface
           : _hovered
           ? colors.hoverSurface
-          : widget.outlined
-          ? colors.surface
           : Colors.transparent,
       shape: RoundedRectangleBorder(
         borderRadius: radius,

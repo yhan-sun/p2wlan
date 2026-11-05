@@ -24,6 +24,7 @@ import '../../shared/log_tail.dart';
 import '../../shared/log_presentation.dart';
 import '../../shared/network_overview_presentation.dart';
 import '../../shared/widgets/info_card.dart';
+import '../../shared/widgets/local_connection_restart_feedback.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
 import 'diagnostics_model.dart';
@@ -99,6 +100,7 @@ class DiagnosticsPage extends StatefulWidget {
 class _DiagnosticsPageState extends State<DiagnosticsPage> {
   late final PlatformCapabilities _capabilities;
   var _advancedExpanded = false;
+  var _roomsExpanded = false;
   final _advancedKey = GlobalKey();
 
   void _openAdvanced() {
@@ -161,14 +163,6 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
           showHeader: widget.showHeader,
           maxWidth: diagnosticsPageMaxWidth,
           children: [
-            if (overview.hasRooms) ...[
-              _RoomConnectionsPanel(
-                scopes: overview.rooms.toList(),
-                onOpenRoom: widget.onOpenRoom,
-                onOpenRooms: widget.onOpenRooms,
-              ),
-              const SizedBox(height: AppTokens.space20),
-            ],
             Wrap(
               spacing: AppTokens.space12,
               runSpacing: AppTokens.space4,
@@ -186,11 +180,7 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
               ],
             ),
             const SizedBox(height: AppTokens.space10),
-            _SystemStatusCard(
-              model: model,
-              refreshing: refreshing,
-              onRecheck: refreshing ? null : statusStore.refresh,
-            ),
+            _SystemStatusCard(model: model),
             // Issues only appear when there is something to do; a healthy page
             // never shows a redundant "no issues" card (the status card above
             // already says everything is fine).
@@ -204,9 +194,24 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                 onOpenTechnicalDetails: _openAdvanced,
               ),
             ],
-            if (model.issues.isNotEmpty) ...[
-              const SizedBox(height: AppTokens.space8),
-              _SupportTools(statusStore: statusStore),
+            const SizedBox(height: AppTokens.space12),
+            _DiagnosticsActions(
+              refreshing: refreshing,
+              onRecheck: refreshing ? null : statusStore.refresh,
+              onCopySummary: model.issues.isEmpty
+                  ? null
+                  : () => _copySummary(context, statusStore),
+            ),
+            if (overview.hasRooms) ...[
+              const SizedBox(height: AppTokens.space16),
+              _RoomConnectionsPanel(
+                scopes: overview.rooms.toList(),
+                open: _roomsExpanded,
+                onToggle: () =>
+                    setState(() => _roomsExpanded = !_roomsExpanded),
+                onOpenRoom: widget.onOpenRoom,
+                onOpenRooms: widget.onOpenRooms,
+              ),
             ],
             if (model.checks.isNotEmpty) ...[
               const SizedBox(height: AppTokens.space14),
@@ -253,6 +258,15 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
     if (settingsStore != null && _capabilities.canActAsLocalVpnNode) {
       children.add(
         _NetworkDiagnosticsSection(
+          key: ValueKey((
+            statusStore,
+            settingsStore,
+            statusStore.sessionRevision,
+            settingsStore.settings.diagnosticsUrl,
+          )),
+          isCurrentOwner: () =>
+              identical(widget.statusStore, statusStore) &&
+              identical(widget.settingsStore, settingsStore),
           settingsStore: settingsStore,
           statusStore: statusStore,
           capabilities: _capabilities,

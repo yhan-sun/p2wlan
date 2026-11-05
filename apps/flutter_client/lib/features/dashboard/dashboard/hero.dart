@@ -79,6 +79,7 @@ class _NetworkHero extends StatelessWidget {
     required this.onStartDaemon,
     required this.onStopDaemon,
     this.onOpenRooms,
+    this.issueBanner,
   });
 
   final DiagnosticsSnapshot? snapshot;
@@ -91,6 +92,7 @@ class _NetworkHero extends StatelessWidget {
   final Future<void> Function() onStartDaemon;
   final Future<void> Function() onStopDaemon;
   final VoidCallback? onOpenRooms;
+  final Widget? issueBanner;
 
   @override
   Widget build(BuildContext context) {
@@ -111,38 +113,54 @@ class _NetworkHero extends StatelessWidget {
         };
 
     final header = hasSnapshot
-        ? Row(
+        ? Wrap(
+            alignment: WrapAlignment.spaceBetween,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: AppTokens.space16,
+            runSpacing: AppTokens.space8,
             children: [
-              Icon(
-                status == _NetworkStatus.healthy
-                    ? Icons.check_circle_outline_rounded
-                    : Icons.info_outline_rounded,
-                size: 20,
-                color: status == _NetworkStatus.healthy
-                    ? P2WlanColors.of(context).successText
-                    : P2WlanColors.of(context).warningText,
-              ),
-              const SizedBox(width: AppTokens.space8),
-              Expanded(
-                child: Text(
-                  status == _NetworkStatus.healthy
-                      ? (strings.isZh ? '本机网络已连接' : 'Local network connected')
-                      : status == _NetworkStatus.stale
-                      ? (strings.isZh ? '上次连接信息' : 'Last known connection')
-                      : _networkStatusLabel(
-                          strings,
-                          status,
-                          canControlLocalDaemon,
-                        ),
-                  key: const Key('home-connection-heading'),
-                  style: TextStyle(
-                    color: theme.colorScheme.onSurface,
-                    fontSize: 17,
-                    fontWeight: FontWeight.w600,
-                    height: 1.35,
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    status == _NetworkStatus.healthy
+                        ? Icons.check_circle_outline_rounded
+                        : Icons.info_outline_rounded,
+                    size: 20,
+                    color: status == _NetworkStatus.healthy
+                        ? P2WlanColors.of(context).successText
+                        : P2WlanColors.of(context).warningText,
                   ),
-                ),
+                  const SizedBox(width: AppTokens.space8),
+                  Flexible(
+                    child: Text(
+                      status == _NetworkStatus.healthy
+                          ? (strings.isZh
+                                ? '本机网络已连接'
+                                : 'Local network connected')
+                          : status == _NetworkStatus.stale
+                          ? (strings.isZh ? '上次连接信息' : 'Last known connection')
+                          : _networkStatusLabel(
+                              strings,
+                              status,
+                              canControlLocalDaemon,
+                            ),
+                      key: const Key('home-connection-heading'),
+                      style: TextStyle(
+                        color: theme.colorScheme.onSurface,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+                ],
               ),
+              if (showStop)
+                _StopDaemonButton(
+                  daemonBusy: daemonBusy,
+                  onStopDaemon: onStopDaemon,
+                ),
             ],
           )
         : Wrap(
@@ -194,45 +212,14 @@ class _NetworkHero extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         if (hasSnapshot) ...[
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final virtualIp = _VirtualIpBlock(
-                virtualIp: snapshot!.virtualIp,
-                showStop: showStop,
-                daemonBusy: daemonBusy,
-                onStopDaemon: onStopDaemon,
-              );
-
-              // On desktop the two pieces of primary information share one
-              // baseline. Narrow windows keep the same order but stack them
-              // so neither the IP nor the counts becomes cramped.
-              if (status != _NetworkStatus.stale &&
-                  constraints.maxWidth >= 720) {
-                return Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    Expanded(child: virtualIp),
-                    const SizedBox(width: AppTokens.space24),
-                    SizedBox(width: 400, child: _HomeMetrics(counts: counts)),
-                  ],
-                );
-              }
-
-              return Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  virtualIp,
-                  if (status == _NetworkStatus.stale) ...[
-                    const SizedBox(height: AppTokens.space14),
-                    const _StaleNote(),
-                  ] else ...[
-                    const SizedBox(height: AppTokens.space16),
-                    _HomeMetrics(counts: counts),
-                  ],
-                ],
-              );
-            },
-          ),
+          _VirtualIpBlock(virtualIp: snapshot!.virtualIp),
+          if (status == _NetworkStatus.stale) ...[
+            const SizedBox(height: AppTokens.space6),
+            const _StaleNote(),
+          ] else ...[
+            const SizedBox(height: AppTokens.space4),
+            _HomeMetrics(counts: counts),
+          ],
         ] else ...[
           Text(
             startupPending
@@ -287,7 +274,9 @@ class _NetworkHero extends StatelessWidget {
     );
 
     final showActions =
-        canControlLocalDaemon && status == _NetworkStatus.stopped;
+        canControlLocalDaemon &&
+        status == _NetworkStatus.stopped &&
+        issueBanner == null;
 
     return _HeroSurface(
       emphasized: !hasSnapshot,
@@ -295,10 +284,14 @@ class _NetworkHero extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           header,
-          SizedBox(height: hasSnapshot ? AppTokens.space12 : AppTokens.space24),
+          if (issueBanner != null) ...[
+            const SizedBox(height: AppTokens.space8),
+            issueBanner!,
+          ],
+          const SizedBox(height: AppTokens.space8),
           infoBlock,
           if (showActions) ...[
-            const SizedBox(height: AppTokens.space24),
+            const SizedBox(height: AppTokens.space16),
             Align(alignment: Alignment.centerLeft, child: actions),
           ],
         ],
@@ -348,7 +341,7 @@ class _HeroSurface extends StatelessWidget {
             : AppTokens.shadowBorder,
       ),
       child: Padding(
-        padding: const EdgeInsets.all(AppTokens.space20),
+        padding: const EdgeInsets.all(AppTokens.space16),
         child: child,
       ),
     );
@@ -357,17 +350,9 @@ class _HeroSurface extends StatelessWidget {
 
 /// Virtual IP with a stable copy target and bounded inline confirmation.
 class _VirtualIpBlock extends StatefulWidget {
-  const _VirtualIpBlock({
-    required this.virtualIp,
-    this.showStop = false,
-    this.daemonBusy = false,
-    this.onStopDaemon,
-  });
+  const _VirtualIpBlock({required this.virtualIp});
 
   final String virtualIp;
-  final bool showStop;
-  final bool daemonBusy;
-  final Future<void> Function()? onStopDaemon;
 
   @override
   State<_VirtualIpBlock> createState() => _VirtualIpBlockState();
@@ -399,118 +384,76 @@ class _VirtualIpBlockState extends State<_VirtualIpBlock> {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final theme = Theme.of(context);
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final stackStop =
-            constraints.maxWidth < 300 ||
-            MediaQuery.textScalerOf(context).scale(12) > 16;
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              strings.virtualIpLabel,
-              style: TextStyle(
-                color: theme.colorScheme.onSurfaceVariant,
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                height: 1.2,
-              ),
-            ),
-            const SizedBox(height: AppTokens.space4),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                Expanded(
-                  child: Semantics(
-                    key: const Key('home-virtual-ip-feedback'),
-                    button: true,
-                    liveRegion: _copied,
-                    label: strings.copyVirtualIp,
-                    value: _copied ? strings.copied : null,
-                    child: Tooltip(
-                      excludeFromSemantics: true,
-                      message: _copied ? strings.copied : strings.copyVirtualIp,
-                      child: Material(
-                        type: MaterialType.transparency,
-                        child: InkWell(
-                          key: const Key('home-virtual-ip'),
-                          onTap: _copy,
-                          borderRadius: BorderRadius.circular(
-                            AppTokens.radiusSm,
-                          ),
-                          child: ConstrainedBox(
-                            constraints: const BoxConstraints(minHeight: 44),
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 4),
-                              child: Row(
-                                children: [
-                                  Flexible(
-                                    child: FittedBox(
-                                      fit: BoxFit.scaleDown,
-                                      alignment: Alignment.centerLeft,
-                                      child: Text(
-                                        dash(widget.virtualIp),
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          color: theme.colorScheme.onSurface,
-                                          fontSize: 28,
-                                          fontWeight: FontWeight.w600,
-                                          height: 1.1,
-                                          fontFeatures:
-                                              AppTokens.tabularFontFeatures,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: AppTokens.space8),
-                                  AnimatedSwitcher(
-                                    duration: AppMotion.feedbackDurationOf(
-                                      context,
-                                    ),
-                                    child: Icon(
-                                      _copied
-                                          ? Icons.check_rounded
-                                          : Icons.copy_rounded,
-                                      key: ValueKey(_copied),
-                                      size: 17,
-                                      color: _copied
-                                          ? P2WlanColors.of(context).successText
-                                          : theme.colorScheme.onSurfaceVariant,
-                                    ),
-                                  ),
-                                ],
-                              ),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          strings.virtualIpLabel,
+          style: TextStyle(
+            color: theme.colorScheme.onSurfaceVariant,
+            fontSize: 12,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+        const SizedBox(height: AppTokens.space6),
+        Semantics(
+          key: const Key('home-virtual-ip-feedback'),
+          button: true,
+          liveRegion: _copied,
+          label: strings.copyVirtualIp,
+          value: _copied ? strings.copied : null,
+          child: Tooltip(
+            excludeFromSemantics: true,
+            message: _copied ? strings.copied : strings.copyVirtualIp,
+            child: Material(
+              type: MaterialType.transparency,
+              child: InkWell(
+                key: const Key('home-virtual-ip'),
+                onTap: _copy,
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(
+                    minHeight: AppTokens.minTouchTarget,
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: Text(
+                            dash(widget.virtualIp),
+                            softWrap: true,
+                            style: TextStyle(
+                              color: theme.colorScheme.onSurface,
+                              fontSize: 24,
+                              fontWeight: FontWeight.w600,
+                              height: 1.1,
+                              fontFeatures: AppTokens.tabularFontFeatures,
                             ),
                           ),
                         ),
-                      ),
+                        const SizedBox(width: AppTokens.space12),
+                        AnimatedSwitcher(
+                          duration: AppMotion.feedbackDurationOf(context),
+                          child: Icon(
+                            _copied ? Icons.check_rounded : Icons.copy_rounded,
+                            key: ValueKey(_copied),
+                            size: 17,
+                            color: _copied
+                                ? P2WlanColors.of(context).successText
+                                : theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
-                if (!stackStop &&
-                    widget.showStop &&
-                    widget.onStopDaemon != null) ...[
-                  const SizedBox(width: AppTokens.space8),
-                  _StopDaemonButton(
-                    daemonBusy: widget.daemonBusy,
-                    onStopDaemon: widget.onStopDaemon!,
-                  ),
-                ],
-              ],
-            ),
-            if (stackStop &&
-                widget.showStop &&
-                widget.onStopDaemon != null) ...[
-              const SizedBox(height: AppTokens.space12),
-              _StopDaemonButton(
-                daemonBusy: widget.daemonBusy,
-                onStopDaemon: widget.onStopDaemon!,
               ),
-            ],
-          ],
-        );
-      },
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -538,7 +481,7 @@ class _VirtualIpBlockState extends State<_VirtualIpBlock> {
   }
 }
 
-/// Full-label stop action kept next to the Virtual IP. It intentionally stays
+/// Full-label stop action grouped with the local connection status. It intentionally stays
 /// a text button on phones: the destructive action must remain discoverable
 /// and must not collapse into an unlabeled icon at compact widths.
 class _StopDaemonButton extends StatelessWidget {
@@ -560,9 +503,12 @@ class _StopDaemonButton extends StatelessWidget {
       style: OutlinedButton.styleFrom(
         foregroundColor: Theme.of(context).colorScheme.onSurfaceVariant,
         side: BorderSide(color: colors.border),
-        minimumSize: const Size(0, 40),
+        minimumSize: const Size(
+          AppTokens.minTouchTarget,
+          AppTokens.minTouchTarget,
+        ),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
-        visualDensity: VisualDensity.compact,
+        visualDensity: VisualDensity.standard,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(AppTokens.radiusMd),
         ),
@@ -623,45 +569,31 @@ class _HomeMetrics extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final colors = P2WlanColors.of(context);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+    return Wrap(
+      spacing: AppTokens.space16,
+      runSpacing: AppTokens.space6,
+      crossAxisAlignment: WrapCrossAlignment.center,
       children: [
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _MetricCell(
-              key: const Key('dashboard-count-online'),
-              value: '${counts.online}',
-              label: strings.onlineDevices,
-            ),
-            Container(width: 1, height: 36, color: colors.border),
-            _MetricCell(
-              key: const Key('dashboard-count-available'),
-              value: '${counts.direct + counts.relay}',
-              label: strings.isZh ? '确认链路' : 'Confirmed paths',
-              tooltip: strings.isZh ? '本机已确认的直连或中继路径；在线设备不一定已有可用路径。' : 'Direct or relay paths confirmed by this device. An online device may still be establishing a path.',
-            ),
-          ],
+        _MetricCell(
+          key: const Key('dashboard-count-online'),
+          value: '${counts.online}',
+          label: strings.onlineDevices,
         ),
-        const SizedBox(height: AppTokens.space10),
-        Center(
-          child: Wrap(
-            spacing: AppTokens.space16,
-            runSpacing: AppTokens.space6,
-            children: [
-              _PathBreakdown(
-                key: const Key('dashboard-count-direct'),
-                value: counts.direct,
-                label: strings.direct,
-              ),
-              _PathBreakdown(
-                key: const Key('dashboard-count-relay'),
-                value: counts.relay,
-                label: strings.relay,
-              ),
-            ],
-          ),
+        _MetricCell(
+          key: const Key('dashboard-count-available'),
+          value: '${counts.direct + counts.relay}',
+          label: strings.isZh ? '确认链路' : 'Confirmed paths',
+          tooltip: strings.isZh ? '本机已确认的直连或中继路径；在线设备不一定已有可用路径。' : 'Direct or relay paths confirmed by this device. An online device may still be establishing a path.',
+        ),
+        _PathBreakdown(
+          key: const Key('dashboard-count-direct'),
+          value: counts.direct,
+          label: strings.direct,
+        ),
+        _PathBreakdown(
+          key: const Key('dashboard-count-relay'),
+          value: counts.relay,
+          label: strings.relay,
         ),
       ],
     );
@@ -712,43 +644,31 @@ class _MetricCell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final content = Column(
-      mainAxisSize: MainAxisSize.min,
+    final content = Wrap(
+      spacing: AppTokens.space4,
+      crossAxisAlignment: WrapCrossAlignment.center,
       children: [
-        SizedBox(
-          height: MediaQuery.textScalerOf(context).scale(20) * 1.1,
-          child: FittedBox(
-            fit: BoxFit.scaleDown,
-            child: Text(
-              value,
-              maxLines: 1,
-              style: TextStyle(
-                color: theme.colorScheme.onSurface,
-                fontSize: 20,
-                fontWeight: FontWeight.w600,
-                height: 1.1,
-                fontFeatures: AppTokens.tabularFontFeatures,
-              ),
-            ),
+        Text(
+          value,
+          style: TextStyle(
+            color: theme.colorScheme.onSurface,
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+            fontFeatures: AppTokens.tabularFontFeatures,
           ),
         ),
-        const SizedBox(height: 2),
         Text(
           label,
-          textAlign: TextAlign.center,
           style: TextStyle(
             color: theme.colorScheme.onSurfaceVariant,
-            fontSize: 12,
-            fontWeight: FontWeight.w600,
-            height: 1.2,
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
           ),
         ),
       ],
     );
-    return Expanded(
-      child: tooltip == null
-          ? content
-          : Tooltip(message: tooltip!, child: content),
-    );
+    return tooltip == null
+        ? content
+        : Tooltip(message: tooltip!, child: content);
   }
 }

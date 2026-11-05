@@ -1317,12 +1317,13 @@ void _registerDashboardTests() {
       find.descendant(of: stopButton, matching: find.text('Stop P2WLAN')),
       findsOneWidget,
     );
-    // The destructive action follows the Virtual IP value, not the network
-    // status header, and remains a discoverable full-label button on phones.
+    // Stopping belongs to the connection header; copying the address keeps
+    // its own target. Both controls retain a full touch target on phones.
     expect(
-      tester.getCenter(stopButton).dy,
-      greaterThan(tester.getBottomRight(find.text('Virtual IP address')).dy),
+      tester.getBottomRight(stopButton).dy,
+      lessThan(tester.getTopLeft(find.text('Virtual IP address')).dy),
     );
+    expect(tester.getSize(stopButton).height, greaterThanOrEqualTo(44));
     // Healthy: status polling is automatic; the hero does not add a refresh.
     expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
     expect(tester.takeException(), isNull);

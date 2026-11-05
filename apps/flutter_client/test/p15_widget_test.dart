@@ -42,6 +42,7 @@ import 'package:p2wlan_flutter_client/core/presentation/traffic_statistics.dart'
 import 'package:p2wlan_flutter_client/shared/formatters.dart';
 
 part 'p15_widget/dashboard_tests.dart';
+part 'p15_widget/dashboard_layout_tests.dart';
 part 'p15_widget/traffic_tests.dart';
 part 'p15_widget/settings_tests.dart';
 part 'p15_widget/settings_phase6_tests.dart';
@@ -63,6 +64,7 @@ part 'p15_widget/helpers.dart';
 
 void main() {
   _registerDashboardTests();
+  _registerDashboardLayoutTests();
   _registerTrafficTests();
   _registerSettingsTests();
   _registerSettingsPhase6Tests();

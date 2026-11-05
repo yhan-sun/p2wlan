@@ -50,6 +50,9 @@ void _registerSettingsPhase6Tests() {
     // The root is a findable category list, never a stack of input fields.
     expect(find.text('General'), findsOneWidget);
     expect(find.text('Account & Connection'), findsOneWidget);
+    expect(find.text('Advanced Network'), findsOneWidget);
+    expect(find.text('Diagnostics & About'), findsOneWidget);
+    expect(find.byType(TextField), findsNothing);
     for (final technical in [
       'MTU',
       'UDP bind',
@@ -64,14 +67,27 @@ void _registerSettingsPhase6Tests() {
       expect(find.text(technical), findsNothing);
     }
 
-    // The one live summary on the root still updates, without making the
-    // entire Settings page subscribe to every polling notification.
-    expect(find.text('Not running'), findsOneWidget);
+    // Entry summaries help locate preferences and updates. Runtime polling
+    // must not replace the version/update summary with a service state.
+    final rawVersion = stores
+        .statusStore
+        .daemonController
+        .clientBuildInfo
+        .appVersion
+        .trim();
+    final version = rawVersion.isEmpty || rawVersion.toLowerCase() == 'unknown'
+        ? 'Version unavailable'
+        : rawVersion;
+    final versionSummary = '$version · Not checked';
+    expect(find.text('English · System'), findsOneWidget);
+    expect(find.text(versionSummary), findsOneWidget);
     api.health = true;
     api.snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
     await stores.statusStore.refresh(silent: true);
     await tester.pump();
-    expect(find.text('Running'), findsOneWidget);
+    expect(find.text(versionSummary), findsOneWidget);
+    expect(find.text('Running'), findsNothing);
+    expect(find.text('Not running'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 

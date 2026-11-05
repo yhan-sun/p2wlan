@@ -159,8 +159,43 @@ void _registerDiagnosticsTests() {
     expect(find.text('Critical tasks'), findsOneWidget);
     expect(find.text('Recent daemon logs'), findsOneWidget);
     expect(find.text('Raw /status JSON'), findsOneWidget);
-    expect(find.text('Support tools'), findsOneWidget);
+    // A reported issue exposes its support action beside recovery, without a
+    // second heading or a duplicate action inside the technical disclosure.
+    expect(find.text('Support tools'), findsNothing);
     expect(find.text('Copy diagnostics summary'), findsOneWidget);
+    final copySummary = find.widgetWithText(
+      TextButton,
+      'Copy diagnostics summary',
+    );
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('diagnostics-primary-actions')),
+        matching: copySummary,
+      ),
+      findsOneWidget,
+    );
+    await tester.ensureVisible(copySummary);
+    await tester.pumpAndSettle();
+    String? copiedSummary;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copiedSummary =
+              (call.arguments as Map<dynamic, dynamic>)['text'] as String?;
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    await tester.tap(copySummary);
+    await tester.pumpAndSettle();
+    expect(copiedSummary, contains('P2WLAN diagnostics'));
 
     tester
         .widget<OutlinedButton>(

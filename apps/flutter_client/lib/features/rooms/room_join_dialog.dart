@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/rooms/room_api.dart';
 import '../../app/p2wlan_colors.dart';
+import 'room_strings.dart';
 
 class RoomJoinRequest {
   const RoomJoinRequest(this.code, {this.password, this.invitation});
@@ -21,9 +22,11 @@ class RoomJoinDialog extends StatefulWidget {
     required this.onJoin,
     required this.isCurrent,
     this.initial = '',
+    this.languageCode = 'zh-CN',
   });
   final String server;
   final String initial;
+  final String languageCode;
   // A null result means the owning account session is no longer current.
   final Future<FriendRoom?> Function(RoomJoinRequest request) onJoin;
   final bool Function() isCurrent;
@@ -33,6 +36,9 @@ class RoomJoinDialog extends StatefulWidget {
 }
 
 class _RoomJoinDialogState extends State<RoomJoinDialog> {
+  RoomStrings get _strings => RoomStrings.fromCode(widget.languageCode);
+  String _s(String source, [List<Object?> values = const []]) =>
+      _strings.text(source, values);
   final _formKey = GlobalKey<FormState>();
   late final _room = TextEditingController(text: widget.initial);
   final _password = TextEditingController();
@@ -52,14 +58,14 @@ class _RoomJoinDialogState extends State<RoomJoinDialog> {
   String? _validateRoom(String? value) {
     final input = value?.trim() ?? '';
     if (RegExp(r'^[0-9]{8}$').hasMatch(input)) return null;
-    if (!_isInvitation) return '请输入 8 位房间号或完整的邀请链接';
+    if (!_isInvitation) return _s("请输入 8 位房间号或完整的邀请链接");
     try {
       RoomInvitation.parse(input, widget.server);
       return null;
     } on RoomException catch (error) {
-      return error.message;
+      return _strings.error(error);
     } on FormatException {
-      return '邀请链接格式无效';
+      return _s("邀请链接格式无效");
     }
   }
 
@@ -94,7 +100,7 @@ class _RoomJoinDialogState extends State<RoomJoinDialog> {
       }
       setState(() {
         _submitting = false;
-        _error = error is RoomException ? error.message : '加入未完成，请检查连接后重试';
+        _error = _strings.error(error);
       });
     }
   }
@@ -125,7 +131,7 @@ class _RoomJoinDialogState extends State<RoomJoinDialog> {
             size: 24,
           ),
           const SizedBox(width: 12),
-          const Expanded(child: Text('加入房间')),
+          Expanded(child: Text(_s("加入房间"))),
         ],
       ),
       content: SizedBox(
@@ -138,7 +144,7 @@ class _RoomJoinDialogState extends State<RoomJoinDialog> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 Text(
-                  '输入房间号与密码，或粘贴好友发来的邀请链接。',
+                  _s("输入房间号与密码，或粘贴好友发来的邀请链接。"),
                   style: Theme.of(context).textTheme.bodyMedium
                       ?.copyWith(color: P2WlanColors.of(context).textSecondary),
                 ),
@@ -153,9 +159,9 @@ class _RoomJoinDialogState extends State<RoomJoinDialog> {
                   maxLength: 4096,
                   minLines: 1,
                   maxLines: 4,
-                  decoration: const InputDecoration(
-                    labelText: '房间号或邀请链接',
-                    hintText: '8 位房间号，或 p2wlan://join…',
+                  decoration: InputDecoration(
+                    labelText: _s("房间号或邀请链接"),
+                    hintText: _s("8 位房间号，或 p2wlan://join…"),
                     counterText: '',
                     border: OutlineInputBorder(),
                   ),
@@ -181,7 +187,7 @@ class _RoomJoinDialogState extends State<RoomJoinDialog> {
                         const SizedBox(width: 8),
                         Expanded(
                           child: Text(
-                            '使用邀请加入，无需密码。确认后加入当前服务器上的房间。',
+                            _s("使用邀请加入，无需密码。确认后加入当前服务器上的房间。"),
                             style: Theme.of(context).textTheme.bodySmall,
                           ),
                         ),
@@ -198,12 +204,12 @@ class _RoomJoinDialogState extends State<RoomJoinDialog> {
                     enableSuggestions: false,
                     maxLength: 72,
                     decoration: InputDecoration(
-                      labelText: '房间密码',
-                      helperText: '请向房主索取房间密码',
+                      labelText: _s("房间密码"),
+                      helperText: _s("请向房主索取房间密码"),
                       counterText: '',
                       border: const OutlineInputBorder(),
                       suffixIcon: IconButton(
-                        tooltip: _obscurePassword ? '显示房间密码' : '隐藏房间密码',
+                        tooltip: _obscurePassword ? _s("显示房间密码") : _s("隐藏房间密码"),
                         onPressed: _submitting
                             ? null
                             : () => setState(
@@ -218,7 +224,9 @@ class _RoomJoinDialogState extends State<RoomJoinDialog> {
                     ),
                     validator: (value) {
                       final length = utf8.encode(value ?? '').length;
-                      return length < 8 || length > 72 ? '密码需为 8–72 字节' : null;
+                      return length < 8 || length > 72
+                          ? _s("密码需为 8–72 字节")
+                          : null;
                     },
                     onFieldSubmitted: (_) => _submit(),
                   ),
@@ -265,7 +273,7 @@ class _RoomJoinDialogState extends State<RoomJoinDialog> {
       actions: [
         TextButton(
           onPressed: _submitting ? null : () => Navigator.pop(context),
-          child: const Text('取消'),
+          child: Text(_s("取消")),
         ),
         FilledButton(
           onPressed: _submitting ? null : _submit,
@@ -273,17 +281,17 @@ class _RoomJoinDialogState extends State<RoomJoinDialog> {
             mainAxisSize: MainAxisSize.min,
             children: [
               if (_submitting) ...[
-                const SizedBox(
+                SizedBox(
                   width: 16,
                   height: 16,
                   child: CircularProgressIndicator(
                     strokeWidth: 2,
-                    semanticsLabel: '正在加入房间',
+                    semanticsLabel: _s("正在加入房间"),
                   ),
                 ),
                 const SizedBox(width: 8),
               ],
-              Text(_submitting ? '正在加入…' : '确认'),
+              Text(_submitting ? _s("正在加入…") : _s("确认")),
             ],
           ),
         ),

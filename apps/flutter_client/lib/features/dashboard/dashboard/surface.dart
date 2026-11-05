@@ -1,5 +1,47 @@
 part of '../dashboard_page.dart';
 
+/// Devices lead the overview. Wide windows use the spare horizontal space
+/// for traffic; narrow windows or enlarged text stack it below the devices.
+class _DashboardDetailsLayout extends StatelessWidget {
+  const _DashboardDetailsLayout({required this.devices, required this.traffic});
+
+  final Widget devices;
+  final Widget traffic;
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final main = KeyedSubtree(
+        key: const Key('home-devices-panel'),
+        child: devices,
+      );
+      final aside = KeyedSubtree(
+        key: const Key('home-traffic-panel'),
+        child: traffic,
+      );
+      if (constraints.maxWidth >= 900 &&
+          MediaQuery.textScalerOf(context).scale(14) <= 18) {
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(flex: 7, child: main),
+            const SizedBox(width: AppTokens.space16),
+            Expanded(flex: 3, child: aside),
+          ],
+        );
+      }
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          main,
+          const SizedBox(height: AppTokens.space16),
+          aside,
+        ],
+      );
+    },
+  );
+}
+
 /// Supporting Home sections use the same restrained surface treatment as the
 /// rest of the product. On wide layouts they form the dashboard's two-column
 /// information grid; on narrow layouts they stack with unchanged reading

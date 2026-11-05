@@ -2,7 +2,8 @@ import 'package:flutter/material.dart';
 
 import '../../core/api/control_api.dart';
 import '../../app/app_strings.dart';
-import '../../shared/widgets/app_notice.dart';
+
+enum _UsernameErrorKind { load, invalid, save }
 
 /// Owns the username draft across category navigation. The server profile is
 /// the saved baseline; the text controller remains the only editable value.
@@ -76,7 +77,7 @@ class _UsernameSettingsState extends State<UsernameSettings> {
   TextEditingController get _name => _controller.text;
   bool _busy = true;
   bool _loaded = false;
-  String? _error;
+  _UsernameErrorKind? _error;
   String? _saved;
   late String _email;
   var _requestRevision = 0;
@@ -143,8 +144,7 @@ class _UsernameSettingsState extends State<UsernameSettings> {
       widget.onProfileLoaded?.call(profile);
     } catch (_) {
       if (mounted && revision == _requestRevision) {
-        _error = AppStringsScope.of(context).settingsUsernameLoadError;
-        showAppNotice(context, content: Text(_error!));
+        _error = _UsernameErrorKind.load;
       }
     } finally {
       if (mounted && revision == _requestRevision) {
@@ -154,6 +154,17 @@ class _UsernameSettingsState extends State<UsernameSettings> {
   }
 
   Future<void> _save() async {
+    if (_busy) return;
+    final name = _name.text.trim();
+    if (name.isEmpty ||
+        name.runes.length > 32 ||
+        RegExp(r'[\x00-\x1f\x7f-\x9f]').hasMatch(name)) {
+      setState(() {
+        _error = _UsernameErrorKind.invalid;
+        _saved = null;
+      });
+      return;
+    }
     final revision = ++_requestRevision;
     setState(() {
       _busy = true;
@@ -171,10 +182,9 @@ class _UsernameSettingsState extends State<UsernameSettings> {
       _controller._acceptSaved(profile.username, preserveDraft: false);
       widget.onProfileLoaded?.call(profile);
       _saved = AppStringsScope.of(context).settingsUsernameSaved;
-    } on ControlApiException catch (error) {
+    } catch (_) {
       if (mounted && revision == _requestRevision) {
-        _error = error.message;
-        showAppNotice(context, content: Text(error.message));
+        _error = _UsernameErrorKind.save;
       }
     } finally {
       if (mounted && revision == _requestRevision) {
@@ -193,6 +203,15 @@ class _UsernameSettingsState extends State<UsernameSettings> {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
+    final errorText = switch (_error) {
+      _UsernameErrorKind.load => strings.settingsUsernameLoadError,
+      _UsernameErrorKind.invalid =>
+        strings.isZh
+            ? '用户名需为 1–32 个字符，且不能包含控制字符。'
+            : 'Use 1–32 characters without control characters.',
+      _UsernameErrorKind.save => strings.isZh ? '无法保存用户名。请检查连接，或换一个名字后重试。' : 'Could not save your username. Check your connection or try a different name.',
+      null => null,
+    };
     return Padding(
       padding: const EdgeInsets.only(bottom: 16),
       child: Align(
@@ -228,7 +247,14 @@ class _UsernameSettingsState extends State<UsernameSettings> {
                     hintText: strings.settingsUsernameHint,
                     helperText: strings.settingsUsernameHelper,
                     helperMaxLines: 3,
+                    error: errorText == null
+                        ? null
+                        : Semantics(liveRegion: true, child: Text(errorText)),
                   ),
+                  onChanged: (_) => setState(() {
+                    _saved = null;
+                    _error = null;
+                  }),
                   onSubmitted: _busy ? null : (_) => _save(),
                 )
               else
@@ -237,13 +263,16 @@ class _UsernameSettingsState extends State<UsernameSettings> {
                   style: Theme.of(context).textTheme.titleSmall,
                 ),
               if (_busy) const LinearProgressIndicator(),
-              if (_error != null && _name.text.trim().isEmpty)
+              if (errorText != null && !_loaded)
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 8),
-                  child: Text(
-                    _error!,
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
+                  child: Semantics(
+                    liveRegion: true,
+                    child: Text(
+                      errorText,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
                     ),
                   ),
                 ),

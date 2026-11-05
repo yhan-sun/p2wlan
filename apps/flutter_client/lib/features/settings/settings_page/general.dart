@@ -13,28 +13,6 @@ class _GeneralSection extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _SettingsGroup(
-          title: strings.settingsDeviceGroup,
-          children: [
-            _SettingsField(
-              controller: state._deviceNameController,
-              focusNode: state._focusFor(state._deviceNameController),
-              errorText: state._fieldErrors[state._deviceNameController],
-              onChanged: (_) =>
-                  state._clearFieldError(state._deviceNameController),
-              label: strings.deviceName,
-              helper: strings.deviceNameHelper,
-              textInputAction: TextInputAction.done,
-              onSubmitted: saving
-                  ? null
-                  : (_) => state._saveCategory(SettingsCategory.general),
-            ),
-            if (state._capabilities.canUseSystemTray) ...[
-              const SizedBox(height: 16),
-              _ApplicationSection(state: state, strings: strings),
-            ],
-          ],
-        ),
-        _SettingsGroup(
           title: strings.settingsPreferencesGroup,
           children: [
             _PreferenceRow(
@@ -126,6 +104,28 @@ class _GeneralSection extends StatelessWidget {
             if (state._immediateError != null) ...[
               const SizedBox(height: 12),
               _SettingsErrorNotice(message: state._immediateError!),
+            ],
+          ],
+        ),
+        _SettingsGroup(
+          title: strings.settingsDeviceGroup,
+          children: [
+            _SettingsField(
+              controller: state._deviceNameController,
+              focusNode: state._focusFor(state._deviceNameController),
+              errorText: state._fieldErrors[state._deviceNameController],
+              onChanged: (_) =>
+                  state._clearFieldError(state._deviceNameController),
+              label: strings.deviceName,
+              helper: strings.deviceNameHelper,
+              textInputAction: TextInputAction.done,
+              onSubmitted: saving
+                  ? null
+                  : (_) => state._saveCategory(SettingsCategory.general),
+            ),
+            if (state._capabilities.canUseSystemTray) ...[
+              const SizedBox(height: 16),
+              _ApplicationSection(state: state, strings: strings),
             ],
           ],
         ),

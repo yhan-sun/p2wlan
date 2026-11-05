@@ -5,6 +5,15 @@ import 'widgets/status_badge.dart';
 String networkScopeLabel(AppStrings strings, NetworkScopeSnapshot scope) =>
     scope.name ?? (strings.isZh ? '当前网络' : 'Current network');
 
+bool networkScopeNeedsAttention(NetworkScopeSnapshot scope) =>
+    switch (scope.state) {
+      NetworkDisplayState.attention ||
+      NetworkDisplayState.stale ||
+      NetworkDisplayState.unavailable ||
+      NetworkDisplayState.failed => true,
+      _ => false,
+    };
+
 String networkDisplayStateLabel(
   AppStrings strings,
   NetworkDisplayState state,
@@ -35,10 +44,18 @@ StatusTone networkDisplayStateTone(NetworkDisplayState state) =>
   NetworkOverview overview,
 ) {
   if (overview.hasRooms) {
+    final attention = overview.rooms.where(networkScopeNeedsAttention).length;
+    final healthy = overview.rooms
+        .where((scope) => scope.state == NetworkDisplayState.running)
+        .length;
     if (overview.runningRooms > 0) {
       return (
         overview.needsAttention ? StatusTone.warn : StatusTone.good,
-        strings.isZh ? '房间已连接' : 'Rooms connected',
+        attention > 0
+            ? (strings.isZh
+                  ? '$healthy 个房间正常，$attention 个需处理'
+                  : '$healthy ${healthy == 1 ? 'room' : 'rooms'} healthy, $attention ${attention == 1 ? 'needs' : 'need'} attention')
+            : (strings.isZh ? '房间已连接' : 'Rooms connected'),
         strings.isZh
             ? '${overview.runningRooms} 个房间运行中'
             : '${overview.runningRooms} active rooms',

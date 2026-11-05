@@ -15,14 +15,19 @@ part of '../diagnostics_page.dart';
 /// disclosure is expanded, so route verification never fires on page load.
 class _NetworkDiagnosticsSection extends StatefulWidget {
   const _NetworkDiagnosticsSection({
+    super.key,
     required this.settingsStore,
     required this.statusStore,
     required this.capabilities,
+    required this.isCurrentOwner,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
   final PlatformCapabilities capabilities;
+  // The parent can change owner while this child is being unmounted. Its
+  // witness distinguishes that replacement from merely leaving the page.
+  final bool Function() isCurrentOwner;
 
   @override
   State<_NetworkDiagnosticsSection> createState() =>
@@ -38,7 +43,10 @@ class _NetworkDiagnosticsSectionState
   var _repairing = false;
   var _rebuilding = false;
   String? _message;
-  var _messageIsError = false;
+  var _messageTone = StatusTone.neutral;
+  DateTime? _lastRouteCheckedAt;
+  var _routeCheckFailed = false;
+  var _restartPhase = LocalConnectionRestartPhase.idle;
 
   @override
   void initState() {
@@ -50,72 +58,139 @@ class _NetworkDiagnosticsSectionState
     }
   }
 
+  @override
+  void didUpdateWidget(covariant _NetworkDiagnosticsSection oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.statusStore != widget.statusStore ||
+        oldWidget.settingsStore != widget.settingsStore) {
+      _routeState = null;
+      _lastRouteCheckedAt = null;
+      _routeCheckFailed = false;
+      _message = null;
+      _restartPhase = LocalConnectionRestartPhase.idle;
+      _verifying = _repairing = _rebuilding = false;
+      if (widget.capabilities.canVerifyRoutes &&
+          widget.statusStore.daemonReachable) {
+        _verifyRoutes();
+      }
+    }
+  }
+
   Future<void> _verifyRoutes() async {
-    if (!widget.capabilities.canVerifyRoutes) return;
-    final url = widget.settingsStore.settings.diagnosticsUrl;
-    final revision = widget.statusStore.sessionRevision;
-    if (!widget.statusStore.daemonReachable) return;
+    if (!widget.capabilities.canVerifyRoutes ||
+        _verifying ||
+        _repairing ||
+        _rebuilding) {
+      return;
+    }
+    final statusStore = widget.statusStore;
+    final settingsStore = widget.settingsStore;
+    final url = settingsStore.settings.diagnosticsUrl;
+    final revision = statusStore.sessionRevision;
+    if (!statusStore.daemonReachable) return;
     setState(() {
       _verifying = true;
+      _message = null;
     });
     try {
-      final result = await widget.statusStore.diagnosticsApi.verifyRoutes(url);
-      if (!_sameSession(revision, url)) return;
-      setState(() => _routeState = result.toJson());
+      final result = await statusStore.diagnosticsApi.verifyRoutes(url);
+      if (!_sameSession(revision, url, statusStore, settingsStore)) return;
+      setState(() {
+        _routeState = result.toJson();
+        _lastRouteCheckedAt = DateTime.now();
+        _routeCheckFailed = false;
+      });
     } catch (_) {
-      // Daemon may not expose /routes/verify yet; leave state unknown.
+      if (_sameSession(revision, url, statusStore, settingsStore)) {
+        setState(() => _routeCheckFailed = true);
+      }
     } finally {
-      if (mounted) setState(() => _verifying = false);
+      if (_ownsStores(statusStore, settingsStore)) {
+        setState(() => _verifying = false);
+      }
     }
   }
 
   Future<void> _repairRoutes() async {
-    if (!widget.capabilities.canRepairRoutes) return;
+    if (!widget.capabilities.canRepairRoutes ||
+        _repairing ||
+        _verifying ||
+        _rebuilding) {
+      return;
+    }
     final strings = AppStringsScope.of(context);
-    final url = widget.settingsStore.settings.diagnosticsUrl;
-    final revision = widget.statusStore.sessionRevision;
+    final statusStore = widget.statusStore;
+    final settingsStore = widget.settingsStore;
+    final url = settingsStore.settings.diagnosticsUrl;
+    final revision = statusStore.sessionRevision;
     setState(() {
       _repairing = true;
       _message = null;
-      _messageIsError = false;
+      _messageTone = StatusTone.neutral;
     });
     try {
-      final result = await widget.statusStore.diagnosticsApi.repairRoutes(url);
+      final result = await statusStore.diagnosticsApi.repairRoutes(url);
       final changed = result.changed;
       final after = result.after;
-      if (!_sameSession(revision, url)) return;
+      if (!_sameSession(revision, url, statusStore, settingsStore)) return;
       // Refresh the authoritative route state from the verify API instead of
       // trusting the repair response to carry the full route table.
-      final routeState = await _fetchAuthoritativeState(url);
-      if (!_sameSession(revision, url)) return;
+      final routeState = await _fetchAuthoritativeState(url, statusStore);
+      if (!_sameSession(revision, url, statusStore, settingsStore)) return;
       setState(() {
         _routeState = routeState;
-        _message = changed
+        _routeCheckFailed = routeState == null;
+        if (routeState != null) _lastRouteCheckedAt = DateTime.now();
+        _message = routeState == null
+            ? (strings.isZh
+                  ? '修复操作已完成，但未能重新检查结果。请再次检查路由。'
+                  : 'The repair operation finished, but its result could not be checked. Check routes again.')
+            : changed
             ? strings.tunnelRouteRepaired(after)
             : strings.tunnelRouteAlreadyInstalled;
+        _messageTone = routeState == null
+            ? StatusTone.warn
+            : changed
+            ? StatusTone.good
+            : StatusTone.neutral;
       });
     } catch (_) {
-      if (_sameSession(revision, url)) {
+      if (_sameSession(revision, url, statusStore, settingsStore)) {
         setState(() {
           _message = strings.tunnelRouteRepairFailed;
-          _messageIsError = true;
+          _messageTone = StatusTone.bad;
         });
       }
     } finally {
-      if (mounted) setState(() => _repairing = false);
+      if (_ownsStores(statusStore, settingsStore)) {
+        setState(() => _repairing = false);
+      }
     }
   }
 
-  bool _sameSession(int revision, String url) =>
+  bool _ownsStores(StatusStore statusStore, SettingsStore settingsStore) =>
       mounted &&
-      widget.statusStore.sessionRevision == revision &&
-      widget.settingsStore.settings.diagnosticsUrl == url;
+      identical(widget.statusStore, statusStore) &&
+      identical(widget.settingsStore, settingsStore);
+
+  bool _sameSession(
+    int revision,
+    String url,
+    StatusStore statusStore,
+    SettingsStore settingsStore,
+  ) =>
+      _ownsStores(statusStore, settingsStore) &&
+      statusStore.sessionRevision == revision &&
+      settingsStore.settings.diagnosticsUrl == url;
 
   /// Reads the same endpoint that handled the repair, without switching to a
   /// replacement account or diagnostics scope across the await.
-  Future<Map<String, dynamic>?> _fetchAuthoritativeState(String url) async {
+  Future<Map<String, dynamic>?> _fetchAuthoritativeState(
+    String url,
+    StatusStore statusStore,
+  ) async {
     try {
-      final result = await widget.statusStore.diagnosticsApi.verifyRoutes(url);
+      final result = await statusStore.diagnosticsApi.verifyRoutes(url);
       return result.toJson();
     } catch (_) {
       return null;
@@ -125,36 +200,66 @@ class _NetworkDiagnosticsSectionState
   /// Restart network service — deliberately heavier than check/repair and kept
   /// at the bottom of the section as a low-weight text action.
   Future<void> _restartNetworkService() async {
-    if (!widget.capabilities.canControlLocalDaemon) return;
-    final strings = AppStringsScope.of(context);
-    final revision = widget.statusStore.sessionRevision;
-    final url = widget.settingsStore.settings.diagnosticsUrl;
+    if (!widget.capabilities.canControlLocalDaemon || _rebuilding) return;
+    final statusStore = widget.statusStore;
+    final settingsStore = widget.settingsStore;
+    final revision = statusStore.sessionRevision;
+    final url = settingsStore.settings.diagnosticsUrl;
+    bool acceptsOwner() =>
+        widget.isCurrentOwner() &&
+        identical(widget.statusStore, statusStore) &&
+        identical(widget.settingsStore, settingsStore) &&
+        revision == statusStore.sessionRevision &&
+        url == settingsStore.settings.diagnosticsUrl;
+    bool ownsUi() =>
+        mounted &&
+        identical(widget.statusStore, statusStore) &&
+        identical(widget.settingsStore, settingsStore);
+    bool acceptsUi() => ownsUi() && acceptsOwner();
+    final retryStart = _restartPhase == LocalConnectionRestartPhase.startFailed;
+    var phase = retryStart
+        ? LocalConnectionRestartPhase.starting
+        : LocalConnectionRestartPhase.stopping;
+    void showPhase(LocalConnectionRestartPhase next) {
+      phase = next;
+      if (acceptsUi()) setState(() => _restartPhase = next);
+    }
+
     setState(() {
       _rebuilding = true;
       _message = null;
-      _messageIsError = false;
+      _restartPhase = phase;
+      _routeState = null;
+      _routeCheckFailed = false;
     });
     try {
-      final stop = await widget.statusStore.stopPrimaryDaemon();
-      if (!_sameSession(revision, url)) return;
-      if (!stop.ok) {
-        setState(() {
-          _message = strings.tunnelRestartFailed;
-          _messageIsError = true;
-        });
-        return;
+      if (!retryStart) {
+        final stop = await statusStore.stopPrimaryDaemon();
+        if (!acceptsOwner()) return;
+        if (!stop.ok) {
+          showPhase(LocalConnectionRestartPhase.stopFailed);
+          return;
+        }
+        showPhase(LocalConnectionRestartPhase.starting);
       }
-      final start = await widget.statusStore.startDaemon();
-      if (!_sameSession(revision, url)) return;
-      setState(() {
-        final ok = start.ok;
-        _message = ok
-            ? strings.daemonRestartedReinstall
-            : strings.tunnelRestartFailed;
-        _messageIsError = !ok;
-      });
+      if (!acceptsOwner()) return;
+      final start = await statusStore.startDaemon();
+      if (!acceptsUi()) return;
+      showPhase(
+        start.ok
+            ? LocalConnectionRestartPhase.complete
+            : LocalConnectionRestartPhase.startFailed,
+      );
+    } catch (_) {
+      if (acceptsUi()) {
+        showPhase(
+          phase == LocalConnectionRestartPhase.stopping
+              ? LocalConnectionRestartPhase.stopFailed
+              : LocalConnectionRestartPhase.startFailed,
+        );
+      }
     } finally {
-      if (mounted) setState(() => _rebuilding = false);
+      if (ownsUi()) setState(() => _rebuilding = false);
     }
   }
 
@@ -201,7 +306,22 @@ class _NetworkDiagnosticsSectionState
         _buildRoutePanel(strings: strings, running: running, busy: busy),
         if (_message != null) ...[
           const SizedBox(height: AppTokens.space10),
-          _NetworkMessage(message: _message!, isError: _messageIsError),
+          _NetworkMessage(message: _message!, tone: _messageTone),
+        ],
+        if (_restartPhase != LocalConnectionRestartPhase.idle) ...[
+          const SizedBox(height: AppTokens.space10),
+          LocalConnectionRestartFeedback(
+            phase: _restartPhase,
+            serviceReachable: widget.statusStore.healthReachable,
+            configurationPending:
+                widget.statusStore.primaryConfigurationPending,
+            busy: busy,
+            onRetry: _restartNetworkService,
+            successMessage: strings.daemonRestartedReinstall,
+            onDismiss: () => setState(
+              () => _restartPhase = LocalConnectionRestartPhase.idle,
+            ),
+          ),
         ],
       ],
     );
@@ -217,7 +337,8 @@ class _NetworkDiagnosticsSectionState
             (_routeState?['entries'] as List).isNotEmpty
         ? ((_routeState?['entries']) as List).first as Map<String, dynamic>
         : null;
-    final routeOk = state?['state'] == 'installed';
+    final routeOk =
+        !_routeCheckFailed && !_verifying && state?['state'] == 'installed';
     final routeConflict = state?['state'] == 'conflict';
     final actual = state?['actual_interface']?.toString();
     final expected = state?['expected_interface']?.toString();
@@ -227,7 +348,7 @@ class _NetworkDiagnosticsSectionState
     if (!running) {
       badgeLabel = strings.offline;
       badgeTone = StatusTone.neutral;
-    } else if (state == null) {
+    } else if (_routeCheckFailed || _verifying || state == null) {
       badgeLabel = strings.routeUnknown;
       badgeTone = StatusTone.warn;
     } else if (routeOk) {
@@ -255,20 +376,41 @@ class _NetworkDiagnosticsSectionState
           value:
               expected ?? widget.settingsStore.settings.effectiveTunInterface,
         ),
-        if (actual != null)
+        if (actual != null && !_routeCheckFailed)
           _KvRow(label: strings.routeActualInterface, value: actual),
         _KvRow(
           label: strings.routeDetail,
-          value: state == null
+          value: _routeCheckFailed
+              ? (strings.isZh
+                    ? '本次检查失败，当前路由状态待确认。'
+                    : 'The latest check failed. Current route status is unconfirmed.')
+              : state == null
               ? strings.routeNotRead
               : strings.routeAuthoritative(
                   _routeState?['state'] ?? state['state'],
                 ),
         ),
+        if (_lastRouteCheckedAt case final checkedAt?)
+          _KvRow(
+            label: strings.isZh ? '上次成功检查' : 'Last successful check',
+            value: checkedAt
+                .toLocal()
+                .toIso8601String()
+                .split('.')
+                .first
+                .replaceFirst('T', ' '),
+          ),
       ],
       footer: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          if (_routeCheckFailed) ...[
+            _NetworkMessage(
+              message: strings.isZh ? '未能完成本次路由检查。上次结果不能代表当前状态，请重新检查。' : 'The latest route check could not be completed. Previous results do not confirm the current state. Check again.',
+              tone: StatusTone.warn,
+            ),
+            const SizedBox(height: AppTokens.space10),
+          ],
           if (canVerify || canRepair) ...[
             LayoutBuilder(
               builder: (context, constraints) {

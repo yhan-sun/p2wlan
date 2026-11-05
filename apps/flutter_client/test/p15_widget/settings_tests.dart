@@ -10,6 +10,7 @@ Future<_Stores> _pumpSettings(
   ValueChanged<bool>? onDirtyChanged,
   SecureTokenRepository? tokenRepository,
   UpdateService? updateService,
+  DaemonController? daemonController,
   Size physicalSize = const Size(800, 2400),
 }) async {
   tester.view.physicalSize = physicalSize;
@@ -17,7 +18,11 @@ Future<_Stores> _pumpSettings(
   addTearDown(tester.view.resetPhysicalSize);
   addTearDown(tester.view.resetDevicePixelRatio);
   final stores = (await tester.runAsync(
-    () => _makeStores(api: api, tokenRepository: tokenRepository),
+    () => _makeStores(
+      api: api,
+      tokenRepository: tokenRepository,
+      daemonController: daemonController,
+    ),
   ))!;
   addTearDown(stores.dispose);
   final page = SettingsPage(
@@ -112,6 +117,142 @@ Future<void> _openAppSelect(WidgetTester tester, Key key) async {
 }
 
 void _registerSettingsTests() {
+  testWidgets('Settings entry rows show useful summaries and all fit a phone', (
+    tester,
+  ) async {
+    final stores = await _pumpSettings(
+      tester,
+      api: _FakeDiagnosticsApi(health: false),
+      capabilities: PlatformCapabilities.fromPlatform('macos'),
+      physicalSize: const Size(390, 844),
+    );
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(
+          accountUsername: 'River',
+          themeMode: 'dark',
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('English · Dark'), findsOneWidget);
+    expect(find.text('River · control.example.com'), findsOneWidget);
+    expect(find.text('Defaults · Automatic connection path'), findsOneWidget);
+    final buildVersion = stores
+        .statusStore
+        .daemonController
+        .clientBuildInfo
+        .appVersion
+        .trim();
+    final unavailableVersion =
+        buildVersion.isEmpty || buildVersion.toLowerCase() == 'unknown';
+    expect(
+      find.text(
+        '${unavailableVersion ? 'Version unavailable' : buildVersion} · Not checked',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('unknown · Not checked'), findsNothing);
+    final first = find.byKey(const ValueKey('settings-category-card-general'));
+    final last = find.byKey(const ValueKey('settings-category-card-developer'));
+    expect(first.hitTestable(), findsOneWidget);
+    expect(last.hitTestable(), findsOneWidget);
+    expect(tester.getSize(first).height, lessThan(100));
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(mtu: 1280),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Custom settings · MTU 1280'), findsOneWidget);
+    await tester.runAsync(
+      () => stores.settingsStore.updateLanguageCode('zh-Hans'),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.text('${unavailableVersion ? '版本未知' : buildVersion} · 未检查'),
+      findsOneWidget,
+    );
+    await _openCategory(tester, '诊断与关于');
+    expect(
+      find.text(unavailableVersion ? '版本未知' : buildVersion),
+      findsOneWidget,
+    );
+    if (unavailableVersion) expect(find.text('unknown'), findsNothing);
+  });
+
+  testWidgets(
+    'Settings puts appearance first and keeps a narrow switch beside its label',
+    (tester) async {
+      await _pumpSettings(
+        tester,
+        api: _FakeDiagnosticsApi(health: false),
+        capabilities: PlatformCapabilities.fromPlatform('macos'),
+        physicalSize: const Size(390, 844),
+      );
+      await _openCategory(tester, 'General');
+      expect(
+        tester
+            .getTopLeft(find.byKey(const ValueKey('settings-language-select')))
+            .dy,
+        lessThan(tester.getTopLeft(_settingsTextField('Device name')).dy),
+      );
+      final toggle = find.byKey(
+        const ValueKey('settings-start-at-login-switch'),
+      );
+      await tester.ensureVisible(toggle);
+      await tester.pumpAndSettle();
+      expect(
+        tester.getCenter(toggle).dy,
+        closeTo(tester.getCenter(find.text('Launch P2WLAN at login')).dy, 1),
+      );
+      expect(
+        tester
+            .getTopLeft(
+              find.text(
+                'Launch at desktop sign-in and connect when your account and device are ready.',
+              ),
+            )
+            .dy,
+        greaterThan(
+          tester.getBottomRight(find.text('Launch P2WLAN at login')).dy,
+        ),
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'Settings shows one pending notice when a completed restart is still unconfirmed',
+    (tester) async {
+      final source = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final snapshot = _mutateSnapshot(source, (raw) {
+        raw['process_id'] = null;
+        raw['runtime_incarnation'] = null;
+        return raw;
+      });
+      final api = _FakeDiagnosticsApi(health: true, snapshot: snapshot);
+      final stores = await _pumpSettings(tester, api: api);
+      await stores.statusStore.refresh();
+      await tester.runAsync(
+        () => stores.settingsStore.updateSettings(
+          stores.settingsStore.settings.copyWith(mtu: 1280),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await _openCategory(tester, 'General');
+      await _tapVisible(tester, find.text('Restart and apply'));
+      await _waitFor(tester, () => !stores.statusStore.daemonBusy);
+      expect(stores.statusStore.primaryConfigurationPending, isTrue);
+      expect(find.text('P2WLAN restart required'), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('local-connection-restart-feedback')),
+        findsNothing,
+      );
+      expect(find.text('Restart and apply'), findsOneWidget);
+    },
+  );
+
   testWidgets('Settings validates diagnostics URL before saving', (
     tester,
   ) async {
@@ -494,7 +635,9 @@ void _registerSettingsTests() {
     );
     await _waitForSaveComplete(tester, const ValueKey('settings-theme-select'));
     expect(stores.settingsStore.settings.languageCode, 'zh-Hans');
-    expect(find.text('设置'), findsWidgets);
+    expect(find.text('通用').hitTestable(), findsWidgets);
+    expect(find.text('语言').hitTestable(), findsOneWidget);
+    expect(find.text('暗色模式').hitTestable(), findsOneWidget);
     // No connection settings save was triggered by the immediate edits.
     expect(find.text('Unsaved changes'), findsNothing);
   });
@@ -667,10 +810,16 @@ void _registerSettingsTests() {
       () => find.byType(CircularProgressIndicator).evaluate().isEmpty,
     );
 
+    // Let the temporary save feedback finish before using the persistent
+    // restart action; its dismiss button can overlap the action near the top.
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pumpAndSettle();
+    final restart = find.widgetWithText(TextButton, 'Restart and apply');
+    await tester.ensureVisible(restart);
+    await tester.pumpAndSettle();
+    expect(restart.hitTestable(), findsOneWidget);
     // Applying the pending restart clears the notice.
-    await tester.ensureVisible(find.text('Restart and apply'));
-    await tester.pump();
-    await tester.tap(find.text('Restart and apply'));
+    await tester.tap(restart);
     await tester.pump();
     await _waitFor(
       tester,
@@ -679,4 +828,159 @@ void _registerSettingsTests() {
     expect(find.text('P2WLAN restart required'), findsNothing);
     expect(find.text('Restart and apply'), findsNothing);
   });
+
+  for (final stopFails in [true, false]) {
+    testWidgets(
+      'Settings restart distinguishes ${stopFails ? 'stop' : 'start'} failure and preserves pending changes',
+      (tester) async {
+        final api = _FakeDiagnosticsApi(
+          health: true,
+          snapshot: await tester.runAsync(_loadFixtureSnapshot),
+        );
+        final controller = _RetryNetworkDaemonController(api)
+          ..stopOk = !stopFails
+          ..startOk = false;
+        final stores = await _pumpSettings(
+          tester,
+          api: api,
+          daemonController: controller,
+        );
+        await stores.statusStore.refresh();
+        await _openCategory(tester, 'Advanced Network');
+        await tester.enterText(_settingsTextField('MTU'), '1280');
+        await tester.pump();
+        await _tapSave(tester);
+        await _waitFor(
+          tester,
+          () => find.text('Restart and apply').evaluate().isNotEmpty,
+        );
+        await _tapVisible(tester, find.text('Restart and apply'));
+        final retry = stopFails
+            ? 'Retry stopping and restarting'
+            : 'Retry starting';
+        await _waitFor(tester, () => find.text(retry).evaluate().isNotEmpty);
+        expect(controller.stops, 1);
+        expect(controller.starts, stopFails ? 0 : 1);
+        expect(stores.statusStore.primaryConfigurationPending, isTrue);
+        expect(
+          find.text('The saved configuration is still pending confirmation.'),
+          findsOneWidget,
+        );
+        await tester.pump(const Duration(seconds: 6));
+        expect(find.text(retry), findsOneWidget);
+        controller.stopOk = true;
+        controller.startOk = true;
+        await _tapVisible(tester, find.text(retry));
+        await _waitFor(
+          tester,
+          () => !stores.statusStore.primaryConfigurationPending,
+        );
+        expect(controller.stops, stopFails ? 2 : 1);
+        expect(controller.starts, stopFails ? 1 : 2);
+        expect(find.text(retry), findsNothing);
+        expect(stores.settingsStore.settings.mtu, 1280);
+      },
+    );
+  }
+
+  for (final scenario in ['leave', 'endpoint', 'replacement', 'disposed']) {
+    final changeOwner = scenario != 'leave';
+    testWidgets(
+      'Settings restart ${scenario == 'endpoint'
+          ? 'rejects a changed endpoint'
+          : scenario == 'replacement'
+          ? 'rejects a replacement owner with the same revision and endpoint'
+          : scenario == 'disposed'
+          ? 'rejects a disposed store'
+          : 'finishes on its original owner'} after leaving',
+      (tester) async {
+        final api = _FakeDiagnosticsApi(
+          health: true,
+          snapshot: await tester.runAsync(_loadFixtureSnapshot),
+        );
+        final controller = _DeferredRestartDaemonController(api);
+        final original = await _pumpSettings(
+          tester,
+          api: api,
+          daemonController: controller,
+        );
+        await original.statusStore.refresh();
+        final originalUrl = original.settingsStore.settings.diagnosticsUrl;
+        await tester.runAsync(
+          () => original.settingsStore.updateSettings(
+            original.settingsStore.settings.copyWith(mtu: 1280),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await _openCategory(tester, 'General');
+        await _tapVisibleNoSettle(tester, find.text('Restart and apply'));
+        expect(controller.stops, 1);
+        expect(controller.starts, 0);
+        final replacementApi = _FakeDiagnosticsApi(health: false);
+        final replacementController = _RetryNetworkDaemonController(
+          replacementApi,
+        );
+        final replacement = (await tester.runAsync(
+          () => _makeStores(
+            api: replacementApi,
+            daemonController: replacementController,
+          ),
+        ))!;
+        addTearDown(replacement.dispose);
+        expect(
+          replacement.statusStore.sessionRevision,
+          original.statusStore.sessionRevision,
+        );
+        expect(replacement.settingsStore.settings.diagnosticsUrl, originalUrl);
+        await tester.pumpWidget(
+          _TestApp(
+            child: SettingsPage(
+              key: scenario == 'replacement'
+                  ? null
+                  : const ValueKey('replacement-settings'),
+              settingsStore: replacement.settingsStore,
+              statusStore: replacement.statusStore,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        if (scenario == 'endpoint') {
+          await tester.runAsync(
+            () => original.settingsStore.updateSettings(
+              original.settingsStore.settings.copyWith(
+                diagnosticsUrl: 'http://127.0.0.1:39279',
+              ),
+            ),
+          );
+        }
+        if (scenario == 'disposed') original.statusStore.dispose();
+        controller.pendingStop.complete(
+          const DaemonCommandResult(ok: true, message: 'stopped'),
+        );
+        await _waitFor(tester, () => !original.statusStore.daemonBusy);
+        await tester.pumpAndSettle();
+        expect(controller.starts, changeOwner ? 0 : 1);
+        expect(replacementController.starts, 0);
+        if (scenario == 'replacement') {
+          expect(
+            find.byKey(const ValueKey('local-connection-restart-feedback')),
+            findsNothing,
+          );
+          expect(
+            tester
+                .widget<SegmentedButton<String>>(
+                  find.byKey(const ValueKey('settings-theme-select')),
+                )
+                .onSelectionChanged,
+            isNotNull,
+          );
+        }
+        if (!changeOwner) {
+          expect(controller.startedSettings.single.diagnosticsUrl, originalUrl);
+          expect(original.statusStore.primaryConfigurationPending, isFalse);
+        }
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 }

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../app/app_strings.dart';
+import '../../app/app_tokens.dart';
 import '../../core/presentation/network_overview.dart';
 import '../network_overview_presentation.dart';
 
@@ -41,27 +42,33 @@ class NetworkScopePicker extends StatelessWidget {
               child: Text(networkScopeLabel(strings, scope)),
             ),
         ],
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 10),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.layers_outlined, size: 18),
-              const SizedBox(width: 8),
-              Flexible(
-                child: Text(
-                  selectedId == null || selected.isEmpty
-                      ? allLabel
-                      : networkScopeLabel(strings, selected.first),
-                  style: const TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(
+            minWidth: AppTokens.minTouchTarget,
+            minHeight: AppTokens.minTouchTarget,
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 10),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.layers_outlined, size: 18),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    selectedId == null || selected.isEmpty
+                        ? allLabel
+                        : networkScopeLabel(strings, selected.first),
+                    style: const TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(width: 6),
-              const Icon(Icons.expand_more_rounded, size: 18),
-            ],
+                const SizedBox(width: 6),
+                const Icon(Icons.expand_more_rounded, size: 18),
+              ],
+            ),
           ),
         ),
       ),

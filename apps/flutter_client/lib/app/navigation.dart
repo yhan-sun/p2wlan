@@ -7,6 +7,7 @@ import 'package:window_manager/window_manager.dart';
 import '../app/app_strings.dart';
 import '../app/app_tokens.dart';
 import '../app/navigation_model.dart';
+import 'session_ui_state.dart';
 import '../app/p2wlan_colors.dart';
 import '../core/capabilities/platform_capabilities.dart';
 import '../core/models/diagnostics_models.dart';
@@ -72,6 +73,9 @@ class _P2WlanShellState extends State<P2WlanShell> {
   /// list resolves the newest peer and opens its own full detail surface.
   String? _pendingPeerId;
   String? _selectedRoomId;
+  String? _pendingRoomDeviceId;
+  P2WlanSection? _roomDeviceReturnSection;
+  final _uiState = SessionUiState();
 
   /// Home opens a peer through the canonical Devices detail flow. Remember
   /// the originating section so dismissing that detail returns to Home rather
@@ -93,8 +97,13 @@ class _P2WlanShellState extends State<P2WlanShell> {
   void initState() {
     super.initState();
     _settingsController = SettingsPageController();
+    _uiState.synchronize(
+      widget.statusStore.sessionRevision,
+      owner: widget.statusStore,
+    );
     if (widget.roomInvitation != null) _section = P2WlanSection.interconnect;
     widget.settingsStore.addListener(_handleSettingsChanged);
+    widget.statusStore.addListener(_handleSessionChanged);
   }
 
   @override
@@ -110,16 +119,26 @@ class _P2WlanShellState extends State<P2WlanShell> {
       oldWidget.settingsStore.removeListener(_handleSettingsChanged);
       widget.settingsStore.addListener(_handleSettingsChanged);
     }
+    if (oldWidget.statusStore != widget.statusStore) {
+      oldWidget.statusStore.removeListener(_handleSessionChanged);
+      widget.statusStore.addListener(_handleSessionChanged);
+      _handleSessionChanged();
+    }
   }
 
   @override
   void dispose() {
     widget.settingsStore.removeListener(_handleSettingsChanged);
+    widget.statusStore.removeListener(_handleSessionChanged);
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    _uiState.synchronize(
+      widget.statusStore.sessionRevision,
+      owner: widget.statusStore,
+    );
     final strings = AppStrings.fromCode(
       widget.settingsStore.settings.languageCode,
     );
@@ -182,6 +201,24 @@ class _P2WlanShellState extends State<P2WlanShell> {
     if (mounted) {
       setState(() {});
     }
+  }
+
+  void _handleSessionChanged() {
+    if (!mounted ||
+        !_uiState.synchronize(
+          widget.statusStore.sessionRevision,
+          owner: widget.statusStore,
+        )) {
+      return;
+    }
+    setState(() {
+      _pendingPeerId = null;
+      _pendingRoomDeviceId = null;
+      _roomDeviceReturnSection = null;
+      _selectedRoomId = null;
+      _peerDetailsReturnSection = null;
+      _settingsDirty = false;
+    });
   }
 
   Widget _buildNavigation(AppStrings strings, bool useDesktopSidebar) {
@@ -265,6 +302,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
   Widget _buildBody({required bool showPageHeader}) {
     final page = switch (_section) {
       P2WlanSection.home => DashboardPage(
+        uiState: _uiState.home,
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         showHeader: showPageHeader,
@@ -274,9 +312,11 @@ class _P2WlanShellState extends State<P2WlanShell> {
         onOpenTroubleshooting: () => _select(P2WlanSection.troubleshooting),
         onOpenRooms: () => _select(P2WlanSection.interconnect),
         onOpenRoom: _openRoom,
+        onOpenRoomDevice: _openRoomDevice,
         onReauthenticate: widget.onReauthenticate,
       ),
       P2WlanSection.devices => NodesPage(
+        uiState: _uiState.devices,
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         showHeader: showPageHeader,
@@ -286,6 +326,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
         onPeerDetailsClosed: _handlePeerDetailsClosed,
         onOpenRooms: () => _select(P2WlanSection.interconnect),
         onOpenRoom: _openRoom,
+        onOpenRoomDevice: _openRoomDevice,
       ),
       P2WlanSection.troubleshooting => DiagnosticsPage(
         settingsStore: widget.settingsStore,
@@ -301,6 +342,9 @@ class _P2WlanShellState extends State<P2WlanShell> {
       P2WlanSection.interconnect => RoomsPage(
         initialInvitation: widget.roomInvitation,
         initialRoomId: _selectedRoomId,
+        initialDeviceId: _pendingRoomDeviceId,
+        onInitialDeviceOpened: () => _pendingRoomDeviceId = null,
+        onDeviceDetailsClosed: _handleRoomDeviceDetailsClosed,
         onRoomSelected: (id) => _selectedRoomId = id,
         onInvitationHandled: widget.onRoomInvitationHandled,
         onReauthenticate: widget.onReauthenticate,
@@ -324,7 +368,11 @@ class _P2WlanShellState extends State<P2WlanShell> {
         showHeader: showPageHeader,
       ),
     };
-    final identity = (_section, widget.statusStore.sessionRevision);
+    final identity = (
+      _section,
+      widget.statusStore,
+      widget.statusStore.sessionRevision,
+    );
     return SizedBox.expand(
       child: AppEntrance(
         identity: identity,
@@ -356,6 +404,10 @@ class _P2WlanShellState extends State<P2WlanShell> {
         _peerDetailsReturnSection = null;
       }
       _section = section;
+      if (section != P2WlanSection.interconnect) {
+        _pendingRoomDeviceId = null;
+        _roomDeviceReturnSection = null;
+      }
       if (P2WlanSection.mobilePrimary.contains(section)) {
         _lastPrimarySection = section;
       }
@@ -373,8 +425,25 @@ class _P2WlanShellState extends State<P2WlanShell> {
   }
 
   void _openRoom(String roomId) {
+    _pendingRoomDeviceId = null;
+    _roomDeviceReturnSection = null;
     _selectedRoomId = roomId;
     _select(P2WlanSection.interconnect);
+  }
+
+  void _openRoomDevice(String roomId, String deviceId) {
+    _roomDeviceReturnSection = _section;
+    _selectedRoomId = roomId;
+    _pendingRoomDeviceId = deviceId;
+    _select(P2WlanSection.interconnect);
+  }
+
+  void _handleRoomDeviceDetailsClosed() {
+    final origin = _roomDeviceReturnSection;
+    _roomDeviceReturnSection = null;
+    if (mounted && origin != null && _section == P2WlanSection.interconnect) {
+      _doSelect(origin);
+    }
   }
 
   Future<void> _requestReauthentication() async {

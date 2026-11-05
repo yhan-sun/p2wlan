@@ -388,11 +388,14 @@ class _OnboardingPageState extends State<OnboardingPage> {
                                   ],
                                   if (_error != null) ...[
                                     const SizedBox(height: AppTokens.space16),
-                                    Text(
-                                      _error!,
-                                      style: TextStyle(
-                                        color: P2WlanColors.of(context)
-                                            .dangerText,
+                                    Semantics(
+                                      liveRegion: true,
+                                      child: Text(
+                                        _error!,
+                                        style: TextStyle(
+                                          color: P2WlanColors.of(context)
+                                              .dangerText,
+                                        ),
                                       ),
                                     ),
                                   ],

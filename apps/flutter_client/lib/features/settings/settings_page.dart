@@ -26,6 +26,7 @@ import '../../core/update/update_service.dart';
 import '../../shared/widgets/app_back_button.dart';
 import '../../shared/widgets/app_motion.dart';
 import '../../shared/widgets/app_select.dart';
+import '../../shared/widgets/local_connection_restart_feedback.dart';
 import '../../shared/widgets/page_heading.dart';
 
 part 'settings_page/categories.dart';
@@ -154,6 +155,16 @@ class _SettingsPageState extends State<SettingsPage> {
   SettingsCategory? _formErrorCategory;
   var _saving = false;
   SettingsCategory? _savingCategory;
+  var _restartPhase = LocalConnectionRestartPhase.idle;
+  (int, String)? _restartOwner;
+  LocalConnectionRestartPhase get _currentRestartPhase =>
+      _restartOwner ==
+          (
+            widget.statusStore.sessionRevision,
+            widget.settingsStore.settings.diagnosticsUrl,
+          )
+      ? _restartPhase
+      : LocalConnectionRestartPhase.idle;
   var _socketPool = defaultSocketPool;
   var _closeBehavior = defaultCloseBehavior;
   var _showTokenField = false;
@@ -282,6 +293,15 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void didUpdateWidget(covariant SettingsPage oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.statusStore != widget.statusStore ||
+        oldWidget.settingsStore != widget.settingsStore) {
+      if (_restartPhase == LocalConnectionRestartPhase.stopping ||
+          _restartPhase == LocalConnectionRestartPhase.starting) {
+        _saving = false;
+      }
+      _restartPhase = LocalConnectionRestartPhase.idle;
+      _restartOwner = null;
+    }
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller?._detach(_handleBackRequest);
       widget.controller?._attach(_handleBackRequest);
@@ -425,28 +445,86 @@ class _SettingsPageState extends State<SettingsPage> {
   /// Short summary shown on a category row so the settings home answers "find
   /// a setting" without opening every detail.
   String _categorySummary(SettingsCategory category, AppStrings strings) {
+    final settings = widget.settingsStore.settings;
+    final theme = switch (AppThemeMode.fromCode(settings.themeMode)) {
+      AppThemeMode.system => strings.themeSystem,
+      AppThemeMode.light => strings.themeLight,
+      AppThemeMode.dark => strings.themeDark,
+    };
     return switch (category) {
       SettingsCategory.general =>
-        _deviceNameController.text.trim().isEmpty
-            ? strings.deviceName
-            : _deviceNameController.text.trim(),
-      SettingsCategory.accountNetwork => _describeCredential(strings),
-      SettingsCategory.advancedNetwork => 'MTU ${_mtuController.text.trim()}',
+        '${strings.languageLabel(settings.languageCode)} · $theme',
+      SettingsCategory.accountNetwork => _accountSummary(strings),
+      SettingsCategory.advancedNetwork =>
+        _usesDefaultNetworkSettings
+            ? (strings.isZh
+                  ? '默认配置 · 自动选择连接路径'
+                  : 'Defaults · Automatic connection path')
+            : (strings.isZh
+                  ? '自定义配置 · MTU ${settings.mtu}'
+                  : 'Custom settings · MTU ${settings.mtu}'),
       SettingsCategory.developer => _developerSummary(strings),
     };
   }
 
+  String _accountSummary(AppStrings strings) {
+    final settings = widget.settingsStore.settings;
+    final account = settings.accountUsername.trim().isNotEmpty
+        ? settings.accountUsername.trim()
+        : settings.accountEmail.trim().isNotEmpty
+        ? settings.accountEmail.trim()
+        : settings.hasAuthenticatedConnection
+        ? (strings.isZh ? '已登录' : 'Signed in')
+        : (strings.isZh ? '未登录' : 'Not signed in');
+    final server = Uri.tryParse(settings.controlServer);
+    final host = server == null || server.host.isEmpty
+        ? (strings.isZh ? '未配置服务器' : 'No server configured')
+        : '${server.host}${server.hasPort ? ':${server.port}' : ''}';
+    return '$account · $host';
+  }
+
+  bool get _usesDefaultNetworkSettings {
+    final settings = widget.settingsStore.settings;
+    const defaults = AppSettings();
+    return settings.mtu == defaults.mtu &&
+        settings.overlayCidr == defaults.overlayCidr &&
+        settings.effectiveTunInterface == defaults.effectiveTunInterface &&
+        settings.udpBind == defaults.udpBind &&
+        settings.udpAdvertise == defaults.udpAdvertise &&
+        settings.socketPool == defaults.socketPool &&
+        settings.relayServers == defaults.relayServers;
+  }
+
+  String _clientVersionLabel(AppStrings strings) {
+    final version = widget
+        .statusStore
+        .daemonController
+        .clientBuildInfo
+        .appVersion
+        .trim();
+    return version.isEmpty || version.toLowerCase() == 'unknown'
+        ? (strings.isZh ? '版本未知' : 'Version unavailable')
+        : version;
+  }
+
   String _developerSummary(AppStrings strings) {
+    final version = _clientVersionLabel(strings);
     final result = _updateCheckResult;
-    if (result?.hasUpdate == true) {
-      return strings.updateAvailableStatus(result!.update!.version.tag);
-    }
-    if (!_capabilities.canControlLocalDaemon) {
-      return widget.statusStore.daemonController.clientBuildInfo.appVersion;
-    }
-    return widget.statusStore.daemonReachable
-        ? strings.daemonRunning
-        : strings.daemonStopped;
+    final update = _checkingForUpdates
+        ? strings.checkingForUpdates
+        : result == null
+        ? strings.updateNotChecked
+        : switch (result.status) {
+            UpdateCheckStatus.upToDate => strings.updateUpToDate,
+            UpdateCheckStatus.updateAvailable => strings.updateAvailableStatus(
+              result.update!.version.tag,
+            ),
+            UpdateCheckStatus.developmentBuild =>
+              strings.updateDevelopmentBuild,
+            UpdateCheckStatus.invalidRelease ||
+            UpdateCheckStatus.networkError => strings.updateCheckFailed,
+          };
+    return '$version · $update';
   }
 
   List<SettingsCategory> get _visibleCategories =>
@@ -500,7 +578,9 @@ class _SettingsPageState extends State<SettingsPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  if (widget.showHeader) ...[
+                  if (widget.showHeader &&
+                      layout == _SettingsLayout.rootDetail &&
+                      selected == null) ...[
                     PageHeading(
                       title: strings.settings,
                       subtitle: strings.settingsSubtitle,

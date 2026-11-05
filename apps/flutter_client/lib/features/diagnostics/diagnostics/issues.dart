@@ -23,23 +23,29 @@ class _IssuesPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    return AppPanel(
-      title: strings.needsAttention,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          for (var index = 0; index < issues.length; index++) ...[
-            if (index != 0) const SizedBox(height: AppTokens.space10),
-            _IssueRow(
-              issue: issues[index],
-              onOpenDevices: onOpenDevices,
-              onOpenSettings: onOpenSettings,
-              onReauthenticate: onReauthenticate,
-              onOpenTechnicalDetails: onOpenTechnicalDetails,
-            ),
-          ],
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          strings.needsAttention,
+          style: TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+            color: Theme.of(context).colorScheme.onSurface,
+          ),
+        ),
+        const SizedBox(height: AppTokens.space8),
+        for (var index = 0; index < issues.length; index++) ...[
+          if (index != 0) const SizedBox(height: AppTokens.space10),
+          _IssueRow(
+            issue: issues[index],
+            onOpenDevices: onOpenDevices,
+            onOpenSettings: onOpenSettings,
+            onReauthenticate: onReauthenticate,
+            onOpenTechnicalDetails: onOpenTechnicalDetails,
+          ),
         ],
-      ),
+      ],
     );
   }
 }

@@ -962,9 +962,11 @@ class DeviceDetailsDialog extends StatelessWidget {
     this.onEdit,
     this.onDelete,
     this.onSpeedTest,
+    this.fullScreen = false,
   }) : assert(peer != null || content != null);
 
   final PeerSnapshot? peer;
+  final bool fullScreen;
   final Widget? content;
   final Widget? contextHeader;
   final AppStrings strings;
@@ -1022,6 +1024,55 @@ class DeviceDetailsDialog extends StatelessWidget {
                 _closeDetailOnRemoved(context, () => onDelete!(selected)),
       onSpeedTest: onSpeedTest,
     );
+
+    final scrollContent = SingleChildScrollView(
+      padding: const EdgeInsets.all(AppTokens.space20),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (contextHeader != null) ...[
+            contextHeader!,
+            const SizedBox(height: 12),
+          ],
+          if (content != null && trafficCounters != null) ...[
+            _PeerTrafficSection(
+              counters: trafficCounters!,
+              strings: strings,
+              current: current ?? true,
+              localScope: true,
+              serviceUptimeMs: serviceUptimeMs,
+              transferBytesPerSecond: transferBytesPerSecond,
+              networkId: networkId,
+            ),
+            const SizedBox(height: 12),
+          ],
+          content ??
+              (statusStore == null
+                  ? details(peer!)
+                  : AnimatedBuilder(
+                      animation: statusStore!,
+                      builder: (context, _) => details(
+                        _latestPeer(statusStore, peer!, networkId: networkId),
+                      ),
+                    )),
+        ],
+      ),
+    );
+    if (fullScreen) {
+      return AppStringsScope(
+        strings: strings,
+        child: Scaffold(
+          appBar: AppBar(
+            leading: AppBackButton(
+              key: const Key('nodes-detail-close'),
+              onPressed: () => Navigator.of(context).pop(),
+            ),
+            title: Text(strings.deviceDetails),
+          ),
+          body: SafeArea(child: scrollContent),
+        ),
+      );
+    }
 
     return AppStringsScope(
       strings: strings,
@@ -1091,45 +1142,7 @@ class DeviceDetailsDialog extends StatelessWidget {
                     ),
                   ),
                   Divider(height: 1, color: colors.divider),
-                  Flexible(
-                    child: SingleChildScrollView(
-                      padding: const EdgeInsets.all(AppTokens.space20),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (contextHeader != null) ...[
-                            contextHeader!,
-                            const SizedBox(height: 12),
-                          ],
-                          if (content != null && trafficCounters != null) ...[
-                            _PeerTrafficSection(
-                              counters: trafficCounters!,
-                              strings: strings,
-                              current: current ?? true,
-                              localScope: true,
-                              serviceUptimeMs: serviceUptimeMs,
-                              transferBytesPerSecond: transferBytesPerSecond,
-                              networkId: networkId,
-                            ),
-                            const SizedBox(height: 12),
-                          ],
-                          content ??
-                              (statusStore == null
-                                  ? details(peer!)
-                                  : AnimatedBuilder(
-                                      animation: statusStore!,
-                                      builder: (context, _) => details(
-                                        _latestPeer(
-                                          statusStore,
-                                          peer!,
-                                          networkId: networkId,
-                                        ),
-                                      ),
-                                    )),
-                        ],
-                      ),
-                    ),
-                  ),
+                  Flexible(child: scrollContent),
                 ],
               ),
             ),

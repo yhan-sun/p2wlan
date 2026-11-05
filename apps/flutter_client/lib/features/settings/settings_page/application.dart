@@ -126,6 +126,7 @@ class _StartupRegistrationPreferenceState
         _PreferenceRow(
           label: _startupLabel(widget.strings),
           subtitle: _startupHelper(widget.strings),
+          inlineControl: true,
           trailing: Switch(
             key: const ValueKey('settings-start-at-login-switch'),
             value: _enabled,
@@ -145,8 +146,8 @@ String _startupLabel(AppStrings strings) =>
     strings.isZh ? '登录时启动 P2WLAN' : 'Launch P2WLAN at login';
 
 String _startupHelper(AppStrings strings) => strings.isZh
-    ? '登录桌面系统后启动应用，并在登录状态和首次配置有效时自动连接已配置的 P2WLAN 网络。'
-    : 'Launches the desktop app at login and reconnects the configured P2WLAN network when the account and onboarding state are valid.';
+    ? '登录桌面后启动；账号和本机配置就绪时自动连接。'
+    : 'Launch at desktop sign-in and connect when your account and device are ready.';
 
 String _startupReadError(AppStrings strings) => strings.isZh
     ? '无法读取系统登录自启设置。请检查当前用户权限后重试。'

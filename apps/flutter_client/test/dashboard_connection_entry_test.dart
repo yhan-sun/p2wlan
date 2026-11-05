@@ -104,6 +104,7 @@ Future<void> _pumpHome(
   WidgetTester tester,
   _Harness harness, {
   VoidCallback? onOpenRooms,
+  VoidCallback? onOpenTroubleshooting,
   double textScale = 1,
   bool desktopFrame = false,
 }) async {
@@ -127,6 +128,7 @@ Future<void> _pumpHome(
                   statusStore: harness.status,
                   capabilities: PlatformCapabilities.fromPlatform('linux'),
                   onOpenRooms: onOpenRooms,
+                  onOpenTroubleshooting: onOpenTroubleshooting,
                 ),
               ),
             ],
@@ -217,14 +219,20 @@ void main() {
   );
 
   testWidgets(
-    'initial detection and pending permission keep configured start disabled',
+    'initial detection and pending permission disable start; failure offers recovery',
     (tester) async {
       final harness = (await tester.runAsync(_harness))!;
       addTearDown(harness.dispose);
       final health = Completer<bool>();
       harness.api.pendingHealth = health;
       final refresh = harness.status.refresh(silent: true);
-      await _pumpHome(tester, harness, onOpenRooms: () {});
+      var recoveryVisits = 0;
+      await _pumpHome(
+        tester,
+        harness,
+        onOpenRooms: () {},
+        onOpenTroubleshooting: () => recoveryVisits++,
+      );
       expect(
         tester
             .widget<OutlinedButton>(
@@ -267,7 +275,19 @@ void main() {
       await tester.pumpAndSettle();
       expect(harness.status.daemonBusy, isFalse);
       expect(harness.controller.starts, hasLength(1));
-      expect(find.text('Start personal network'), findsOneWidget);
+      // A real startup failure promotes its recovery action. Normal room/start
+      // CTAs return after recovery rather than competing with it on this state.
+      expect(find.text('Start personal network'), findsNothing);
+      expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
+      expect(find.byKey(const Key('home-open-rooms')), findsNothing);
+      expect(find.byType(FilledButton), findsOneWidget);
+      final recovery = find.byKey(const Key('home-check-issues'));
+      expect(tester.widget<FilledButton>(recovery).onPressed, isNotNull);
+      await tester.ensureVisible(recovery);
+      await tester.pumpAndSettle();
+      await tester.tap(recovery);
+      expect(recoveryVisits, 1);
+      expect(harness.controller.starts, hasLength(1));
     },
   );
 
