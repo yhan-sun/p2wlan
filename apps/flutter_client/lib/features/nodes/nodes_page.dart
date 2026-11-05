@@ -364,6 +364,7 @@ class _NodesPageState extends State<NodesPage> {
                         ),
                       _NodesSectionLabel(
                         showMetrics: visiblePeers.isNotEmpty,
+                        showCompactTitle: !overview.hasRooms,
                         title: overview.hasRooms
                             ? stringsOf(context).devices
                             : (stringsOf(context).isZh

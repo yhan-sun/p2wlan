@@ -635,7 +635,9 @@ void _registerSettingsTests() {
     );
     await _waitForSaveComplete(tester, const ValueKey('settings-theme-select'));
     expect(stores.settingsStore.settings.languageCode, 'zh-Hans');
-    expect(find.text('设置'), findsWidgets);
+    expect(find.text('通用').hitTestable(), findsWidgets);
+    expect(find.text('语言').hitTestable(), findsOneWidget);
+    expect(find.text('暗色模式').hitTestable(), findsOneWidget);
     // No connection settings save was triggered by the immediate edits.
     expect(find.text('Unsaved changes'), findsNothing);
   });
@@ -808,10 +810,16 @@ void _registerSettingsTests() {
       () => find.byType(CircularProgressIndicator).evaluate().isEmpty,
     );
 
+    // Let the temporary save feedback finish before using the persistent
+    // restart action; its dismiss button can overlap the action near the top.
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pumpAndSettle();
+    final restart = find.widgetWithText(TextButton, 'Restart and apply');
+    await tester.ensureVisible(restart);
+    await tester.pumpAndSettle();
+    expect(restart.hitTestable(), findsOneWidget);
     // Applying the pending restart clears the notice.
-    await tester.ensureVisible(find.text('Restart and apply'));
-    await tester.pump();
-    await tester.tap(find.text('Restart and apply'));
+    await tester.tap(restart);
     await tester.pump();
     await _waitFor(
       tester,

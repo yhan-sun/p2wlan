@@ -213,10 +213,15 @@ class _NodesDevicePanel extends StatelessWidget {
 }
 
 class _NodesSectionLabel extends StatelessWidget {
-  const _NodesSectionLabel({required this.title, this.showMetrics = false});
+  const _NodesSectionLabel({
+    required this.title,
+    this.showMetrics = false,
+    this.showCompactTitle = true,
+  });
 
   final String title;
   final bool showMetrics;
+  final bool showCompactTitle;
 
   @override
   Widget build(BuildContext context) {
@@ -226,54 +231,58 @@ class _NodesSectionLabel extends StatelessWidget {
       title,
       style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600),
     );
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(14, 12, 14, 4),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final columns =
-              showMetrics &&
-              constraints.maxWidth >= 472 &&
-              MediaQuery.textScalerOf(context).scale(12) <= 16;
-          if (!columns) return titleWidget;
-          return Row(
-            children: [
-              Expanded(child: titleWidget),
-              SizedBox(
-                width: 202,
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.end,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final columns =
+            showMetrics &&
+            constraints.maxWidth >= 500 &&
+            MediaQuery.textScalerOf(context).scale(12) <= 16;
+        if (!columns && !showCompactTitle) {
+          return const SizedBox(height: 4);
+        }
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 4),
+          child: !columns
+              ? titleWidget
+              : Row(
                   children: [
-                    Tooltip(
-                      message: strings.transferSpeed,
-                      child: _PeerMetricText(
-                        value: strings.isZh ? '速率' : 'Rate',
-                        width: 72,
-                        color: color,
+                    Expanded(child: titleWidget),
+                    SizedBox(
+                      width: 202,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          Tooltip(
+                            message: strings.transferSpeed,
+                            child: _PeerMetricText(
+                              value: strings.isZh ? '速率' : 'Rate',
+                              width: 72,
+                              color: color,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Tooltip(
+                            message: strings.latency,
+                            child: _PeerMetricText(
+                              value: 'RTT',
+                              width: 48,
+                              color: color,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          _PeerMetricText(
+                            value: strings.isZh ? '连接' : 'Path',
+                            width: 60,
+                            color: color,
+                          ),
+                        ],
                       ),
                     ),
-                    const SizedBox(width: 8),
-                    Tooltip(
-                      message: strings.latency,
-                      child: _PeerMetricText(
-                        value: 'RTT',
-                        width: 48,
-                        color: color,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    _PeerMetricText(
-                      value: strings.isZh ? '连接' : 'Path',
-                      width: 60,
-                      color: color,
-                    ),
+                    const SizedBox(width: 26),
                   ],
                 ),
-              ),
-              const SizedBox(width: 26),
-            ],
-          );
-        },
-      ),
+        );
+      },
     );
   }
 }
