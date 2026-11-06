@@ -244,8 +244,10 @@ class PublishedServerSmoke:
             self.first_bootstrap_output = output
 
     def native_unit_files(self):
-        return self.command('native_unit_files', ['systemctl', 'list-unit-files', '--no-legend', '--no-pager',
-            'p2wlan-control.service', 'p2wlan-relay.service']).strip()
+        output = self.command('native_unit_files', ['systemctl', 'list-unit-files', '--no-legend', '--no-pager'])
+        expected = {'p2wlan-control.service', 'p2wlan-relay.service'}
+        return {fields[0] for line in output.decode().splitlines()
+                if (fields := line.split()) and fields[0] in expected}
 
     def before_confirmation(self):
         targets = (self.program, self.config, self.data) if self.args.method == 'native' else (self.deployment,)
@@ -510,9 +512,9 @@ class PublishedServerSmoke:
         if not self.attempted_install:
             return
         if self.args.method == 'native':
+            installed_units = self.native_unit_files()
             for unit in ('p2wlan-control.service', 'p2wlan-relay.service'):
-                files = self.command('cleanup_unit_state', ['systemctl', 'list-unit-files', '--no-legend', '--no-pager', unit])
-                if files.strip():
+                if unit in installed_units:
                     self.command('cleanup_native', ['systemctl', 'disable', '--now', unit], timeout=60)
         elif (self.deployment / 'compose.yml').is_file() and (self.deployment / '.env').is_file():
             self.compose(['down', '--remove-orphans'], 'cleanup_compose', timeout=60)
