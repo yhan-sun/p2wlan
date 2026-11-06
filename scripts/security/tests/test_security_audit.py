@@ -101,6 +101,79 @@ jobs:
             )
             self.assertEqual(workflow_permissions.run(root)["result"], "pass")
 
+    def test_server_image_can_publish_packages_with_a_scoped_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_workflow(root, "build-server.yml", """name: Server
+on:
+  push:
+    tags: ["server-v*"]
+permissions:
+  contents: read
+jobs:
+  image:
+    if: startsWith(github.ref, 'refs/tags/server-v')
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps: []
+""")
+            evidence = workflow_permissions.run(root)
+            self.assertEqual(evidence["result"], "pass", evidence["findings"])
+            exceptions = [item for item in evidence["allowlisted_exceptions"]
+                          if item["permission"] == "packages"]
+            self.assertEqual(len(exceptions), 1)
+            self.assertEqual(exceptions[0]["path"], ".github/workflows/build-server.yml")
+            self.assertEqual(exceptions[0]["scope"], "job:image")
+            self.assertTrue(exceptions[0]["reason"])
+
+    def test_server_package_exception_cannot_expand_its_write_scope(self) -> None:
+        cases = (
+            ("build-server.yml", "image", "packages", True),
+            ("build-server.yml", "build", "packages", False),
+            ("ci.yml", "image", "packages", False),
+            ("build-server.yml", "image", "id-token", False),
+        )
+        for filename, job, permission, workflow_level in cases:
+            with self.subTest(filename=filename, job=job, permission=permission,
+                              workflow_level=workflow_level), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                top = f"  {permission}: write\n" if workflow_level else "  contents: read\n"
+                scoped = "" if workflow_level else f"    permissions:\n      {permission}: write\n"
+                self.write_workflow(root, filename, (
+                    "name: Server\non:\n  push:\n    tags: [\"server-v*\"]\npermissions:\n" + top
+                    + "jobs:\n  " + job + ":\n" + scoped
+                    + "    runs-on: ubuntu-latest\n    steps: []\n"
+                ))
+                evidence = workflow_permissions.run(root)
+                self.assertEqual(evidence["result"], "fail")
+                expected_scope = "workflow" if workflow_level else "job:" + job
+                self.assertTrue(any(
+                    item["code"] == "write_permission_not_allowlisted" and item["scope"] == expected_scope
+                    for item in evidence["findings"]
+                ), evidence["findings"])
+
+    def test_server_image_package_write_is_still_forbidden_on_pull_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_workflow(root, "build-server.yml", """name: Server
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  image:
+    permissions:
+      packages: write
+    runs-on: ubuntu-latest
+    steps: []
+""")
+            evidence = workflow_permissions.run(root)
+            self.assertEqual(evidence["result"], "fail")
+            self.assertTrue(any(item["code"] == "write_permission_on_pr_event"
+                                and item["scope"] == "job:image" for item in evidence["findings"]))
+
     def test_pull_request_target_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

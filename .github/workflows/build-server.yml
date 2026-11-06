@@ -215,10 +215,19 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" --raw > published-index.json
           for platform in linux/amd64 linux/arm64; do
+            # Classic Docker storage cannot keep both architectures under one
+            # index digest. Resolve each child from the exact published index
+            # and run that immutable manifest without replacing the other.
+            platform_digest=$(jq -er --arg arch "${platform#linux/}" '
+              [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)]
+              | if length == 1 then .[0].digest else error("expected one platform manifest") end
+            ' published-index.json)
+            [[ "$platform_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
             for component in control relay; do
               actual=$(docker run --rm --platform "$platform" \
-                --entrypoint "/usr/local/bin/p2wlan-$component" "$IMAGE@$DIGEST" --version)
+                --entrypoint "/usr/local/bin/p2wlan-$component" "$IMAGE@$platform_digest" --version)
               test "$actual" = "p2wlan-$component $VERSION ($SOURCE_SHA)"
             done
           done

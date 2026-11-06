@@ -23,6 +23,10 @@ WRITE_ALLOWLIST_REASONS = {
         "contents": "create and populate the GitHub Release for an immutable server-v* tag"
     }
 }
+SCOPED_WRITE_ALLOWLIST = {
+    (".github/workflows/build-server.yml", "job:image", "packages"):
+        "publish the server image bound to an immutable server-v* tag and source SHA"
+}
 PRODUCTION_SECRET_NAMES = {
     "ANDROID_KEYSTORE_BASE64",
     "ANDROID_KEYSTORE_PASSWORD",
@@ -295,7 +299,8 @@ def audit_workflow(
                 continue
             if level != "write":
                 continue
-            if name not in WRITE_ALLOWLIST.get(path.name, set()):
+            if (name not in WRITE_ALLOWLIST.get(path.name, set())
+                    and (relative, block.scope, name) not in SCOPED_WRITE_ALLOWLIST):
                 findings.append(
                     Finding(
                         relative,
@@ -379,6 +384,9 @@ def run(
             {"path": path, "permission": permission, "reason": reason}
             for path, permissions in sorted(WRITE_ALLOWLIST_REASONS.items())
             for permission, reason in sorted(permissions.items())
+        ] + [
+            {"path": path, "scope": scope, "permission": permission, "reason": reason}
+            for (path, scope, permission), reason in sorted(SCOPED_WRITE_ALLOWLIST.items())
         ],
         production_secret_names=sorted(PRODUCTION_SECRET_NAMES),
         workflows=all_blocks,
