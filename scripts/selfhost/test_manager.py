@@ -1,6 +1,10 @@
+import hashlib
+import io
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 
@@ -157,6 +161,88 @@ exit 0
         self.assertIn('p2wlan-db" --verify "$db_path"', manager)
         self.assertIn('openssl x509 -checkend 604800', manager)
         self.assertIn('Result: $failures failure(s), $warnings warning(s)', manager)
+
+
+class ManagerUpdateTests(unittest.TestCase):
+    executable = staticmethod(ManagerHealthTests.executable)
+
+    def setUp(self):
+        ManagerHealthTests.setUp(self)
+        self.manager_calls = self.root / 'manager-calls'
+        self.env['MANAGER_CALLS'] = str(self.manager_calls)
+        real_install = shutil.which('install')
+        self.assertIsNotNone(real_install)
+        self.env['REAL_INSTALL'] = real_install
+        self.executable(self.bin / 'systemctl', '''#!/bin/sh
+printf 'systemctl %s\\n' "$*" >> "$MANAGER_CALLS"
+''')
+        self.executable(self.bin / 'python3', '''#!/bin/sh
+printf 'storage %s\\n' "$*" >> "$MANAGER_CALLS"
+cat >/dev/null
+''')
+        self.executable(self.bin / 'chown', '''#!/bin/sh
+printf 'chown %s\\n' "$*" >> "$MANAGER_CALLS"
+''')
+        # Release extraction and publication stay real inside the temporary
+        # installation; intercept the manager's global launcher installation.
+        self.executable(self.bin / 'install', '''#!/bin/sh
+for value in "$@"; do
+  if [ "$value" = /usr/local/bin/p2wlan-server ]; then
+    printf 'install-launcher\\n' >> "$MANAGER_CALLS"
+    exit 0
+  fi
+done
+exec "$REAL_INSTALL" "$@"
+''')
+        self.version = 'server-v9.9.9'
+        self.archive = self.root / 'p2wlan-server-linux-amd64.tar.gz'
+        members = {
+            name: b'#!/bin/sh\nexit 0\n'
+            for name in ('p2wlan-control', 'p2wlan-relay', 'p2wlan-config', 'p2wlan-db',
+                         'p2wlan-server', 'install-server.sh', 'deploy-server.sh')
+        }
+        members['BUILD-METADATA.txt'] = f'version={self.version}\n'.encode()
+        with tarfile.open(self.archive, 'w:gz') as archive:
+            for name, content in members.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(content)
+                member.mode = 0o755 if name != 'BUILD-METADATA.txt' else 0o644
+                archive.addfile(member, io.BytesIO(content))
+        digest = hashlib.sha256(self.archive.read_bytes()).hexdigest()
+        Path(str(self.archive) + '.sha256').write_text(f'{digest}  {self.archive.name}\n')
+
+    def run_update(self, *options):
+        self.manager_calls.write_text('')
+        return subprocess.run(
+            ['bash', str(ROOT / 'scripts/p2wlan-server'), 'update', '--archive', str(self.archive), *options],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+
+    def test_no_restart_installs_release_without_restarting_services(self):
+        result = self.run_update('--service', 'control', '--no-restart')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / 'current').resolve(), (self.root / 'releases' / self.version).resolve())
+        calls = self.manager_calls.read_text().splitlines()
+        self.assertIn('install-launcher', calls)
+        self.assertTrue(any(call.startswith('storage ') for call in calls))
+        self.assertFalse(any(call.startswith('systemctl ') for call in calls), calls)
+
+    def test_default_update_restarts_only_selected_services(self):
+        for service, expected in (
+            ('control', ['p2wlan-control.service']),
+            ('relay', ['p2wlan-relay.service']),
+            (None, ['p2wlan-control.service', 'p2wlan-relay.service']),
+        ):
+            with self.subTest(service=service or 'default-all'):
+                options = ['--service', service] if service else []
+                result = self.run_update(*options)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                calls = self.manager_calls.read_text().splitlines()
+                restarts = [call.removeprefix('systemctl restart ') for call in calls
+                            if call.startswith('systemctl restart ')]
+                self.assertEqual(restarts, expected)
+                self.assertIn('systemctl daemon-reload', calls)
+                self.assertEqual(any(call.startswith('storage ') for call in calls), service != 'relay')
 
 
 if __name__ == '__main__':

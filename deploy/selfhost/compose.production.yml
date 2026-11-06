@@ -1,0 +1,61 @@
+# Use this file on its own: it never builds source on the deployment host.
+# The installer verifies P2WLAN_IMAGE is an immutable repository@sha256 digest
+# and validates the image identity and non-root UID/GID before starting Compose.
+name: p2wlan-selfhost
+
+x-service: &service
+  image: "${P2WLAN_IMAGE:?Set P2WLAN_IMAGE to a verified repository@sha256 digest}"
+  user: "${P2WLAN_UID:-10001}:${P2WLAN_GID:-10001}"
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  control:
+    <<: *service
+    env_file: "${P2WLAN_CONFIG_DIR:?Set P2WLAN_CONFIG_DIR to an absolute private configuration directory}/control.env"
+    ports:
+      - "127.0.0.1:${CONTROL_PORT:-18080}:${CONTROL_PORT:-18080}"
+    volumes:
+      - type: bind
+        source: "${P2WLAN_CONFIG_DIR:?Set P2WLAN_CONFIG_DIR}/data"
+        target: /data
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: [CMD-SHELL, 'curl -fsS --connect-timeout 2 --max-time 4 "http://127.0.0.1:$$PORT/health" >/dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 6
+  relay:
+    <<: *service
+    entrypoint: [/usr/local/bin/p2wlan-relay]
+    env_file: "${P2WLAN_CONFIG_DIR:?Set P2WLAN_CONFIG_DIR}/relay.env"
+    ports:
+      - target: ${RELAY_PORT:-18081}
+        published: "${RELAY_PORT:-18081}"
+        host_ip: "${RELAY_PUBLISH_HOST:?Set RELAY_PUBLISH_HOST explicitly in .env}"
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: "${P2WLAN_CONFIG_DIR:?Set P2WLAN_CONFIG_DIR}/tls.crt"
+        target: /etc/p2wlan/tls.crt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${P2WLAN_CONFIG_DIR:?Set P2WLAN_CONFIG_DIR}/tls.key"
+        target: /etc/p2wlan/tls.key
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      control:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD-SHELL, 'curl -fsS --connect-timeout 2 --max-time 4 "http://$$RELAY_METRICS_BIND/readyz" >/dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 6
