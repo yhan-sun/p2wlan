@@ -8,9 +8,14 @@ on:
         required: true
         type: string
       expected_source_sha:
-        description: Exact 40-character source commit expected in both published artifacts
+        description: Exact 40-character source commit expected in the published packages
         required: true
         type: string
+      include_prebuilt_image:
+        description: Also test optional GHCR image assets (the release must include them)
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -21,13 +26,13 @@ concurrency:
 
 jobs:
   published:
-    name: Public bootstrap (${{ matrix.method }}, Ubuntu 22.04)
+    name: Public bootstrap (${{ matrix.label }}, Ubuntu 22.04)
     runs-on: ubuntu-22.04
-    timeout-minutes: 35
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
-        method: [native, docker]
+        include: ${{ fromJSON(inputs.include_prebuilt_image && '[{"method":"native","docker_mode":"build","label":"native"},{"method":"docker","docker_mode":"build","label":"source"},{"method":"docker","docker_mode":"image","label":"image"}]' || '[{"method":"native","docker_mode":"build","label":"native"},{"method":"docker","docker_mode":"build","label":"source"}]') }}
     steps:
       - name: Check out acceptance harness only
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -40,23 +45,28 @@ jobs:
           SERVER_VERSION: ${{ inputs.version }}
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
           INSTALL_METHOD: ${{ matrix.method }}
+          DOCKER_MODE: ${{ matrix.docker_mode }}
+          EVIDENCE_LABEL: ${{ matrix.label }}
         run: |
           set -euo pipefail
           # The Python harness runs deployment commands with cwd=/, downloads
           # bootstrap from public raw main, feeds it through a source pipe to a
-          # real PTY with zero CLI flags, and never builds repository sources.
-          # No registry login action or token is used by either installation.
+          # real PTY with zero CLI flags for native/default source deployment.
+          # Compose builds only the published source snapshot, not this checkout.
+          # Optional image mode explicitly selects --docker-mode image.
+          # No registry login action or token is used by any installation.
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
             python3 "$GITHUB_WORKSPACE/acceptance-harness/scripts/selfhost/verify_published_server.py" \
             --method "$INSTALL_METHOD" --version "$SERVER_VERSION" \
+            --docker-mode "$DOCKER_MODE" \
             --expected-source-sha "$EXPECTED_SOURCE_SHA" --repo "$GITHUB_REPOSITORY" \
-            --output "$RUNNER_TEMP/server-release-smoke-$INSTALL_METHOD.json"
+            --output "$RUNNER_TEMP/server-release-smoke-$EVIDENCE_LABEL.json"
 
       - name: Save public deployment evidence without credentials or database files
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: server-release-smoke-${{ matrix.method }}-${{ inputs.version }}
-          path: ${{ runner.temp }}/server-release-smoke-${{ matrix.method }}.json
+          name: server-release-smoke-${{ matrix.label }}-${{ inputs.version }}
+          path: ${{ runner.temp }}/server-release-smoke-${{ matrix.label }}.json
           if-no-files-found: warn
           retention-days: 14

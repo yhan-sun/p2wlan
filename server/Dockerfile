@@ -1,4 +1,13 @@
 ARG GO_VERSION=1.26.10
+ARG NODE_VERSION=22.16.0
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-bookworm-slim AS admin
+
+WORKDIR /src/admin-ui
+COPY admin-ui/package.json admin-ui/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY admin-ui/ ./
+RUN npm run typecheck && npm run build
+
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS build
 
 ARG TARGETOS=linux
@@ -11,6 +20,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+# The context excludes committed/generated web assets. Embed only this build's UI.
+COPY --from=admin /src/admin/web/ ./admin/web/
 RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath \
       -ldflags="-s -w -X main.buildVersion=$VERSION -X main.buildCommit=$COMMIT" -o /out/p2wlan-control . \
  && CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath \

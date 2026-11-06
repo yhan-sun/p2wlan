@@ -8,6 +8,7 @@ main() {
   BOOT_REPO=${P2WLAN_REPO:-yhan-sun/p2wlan}
   BOOT_VERSION=${P2WLAN_SERVER_VERSION:-}
   BOOT_METHOD=
+  BOOT_DOCKER_MODE=${P2WLAN_DOCKER_MODE:-build}
   BOOT_INTERACTIVE=0
   [ "$#" -ne 0 ] || BOOT_INTERACTIVE=1
   BOOT_INSTALL_DEPS=0
@@ -28,6 +29,7 @@ One-line interactive deployment (no checkout required):
 
 Options:
   --method native|docker     installation method; interactive menu if omitted
+  --docker-mode build|image  Docker source build (default) or released GHCR image
   --version server-vX.Y.Z     exact server release; required for unattended use
   --interactive              select/confirm a release using /dev/tty
   --non-interactive          never prompt; requires --version
@@ -53,7 +55,9 @@ Debian 12/13, amd64/arm64, with systemd. Native installation prepares only
 native prerequisites and never installs or invokes Docker. Existing prepared
 Linux environments can be reused. Public use requires a trusted Relay
 certificate and a Control HTTPS/WSS reverse proxy. Unattended deployments
-should specify --method; its compatibility default is docker.
+should specify --method; its compatibility default is docker. Docker builds
+the selected source release with Compose by default, without a registry login.
+Go and Node run inside the build containers, not on the deployment host.
 HELP
   }
   value() { [ "$#" -ge 2 ] && [ -n "$2" ] && [[ "$2" != --* ]] || die "$1 requires a value"; }
@@ -68,6 +72,7 @@ HELP
     case "$1" in
       --version) value "$@"; BOOT_VERSION=$2; shift 2 ;;
       --method) value "$@"; BOOT_METHOD=$2; shift 2 ;;
+      --docker-mode) value "$@"; BOOT_DOCKER_MODE=$2; BOOT_DOCKER_OPTIONS=1; shift 2 ;;
       --repo) value "$@"; BOOT_REPO=$2; shift 2 ;;
       --interactive) BOOT_INTERACTIVE=1; shift ;;
       --non-interactive) BOOT_INTERACTIVE=0; shift ;;
@@ -90,6 +95,7 @@ HELP
   BOOT_FORWARD[1]=$BOOT_REPO
   [ -z "$BOOT_VERSION" ] || valid_version "$BOOT_VERSION"
   case "$BOOT_METHOD" in ''|native|docker) ;; *) die 'method must be native or docker' ;; esac
+  case "$BOOT_DOCKER_MODE" in build|image) ;; *) die 'docker mode must be build or image' ;; esac
   [ "$BOOT_INTERACTIVE" -eq 1 ] || [ -n "$BOOT_VERSION" ] || die '--non-interactive requires --version; use --interactive to discover a server release'
   [ "$(uname -s)" = Linux ] || die 'server bootstrap requires Linux'
   case "$(uname -m)" in x86_64|amd64) BOOT_ARCH=amd64 ;; aarch64|arm64) BOOT_ARCH=arm64 ;; *) die 'supported architectures: amd64 and arm64' ;; esac
@@ -98,7 +104,9 @@ HELP
     { exec 3<>/dev/tty; } 2>/dev/null || die 'interactive deployment requires a terminal; use --non-interactive --version TAG'
     printf '\nP2WLAN 一键安装向导\n阶段一：选择安装方式\n' >&3
     if [ -z "$BOOT_METHOD" ]; then
-      printf '  1) 直接安装（Linux + systemd，不需要 Docker）\n  2) Docker 部署（Docker Compose）\n  0) 取消并退出\n' >&3
+      docker_description='Compose 本机源码构建'
+      [ "$BOOT_DOCKER_MODE" != image ] || docker_description='预构建镜像'
+      printf '  1) 直接安装（Linux + systemd，不需要 Docker）\n  2) Docker 部署（%s）\n  0) 取消并退出\n' "$docker_description" >&3
       while [ -z "$BOOT_METHOD" ]; do
         prompt method_choice '安装方式' 2
         case "$method_choice" in
@@ -113,7 +121,7 @@ HELP
   fi
   BOOT_METHOD=${BOOT_METHOD:-docker}
   if [ "$BOOT_METHOD" = native ]; then
-    [ "$BOOT_DOCKER_OPTIONS" -eq 0 ] || die '--dir, --publish-host and --wait-timeout apply only to Docker; use --root/--config-dir/--data-dir for native installation'
+    [ "$BOOT_DOCKER_OPTIONS" -eq 0 ] || die '--docker-mode, --dir, --publish-host and --wait-timeout apply only to Docker; use --root/--config-dir/--data-dir for native installation'
     if [ "$BOOT_DRY_RUN" -eq 0 ]; then
       command -v systemctl >/dev/null 2>&1 && [ -d "${P2WLAN_SYSTEMD_DIR:-/run/systemd/system}" ] || die 'native installation requires a running systemd host'
     fi
@@ -140,6 +148,7 @@ HELP
   done
   need_engine=0
   need_compose=0
+  need_buildx=0
   compose_help=
   if [ "$BOOT_METHOD" = docker ]; then
     command -v docker >/dev/null 2>&1 || need_engine=1
@@ -147,9 +156,12 @@ HELP
       compose_help=$(docker compose up --help 2>/dev/null || true)
     fi
     [[ "$compose_help" == *--wait* && "$compose_help" == *--wait-timeout* ]] || need_compose=1
+    if [ "$BOOT_DOCKER_MODE" = build ]; then
+      docker buildx version >/dev/null 2>&1 || need_buildx=1
+    fi
   fi
   need_docker=0
-  [ "$need_engine" -eq 0 ] && [ "$need_compose" -eq 0 ] || need_docker=1
+  [ "$need_engine" -eq 0 ] && [ "$need_compose" -eq 0 ] && [ "$need_buildx" -eq 0 ] || need_docker=1
   if [ "$BOOT_DRY_RUN" -eq 0 ] && { [ "$need_base" -eq 1 ] || [ "$need_docker" -eq 1 ]; }; then
     os_file=${P2WLAN_BOOTSTRAP_OS_RELEASE:-/etc/os-release}
     [ -f "$os_file" ] || die "cannot identify Linux distribution; prepare the $BOOT_METHOD prerequisites manually"
@@ -215,13 +227,19 @@ SOURCES
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
         systemctl enable --now docker
       else
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove --no-install-recommends docker-compose-plugin
+        docker_plugins=()
+        [ "$need_compose" -eq 0 ] || docker_plugins+=(docker-compose-plugin)
+        [ "$need_buildx" -eq 0 ] || docker_plugins+=(docker-buildx-plugin)
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove --no-install-recommends "${docker_plugins[@]}"
       fi
     fi
   fi
   command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 || die 'Python 3 and curl are required; dry-run never installs prerequisites'
   if [ "$BOOT_DRY_RUN" -eq 0 ] && [ "$BOOT_METHOD" = docker ]; then
     command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 || die 'Docker Compose is unavailable after dependency preparation'
+    if [ "$BOOT_DOCKER_MODE" = build ]; then
+      docker buildx version >/dev/null 2>&1 || die 'Docker Buildx is unavailable after dependency preparation'
+    fi
     python3 - "${P2WLAN_SYSTEMD_DIR:-/run/systemd/system}" <<'PY_ENGINE'
 from pathlib import Path
 import shutil
@@ -253,17 +271,20 @@ import collections
 import datetime
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import sys
 import tarfile
 
 DOCKER_ASSETS = {'p2wlan-server-docker.tar.gz', 'p2wlan-server-docker.tar.gz.sha256', 'SERVER-IMAGE.json', 'SERVER-IMAGE.json.sha256'}
+SOURCE_ASSET = 'p2wlan-server-source.tar.gz'
 
 def required_assets(method, arch):
     if method == 'native':
         name = f'p2wlan-server-linux-{arch}.tar.gz'
         return {name, name + '.sha256'}
+    if method == 'docker-source':
+        return {SOURCE_ASSET, SOURCE_ASSET + '.sha256'}
     return DOCKER_ASSETS
 
 def tag(value):
@@ -361,9 +382,73 @@ def verify_native(archive, output, requested, arch):
             target.chmod(0o755 if name in executables else 0o600)
     print('Verified native ' + requested + ' source=' + metadata['commit'] + ' arch=' + arch)
 
+def verify_source(archive, output, requested):
+    metadata_names = {'SERVER-SOURCE.json', 'SERVER-SOURCE.json.sha256'}
+    fixed = {'scripts/install-server-docker.sh', 'deploy/selfhost/compose.production.yml',
+             'deploy/selfhost/compose.build.yml'}
+    required = fixed | {'server/Dockerfile', 'server/go.mod', 'server/go.sum'}
+
+    def safe_name(name):
+        path = PurePosixPath(name)
+        return (bool(name) and str(path) == name and not path.is_absolute()
+                and '..' not in path.parts and not any(c in name for c in '\\\r\n\x00'))
+
+    with tarfile.open(archive, 'r:gz') as bundle:
+        files, directories, total = {}, set(), 0
+        for member in bundle:
+            name = member.name.rstrip('/') if member.isdir() else member.name
+            if not safe_name(name) or name in files or name in directories:
+                raise ValueError('source archive contains an unsafe or duplicate path')
+            if member.isdir():
+                directories.add(name)
+                if len(directories) > 4096:
+                    raise ValueError('source archive has too many directories')
+                continue
+            if (not member.isfile() or not (name in metadata_names or name in fixed or name.startswith('server/'))
+                    or member.size > (1024 * 1024 if name in metadata_names else 64 * 1024 * 1024)):
+                raise ValueError('source archive requires bounded regular source members')
+            total += member.size
+            files[name] = member
+            if len(files) > 4098 or total > 256 * 1024 * 1024:
+                raise ValueError('source archive exceeds its expanded size limit')
+        if not metadata_names.issubset(files):
+            raise ValueError('source deployment metadata is missing')
+        raw = bundle.extractfile(files['SERVER-SOURCE.json']).read()
+        checksum = bundle.extractfile(files['SERVER-SOURCE.json.sha256']).read().decode().strip()
+        match = re.fullmatch(r'([a-fA-F0-9]{64}) [ *]SERVER-SOURCE.json', checksum)
+        if not match or hashlib.sha256(raw).hexdigest() != match[1].lower():
+            raise ValueError('source manifest checksum mismatch')
+        metadata = json.loads(raw)
+        if (metadata.get('schema_version') != 1 or metadata.get('version') != requested
+                or metadata.get('context') != 'server'
+                or not re.fullmatch(r'[a-f0-9]{40}', metadata.get('source_sha', ''))):
+            raise ValueError('source archive requires the selected version and an exact source SHA')
+        manifest = metadata.get('files')
+        if (not isinstance(manifest, dict) or not 1 <= len(manifest) <= 4096
+                or set(files) != set(manifest) | metadata_names or not required.issubset(manifest)):
+            raise ValueError('source checksum manifest does not match the archive members')
+        parents = set()
+        for name, digest in manifest.items():
+            if not safe_name(name) or not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest):
+                raise ValueError('invalid source checksum manifest entry')
+            parents.update(str(parent) for parent in PurePosixPath(name).parents if str(parent) != '.')
+            if hash_stream(bundle.extractfile(files[name])) != digest:
+                raise ValueError('source file checksum mismatch: ' + name)
+        if not directories.issubset(parents) or parents.intersection(files):
+            raise ValueError('source archive contains conflicting or unexpected directories')
+        output.mkdir(mode=0o700)
+        for name, member in files.items():
+            target = output / name
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with bundle.extractfile(member) as source, target.open('xb') as destination:
+                for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                    destination.write(chunk)
+            target.chmod(0o755 if member.mode & 0o111 else 0o600)
+    print('Verified source ' + requested + ' source=' + metadata['source_sha'] + '; Compose will build locally')
+
 def verify(archive, output, requested, method, arch):
     archive, output = Path(archive), Path(output)
-    limit = 256 * 1024 * 1024 if method == 'native' else 16 * 1024 * 1024
+    limit = 256 * 1024 * 1024 if method == 'native' else (128 * 1024 * 1024 if method == 'docker-source' else 16 * 1024 * 1024)
     if archive.stat().st_size > limit:
         raise ValueError('deployment archive exceeds its size limit')
     checksum = archive.with_name(archive.name + '.sha256').read_text().strip()
@@ -374,6 +459,9 @@ def verify(archive, output, requested, method, arch):
         raise ValueError('deployment archive checksum mismatch')
     if method == 'native':
         verify_native(archive, output, requested, arch)
+        return
+    if method == 'docker-source':
+        verify_source(archive, output, requested)
         return
     limits = {'install-server-docker.sh': 2 * 1024 * 1024, 'compose.production.yml': 1024 * 1024,
               'SERVER-IMAGE.json': 64 * 1024, 'SERVER-IMAGE.json.sha256': 1024}
@@ -434,8 +522,12 @@ except (OSError, ValueError, TypeError, AttributeError, tarfile.TarError, Unicod
     sys.exit('bootstrap-server: ' + str(error))
 PY
 
+  bundle_method=$BOOT_METHOD
+  if [ "$BOOT_METHOD" = docker ] && [ "$BOOT_DOCKER_MODE" = build ]; then
+    bundle_method=docker-source
+  fi
   if [ -z "$BOOT_VERSION" ]; then
-    printf '\n阶段三：选择服务端版本\n正在查找带完整 %s 部署包的正式版本…\n' "$BOOT_METHOD" >&3
+    printf '\n阶段三：选择服务端版本\n正在查找带完整 %s 部署包的正式版本…\n' "$bundle_method" >&3
     pages=()
     for page in 1 2 3 4 5; do
       result="$BOOT_TMP_DIR/releases-$page.json"
@@ -447,7 +539,7 @@ PY
       [ "$count" -ge 100 ] || break
     done
     catalog="$BOOT_TMP_DIR/catalog.json"
-    python3 "$BOOT_TMP_DIR/verify.py" catalog "$BOOT_METHOD" "$BOOT_ARCH" "${pages[@]}" > "$catalog"
+    python3 "$BOOT_TMP_DIR/verify.py" catalog "$bundle_method" "$BOOT_ARCH" "${pages[@]}" > "$catalog"
     python3 "$BOOT_TMP_DIR/verify.py" show "$catalog" >&3
     printf '  m) 手动输入其他 server-v 版本\n  0) 取消并退出\n' >&3
     while [ -z "$BOOT_VERSION" ]; do
@@ -483,13 +575,17 @@ PY
     asset="p2wlan-server-linux-$BOOT_ARCH.tar.gz"
     max_size=268435456
     download_timeout=300
+  elif [ "$BOOT_DOCKER_MODE" = build ]; then
+    asset=p2wlan-server-source.tar.gz
+    max_size=134217728
+    download_timeout=300
   fi
   base="https://github.com/$BOOT_REPO/releases/download/$BOOT_VERSION"
   for name in "$asset" "$asset.sha256"; do
     curl -fSL --retry 3 --connect-timeout 15 --max-time "$download_timeout" --max-filesize "$max_size" \
       "$base/$name" -o "$BOOT_TMP_DIR/$name"
   done
-  python3 "$BOOT_TMP_DIR/verify.py" verify "$BOOT_TMP_DIR/$asset" "$BOOT_TMP_DIR/deployment" "$BOOT_VERSION" "$BOOT_METHOD" "$BOOT_ARCH"
+  python3 "$BOOT_TMP_DIR/verify.py" verify "$BOOT_TMP_DIR/$asset" "$BOOT_TMP_DIR/deployment" "$BOOT_VERSION" "$bundle_method" "$BOOT_ARCH"
   if [ "$BOOT_DRY_RUN" -eq 1 ]; then
     echo "Verified $BOOT_METHOD deployment bundle; would configure and deploy the selected release."
     return 0
@@ -513,6 +609,9 @@ PY
     fi
     bash "$BOOT_TMP_DIR/deployment/install-server.sh" --archive "$BOOT_TMP_DIR/$asset" \
       --version "$BOOT_VERSION" "${BOOT_FORWARD[@]}"
+  elif [ "$BOOT_DOCKER_MODE" = build ]; then
+    bash "$BOOT_TMP_DIR/deployment/scripts/install-server-docker.sh" \
+      --source "$BOOT_TMP_DIR/deployment" "${BOOT_FORWARD[@]}"
   else
     bash "$BOOT_TMP_DIR/deployment/install-server-docker.sh" \
       --manifest "$BOOT_TMP_DIR/deployment/SERVER-IMAGE.json" "${BOOT_FORWARD[@]}"

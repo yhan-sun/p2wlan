@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Install public release artifacts on an ephemeral GitHub-hosted Linux VM.
 
-This is a real deployment acceptance check, not a source-build or mocked test.
+This exercises public release packages, including the default Compose source
+build. The checked-out repository supplies only this acceptance harness.
 It deliberately refuses to run on developer machines or self-hosted runners.
 """
 import argparse
@@ -9,7 +10,7 @@ import datetime
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import pty
 import pwd
@@ -20,6 +21,7 @@ import socket
 import ssl
 import stat
 import subprocess
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -63,6 +65,58 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def verify_source_archive(archive, version, source_sha):
+    """Independently verify the published source snapshot without extracting it."""
+    metadata_names = {'SERVER-SOURCE.json', 'SERVER-SOURCE.json.sha256'}
+    fixed = {'scripts/install-server-docker.sh', 'deploy/selfhost/compose.production.yml',
+             'deploy/selfhost/compose.build.yml'}
+    required = fixed | {'server/Dockerfile', 'server/go.mod', 'server/go.sum'}
+    with tarfile.open(archive, 'r:gz') as bundle:
+        members, directories, expanded = {}, set(), 0
+        for member in bundle:
+            name = member.name.rstrip('/') if member.isdir() else member.name
+            path = PurePosixPath(name)
+            require(name and str(path) == name and not path.is_absolute() and '..' not in path.parts
+                    and not any(character in name for character in '\\\r\n\x00')
+                    and name not in members and name not in directories, 'public_source_unsafe_archive_path')
+            if member.isdir():
+                directories.add(name)
+                require(len(directories) <= 4096, 'public_source_directory_limit')
+                continue
+            require(member.isfile() and (name in metadata_names or name in fixed or name.startswith('server/'))
+                    and member.size <= (1024 * 1024 if name in metadata_names else 64 * 1024 * 1024),
+                    'public_source_requires_bounded_regular_members')
+            members[name] = member
+            expanded += member.size
+            require(len(members) <= 4098 and expanded <= 256 * 1024 * 1024, 'public_source_expanded_size_limit')
+        require(metadata_names.issubset(members), 'public_source_manifest_missing')
+        raw = bundle.extractfile(members['SERVER-SOURCE.json']).read()
+        sidecar = bundle.extractfile(members['SERVER-SOURCE.json.sha256']).read().decode('ascii').strip()
+        match = re.fullmatch(r'([a-fA-F0-9]{64}) [ *]SERVER-SOURCE.json', sidecar)
+        require(match and hashlib.sha256(raw).hexdigest() == match[1].lower(), 'public_source_manifest_checksum')
+        metadata = json.loads(raw)
+        require(metadata.get('schema_version') == 1 and metadata.get('version') == version
+                and metadata.get('source_sha') == source_sha and metadata.get('context') == 'server',
+                'public_source_manifest_identity')
+        manifest = metadata.get('files')
+        require(isinstance(manifest, dict) and 1 <= len(manifest) <= 4096
+                and set(members) == set(manifest) | metadata_names and required.issubset(manifest),
+                'public_source_manifest_members')
+        parents = set()
+        for name, expected in manifest.items():
+            require(isinstance(expected, str) and re.fullmatch(r'[a-f0-9]{64}', expected),
+                    'public_source_invalid_file_checksum')
+            parents.update(str(parent) for parent in PurePosixPath(name).parents if str(parent) != '.')
+            digest = hashlib.sha256()
+            with bundle.extractfile(members[name]) as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            require(digest.hexdigest() == expected, 'public_source_file_checksum')
+        require(directories.issubset(parents) and not parents.intersection(members),
+                'public_source_conflicting_directories')
+        return hashlib.sha256(raw).hexdigest(), len(manifest)
+
+
 class PublishedServerSmoke:
     def __init__(self, args):
         self.args = args
@@ -71,6 +125,7 @@ class PublishedServerSmoke:
         self.bootstrap_digest = None
         self.image = None
         self.image_id = None
+        self.docker_events_since = None
         self.first_bootstrap_output = b''
         self.last_command_output = b''
         self.child_env = {key: value for key, value in os.environ.items() if key not in (
@@ -80,6 +135,8 @@ class PublishedServerSmoke:
         self.evidence = dict(schema_version=1, method=args.method, version=args.version,
                              expected_source_sha=args.expected_source_sha, checks={},
                              started_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+        if args.method == 'docker':
+            self.evidence['docker_mode'] = args.docker_mode
 
     def command(self, label, arguments, *, timeout=30, input_bytes=None):
         """Bound time, output and descendants without publishing captured output."""
@@ -166,8 +223,12 @@ class PublishedServerSmoke:
         else:
             self.docker_config.mkdir(mode=0o700)
             self.child_env['DOCKER_CONFIG'] = str(self.docker_config)
+            # Keep BuildKit's progress bounded even though the bootstrap owns
+            # a real PTY; terminal redraws are not useful acceptance evidence.
+            self.child_env['BUILDKIT_PROGRESS'] = 'plain'
             self.command('docker_engine', ['docker', 'info'], timeout=30)
             self.command('docker_compose', ['docker', 'compose', 'version'], timeout=30)
+            self.docker_events_since = str(int(time.time()) - 1)
         self.evidence['checks']['fresh_ephemeral_environment'] = True
         self.evidence['runner_architecture'] = platform.machine()
 
@@ -200,18 +261,78 @@ class PublishedServerSmoke:
         self.require_anonymous_config()
         self.evidence['image'] = self.image
 
+    def prepare_source(self):
+        base = f'https://github.com/{self.args.repo}/releases/download/{self.args.version}'
+        name = 'p2wlan-server-source.tar.gz'
+        sidecar = self.public_download(base + '/' + name + '.sha256', 1024).decode('ascii').strip()
+        match = re.fullmatch(r'([a-fA-F0-9]{64}) [ *]' + re.escape(name), sidecar)
+        require(match, 'public_source_archive_checksum_format')
+        with tempfile.TemporaryDirectory(prefix='p2wlan-public-source-', dir=os.environ['RUNNER_TEMP']) as directory:
+            archive = Path(directory) / name
+            self.command('public_source_download', ['curl', '-fsSL', '--retry', '3', '--connect-timeout', '15',
+                '--max-time', '180', '--max-filesize', str(128 * 1024 * 1024), '--output', str(archive),
+                base + '/' + name], timeout=210)
+            require(archive.stat().st_size <= 128 * 1024 * 1024 and sha256(archive) == match[1].lower(),
+                    'public_source_archive_checksum')
+            manifest_digest, count = verify_source_archive(archive, self.args.version, self.args.expected_source_sha)
+        self.evidence.update(source_archive_sha256=match[1].lower(), source_manifest_sha256=manifest_digest,
+                             source_file_count=count)
+        self.evidence['checks']['public_source_archive_and_file_hashes'] = True
+        self.require_no_application_pull()
+
     def inspect_image(self):
         self.require_anonymous_config()
+        if self.args.docker_mode == 'build':
+            settings = environment_file(self.deployment / '.env')
+            self.image = settings.get('P2WLAN_IMAGE', '')
+            source = self.deployment / 'sources' / self.args.expected_source_sha
+            require(settings.get('P2WLAN_INSTALL_MODE') == 'source' and settings.get('P2WLAN_SOURCE_DIR') == str(source)
+                    and source.is_dir() and re.fullmatch(r'sha256:[a-f0-9]{64}', self.image),
+                    'installed_source_build_configuration')
+            metadata = json.loads((source / 'SERVER-SOURCE.json').read_text())
+            require(metadata.get('version') == self.args.version
+                    and metadata.get('source_sha') == self.args.expected_source_sha
+                    and sha256(source / 'SERVER-SOURCE.json') == self.evidence.get('source_manifest_sha256'),
+                    'persisted_source_identity')
+            for name, expected in metadata['files'].items():
+                path = source / name
+                require(path.is_file() and not path.is_symlink() and sha256(path) == expected,
+                        'persisted_source_file_checksum')
+            built_id = self.command('compose_builder_image_identity', ['docker', 'image', 'inspect',
+                settings.get('P2WLAN_BUILD_IMAGE', ''), '--format', '{{.Id}}']).decode().strip()
+            require(built_id == self.image, 'compose_builder_output_must_match_runtime_image')
+            self.evidence['source_directory'] = str(source)
         metadata = json.loads(self.command('image_identity', ['docker', 'image', 'inspect', self.image,
                                                              '--format', '{{json .}}']))
         labels = metadata.get('Config', {}).get('Labels') or {}
         require(labels.get('org.opencontainers.image.version') == self.args.version
-                and labels.get('org.opencontainers.image.revision') == self.args.expected_source_sha
-                and self.image in metadata.get('RepoDigests', []), 'published_image_identity_mismatch')
+                and labels.get('org.opencontainers.image.revision') == self.args.expected_source_sha,
+                'published_image_identity_mismatch')
+        if self.args.docker_mode == 'image':
+            require(self.image in metadata.get('RepoDigests', []), 'published_image_digest_mismatch')
         self.image_id = metadata.get('Id', '')
         require(re.fullmatch(r'sha256:[a-f0-9]{64}', self.image_id), 'invalid_published_image_id')
         self.evidence.update(image=self.image, image_id=self.image_id)
-        self.evidence['checks']['anonymous_fixed_digest_pull'] = True
+        if self.args.docker_mode == 'image':
+            self.evidence['checks']['anonymous_fixed_digest_pull'] = True
+        else:
+            require(self.image_id == self.image, 'source_runtime_requires_verified_local_image_id')
+            self.require_no_application_pull()
+            self.evidence['checks']['compose_source_build_and_local_image_identity'] = True
+
+    def require_no_application_pull(self):
+        self.require_anonymous_config()
+        prefix = 'ghcr.io/' + self.args.repo.lower() + '/server'
+        repositories = self.command('application_image_repositories', ['docker', 'image', 'ls', '--format',
+                                   '{{.Repository}}']).decode().splitlines()
+        require(not any(repository.lower().startswith(prefix) for repository in repositories),
+                'source_mode_must_not_have_ghcr_application_images')
+        if self.docker_events_since is not None:
+            events = self.command('application_image_pull_events', ['docker', 'events', '--since',
+                self.docker_events_since, '--until', str(int(time.time())), '--filter', 'type=image',
+                '--filter', 'event=pull', '--format', '{{json .}}']).decode().splitlines()
+            require(not any(prefix in event.lower() for event in events), 'source_mode_pulled_ghcr_application_image')
+        self.evidence['checks']['source_mode_without_ghcr_auth_or_application_pull'] = True
 
     def require_anonymous_config(self):
         settings = self.docker_config / 'config.json'
@@ -235,11 +356,13 @@ class PublishedServerSmoke:
             arguments += ['--root', str(self.program), '--config-dir', str(self.config), '--data-dir', str(self.data)]
         else:
             arguments += ['--dir', str(self.deployment), '--wait-timeout', '120']
+            if self.args.docker_mode == 'image':
+                arguments += ['--docker-mode', 'image']
         if first:
             arguments += ['--dev-localhost']
         self.attempted_install = True
         output = (self.wizard(source) if first else self.command('public_bootstrap_reinstall',
-                  arguments, timeout=900, input_bytes=source))
+                  arguments, timeout=1800, input_bytes=source))
         if first:
             self.first_bootstrap_output = output
 
@@ -256,7 +379,10 @@ class PublishedServerSmoke:
         if self.args.method == 'native':
             require(not self.native_unit_files(), 'native_unit_appeared_before_confirmation')
         else:
-            containers = self.command('preconfirmation_containers', ['docker', 'ps', '-aq', '--filter', 'ancestor=' + self.image])
+            arguments = ['docker', 'ps', '-aq']
+            if self.args.docker_mode == 'image':
+                arguments += ['--filter', 'ancestor=' + self.image]
+            containers = self.command('preconfirmation_containers', arguments)
             require(not containers.strip(), 'container_appeared_before_confirmation')
         self.evidence['checks']['confirmation_precedes_runtime_or_persistent_paths'] = True
 
@@ -276,11 +402,14 @@ class PublishedServerSmoke:
             os.dup2(source_read, 0)
             os.close(source_read)
             os.chdir('/')
-            os.execve('/bin/bash', ['bash', '-s'], self.child_env)
+            arguments = ['bash', '-s']
+            if self.args.method == 'docker' and self.args.docker_mode == 'image':
+                arguments += ['--', '--interactive', '--docker-mode', 'image']
+            os.execve('/bin/bash', arguments, self.child_env)
         os.close(source_read)
         output, cursor, sent, status = bytearray(), 0, 0, None
         total_steps = len(steps)
-        deadline, prompt_deadline = time.monotonic() + 900, time.monotonic() + 90
+        deadline, prompt_deadline = time.monotonic() + 1800, time.monotonic() + 90
         try:
             with selectors.DefaultSelector() as selector:
                 os.set_blocking(source_write, False)
@@ -346,7 +475,9 @@ class PublishedServerSmoke:
             self.last_command_output = bytes(output)
             self.scan_output(output)
             require(not steps and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, 'public_wizard_failed')
-            self.evidence['checks']['public_no_argument_wizard'] = True
+            check = ('public_explicit_image_wizard' if self.args.method == 'docker'
+                     and self.args.docker_mode == 'image' else 'public_no_argument_wizard')
+            self.evidence['checks'][check] = True
             return bytes(output)
         finally:
             self.last_command_output = bytes(output)
@@ -495,6 +626,8 @@ class PublishedServerSmoke:
                      'container_database_integrity')
         self.verify_tls()
         self.require_anonymous_config()
+        if self.args.docker_mode == 'build':
+            self.require_no_application_pull()
         self.evidence['checks'].update(real_healthy_compose_containers=True, fixed_container_image_identity=True,
                                        nonroot_service_processes=True, database_integrity=True, real_relay_tls=True)
 
@@ -522,7 +655,7 @@ class PublishedServerSmoke:
     def exercise(self):
         self.preflight()
         if self.args.method == 'docker':
-            self.prepare_image()
+            self.prepare_source() if self.args.docker_mode == 'build' else self.prepare_image()
         self.bootstrap(first=True)
         if self.args.method == 'docker':
             self.inspect_image()
@@ -539,6 +672,8 @@ class PublishedServerSmoke:
         self.http('/api/v1/profile', token=token)
         self.stop()
         self.bootstrap(first=False)
+        if self.args.method == 'docker':
+            self.inspect_image()
         require(self.credential_fingerprint() == original, 'credentials_changed_during_reinstallation')
         self.verify()
         self.http('/api/v1/profile', token=token)
@@ -583,20 +718,22 @@ def environment_file_text(content):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--method', choices=('native', 'docker'), required=True)
+    parser.add_argument('--docker-mode', choices=('build', 'image'), default='build')
     parser.add_argument('--version', required=True)
     parser.add_argument('--expected-source-sha', required=True)
     parser.add_argument('--repo', default='yhan-sun/p2wlan')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    label = args.method if args.method == 'native' else ('source' if args.docker_mode == 'build' else 'image')
     output = args.output
     require(os.environ.get('RUNNER_TEMP') and output.parent.resolve() == Path(os.environ['RUNNER_TEMP']).resolve()
-            and output.name == 'server-release-smoke-' + args.method + '.json' and not output.is_symlink(),
+            and output.name == 'server-release-smoke-' + label + '.json' and not output.is_symlink(),
             'evidence_must_be_in_the_runner_temporary_directory')
     smoke = PublishedServerSmoke(args)
     error = None
     try:
         smoke.exercise()
-    except (SmokeFailure, OSError, ValueError, KeyError, StopIteration, TypeError, AttributeError) as caught:
+    except (SmokeFailure, OSError, ValueError, KeyError, StopIteration, TypeError, AttributeError, tarfile.TarError) as caught:
         error = str(caught) if isinstance(caught, SmokeFailure) else 'acceptance_' + type(caught).__name__
         smoke.failure_diagnostics()
     finally:
@@ -613,7 +750,7 @@ def main():
             temporary = Path(stream.name)
         temporary.chmod(0o644)  # The evidence contains public identity and booleans only.
         temporary.replace(output)
-    print(('FAIL' if error else 'PASS') + ': public ' + args.method + ' deployment ' + args.version)
+    print(('FAIL' if error else 'PASS') + ': public ' + label + ' deployment ' + args.version)
     return 1 if error else 0
 
 

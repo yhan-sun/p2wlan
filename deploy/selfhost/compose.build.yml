@@ -1,0 +1,12 @@
+# Build before loading the runtime project: a new deployment has no env files yet.
+name: p2wlan-server-build
+
+services:
+  builder:
+    image: "${P2WLAN_BUILD_IMAGE:?Set P2WLAN_BUILD_IMAGE to a local build tag}"
+    build:
+      context: "${P2WLAN_BUILD_CONTEXT:?Set P2WLAN_BUILD_CONTEXT to the verified server source directory}"
+      dockerfile: Dockerfile
+      args:
+        VERSION: "${P2WLAN_VERSION:?Set P2WLAN_VERSION to the fixed server release tag}"
+        COMMIT: "${P2WLAN_COMMIT:?Set P2WLAN_COMMIT to the verified source commit}"

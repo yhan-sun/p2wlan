@@ -41,7 +41,8 @@ import json, os, pathlib, sys, urllib.parse
 args = sys.argv[1:]
 with open(os.environ['DOCKER_FIXTURE_LOG'], 'a') as log:
     log.write(json.dumps({'args': args, 'env': {key: os.environ.get(key) for key in
-        ('P2WLAN_IMAGE', 'P2WLAN_CONFIG_DIR', 'RELAY_PUBLISH_HOST')}}) + '\n')
+        ('P2WLAN_IMAGE', 'P2WLAN_CONFIG_DIR', 'RELAY_PUBLISH_HOST', 'P2WLAN_BUILD_CONTEXT',
+         'P2WLAN_BUILD_IMAGE', 'P2WLAN_VERSION', 'P2WLAN_COMMIT')}}) + '\n')
 if args[:1] == ['info']:
     if os.environ.get('FAIL_DOCKER_INFO'): sys.exit(1)
     print(json.dumps({'OSType': os.environ.get('DOCKER_FIXTURE_OS', 'linux'),
@@ -54,14 +55,16 @@ elif args[:2] == ['compose', 'up'] and '--help' in args:
     print('' if os.environ.get('DOCKER_FIXTURE_NO_WAIT') else '--wait --wait-timeout')
 elif args[:2] == ['image', 'inspect']:
     print(json.dumps({'Id': os.environ['DOCKER_FIXTURE_ID'], 'RepoDigests': [os.environ['DOCKER_FIXTURE_IMAGE']],
-          'Config': {'Labels': {'org.opencontainers.image.revision': os.environ['DOCKER_FIXTURE_COMMIT'],
-                               'org.opencontainers.image.version': 'server-v9.9.9'}}}))
+          'Config': {'Labels': {'org.opencontainers.image.revision': os.environ.get('DOCKER_FIXTURE_LABEL_COMMIT', os.environ['DOCKER_FIXTURE_COMMIT']),
+                               'org.opencontainers.image.version': os.environ.get('DOCKER_FIXTURE_VERSION', 'server-v9.9.9')}}}))
 elif args[:1] == ['pull']:
     if os.environ.get('FAIL_DOCKER_PULL'): sys.exit(1)
 elif args[:1] == ['run']:
     if '--version' in args and '--entrypoint' in args:
         component = pathlib.Path(args[args.index('--entrypoint') + 1]).name
-        print(f"{component} server-v9.9.9 ({os.environ['DOCKER_FIXTURE_COMMIT']})")
+        version = os.environ.get('DOCKER_FIXTURE_VERSION', 'server-v9.9.9')
+        commit = os.environ.get('DOCKER_FIXTURE_BINARY_COMMIT', os.environ['DOCKER_FIXTURE_COMMIT'])
+        print(f"{component} {version} ({commit})")
         sys.exit(0)
     if '--help' in args:
         print('--mode --output --relay-endpoint --tls-cert --tls-key --dev-localhost')
@@ -100,7 +103,9 @@ elif args[:1] == ['run']:
     if os.getuid() == 0:
         for path in [output, output / 'data'] + list(output.iterdir()): os.chown(path, uid, gid)
 elif args[:1] == ['compose']:
-    if 'config' in args:
+    if 'build' in args:
+        if os.environ.get('FAIL_DOCKER_BUILD'): sys.exit(1)
+    elif 'config' in args:
         if os.environ.get('FAIL_COMPOSE_CONFIG'): sys.exit(1)
     elif 'up' in args:
         if os.environ.get('FAIL_COMPOSE_UP'): sys.exit(1)
@@ -116,6 +121,8 @@ else:
 
     @staticmethod
     def executable(path, content):
+        if path.is_symlink():
+            path.unlink()
         path.write_text(content)
         path.chmod(0o755)
 
@@ -187,6 +194,42 @@ else:
             arguments = call['args']
             self.assertFalse(arguments[:1] in (['pull'], ['run']), arguments)
             self.assertFalse(arguments[:1] == ['compose'] and 'up' in arguments and '--help' not in arguments, arguments)
+            self.assertFalse(arguments[:1] == ['compose'] and 'build' in arguments, arguments)
+
+    def source_bundle(self, *, name='source-bundle', commit=COMMIT, version='server-v9.9.9'):
+        directory = self.path / name
+        files = {
+            'server/Dockerfile': (ROOT / 'server/Dockerfile').read_bytes(),
+            'server/go.mod': b'module example.test/server\n',
+            'server/go.sum': b'',
+            'server/main.go': b'package main\nfunc main() {}\n',
+            'scripts/install-server-docker.sh': (ROOT / 'scripts/install-server-docker.sh').read_bytes(),
+            'deploy/selfhost/compose.production.yml': (ROOT / 'deploy/selfhost/compose.production.yml').read_bytes(),
+            'deploy/selfhost/compose.build.yml': b'''services:
+  builder:
+    image: "${P2WLAN_BUILD_IMAGE}"
+    build:
+      context: "${P2WLAN_BUILD_CONTEXT}"
+      args:
+        VERSION: "${P2WLAN_VERSION}"
+        COMMIT: "${P2WLAN_COMMIT}"
+''',
+        }
+        for relative, content in files.items():
+            path = directory / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        metadata = dict(schema_version=1, version=version, source_sha=commit, context='server',
+                        files={relative: hashlib.sha256(content).hexdigest() for relative, content in files.items()})
+        self.write_source_manifest(directory, metadata)
+        return directory
+
+    @staticmethod
+    def write_source_manifest(directory, metadata):
+        content = (json.dumps(metadata, sort_keys=True, indent=2) + '\n').encode()
+        (directory / 'SERVER-SOURCE.json').write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        (directory / 'SERVER-SOURCE.json.sha256').write_text(f'{digest}  SERVER-SOURCE.json\n')
 
     def manifest(self, *, commit=COMMIT, checksum=True):
         path = self.path / 'SERVER-IMAGE.json'
@@ -571,6 +614,232 @@ urllib.request.urlopen = fixture_urlopen
         result = self.run_installer('--dev-localhost')
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('fixture-private-token', result.stdout + result.stderr)
+
+    def test_source_dry_run_verifies_files_without_docker_or_temporary_snapshots(self):
+        source = self.source_bundle()
+        hooks = self.path / 'python-hooks'
+        hooks.mkdir()
+        (hooks / 'sitecustomize.py').write_text('''import tempfile
+def forbidden(*args, **kwargs):
+    raise AssertionError('dry-run created a temporary source snapshot')
+tempfile.TemporaryDirectory = forbidden
+''')
+        self.env['PYTHONPATH'] = str(hooks)
+        result = self.run_installer('--source', str(source), '--dev-localhost', '--dry-run', image=None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(COMMIT, result.stdout)
+        self.assert_not_deployed()
+
+    def test_source_build_uses_an_isolated_builder_and_immutable_runtime_image_id(self):
+        source = self.source_bundle()
+        certificate, key = self.path / 'certificate.pem', self.path / 'key.pem'
+        certificate.write_text('fixture-certificate')
+        key.write_text('fixture-private-key')
+        result = self.run_installer('--source', str(source), '--relay-endpoint', 'tls://relay.example.test:18081',
+                                    '--tls-cert', str(certificate), '--tls-key', str(key), image=None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls()
+        build = next(call for call in calls if call['args'][:1] == ['compose'] and 'build' in call['args'])
+        self.assertEqual(build['args'][-2:], ['build', 'builder'])
+        self.assertEqual(build['args'][build['args'].index('--env-file') + 1], '/dev/null')
+        saved = (self.target / 'sources' / COMMIT).resolve()
+        self.assertEqual(build['env']['P2WLAN_BUILD_CONTEXT'], str(saved / 'server'))
+        self.assertEqual(build['env']['P2WLAN_VERSION'], 'server-v9.9.9')
+        self.assertEqual(build['env']['P2WLAN_COMMIT'], COMMIT)
+        settings = (self.target / '.env').read_text()
+        self.assertIn('P2WLAN_INSTALL_MODE=source', settings)
+        self.assertIn(f'P2WLAN_IMAGE={IMAGE_ID}', settings)
+        self.assertIn(f'P2WLAN_SOURCE_DIR={saved}', settings)
+        self.assertIn('P2WLAN_DEV_LOCALHOST=false', settings)
+        self.assertIn('P2WLAN_BUILD_IMAGE=' + build['env']['P2WLAN_BUILD_IMAGE'], settings)
+        self.assertFalse(any(call['args'][:1] == ['pull'] for call in calls))
+        containers = [call['args'] for call in calls if call['args'][:1] == ['run']]
+        self.assertTrue(any('--version' in arguments for arguments in containers))
+        self.assertTrue(any('--output' in arguments for arguments in containers))
+        self.assertTrue(all(IMAGE_ID in arguments for arguments in containers))
+
+    @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
+    def test_source_wizard_cancel_does_not_build_generate_or_create_the_deployment(self):
+        source = self.source_bundle()
+        code, output = self.run_interactive([('确认部署', '0')], '--source', str(source),
+            '--dev-localhost', '--relay-endpoint', 'tls://localhost:18081', '--control-port', '18080',
+            '--metrics-port', '18082', '--publish-host', '127.0.0.1', '--no-start', image=None,
+            before_reply=lambda *_: self.assert_not_deployed())
+        self.assertIn(code, (0, 1), output)
+        self.assert_not_deployed()
+
+    def test_source_manifest_checksum_and_identity_are_validated_before_building(self):
+        for field, value in (('schema_version', 2), ('version', 'latest'), ('source_sha', 'unknown'), ('context', '../server')):
+            with self.subTest(field=field):
+                source = self.source_bundle(name='invalid-' + field)
+                metadata = json.loads((source / 'SERVER-SOURCE.json').read_text())
+                metadata[field] = value
+                self.write_source_manifest(source, metadata)
+                result = self.run_installer('--source', str(source), '--dev-localhost', '--dry-run', image=None)
+                self.assertNotEqual(result.returncode, 0)
+                self.assert_not_deployed()
+        source = self.source_bundle(name='bad-metadata-checksum')
+        (source / 'SERVER-SOURCE.json.sha256').write_text(f'{"0" * 64}  SERVER-SOURCE.json\n')
+        result = self.run_installer('--source', str(source), '--dev-localhost', '--dry-run', image=None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_not_deployed()
+
+    def test_source_file_hash_mismatch_cannot_build_or_publish_configuration(self):
+        source = self.source_bundle()
+        (source / 'server/main.go').write_text('changed after packaging')
+        result = self.run_installer('--source', str(source), '--dev-localhost', image=None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_not_deployed()
+
+    def test_source_manifest_rejects_traversal_and_unsupported_paths(self):
+        for index, name in enumerate(('../outside', 'server/../outside', 'server//file', '/server/main.go',
+                                      'deploy/selfhost/unverified.yml')):
+            with self.subTest(name=name):
+                source = self.source_bundle(name='invalid-path-' + str(index))
+                metadata = json.loads((source / 'SERVER-SOURCE.json').read_text())
+                metadata['files'][name] = '0' * 64
+                self.write_source_manifest(source, metadata)
+                result = self.run_installer('--source', str(source), '--dev-localhost', '--dry-run', image=None)
+                self.assertNotEqual(result.returncode, 0)
+                self.assert_not_deployed()
+
+    def test_source_rejects_symbolic_links_linked_ancestors_and_hard_links(self):
+        for kind in ('file-symlink', 'directory-symlink', 'hard-link', 'metadata-symlink'):
+            with self.subTest(kind=kind):
+                source = self.source_bundle(name=kind)
+                if kind == 'directory-symlink':
+                    (source / 'server').rename(source / 'real-server')
+                    (source / 'server').symlink_to(source / 'real-server', target_is_directory=True)
+                else:
+                    path = source / ('SERVER-SOURCE.json' if kind == 'metadata-symlink' else 'server/main.go')
+                    original = self.path / (kind + '-original')
+                    path.rename(original)
+                    os.link(original, path) if kind == 'hard-link' else path.symlink_to(original)
+                result = self.run_installer('--source', str(source), '--dev-localhost', '--dry-run', image=None)
+                self.assertNotEqual(result.returncode, 0)
+                self.assert_not_deployed()
+
+    def test_source_limits_metadata_file_count_individual_and_total_bytes(self):
+        source = self.source_bundle(name='too-many-files')
+        metadata = json.loads((source / 'SERVER-SOURCE.json').read_text())
+        metadata['files'].update({f'server/extra-{index}': '0' * 64 for index in range(4097)})
+        self.write_source_manifest(source, metadata)
+        result = self.run_installer('--source', str(source), '--dev-localhost', '--dry-run', image=None)
+        self.assertNotEqual(result.returncode, 0)
+        source = self.source_bundle(name='oversized-metadata')
+        (source / 'SERVER-SOURCE.json').write_bytes(b' ' * (1024 * 1024 + 1))
+        result = self.run_installer('--source', str(source), '--dev-localhost', '--dry-run', image=None)
+        self.assertNotEqual(result.returncode, 0)
+        source = self.source_bundle(name='oversized-file')
+        large = source / 'server/large.bin'
+        with large.open('wb') as stream:
+            stream.truncate(64 * 1024 * 1024 + 1)
+        metadata = json.loads((source / 'SERVER-SOURCE.json').read_text())
+        metadata['files']['server/large.bin'] = '0' * 64
+        self.write_source_manifest(source, metadata)
+        result = self.run_installer('--source', str(source), '--dev-localhost', '--dry-run', image=None)
+        self.assertNotEqual(result.returncode, 0)
+        source = self.source_bundle(name='oversized-total')
+        metadata = json.loads((source / 'SERVER-SOURCE.json').read_text())
+        digest = hashlib.sha256()
+        zeroes = b'\0' * (1024 * 1024)
+        for _ in range(64):
+            digest.update(zeroes)
+        for index in range(5):
+            name = f'server/large-{index}.bin'
+            with (source / name).open('wb') as stream:
+                stream.truncate(64 * 1024 * 1024)
+            metadata['files'][name] = digest.hexdigest()
+        self.write_source_manifest(source, metadata)
+        result = self.run_installer('--source', str(source), '--dev-localhost', '--dry-run', image=None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_not_deployed()
+
+    def test_unlisted_source_files_are_never_copied_into_the_build_context(self):
+        source = self.source_bundle()
+        (source / 'server/unlisted.txt').write_text('not part of the verified source')
+        result = self.run_installer('--source', str(source), '--dev-localhost', '--no-start', image=None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.target / 'sources' / COMMIT / 'server/unlisted.txt').exists())
+
+    def test_source_reinstallation_restores_its_build_mode_and_preserves_credentials_and_database(self):
+        source = self.source_bundle()
+        first = self.run_installer('--source', str(source), '--dev-localhost', '--no-start', image=None)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        config = self.target / 'config'
+        (config / 'data/p2pnet.db').write_bytes(b'persisted database')
+        before = {str(path.relative_to(config)): path.read_bytes() for path in config.rglob('*') if path.is_file()}
+        second = self.run_installer('--no-start', image=None)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(before, {str(path.relative_to(config)): path.read_bytes() for path in config.rglob('*') if path.is_file()})
+        calls = self.calls()
+        self.assertEqual(sum(call['args'][:1] == ['compose'] and 'build' in call['args'] for call in calls), 2)
+        self.assertEqual(sum('--output' in call['args'] for call in calls), 1)
+        self.assertFalse(any(call['args'][:1] == ['pull'] for call in calls))
+
+    def test_source_build_failure_preserves_the_existing_runtime_configuration(self):
+        source = self.source_bundle()
+        first = self.run_installer('--source', str(source), '--dev-localhost', '--no-start', image=None)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        config = self.target / 'config'
+        (config / 'data/p2pnet.db').write_bytes(b'persisted database')
+        before = {str(path.relative_to(self.target)): path.read_bytes() for path in config.rglob('*') if path.is_file()}
+        environment = (self.target / '.env').read_bytes()
+        runtime = (self.target / 'compose.yml').read_bytes()
+        calls_before = len(self.calls())
+        newer = self.source_bundle(name='newer', commit='e' * 40, version='server-v9.9.10')
+        self.env['FAIL_DOCKER_BUILD'] = '1'
+        result = self.run_installer('--source', str(newer), image=None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.target / '.env').read_bytes(), environment)
+        self.assertEqual((self.target / 'compose.yml').read_bytes(), runtime)
+        self.assertEqual(before, {str(path.relative_to(self.target)): path.read_bytes() for path in config.rglob('*') if path.is_file()})
+        later = self.calls()[calls_before:]
+        self.assertFalse(any(call['args'][:1] == ['run'] for call in later))
+        self.assertFalse(any('up' in call['args'] and '--help' not in call['args'] for call in later))
+
+    def test_saved_source_corruption_is_rejected_before_rebuilding(self):
+        source = self.source_bundle()
+        first = self.run_installer('--source', str(source), '--dev-localhost', '--no-start', image=None)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        environment = (self.target / '.env').read_bytes()
+        (self.target / 'sources' / COMMIT / 'server/main.go').write_text('corrupted')
+        result = self.run_installer('--source', str(source), '--no-start', image=None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.target / '.env').read_bytes(), environment)
+        self.assertEqual(sum('build' in call['args'] for call in self.calls()), 1)
+
+    def test_built_labels_and_binary_versions_must_match_the_verified_source(self):
+        for field in ('DOCKER_FIXTURE_LABEL_COMMIT', 'DOCKER_FIXTURE_BINARY_COMMIT'):
+            with self.subTest(field=field):
+                source = self.source_bundle(name=field)
+                self.env[field] = 'd' * 40
+                result = self.run_installer('--source', str(source), '--dev-localhost', '--no-start', image=None)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.target / '.env').exists())
+                self.assertFalse((self.target / 'config').exists())
+                self.assertFalse(any('--output' in call['args'] for call in self.calls()))
+                self.env.pop(field)
+
+    def test_source_upgrade_builds_the_selected_new_commit_without_regenerating_configuration(self):
+        source = self.source_bundle()
+        first = self.run_installer('--source', str(source), '--dev-localhost', '--no-start', image=None)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        config = self.target / 'config'
+        (config / 'data/p2pnet.db').write_bytes(b'persisted database')
+        before = {str(path.relative_to(config)): path.read_bytes() for path in config.rglob('*') if path.is_file()}
+        commit, version = 'e' * 40, 'server-v9.9.10'
+        newer = self.source_bundle(name='upgrade', commit=commit, version=version)
+        self.env.update(DOCKER_FIXTURE_COMMIT=commit, DOCKER_FIXTURE_VERSION=version,
+                        DOCKER_FIXTURE_ID='sha256:' + 'd' * 64)
+        second = self.run_installer('--source', str(newer), '--no-start', image=None)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(before, {str(path.relative_to(config)): path.read_bytes() for path in config.rglob('*') if path.is_file()})
+        settings = (self.target / '.env').read_text()
+        self.assertIn(f'P2WLAN_COMMIT={commit}', settings)
+        self.assertIn(f'P2WLAN_VERSION={version}', settings)
+        self.assertIn('P2WLAN_IMAGE=sha256:' + 'd' * 64, settings)
+        self.assertEqual(sum('--output' in call['args'] for call in self.calls()), 1)
 
 
 if __name__ == '__main__':

@@ -3,15 +3,16 @@ set -euo pipefail
 command -v python3 >/dev/null 2>&1 || { echo 'install-server-docker: Python 3 is required' >&2; exit 1; }
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 exec python3 - "$SCRIPT_DIR" "$@" <<'PY'
-"""Install the same immutable server image for configuration and both services."""
+"""Build verified server source locally or install a fixed server image."""
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import ipaddress
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
@@ -25,6 +26,7 @@ os.umask(0o077)
 script_dir = Path(sys.argv[1])
 parser = argparse.ArgumentParser(prog='install-server-docker.sh', description='P2WLAN Docker installer (local Linux Docker Engine + Compose)')
 source = parser.add_mutually_exclusive_group()
+source.add_argument('--source', help='verified SERVER-SOURCE.json bundle directory; build locally with Compose')
 source.add_argument('--version', help='fixed server-vX.Y.Z release; downloads its image digest manifest')
 source.add_argument('--image', help='released image pinned as registry/repository@sha256:DIGEST')
 source.add_argument('--manifest', help='local checksum-verified SERVER-IMAGE.json from a fixed release bundle')
@@ -73,7 +75,8 @@ def read_env(path, content=None):
     values = {}
     allowed = {'P2WLAN_UID', 'P2WLAN_GID', 'CONTROL_PORT', 'RELAY_PORT', 'METRICS_PORT',
                'RELAY_PUBLISH_HOST', 'P2WLAN_IMAGE', 'P2WLAN_CONFIG_DIR', 'COMPOSE_PROJECT_NAME',
-               'P2WLAN_VERSION', 'P2WLAN_COMMIT', 'P2WLAN_DEV_LOCALHOST'}
+               'P2WLAN_VERSION', 'P2WLAN_COMMIT', 'P2WLAN_DEV_LOCALHOST',
+               'P2WLAN_INSTALL_MODE', 'P2WLAN_SOURCE_DIR', 'P2WLAN_BUILD_IMAGE'}
     for line in (path.read_text() if content is None else content.decode()).splitlines():
         if not line or line.startswith('#'):
             continue
@@ -83,6 +86,8 @@ def read_env(path, content=None):
         if any(c in value for c in '\r\n\x00'):
             fail('invalid deployment environment value')
         values[key] = value
+    if values.get('P2WLAN_INSTALL_MODE', 'image') not in ('source', 'image'):
+        fail('invalid saved installation mode')
     return values
 
 def write_env(path, values):
@@ -295,7 +300,155 @@ def manifest(path, requested=None):
     validate_reference(data.get('image'))
     return data
 
-def install():
+SOURCE_REQUIRED = {'server/Dockerfile', 'server/go.mod', 'server/go.sum', 'scripts/install-server-docker.sh',
+                   'deploy/selfhost/compose.production.yml', 'deploy/selfhost/compose.build.yml'}
+SOURCE_METADATA = {'SERVER-SOURCE.json', 'SERVER-SOURCE.json.sha256'}
+
+def source_member(name):
+    if (not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_./-]{1,512}', name)
+            or str(PurePosixPath(name)) != name or name.startswith('/')
+            or any(part in ('.', '..') for part in name.split('/')) or len(name.split('/')) > 32
+            or not (name.startswith('server/') or name in SOURCE_REQUIRED)):
+        fail('source manifest contains an unsupported relative path')
+    return name
+
+def source_read(root, name, limit, *, destination=None, capture=False):
+    """Read via no-follow directory handles and fence each regular file read."""
+    parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    descriptor = None
+    writer = None
+    try:
+        parts = name.split('/')
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > limit:
+            fail('source files must be bounded regular files without hard links')
+        if destination is not None:
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            writer = destination.open('xb')
+        content = bytearray() if capture else None
+        digest, length = hashlib.sha256(), 0
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            length += len(block)
+            if length > limit:
+                fail('source file exceeds its size limit')
+            digest.update(block)
+            if writer is not None:
+                writer.write(block)
+            if content is not None:
+                content.extend(block)
+        after = os.fstat(descriptor)
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+        if identity(before) != identity(after) or length != before.st_size:
+            fail('source file changed during verification')
+        if writer is not None:
+            writer.close()
+            writer = None
+            destination.chmod(0o700 if before.st_mode & 0o111 else 0o600)
+        return bytes(content) if content is not None else None, digest.hexdigest(), length
+    finally:
+        if writer is not None:
+            writer.close()
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+def verified_source(raw, resources, *, copy=True, exact=False):
+    root = Path(raw)
+    if root.is_symlink() or not root.is_dir():
+        fail('source directory must be a real directory')
+    root = root.resolve()
+    metadata_bytes, metadata_hash, _ = source_read(root, 'SERVER-SOURCE.json', 1024 * 1024, capture=True)
+    checksum, _, _ = source_read(root, 'SERVER-SOURCE.json.sha256', 1024, capture=True)
+    match = re.fullmatch(r'([a-fA-F0-9]{64}) [ *]SERVER-SOURCE.json', checksum.decode().strip())
+    if not match or metadata_hash != match[1].lower():
+        fail('source manifest checksum mismatch')
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                fail('source manifest contains duplicate keys')
+            result[key] = value
+        return result
+    metadata = json.loads(metadata_bytes, object_pairs_hook=unique_object)
+    if (not isinstance(metadata, dict) or metadata.get('schema_version') != 1 or metadata.get('context') != 'server'
+            or not isinstance(metadata.get('version'), str) or not isinstance(metadata.get('source_sha'), str)
+            or not re.fullmatch(r'server-v[A-Za-z0-9._-]+', metadata.get('version', ''))
+            or not re.fullmatch(r'[a-f0-9]{40}', metadata.get('source_sha', ''))):
+        fail('source manifest requires a fixed server version, source SHA and server context')
+    files = metadata.get('files')
+    if not isinstance(files, dict) or not 1 <= len(files) <= 4096 or not SOURCE_REQUIRED.issubset(files):
+        fail('source manifest is missing required build files or exceeds its file count limit')
+    for name, digest in files.items():
+        source_member(name)
+        if not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest):
+            fail('source manifest contains an invalid file checksum')
+    if exact:
+        expected_files = set(files) | SOURCE_METADATA
+        expected_directories = {str(parent) for name in files for parent in PurePosixPath(name).parents if str(parent) != '.'}
+        observed = set()
+        for directory, folders, names in os.walk(root, followlinks=False):
+            for name in folders:
+                path = Path(directory) / name
+                if path.is_symlink() or path.relative_to(root).as_posix() not in expected_directories:
+                    fail('saved source directory contains unexpected directories or links')
+            for name in names:
+                relative = (Path(directory) / name).relative_to(root).as_posix()
+                if relative not in expected_files:
+                    fail('saved source directory contains unverified files')
+                observed.add(relative)
+        if observed != expected_files:
+            fail('saved source directory is incomplete')
+    snapshot = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix='p2wlan-source-'))) if copy else None
+    total = len(metadata_bytes) + len(checksum)
+    for name, digest in files.items():
+        _, actual, size = source_read(root, name, min(64 * 1024 * 1024, 256 * 1024 * 1024 - total),
+                                     destination=snapshot / name if snapshot is not None else None)
+        if actual != digest:
+            fail('source file checksum mismatch: ' + name)
+        total += size
+    if snapshot is not None:
+        (snapshot / 'SERVER-SOURCE.json').write_bytes(metadata_bytes)
+        (snapshot / 'SERVER-SOURCE.json.sha256').write_bytes(checksum)
+    return dict(metadata=metadata, snapshot=snapshot, root=root, metadata_hash=metadata_hash)
+
+def source_image(directory, commit):
+    return 'p2wlan-' + hashlib.sha256(str(directory).encode()).hexdigest()[:12] + '-server:' + commit
+
+def persist_source(directory, bundle, resources):
+    parent = directory / 'sources'
+    if parent.exists() or parent.is_symlink():
+        owner = protected(parent, directory=True)
+        if owner.st_uid != os.geteuid():
+            fail('saved source parent must belong to the installer user')
+    else:
+        parent.mkdir(mode=0o700)
+    target = parent / bundle['metadata']['source_sha']
+    if target.exists() or target.is_symlink():
+        owner = protected(target, directory=True)
+        if owner.st_uid != os.geteuid():
+            fail('saved source must belong to the installer user')
+        saved = verified_source(target, resources, copy=False, exact=True)
+        if saved['metadata_hash'] != bundle['metadata_hash']:
+            fail('saved source SHA already has different release metadata')
+        return target
+    temporary = Path(tempfile.mkdtemp(prefix='.source-', dir=parent))
+    try:
+        shutil.copytree(bundle['snapshot'], temporary, dirs_exist_ok=True)
+        temporary.rename(target)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return target
+
+def install(resources):
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repo):
         fail('repo must be OWNER/REPO')
     if args.version and not re.fullmatch(r'server-v[A-Za-z0-9._-]+', args.version):
@@ -345,7 +498,30 @@ def install():
             fail('existing publication is preserved; edit .env explicitly to change it')
     else:
         settings = {}
-    template = next((path for path in (script_dir / 'compose.production.yml', script_dir.parent / 'deploy/selfhost/compose.production.yml') if path.is_file()), None)
+    selection = bool(args.source or args.version or args.image or args.local_image or args.manifest)
+    source_bundle = None
+    expected = None
+    if args.source:
+        source_bundle = verified_source(args.source, resources, copy=not args.dry_run)
+    elif not selection and existing and settings.get('P2WLAN_INSTALL_MODE') == 'source':
+        stored_commit = settings.get('P2WLAN_COMMIT', '')
+        stored_source = directory / 'sources' / stored_commit
+        if (not re.fullmatch(r'[a-f0-9]{40}', stored_commit)
+                or settings.get('P2WLAN_SOURCE_DIR') != str(stored_source)
+                or settings.get('P2WLAN_BUILD_IMAGE') != source_image(directory, stored_commit)):
+            fail('saved source deployment identity is invalid')
+        source_bundle = verified_source(stored_source, resources, copy=not args.dry_run, exact=True)
+        if (source_bundle['metadata']['version'] != settings.get('P2WLAN_VERSION')
+                or source_bundle['metadata']['source_sha'] != stored_commit):
+            fail('saved source identity does not match deployment settings')
+    elif not selection and not existing and (script_dir.parent / 'SERVER-SOURCE.json').is_file():
+        source_bundle = verified_source(script_dir.parent, resources, copy=not args.dry_run)
+    if source_bundle is not None:
+        expected = source_bundle['metadata']
+        selection = True
+        template = (source_bundle['snapshot'] or source_bundle['root']) / 'deploy/selfhost/compose.production.yml'
+    else:
+        template = next((path for path in (script_dir / 'compose.production.yml', script_dir.parent / 'deploy/selfhost/compose.production.yml') if path.is_file()), None)
     if template is None:
         fail('compose.production.yml is missing; use the complete Docker deployment bundle')
     if args.dry_run:
@@ -357,13 +533,16 @@ def install():
                 relay_port = endpoint_parts(endpoint, args.dev_localhost)[1]
                 port_number(control_port, (relay_port,))
                 port_number(metrics_port, (relay_port, control_port))
-        print('Would deploy ' + (args.image or args.local_image or args.version or settings.get('P2WLAN_IMAGE', 'a fixed server release')))
+        if source_bundle is not None:
+            print('Would build source ' + expected['version'] + ' commit=' + expected['source_sha'] + ' with Docker Compose')
+        else:
+            print('Would deploy ' + (args.image or args.local_image or args.version or settings.get('P2WLAN_IMAGE', 'a fixed server release')))
         print(f'Directory: {directory}; start={not args.no_start}; health timeout={args.wait_timeout}s')
         return
     adjacent = script_dir / 'SERVER-IMAGE.json'
-    selection = bool(args.version or args.image or args.local_image or args.manifest)
-    expected = None
-    if args.manifest:
+    if source_bundle is not None:
+        pass
+    elif args.manifest:
         expected = manifest(Path(args.manifest))
         args.image = expected['image']
     elif not selection and existing:
@@ -379,8 +558,8 @@ def install():
         args.version = prompt(terminal, '固定服务端版本（server-vX.Y.Z）')
         if not re.fullmatch(r'server-v[A-Za-z0-9._-]+', args.version):
             fail('version must be a fixed server-vX.Y.Z tag')
-    if not (args.version or args.image or args.local_image):
-        fail('provide --version or --image, or use --interactive')
+    if not (source_bundle or args.version or args.image or args.local_image):
+        fail('provide --source, --version or --image, or use --interactive')
     # Fetch metadata into an ephemeral directory so the complete plan can be
     # confirmed before pulling an image or creating the persistent deployment.
     if args.version:
@@ -395,8 +574,9 @@ def install():
                 (metadata_dir / name).write_bytes(data)
             expected = manifest(metadata_dir / 'SERVER-IMAGE.json', args.version)
             args.image = expected['image']
-    image = args.local_image or args.image
-    validate_reference(image, local=bool(args.local_image))
+    image = source_image(directory, expected['source_sha']) if source_bundle else args.local_image or args.image
+    if source_bundle is None:
+        validate_reference(image, local=bool(args.local_image))
 
     def plan_for(saved):
         if saved:
@@ -438,8 +618,11 @@ def install():
                 plan['no_start'] = choice(terminal, '启动方式', '2' if plan['no_start'] else '1', ('1', '2')) == '2'
             terminal.write('\n[7/7] 部署摘要\n')
             target_version = expected['version'] if expected else args.version or '镜像版本将在拉取后核验'
+            if source_bundle:
+                image = source_image(directory, expected['source_sha'])
+                terminal.write('安装来源：已校验源码，本机 Docker Compose 构建\n源码提交：' + expected['source_sha'] + '\n')
             for label, value in (
-                ('目标版本', target_version), ('固定镜像', image), ('部署目录', str(directory)),
+                ('目标版本', target_version), ('本机构建镜像' if source_bundle else '固定镜像', image), ('部署目录', str(directory)),
                 ('部署模式', '本机测试' if plan['dev'] else '公网部署'), ('Relay地址', plan['endpoint']),
                 ('Control端口', plan['control_port']), ('Relay端口', plan['relay_port']),
                 ('metrics端口', plan['metrics_port']), ('Relay绑定IP', plan['publish_host']),
@@ -516,7 +699,24 @@ def install():
             fail('deployment changed; rerun to preserve the new configuration')
         with tempfile.TemporaryDirectory(prefix='.setup-', dir=directory) as temporary:
             stage = Path(temporary)
-            if not args.local_image:
+            saved_source = None
+            build_image = None
+            if source_bundle:
+                saved_source = persist_source(directory, source_bundle, resources)
+                project = 'p2wlan-' + hashlib.sha256(str(directory).encode()).hexdigest()[:12]
+                build_image = source_image(directory, expected['source_sha'])
+                build_env = dict(os.environ, P2WLAN_BUILD_CONTEXT=str(saved_source / 'server'),
+                                 P2WLAN_BUILD_IMAGE=build_image, P2WLAN_VERSION=expected['version'],
+                                 P2WLAN_COMMIT=expected['source_sha'])
+                print('[1/3] Building the verified source with Docker Compose')
+                try:
+                    run(['docker', 'compose', '--project-name', project + '-build', '--env-file', '/dev/null',
+                         '-f', str(saved_source / 'deploy/selfhost/compose.build.yml'), 'build', 'builder'],
+                        timeout=1800, capture=False, env=build_env)
+                except InstallError:
+                    fail('source build failed; existing runtime configuration and data were preserved')
+                image = build_image
+            elif not args.local_image:
                 print('[1/3] Pulling the fixed image digest')
                 try:
                     run(['docker', 'pull', image], timeout=600, capture=False)
@@ -529,6 +729,11 @@ def install():
             if args.local_image:
                 if metadata.get('Id') != image:
                     fail('local image identity mismatch')
+            elif source_bundle:
+                if (version != expected['version'] or commit != expected['source_sha']
+                        or not re.fullmatch(r'sha256:[a-f0-9]{64}', metadata.get('Id', ''))):
+                    fail('built image identity does not match the verified source')
+                image = metadata['Id']
             else:
                 if (not re.fullmatch(r'server-v[A-Za-z0-9._-]+', version)
                         or not re.fullmatch(r'[a-f0-9]{40}', commit)
@@ -597,7 +802,13 @@ def install():
             project = 'p2wlan-' + hashlib.sha256(str(directory).encode()).hexdigest()[:12]
             settings.update(P2WLAN_IMAGE=image, P2WLAN_CONFIG_DIR=str(config), COMPOSE_PROJECT_NAME=project,
                             P2WLAN_VERSION=version, P2WLAN_COMMIT=commit,
-                            P2WLAN_DEV_LOCALHOST='true' if args.dev_localhost else 'false')
+                            P2WLAN_DEV_LOCALHOST='true' if args.dev_localhost else 'false',
+                            P2WLAN_INSTALL_MODE='source' if source_bundle else 'image')
+            if source_bundle:
+                settings.update(P2WLAN_SOURCE_DIR=str(saved_source), P2WLAN_BUILD_IMAGE=build_image)
+            else:
+                settings.pop('P2WLAN_SOURCE_DIR', None)
+                settings.pop('P2WLAN_BUILD_IMAGE', None)
             staged_compose = stage / 'compose.yml'
             shutil.copyfile(template, staged_compose)
             staged_env = stage / '.env'
@@ -640,7 +851,8 @@ def install():
         terminal.close()
 
 try:
-    install()
+    with contextlib.ExitStack() as resources:
+        install(resources)
 except (InstallError, OSError, ValueError, KeyError) as error:
     sys.exit('install-server-docker: ' + str(error))
 PY

@@ -307,7 +307,7 @@ P2WLAN uses a self-contained **WireGuard-like Noise** data plane with X25519, Ch
 
 ## Self-hosting
 
-The Control Plane and Relay live under [`server/`](server/). Fixed server packages use **`server-vX.Y.Z`** tags and support native Linux systemd installation or Docker Compose deployment. Ordinary deployments do not require Go or Node.js on the server.
+The Control Plane and Relay live under [`server/`](server/). Fixed server packages use **`server-vX.Y.Z`** tags and support native Linux systemd installation or Docker Compose deployment. Docker builds the verified release source package by default; Node.js and Go run inside build containers, so neither is required on the host.
 
 Log in to the Linux server and copy this entire line to start interactive deployment. No source checkout is needed:
 
@@ -318,14 +318,14 @@ curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/bootst
 The wizard takes you through the complete flow:
 
 1. On the first screen, choose `1` for direct system installation, `2` for Docker deployment (default), or `0` to exit.
-2. Check and approve missing dependencies for the chosen method. Direct installation uses systemd; Docker deployment prepares Engine / Compose.
+2. Check and approve missing dependencies for the chosen method. Direct installation uses systemd; Docker deployment prepares Engine, Compose, and Buildx.
 3. Choose an available release for that method or enter a fixed `server-vX.Y.Z`, then download and verify its package.
 4. Confirm installation, configuration, and data paths, then choose public or localhost mode. Existing deployments enter an upgrade flow that preserves their configuration.
 5. For public deployment, enter the Relay domain or IP, port, certificate chain, and private-key paths; confirm internal ports and, for Docker, the Relay bind address.
 6. Choose immediate startup or preparation only, review the complete summary, then confirm, edit, or cancel.
-7. After confirmation, install the verified binaries or pull the fixed image digest and generate configuration for a new deployment. Startup waits for health checks, then shows endpoints, credential-file locations, and management commands.
+7. After confirmation, native installation uses the verified binaries. Docker uses Compose to build the admin UI and server from the selected release source, then starts the verified local image ID. New deployments receive matching configuration. Startup waits for health checks, then shows endpoints, credential-file locations, and management commands.
 
-Existing configuration, credentials, and database state are preserved; the admin token is not printed. See the [complete interactive flow](docs/guides/self-hosting.md#完整交互流程) for fields, defaults, and a terminal example.
+Existing configuration, credentials, and database state are preserved. To upgrade, run the same command again and select a new version. Docker source files remain in the deployment directory and Docker can reuse its build cache; the first build usually takes longer than pulling a prebuilt image. If the selected release also provides prebuilt image assets, replace the command's final `sudo bash` with `sudo bash -s -- --method docker --docker-mode image --interactive` to select that mode explicitly. The admin token is not printed. See the [complete interactive flow](docs/guides/self-hosting.md#完整交互流程) for fields, defaults, and a terminal example.
 
 The command requires `curl`, `sudo`, and a published bootstrap script and server release for the chosen method; omit `sudo` in a root shell. Automatic environment preparation supports amd64 / arm64 systemd hosts on Ubuntu 22.04 / 24.04 / 26.04 and Debian 12 / 13. Prepare a trusted Relay certificate and a Control HTTPS/WSS reverse proxy before public deployment. See the [self-hosting guide](docs/guides/self-hosting.md) for fixed-version commands, path options, and other Linux environments.
 

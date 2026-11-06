@@ -1,5 +1,8 @@
 dist/
-admin-ui/
+admin-ui/node_modules/
+admin-ui/.vite/
+admin-ui/coverage/
+admin/web/
 *.db
 *.db-*
 *.sqlite*
@@ -16,3 +19,4 @@ log-uploads/
 p2wlan-control
 p2wlan-relay
 p2wlan-config
+p2wlan-db

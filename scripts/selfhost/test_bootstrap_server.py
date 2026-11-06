@@ -26,6 +26,8 @@ ARCHIVE = 'p2wlan-server-docker.tar.gz'
 ASSETS = (ARCHIVE, ARCHIVE + '.sha256', 'SERVER-IMAGE.json', 'SERVER-IMAGE.json.sha256')
 NATIVE_ARCHIVE = 'p2wlan-server-linux-amd64.tar.gz'
 NATIVE_ASSETS = (NATIVE_ARCHIVE, NATIVE_ARCHIVE + '.sha256')
+SOURCE_ARCHIVE = 'p2wlan-server-source.tar.gz'
+SOURCE_ASSETS = (SOURCE_ARCHIVE, SOURCE_ARCHIVE + '.sha256')
 
 
 class BootstrapServerTests(unittest.TestCase):
@@ -53,6 +55,7 @@ class BootstrapServerTests(unittest.TestCase):
                         BOOTSTRAP_INSTALLER_LOG=str(self.installer_log),
                         BOOTSTRAP_EXECUTION_DIR_LOG=str(self.path / 'executed-package-dir'),
                         BOOTSTRAP_COMPOSE_READY=str(self.path / 'compose-ready'),
+                        P2WLAN_DOCKER_MODE='image',
                         BOOTSTRAP_REAL_PYTHON=sys.executable,
                         P2WLAN_BOOTSTRAP_OS_RELEASE=str(self.os_release), P2WLAN_SYSTEMD_DIR=str(systemd))
         for name in ('bash', 'cat', 'cp', 'dirname', 'mktemp', 'rm', 'chmod', 'awk', 'sed', 'tar',
@@ -138,6 +141,7 @@ with open(os.environ['BOOTSTRAP_SYSTEM_LOG'], 'a') as log: log.write(json.dumps(
 if args[:1] == ['info'] and os.environ.get('BOOTSTRAP_FAIL_DOCKER'): sys.exit(1)
 ready = pathlib.Path(os.environ['BOOTSTRAP_COMPOSE_READY']).exists()
 if args[:2] == ['compose', 'version'] and os.environ.get('BOOTSTRAP_NO_COMPOSE') and not ready: sys.exit(1)
+if args[:2] == ['buildx', 'version'] and os.environ.get('BOOTSTRAP_NO_BUILDX') and not ready: sys.exit(1)
 if args[:2] == ['context', 'inspect']: print('unix:///fixture/docker.sock')
 elif args[:2] == ['compose', 'up'] and '--help' in args:
     print('' if os.environ.get('BOOTSTRAP_OLD_COMPOSE') and not ready else '--wait --wait-timeout')
@@ -157,7 +161,7 @@ if name in ('apt-get', 'dnf') and 'install' in args:
     if any('docker' in value for value in args):
         shutil.copyfile(os.environ['BOOTSTRAP_DOCKER_SOURCE'], binary / 'docker')
         (binary / 'docker').chmod(0o755)
-    if 'docker-compose-plugin' in args:
+    if 'docker-compose-plugin' in args or 'docker-buildx-plugin' in args:
         pathlib.Path(os.environ['BOOTSTRAP_COMPOSE_READY']).touch()
 ''')
         self.manifest = {'schema_version': 1, 'version': VERSION, 'source_sha': COMMIT, 'image': IMAGE,
@@ -195,6 +199,16 @@ sys.exit(int(os.environ.get('BOOTSTRAP_INSTALLER_EXIT', '0')))
 FIXTURE
 '''
         self.pack_native()
+        self.source_members = {
+            'scripts/install-server-docker.sh': self.members['install-server-docker.sh'],
+            'deploy/selfhost/compose.production.yml': b'services: {}\n',
+            'deploy/selfhost/compose.build.yml': b'services: {builder: {build: {context: "${P2WLAN_BUILD_CONTEXT}"}}}\n',
+            'server/Dockerfile': b'FROM scratch\n',
+            'server/go.mod': b'module example.test/server\n',
+            'server/go.sum': b'',
+        }
+        self.source_metadata = dict(schema_version=1, version=VERSION, source_sha=COMMIT, context='server')
+        self.pack_source()
 
     @staticmethod
     def executable(path, content):
@@ -260,6 +274,34 @@ FIXTURE
                     bundle.addfile(member, io.BytesIO(data))
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         (self.downloads / (NATIVE_ARCHIVE + '.sha256')).write_text(f'{digest}  {NATIVE_ARCHIVE}\n')
+
+    def pack_source(self, *, bad_inner=False, duplicate=None, symlink=None, extra=None, altered=None):
+        metadata = dict(self.source_metadata,
+                        files={name: hashlib.sha256(data).hexdigest() for name, data in self.source_members.items()})
+        raw = json.dumps(metadata).encode()
+        digest = '0' * 64 if bad_inner else hashlib.sha256(raw).hexdigest()
+        content = dict(self.source_members)
+        content.update({'SERVER-SOURCE.json': raw,
+                        'SERVER-SOURCE.json.sha256': f'{digest}  SERVER-SOURCE.json\n'.encode()})
+        if extra:
+            content[extra] = b'unexpected archive member'
+        if altered:
+            content[altered] += b'tampered after hashing'
+        archive = self.downloads / SOURCE_ARCHIVE
+        with tarfile.open(archive, 'w:gz') as bundle:
+            for name, data in content.items():
+                member = tarfile.TarInfo(name)
+                member.mode = 0o755 if name.endswith('.sh') else 0o644
+                member.size = len(data)
+                if name == symlink:
+                    member.type, member.linkname, member.size = tarfile.SYMTYPE, '/outside/fixture', 0
+                    bundle.addfile(member)
+                else:
+                    bundle.addfile(member, io.BytesIO(data))
+                if name == duplicate:
+                    bundle.addfile(member, io.BytesIO(data))
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        (self.downloads / (SOURCE_ARCHIVE + '.sha256')).write_text(f'{digest}  {SOURCE_ARCHIVE}\n')
 
     def run_bootstrap(self, *args, version=VERSION, headless=True, include_dir=True):
         command = ['/bin/bash', '-s', '--']
@@ -345,6 +387,92 @@ FIXTURE
 }
 ''')
         self.env['BASH_ENV'] = str(startup)
+
+    def test_default_docker_pipe_selects_source_release_and_hands_off_verified_source(self):
+        # The remaining image tests explicitly select their legacy path using
+        # the fixture environment. No override is present in this default test.
+        self.env.pop('P2WLAN_DOCKER_MODE')
+        self.releases([
+            self.release('v99.0.0', published='2026-11-06T00:00:00Z', names=SOURCE_ASSETS),
+            self.release('server-v9.9.10', published='2026-11-05T00:00:00Z'),
+            self.release(VERSION, published='2026-11-04T00:00:00Z', names=SOURCE_ASSETS),
+        ])
+        code, output = self.run_piped_pty()
+        self.assertEqual(code, 0, output)
+        self.assertIn('Compose 本机源码构建', output)
+        self.assertIn('Verified source ' + VERSION, output)
+        self.assertNotIn('1) server-v9.9.10', output)
+        arguments = json.loads(self.installer_log.read_text())
+        self.assertIn('--interactive', arguments)
+        source = Path(arguments[arguments.index('--source') + 1])
+        self.assertFalse(source.exists(), 'bootstrap temporary source must be cleaned')
+        self.assertNotIn('--manifest', arguments)
+        downloads = [url for url in self.json_lines(self.curl_log) if '/releases/download/' in url]
+        self.assertEqual({url.rsplit('/', 1)[-1] for url in downloads}, set(SOURCE_ASSETS))
+        self.assertFalse(any('ghcr.io' in url for url in self.json_lines(self.curl_log)))
+
+    def test_explicit_source_build_automation_pins_version_without_image_metadata(self):
+        result = self.run_bootstrap('--docker-mode', 'build', '--no-start')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        arguments = json.loads(self.installer_log.read_text())
+        self.assertIn('--source', arguments)
+        self.assertIn('--non-interactive', arguments)
+        self.assertIn('--no-start', arguments)
+        self.assertNotIn('--manifest', arguments)
+        self.assertTrue(all(f'/releases/download/{VERSION}/' in url for url in self.json_lines(self.curl_log)))
+
+    def test_source_dry_run_never_executes_installer_or_builds(self):
+        result = self.run_bootstrap('--docker-mode', 'build', '--dry-run')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Verified source', result.stdout)
+        self.assert_installer_not_run()
+        self.assertFalse(any(call[0] == 'docker' and 'build' in call for call in self.json_lines(self.system_log)))
+
+    def test_invalid_source_archives_cannot_execute_the_installer(self):
+        cases = (
+            ({'bad_inner': True}, 'source manifest checksum mismatch'),
+            ({'duplicate': 'server/Dockerfile'}, 'unsafe or duplicate path'),
+            ({'symlink': 'scripts/install-server-docker.sh'}, 'bounded regular source members'),
+            ({'extra': '../outside'}, 'unsafe or duplicate path'),
+            ({'extra': 'server/unlisted.go'}, 'checksum manifest does not match'),
+            ({'altered': 'server/go.mod'}, 'source file checksum mismatch'),
+        )
+        for options, reason in cases:
+            with self.subTest(options=options):
+                self.pack_source(**options)
+                result = self.run_bootstrap('--docker-mode', 'build')
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assertNotIn('Traceback', result.stderr)
+                self.assert_installer_not_run()
+
+    def test_source_metadata_requires_version_commit_and_expected_build_context(self):
+        for key, value in (('version', 'server-v8.8.8'), ('source_sha', 'unknown'),
+                           ('context', '../server'), ('schema_version', 2)):
+            with self.subTest(key=key):
+                old = self.source_metadata[key]
+                self.source_metadata[key] = value
+                self.pack_source()
+                result = self.run_bootstrap('--docker-mode', 'build')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('source archive requires the selected version', result.stderr)
+                self.assertNotIn('Traceback', result.stderr)
+                self.assert_installer_not_run()
+                self.source_metadata[key] = old
+
+    def test_source_build_prepares_only_missing_buildx_on_an_existing_engine(self):
+        self.env['BOOTSTRAP_NO_BUILDX'] = '1'
+        result = self.run_bootstrap('--docker-mode', 'build', '--install-deps', '--no-start')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        installs = [call for call in self.json_lines(self.system_log) if call[:1] == ['apt-get'] and 'install' in call]
+        self.assertTrue(any('docker-buildx-plugin' in call for call in installs))
+        self.assertFalse(any('docker-ce' in call or 'docker-compose-plugin' in call for call in installs))
+
+    def test_invalid_docker_mode_is_rejected_before_network_or_deployment(self):
+        result = self.run_bootstrap('--docker-mode', 'unknown')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.json_lines(self.curl_log), [])
+        self.assert_installer_not_run()
 
     def test_fixed_version_bootstrap_uses_only_that_tags_assets(self):
         result = self.run_bootstrap('--no-start')

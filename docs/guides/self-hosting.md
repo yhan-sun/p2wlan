@@ -11,9 +11,11 @@
 - p2wlan-server、install-server.sh、deploy-server.sh
 - BUILD-METADATA.txt 和 SHA256SUMS
 
-普通部署不需要在服务器上安装 Go、Node.js 或从源码构建。Linux systemd manager 的安装、升级和 doctor 需要 Python 3 标准库，以固定文件句柄检查和准备私有日志存储；该检查代码随同一归档的 manager 发布，不在线下载。管理台使用 React/TypeScript/Vite 开发，但 Vite 只在开发和 CI 构建阶段运行；生成的静态产物由 `go:embed` 编译进 `p2wlan-control`，发布后仍然是单一 Control 进程。
+原生安装直接使用发布二进制；Docker 默认构建已校验的发布源码。两种方式均不需要在宿主机安装 Go 或 Node.js。Linux systemd manager 的安装、升级和 doctor 需要 Python 3 标准库，以固定文件句柄检查和准备私有日志存储；该检查代码随同一归档的 manager 发布，不在线下载。管理台使用 React/TypeScript/Vite 开发，构建后的静态产物由 `go:embed` 编译进 `p2wlan-control`，运行时仍然是单一 Control 进程。
 
-Docker 部署使用独立的 `p2wlan-server-docker.tar.gz` 和同名 `.sha256`。包内含安装向导、生产 Compose 模板、`SERVER-IMAGE.json` 和该元数据的 checksum。元数据绑定服务端 tag、源码 SHA、多架构镜像摘要及平台；安装时拉取 `ghcr.io/yhan-sun/p2wlan/server@sha256:...`，不在业务服务器构建镜像，也不使用 `latest`。
+Docker 默认使用 `p2wlan-server-source.tar.gz` 和同名 `.sha256`。包内含完整 `server/` 源码、同版本安装器、构建与生产 Compose 模板，以及 `SERVER-SOURCE.json` 和该元数据的 checksum。元数据绑定固定 tag、源码 SHA、构建上下文和每个源码文件的摘要。校验后，由独立 Compose builder 在容器内构建 Node 管理台和 Go 服务，再用核验后的本地镜像 ID 运行生产服务；首次构建通常比拉取镜像慢，需要可访问构建基础镜像和依赖源。
+
+发布者可额外提供预构建镜像模式，使用 `p2wlan-server-docker.tar.gz`、`SERVER-IMAGE.json` 及各自 checksum，绑定 GHCR 多架构固定摘要。引导入口只有显式指定 `--docker-mode image` 才使用该模式；默认源码部署不依赖这些可选资产或 GHCR 应用镜像。
 
 ## 支持与验证范围
 
@@ -22,9 +24,9 @@ Docker 部署使用独立的 `p2wlan-server-docker.tar.gz` 和同名 `.sha256`�
 | 运行形态 | 自动验证范围 | 边界 |
 | --- | --- | --- |
 | Linux 原生服务 | Ubuntu 22.04 上执行 Go vet、race/full tests、Control/Relay 双进程认证 smoke、IPv6 TLS/撤权验证和 manager contract | 这是固定服务端归档与 systemd manager 的主要验证路径 |
-| 管理台前端 | 固定 Node 版本安装依赖，执行 TypeScript typecheck、Vite production build，并校验构建后的静态产物；服务端发布任务会在 Go 编译前再次构建管理台 | Node 只属于构建链，不进入生产服务器运行时 |
+| 管理台前端 | 固定 Node 版本安装依赖，执行 TypeScript typecheck、Vite production build，并校验构建后的静态产物；服务端发布和 Docker 构建均在 Go 编译前构建管理台 | Docker 的 Node 和 Go 工具链只进入构建阶段，不进入运行镜像 |
 | Linux 静态服务端二进制 | Ubuntu 20.04 容器验证 `CGO_ENABLED=0` 产物没有动态 loader，并能执行 `--version` | 只证明基础 loader 兼容，不等于 Ubuntu 20.04 上完整 systemd、网络和业务链路已验收 |
-| Docker Compose | Ubuntu 22.04 runner 构建实际 Debian bookworm 镜像、启动 Control/Relay、检查 readyz，并验证 SQLite 数据卷重启持久性 | 生产部署仍应使用固定镜像摘要并自行完成公网、TLS 和恢复演练 |
+| Docker Compose | Ubuntu 22.04 runner 构建实际 Debian bookworm 镜像、启动 Control/Relay、检查 readyz，并验证 SQLite 数据卷重启持久性；公开发布验收另从固定源码包执行交互安装和重装 | 源码构建与可选镜像验收分别记录结果；本机健康检查不能替代公网、TLS 和恢复演练 |
 | Windows 服务端代码 | `windows-latest` 执行 Go vet/tests 和真实 Control/Relay 双进程 smoke | 当前固定 `server-vX.Y.Z` 发布归档不是 Windows 安装包，因此 Windows 不属于公开的固定归档部署路径 |
 
 这表示 Ubuntu 20.04 会验证发布形态的静态 Control/Relay 二进制可以启动并报告版本，但当前 CI 不声明 Ubuntu 20.04 的完整 systemd 管理、真实网络、TLS、升级恢复和长期运行已经端到端验收。未列入完整验证矩阵的 Linux 发行版不能仅凭“能启动二进制”视为正式兼容；正式部署优先使用已验证的 Ubuntu 22.04 或固定镜像，并自行核对 systemd、文件权限、反向代理、TLS、数据库和内核网络能力。
@@ -39,22 +41,22 @@ Docker 部署使用独立的 `p2wlan-server-docker.tar.gz` 和同名 `.sha256`�
 
 这一下载入口需要系统已有 `curl` 和 `sudo`；root 终端可去掉 `sudo`。首屏先选择 `1` 直接安装（原生 systemd）、`2` Docker 部署（默认）或 `0` 退出，然后检查并询问是否安装该方式的缺失依赖。直接安装准备原生运行工具；Docker 方式准备 Docker Engine / Compose。自动准备环境支持 Ubuntu 22.04 / 24.04 / 26.04、Debian 12 / 13 的 amd64 / arm64 systemd 主机，Docker 使用官方 apt 源；其他 Linux 主机可在自行准备好对应运行环境后使用。
 
-脚本只发现非 draft、非 prerelease、包含所选方式资产的正式 `server-vX.Y.Z`。直接安装要求与主机架构匹配的原生归档及同名 checksum；Docker 要求部署包、镜像元数据及各自同名 checksum 均上传完成。确认版本后下载同一 tag 的包，校验摘要与发布身份，再运行包内向导。按提示填写路径、Relay 地址和可信 TLS 文件，完成配套配置、启动与健康检查。整个流程通过当前终端交互，支持从 `curl` 管道启动。
+脚本只发现非 draft、非 prerelease、包含所选方式资产的正式 `server-vX.Y.Z`。直接安装要求与主机架构匹配的原生归档及同名 checksum；默认 Docker 要求源码部署包及同名 checksum 均上传完成。显式镜像模式另要求 Docker 部署包、镜像元数据及各自 checksum。确认版本后下载同一 tag 的包，校验摘要与发布身份，再运行包内向导。按提示填写路径、Relay 地址和可信 TLS 文件，完成配套配置、启动与健康检查。整个流程通过当前终端交互，支持从 `curl` 管道启动。
 
 这个入口要求 `main` 已提供 `bootstrap-server.sh`，并已有包含对应安装器与资产的正式服务端 Release。原生列表与 Docker 列表分别筛选，只有原生归档的版本不会出现在 Docker 列表中；历史归档仍须具备相应安装器接口。查找不到匹配发布或校验失败时会停止，不回退到未校验源码部署。公网 Control 的可信 HTTPS/WSS 反向代理和 Relay 证书仍由部署者准备。
 
-引导脚本的 `main` 地址用于获取当前安装入口；实际程序和 Docker 模板、镜像来自一个已经解析并固定的 Release。重复部署时显式指定方式和 tag，例如选择 Docker：
+引导脚本的 `main` 地址用于获取当前安装入口；实际程序、源码和 Docker 模板来自一个已经解析并固定的 Release。重复部署时显式指定方式和 tag，例如选择默认的 Docker 源码构建：
 
     curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/bootstrap-server.sh | sudo bash -s -- --method docker --version server-vX.Y.Z --interactive
 
-直接安装将 `--method docker` 换为 `--method native`。
+直接安装将 `--method docker` 换为 `--method native`。Docker 的 `--docker-mode build` 是默认值，无额外选择菜单；只有所选版本另有镜像资产时，才可显式加 `--docker-mode image` 使用预构建镜像。
 
 自动发现最多读取 5 页、每页 100 条 Release。GitHub API 限流或需要直接选择较早版本时，可使用上面的明确版本命令绕过发现过程。
 
 无人值守必须显式指定 `--version`，建议同时用 `--method` 明确方式，未传时默认 Docker；允许安装缺失依赖时再加 `--install-deps`。Docker 示例：
 
     curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/bootstrap-server.sh | sudo bash -s -- \
-      --method docker --version server-vX.Y.Z --non-interactive --install-deps \
+      --method docker --docker-mode build --version server-vX.Y.Z --non-interactive --install-deps \
       --dir /opt/p2wlan-docker --relay-endpoint tls://relay.example.com:18081 \
       --tls-cert /etc/ssl/p2wlan/fullchain.pem --tls-key /etc/ssl/p2wlan/privkey.pem
 
@@ -71,7 +73,7 @@ Docker 部署使用独立的 `p2wlan-server-docker.tar.gz` 和同名 `.sha256`�
 | 方式 | 专用参数 | 默认路径 |
 | --- | --- | --- |
 | 直接安装 `native` | `--root`、`--config-dir`、`--data-dir`、`--start` | 程序 `/opt/p2wlan-server`；配置 `/etc/p2wlan`；数据 `/var/lib/p2wlan` |
-| Docker `docker` | `--dir`、`--publish-host`、`--wait-timeout` | 持久目录 `/opt/p2wlan-docker` |
+| Docker `docker` | `--docker-mode build\|image`、`--dir`、`--publish-host`、`--wait-timeout` | 持久目录 `/opt/p2wlan-docker`；默认 `build` |
 
 引导入口的无人值守部署默认安装并启动；`--no-start` 只准备原生安装或 Docker 部署文件。`--dry-run` 查询发布、下载并校验所选方式的包，但不安装依赖、不执行包内安装器或启动服务；主机仍须已有 Python 3 和 curl。它不能替代服务与公网连通性验收。
 
@@ -84,8 +86,8 @@ Docker 部署使用独立的 `p2wlan-server-docker.tar.gz` 和同名 `.sha256`�
 5. **选择部署模式。** 新部署选择公网服务或本机测试。公网服务使用已有可信证书；本机测试生成短期 loopback 测试证书，不面向公网客户端。
 6. **填写 Relay 和 TLS。** 公网模式依次填写 Relay 域名或 IP、端口、完整证书链 PEM 路径、匹配私钥 PEM 路径。证书须覆盖所填主机名且在有效期内；向导不会签发公信证书。
 7. **确认内部端口。** Control 内部 HTTP 默认 `18080`、Relay 健康检查默认 `18082`，Relay 端口默认 `18081`。Docker 还确认 Relay 发布绑定 IP，公网默认 `0.0.0.0`。Control 始终只发布到 loopback，公网 HTTPS/WSS 由外部反向代理提供。
-8. **选择执行方式并确认摘要。** 启动方式选 `1` 安装并启动、`2` 只准备，默认 `1`。摘要列出固定版本、目录、Relay、端口、TLS 文件和执行方式，Docker 还列出镜像身份，不显示秘密；最后选 `1` 确认、`2` 重填、`0` 取消。已有部署保留配置，重填只调整允许的执行选项。
-9. **自动执行并交付入口。** 原生分支安装已校验的二进制和 systemd unit；Docker 分支拉取固定摘要镜像。新部署生成匹配的 Control/Relay 配置。立即启动会等待健康检查，失败时报告排查入口；只准备不会声称服务已经健康。完成后显示本机 Control、Relay、管理台、凭据文件位置和对应方式的管理命令。
+8. **选择执行方式并确认摘要。** 启动方式选 `1` 安装并启动、`2` 只准备，默认 `1`。摘要列出固定版本、目录、Relay、端口、TLS 文件和执行方式，Docker 还列出源码身份或显式选择的镜像身份，不显示秘密；最后选 `1` 确认、`2` 重填、`0` 取消。已有部署保留配置，重填只调整允许的执行选项。
+9. **自动执行并交付入口。** 原生分支安装已校验的二进制和 systemd unit；默认 Docker 分支运行独立 Compose builder，先构建管理台再构建 Go 服务，核验本地镜像 ID、标签和二进制版本；显式镜像模式才拉取固定摘要。新部署生成匹配的 Control/Relay 配置。立即启动会等待健康检查，失败时报告排查入口；只准备不会声称服务已经健康。完成后显示本机 Control、Relay、管理台、凭据文件位置和对应方式的管理命令。
 
 已有部署不会重新询问并生成一套新 JWT、管理台或 Relay 凭据；向导展示已保存的配置，让部署者确认升级和启动方式。更换 TLS 或调整既有参数应按下文的配置与证书维护步骤显式进行。
 
@@ -94,7 +96,7 @@ Docker 部署使用独立的 `p2wlan-server-docker.tar.gz` 和同名 `.sha256`�
 ```text
 阶段一：选择安装方式
   1) 直接安装（Linux + systemd，不需要 Docker）
-  2) Docker 部署（Docker Compose）
+  2) Docker 部署（Compose 本机源码构建）
   0) 取消并退出
 安装方式 [2]: 2
 请选择版本编号 [1]: 1
@@ -123,33 +125,27 @@ Relay绑定IP [0.0.0.0]: 0.0.0.0
 
 ### 直接使用 Docker 部署包
 
-主机需要 Python 3、本机运行的 Docker Engine 和 Compose v2；当前安装器使用 rootful Linux Engine，不支持远程 Docker context、rootless 或用户命名空间映射，也不自动安装 Docker。先确认 Docker 已启动且 `docker compose version` 可用，再在服务器上的仓库目录运行：
+主机需要 Python 3、本机运行的 Docker Engine 和 Compose v2；当前安装器使用 rootful Linux Engine，不支持远程 Docker context、rootless 或用户命名空间映射，也不自动安装 Docker。自动准备环境应使用前面的一行引导入口。
 
-    sudo bash scripts/install-server-docker.sh
+需要手工传递部署包时，从同一个固定 Release 下载源码包及 checksum，先校验再解包；安装器的 `--source` 指向含 `SERVER-SOURCE.json` 的包根目录：
 
-向导接收固定的 `server-vX.Y.Z`，从同一 Release 下载并校验 `SERVER-IMAGE.json`，按其中的精确摘要拉取镜像。首次部署填写 Relay 的 `tls://host:port` 地址、覆盖该主机名的完整证书链和匹配私钥路径。配置生成器在所选镜像中运行，自动生成匹配的 Control/Relay 凭据；安装器保存持久配置和数据库，启动 Compose 服务并等待健康检查。Control 默认只发布到 loopback，公网 HTTPS/WSS 仍由外部可信反向代理提供。
+    sha256sum -c p2wlan-server-source.tar.gz.sha256
+    mkdir p2wlan-server-source
+    tar -xzf p2wlan-server-source.tar.gz -C p2wlan-server-source
+    cd p2wlan-server-source
+    sudo bash scripts/install-server-docker.sh --source "$PWD" --interactive
 
-从 Release 下载 Docker 部署包后，无需 checkout 源码；先校验、解包，再运行包内向导。相邻的元数据已绑定该次发布，无需手抄镜像摘要：
+向导验证源码 manifest 和每个文件摘要，确认后把源码保存在持久目录 `sources/<source_sha>/`，再通过 `compose.build.yml` 的独立 builder 构建镜像。构建会执行管理台锁文件安装、typecheck 和 production build，然后编译 Go 程序；宿主不运行 Node 或 Go。构建与运行使用不同 Compose 文件，builder 不读取运行服务的私有 env 文件。
 
-    sha256sum -c p2wlan-server-docker.tar.gz.sha256
-    mkdir p2wlan-server-docker
-    tar -xzf p2wlan-server-docker.tar.gz -C p2wlan-server-docker
-    cd p2wlan-server-docker
-    sudo bash ./install-server-docker.sh
+首次部署填写 Relay 的 `tls://host:port` 地址、覆盖该主机名的完整证书链和匹配私钥路径。配置生成器在核验后的镜像中运行，自动生成匹配的 Control/Relay 凭据；安装器保存持久配置和数据库，启动生产 Compose 服务并等待健康检查。Control 默认只发布到 loopback，公网 HTTPS/WSS 仍由外部可信反向代理提供。
 
-无人值守部署可明确指定版本和 TLS 参数：
+显式预构建镜像部署使用前面的一行入口并加 `--method docker --docker-mode image --interactive`；对应 Release 必须额外提供 Docker 部署包和 `SERVER-IMAGE.json`。直接使用该可选包时，也可向安装器提供 `--version server-vX.Y.Z` 或明确的 `--image repository@sha256:...`；镜像仓库必须允许主机读取。源码部署不需要 GHCR 应用镜像登录，但构建仍需下载基础镜像、npm 和 Go 依赖。
 
-    sudo bash scripts/install-server-docker.sh --non-interactive \
-      --version server-vX.Y.Z --dir /opt/p2wlan-server-docker \
-      --relay-endpoint tls://relay.example.com:18081 \
-      --tls-cert /etc/ssl/p2wlan/fullchain.pem \
-      --tls-key /etc/ssl/p2wlan/privkey.pem
+`--dir` 选择持久部署目录；重复运行保留已有配置、凭据和数据库，升级前仍应备份。`--dev-localhost` 使用仅用于隔离测试的 loopback 证书，不适合公网客户端。`--no-start` 完成镜像和配置准备，不启动 Control/Relay；`--wait-timeout` 设置启动健康检查期限。安装器的 `--dry-run` 校验本地输入并展示计划，不调用 Docker、下载元数据或写入持久部署目录，不作为构建成功或 TLS 已验证的证据。
 
-也可用 `--image` 传入明确的 `repository@sha256:...` 引用。`--dir` 选择持久部署目录；重复运行保留已有配置、凭据和数据库，升级前仍应备份。`--dev-localhost` 使用仅用于隔离测试的 loopback 证书，不适合公网客户端。镜像仓库需要允许部署主机读取；私有 GHCR 包须先配置 Docker 登录，公开部署应由维护者将发布包的容器镜像设为公开可读，权限规则见 [GitHub Container registry 文档](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)。
+部署目录保存 `compose.yml`、唯一的 Compose 运行参数文件 `.env`，以及 `config/` 下的服务配置、TLS 文件和持久 `data/`。源码模式还保存 `sources/<source_sha>/` 与构建所用模板；`.env` 记录安装模式、源码目录、构建镜像名及实际运行的本地镜像 ID。升级时重新运行一行命令并选择新版本，已有源码和 Docker 构建缓存可复用，配置和数据库不会重新生成。
 
-`--no-start` 只准备配置和 Compose 文件，不启动或重建容器；`--wait-timeout` 设置启动健康检查期限。`--dry-run` 只展示部署计划，不调用 Docker、下载元数据或修改文件，不作为镜像和 TLS 已验证的证据。
-
-部署目录保存 `compose.yml`、唯一的 Compose 参数文件 `.env`，以及 `config/` 下的服务配置、TLS 文件和持久 `data/`。在该目录执行 `sudo docker compose ps`、`sudo docker compose logs -f` 或 `sudo docker compose down` 管理服务；默认安装会启动服务，再次运行会读取已有配置并等待服务健康。不要删除 `config/data/` 来更新镜像，也不要在日志或工单中公开 `.env` 和服务配置内容。
+在部署目录执行 `sudo docker compose ps`、`sudo docker compose logs -f` 或 `sudo docker compose down` 管理服务；默认安装会启动服务，再次运行会读取已有配置并等待服务健康。不要删除 `config/data/` 来更新服务，也不要在日志或工单中公开 `.env` 和服务配置内容。
 
 首次安装会将指定证书与私钥复制为 `config/tls.crt` 和 `config/tls.key`。续期只更新原输入路径不会生效；需要显式替换部署目录中的这两个文件，保持原 UID/GID 和 `0600` 权限，执行 `sudo docker compose restart relay`，再验证公网 TLS 证书链和 `/readyz`。
 
@@ -222,7 +218,7 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 
 管理员令牌不能与 `JWT_SECRET`、设备凭据、Relay ticket 或撤权 feed token 复用，也不要放入 URL、公开日志或反向代理访问日志字段。资源关系页面中的账号、membership、设备挂载、在线状态和 signaling 来自 Control 资源状态，不会据此推断数据面路径；连接排障页面（Connections）只读取 daemon 经 `path_telemetry_v1` 权威上报的路径快照与迁移历史；连接健康页面再基于这些已持久化事实和受限历史显示请求时 attention signals，不增加独立路径或告警状态。即使 observation 仍 fresh，也不等于目标 TUN 上的具体业务应用一定端到端可达。
 
-Docker 生产部署使用 `deploy/selfhost/compose.production.yml`，该模板只接收固定镜像，不包含 build。`deploy/selfhost/compose.yml` 保留给 CI 和源码验证。默认 Control 只发布到 loopback；容器以非 root、只读根文件系统和无额外 capability 运行。生产镜像来自固定发布摘要，不能在业务服务器上临时 build 未验证源码。
+Docker 构建使用 `deploy/selfhost/compose.build.yml` 的独立 builder，生产服务使用 `deploy/selfhost/compose.production.yml`；生产模板只运行已核验的本地镜像 ID 或显式固定镜像摘要，不包含 build。`deploy/selfhost/compose.yml` 保留给 CI 和开发验证。默认 Control 只发布到 loopback；运行容器以非 root、只读根文件系统和无额外 capability 运行。源码部署只构建已校验、绑定固定 tag 和提交的发布快照。
 
 Compose 镜像也包含 `p2wlan-db`。在部署目录中，可用运行中的 Control 容器生成一致性 SQLite 快照，输出仍位于私有持久数据目录：
 

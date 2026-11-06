@@ -125,10 +125,88 @@ jobs:
             server/p2wlan-server-linux-${{ matrix.arch }}.tar.gz.sha256
           retention-days: 14
 
+  source:
+    name: Package fixed server source
+    if: ${{ startsWith(github.ref, 'refs/tags/server-v') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out exact release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Test source packaging boundaries
+        run: python3 -m unittest scripts.selfhost.test_server_source
+      - name: Package committed source and deployment files
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 scripts/selfhost/package_server_source.py \
+            --repo-root . --source-sha "$GITHUB_SHA" --version "$VERSION" \
+            --output-dir source-assets
+      - name: Install and repeat the packaged source deployment
+        env:
+          P2WLAN_VERSION: ${{ github.ref_name }}
+          P2WLAN_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir source-tree
+          tar -xzf source-assets/p2wlan-server-source.tar.gz -C source-tree
+          bash source-tree/scripts/install-server-docker.sh --source "$PWD/source-tree" \
+            --dir "$RUNNER_TEMP/p2wlan-source-plan" --dev-localhost --dry-run
+          deployment="$RUNNER_TEMP/source-install"
+          test ! -e "$deployment"
+          installer="$PWD/source-tree/scripts/install-server-docker.sh"
+          sudo bash "$installer" --source "$PWD/source-tree" --dev-localhost \
+            --non-interactive --dir "$deployment" --wait-timeout 120
+          # Read only the public image identity; never dump the environment files.
+          image_id=$(sudo awk -F= '$1 == "P2WLAN_IMAGE" { count++; image=$2 } END { if (count != 1) exit 1; print image }' "$deployment/.env")
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(sudo docker image inspect "$image_id" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$P2WLAN_VERSION"
+          test "$(sudo docker image inspect "$image_id" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$P2WLAN_COMMIT"
+          for component in control relay; do
+            actual=$(sudo docker run --rm --entrypoint "/usr/local/bin/p2wlan-$component" "$image_id" --version)
+            test "$actual" = "p2wlan-$component $P2WLAN_VERSION ($P2WLAN_COMMIT)"
+          done
+          compose=(sudo docker compose --env-file "$deployment/.env" -f "$deployment/compose.yml")
+          check_health() {
+            curl -fsS --connect-timeout 3 --max-time 10 --output /dev/null http://127.0.0.1:18080/health
+            "${compose[@]}" exec -T relay curl -fsS --connect-timeout 3 --max-time 10 \
+              --output /dev/null http://127.0.0.1:18082/readyz
+          }
+          check_health
+          fingerprints="$RUNNER_TEMP/source-install-credentials.sha256"
+          sudo sha256sum "$deployment/config/control.env" "$deployment/config/relay.env" \
+            "$deployment/config/tls.crt" "$deployment/config/tls.key" > "$fingerprints"
+          "${compose[@]}" down --remove-orphans
+          sudo bash "$installer" --source "$PWD/source-tree" --dev-localhost \
+            --non-interactive --dir "$deployment" --wait-timeout 120
+          sudo sha256sum --check --status "$fingerprints"
+          check_health
+          echo 'PASS: packaged source installed, remained healthy, and preserved credentials on repeat deployment'
+      - name: Always stop the source installer fixture
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          deployment="$RUNNER_TEMP/source-install"
+          if sudo test -f "$deployment/.env" && sudo test -f "$deployment/compose.yml"; then
+            sudo docker compose --env-file "$deployment/.env" -f "$deployment/compose.yml" down --remove-orphans
+          fi
+      - name: Upload fixed source bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: p2wlan-server-source-${{ github.sha }}
+          path: source-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
   image:
     name: Publish fixed server image
     needs: build
-    if: ${{ startsWith(github.ref, 'refs/tags/server-v') }}
+    if: ${{ startsWith(github.ref, 'refs/tags/server-v') && vars.SERVER_PUBLISH_IMAGE == 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     permissions:
@@ -152,22 +230,6 @@ jobs:
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/server" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Node
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
-        with:
-          node-version: "22.16.0"
-          cache: npm
-          cache-dependency-path: server/admin-ui/package-lock.json
-
-      - name: Build embedded admin UI
-        working-directory: server/admin-ui
-        run: |
-          set -euo pipefail
-          npm ci --no-audit --no-fund
-          npm run typecheck
-          npm run build
-          python3 ../../scripts/quality/check_admin_assets.py ../admin/web
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
@@ -436,8 +498,8 @@ jobs:
           fi
 
   release:
-    name: Publish server release
-    needs: [build, image]
+    name: Publish native and source server release
+    needs: [build, source]
     if: ${{ startsWith(github.ref, 'refs/tags/server-v') }}
     runs-on: ubuntu-22.04
     permissions:
@@ -449,10 +511,10 @@ jobs:
           pattern: p2wlan-server-linux-*-${{ github.sha }}
           path: release-assets
           merge-multiple: true
-      - name: Download verified image deployment metadata
+      - name: Download fixed source bundle
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: p2wlan-server-image-${{ github.sha }}
+          name: p2wlan-server-source-${{ github.sha }}
           path: release-assets
       - name: Verify release assets
         working-directory: release-assets
@@ -461,12 +523,75 @@ jobs:
         run: |
           set -euo pipefail
           for checksum in *.tar.gz.sha256; do sha256sum -c "$checksum"; done
-          test "$(find . -maxdepth 1 -name 'p2wlan-server-linux-*.tar.gz' | wc -l)" -eq 2
-          test -f p2wlan-server-docker.tar.gz
-          for archive in p2wlan-server-linux-*.tar.gz; do
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 6
+          for arch in amd64 arm64; do
+            archive="p2wlan-server-linux-$arch.tar.gz"
+            test -f "$archive"
             actual_sha="$(tar -xOf "$archive" BUILD-METADATA.txt | awk -F= '/^commit=/{print $2; exit}')"
             test "$actual_sha" = "$EXPECTED_SHA"
+            test "$(tar -xOf "$archive" BUILD-METADATA.txt | awk -F= '/^version=/{print $2; exit}')" = "$GITHUB_REF_NAME"
+            test "$(tar -xOf "$archive" BUILD-METADATA.txt | awk -F= '/^arch=/{print $2; exit}')" = "$arch"
           done
+          python3 - <<'PY_SOURCE'
+          import hashlib, json, os, pathlib, re, tarfile
+          with tarfile.open('p2wlan-server-source.tar.gz') as archive:
+              members = archive.getmembers()
+              names = {m.name for m in members}
+              assert len(names) == len(members) <= 4098
+              assert all(m.isfile() and 0 <= m.size <= 64 * 1024 * 1024 for m in members)
+              assert sum(m.size for m in members) <= 256 * 1024 * 1024
+              assert all(not pathlib.PurePosixPath(n).is_absolute() and '..' not in pathlib.PurePosixPath(n).parts for n in names)
+              assert archive.getmember('SERVER-SOURCE.json').size <= 1024 * 1024
+              raw = archive.extractfile('SERVER-SOURCE.json').read()
+              metadata = json.loads(raw)
+              assert metadata['schema_version'] == 1 and metadata['context'] == 'server'
+              assert metadata['version'] == os.environ['GITHUB_REF_NAME']
+              assert metadata['source_sha'] == os.environ['EXPECTED_SHA']
+              files = metadata['files']
+              assert names == set(files) | {'SERVER-SOURCE.json', 'SERVER-SOURCE.json.sha256'}
+              required = {'server/Dockerfile', 'server/.dockerignore', 'server/go.mod', 'server/go.sum',
+                          'server/admin-ui/package.json', 'server/admin-ui/package-lock.json',
+                          'scripts/install-server-docker.sh', 'deploy/selfhost/compose.production.yml',
+                          'deploy/selfhost/compose.build.yml'}
+              assert required.issubset(files)
+              assert sum(archive.getmember(n).size for n in files) <= 256 * 1024 * 1024
+              for name, digest in files.items():
+                  assert re.fullmatch(r'[0-9a-f]{64}', digest)
+                  assert hashlib.sha256(archive.extractfile(name).read()).hexdigest() == digest
+              checksum = hashlib.sha256(raw).hexdigest() + '  SERVER-SOURCE.json\n'
+              assert archive.extractfile('SERVER-SOURCE.json.sha256').read() == checksum.encode('ascii')
+          PY_SOURCE
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --latest=false
+
+  image_release:
+    name: Append optional prebuilt image deployment assets
+    needs: [release, image]
+    if: ${{ startsWith(github.ref, 'refs/tags/server-v') && vars.SERVER_PUBLISH_IMAGE == 'true' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified image deployment metadata
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: p2wlan-server-image-${{ github.sha }}
+          path: release-assets
+      - name: Verify optional image assets
+        working-directory: release-assets
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          sha256sum -c p2wlan-server-docker.tar.gz.sha256
           python3 - <<'PY'
           import hashlib, json, os, pathlib, re, tarfile
           manifest = pathlib.Path('SERVER-IMAGE.json')
@@ -563,21 +688,18 @@ jobs:
                   raise VerificationError('anonymous image index is missing linux/amd64 or linux/arm64')
               print('PASS: anonymous GHCR access verified for the exact digest and both Linux platforms')
           except (VerificationError, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-              print('::error::Cannot publish the server Release: ' + str(error), file=sys.stderr)
+              print('::error::Cannot append optional prebuilt image assets: ' + str(error), file=sys.stderr)
               print('The exact GHCR image digest must be publicly readable without Docker login. '
                     'Check registry access, set the package visibility to public if needed, '
-                    'then rerun this failed release job.', file=sys.stderr)
+                    'then rerun this optional image release job. The source Release is independent.', file=sys.stderr)
               sys.exit(1)
           finally:
               signal.alarm(0)
           PY
-      - name: Create GitHub release
+      - name: Append prebuilt image assets to the existing release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" release-assets/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            --latest=false
+          gh release upload "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY"
