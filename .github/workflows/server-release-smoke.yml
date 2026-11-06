@@ -1,0 +1,62 @@
+name: Published server deployment smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published server-vX.Y.Z tag to install from its public release assets
+        required: true
+        type: string
+      expected_source_sha:
+        description: Exact 40-character source commit expected in both published artifacts
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-release-smoke-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  published:
+    name: Public bootstrap (${{ matrix.method }}, Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        method: [native, docker]
+    steps:
+      - name: Check out acceptance harness only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: acceptance-harness
+
+      - name: Run the public one-line wizard and reinstall on the real VM
+        env:
+          SERVER_VERSION: ${{ inputs.version }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          INSTALL_METHOD: ${{ matrix.method }}
+        run: |
+          set -euo pipefail
+          # The Python harness runs deployment commands with cwd=/, downloads
+          # bootstrap from public raw main, feeds it through a source pipe to a
+          # real PTY with zero CLI flags, and never builds repository sources.
+          # No registry login action or token is used by either installation.
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
+            python3 "$GITHUB_WORKSPACE/acceptance-harness/scripts/selfhost/verify_published_server.py" \
+            --method "$INSTALL_METHOD" --version "$SERVER_VERSION" \
+            --expected-source-sha "$EXPECTED_SOURCE_SHA" --repo "$GITHUB_REPOSITORY" \
+            --output "$RUNNER_TEMP/server-release-smoke-$INSTALL_METHOD.json"
+
+      - name: Save public deployment evidence without credentials or database files
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: server-release-smoke-${{ matrix.method }}-${{ inputs.version }}
+          path: ${{ runner.temp }}/server-release-smoke-${{ matrix.method }}.json
+          if-no-files-found: warn
+          retention-days: 14

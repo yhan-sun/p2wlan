@@ -236,7 +236,8 @@ func validateRuntimeDirectory(path string) error {
 		return errors.New("runtime directory must be an absolute path")
 	}
 	for _, c := range filepath.ToSlash(path) {
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.ContainsRune("/._-:", c) {
+		// Tildes stay literal, including those in Windows 8.3 directory names.
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.ContainsRune("/._-:~", c) {
 			continue
 		}
 		return errors.New("runtime directory contains characters unsafe for an EnvironmentFile")

@@ -9,19 +9,25 @@ import (
 
 func TestNativeRuntimeDirectoriesDoNotChangeGenerationDestination(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		config, db bool
+		name         string
+		config, db   bool
+		literalTilde bool
 	}{
 		{name: "defaults"},
 		{name: "config-only", config: true},
 		{name: "data-only", db: true},
 		{name: "config-and-data", config: true, db: true},
+		{name: "literal-tilde", config: true, db: true, literalTilde: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			parent := t.TempDir()
 			out := filepath.Join(parent, "staged-config")
 			finalConfig := filepath.Join(parent, "installed-config")
 			finalData := filepath.Join(parent, "installed-data")
+			if tc.literalTilde {
+				finalConfig = filepath.Join(parent, "~installed-config")
+				finalData = filepath.Join(parent, "RUNNER~1", "data")
+			}
 			o := options{output: out, mode: "native", endpoint: "tls://localhost:18081", dev: true, controlPort: 18080, metricsPort: 18082}
 			wantConfig, wantData := out, filepath.Join(out, "data")
 			if tc.config {
