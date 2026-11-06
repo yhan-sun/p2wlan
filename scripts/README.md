@@ -14,11 +14,13 @@
 | `outbound-liveness/live_check.sh` | UDP outbound liveness blocked/normal 检查 | 取决于参数 | 只用于 liveness 证据，不等同 Direct 成功 |
 | `release/verify_release_identity.py` | build-info、版本、commit、SHA 和 dirty gate | 否 | release workflow 的 fail-closed gate |
 | `staging/validate_staging_config.py` | staging catalog、TLS、audience/region 和 key 配置校验 | 否 | 默认只读，不部署、不重启 |
+| `bootstrap-server.sh` | 新服务器的一行远程部署入口 | 否 | 首屏选择直接安装或 Docker，只准备该方式的依赖，筛选并校验对应固定 server-v 发布包后进入包内向导；无需源码 checkout |
+| `install-server-docker.sh` | 使用固定发布镜像的 Docker Compose 交互部署 | 否 | 需 Docker Engine + Compose v2；按 tag 校验镜像元数据，保留配置和数据并等待容器健康；详见[自托管指南](../docs/guides/self-hosting.md) |
+| `install-server.sh` | Linux + systemd 本机交互安装或固定版本无人值守安装 | 否 | 无参数进入向导；校验同归档的程序并生成匹配配置，已有配置保留；公网 HTTPS/TLS 前提见[自托管指南](../docs/guides/self-hosting.md) |
 | `deploy-server.sh` | 从 Release/Actions 包上传服务端，或让服务器自行拉取版本 | 是 | SSH 密码由 OpenSSH 交互读取；`--start` 才启用服务并做健康检查 |
 | `p2wlan-server` | 固定归档的本机服务管理、初始化、诊断、备份与恢复 | 否 | `setup` 补齐部署初始化，`doctor` 分层检查本机运行条件，不替代真实公网/TUN 验收 |
 
-每个主要入口旁边都有同名 Markdown，例如 `mini-air-smoke.sh` 对应
-`mini-air-smoke.md`。Markdown 记录前提、用法、输出字段、结果解释和限制。
+双机验收脚本旁的同名 Markdown 记录前提、用法、输出字段、结果解释和限制，例如 `mini-air-smoke.sh` 对应 `mini-air-smoke.md`。服务端安装和管理的操作说明见[自托管指南](../docs/guides/self-hosting.md)与[运维指南](../docs/guides/operations.md)。
 
 ## 双机脚本的共同安全规则
 

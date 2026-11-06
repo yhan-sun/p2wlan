@@ -125,6 +125,152 @@ jobs:
             server/p2wlan-server-linux-${{ matrix.arch }}.tar.gz.sha256
           retention-days: 14
 
+  image:
+    name: Publish fixed server image
+    needs: build
+    if: ${{ startsWith(github.ref, 'refs/tags/server-v') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out exact release source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Resolve image identity
+        id: identity
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^server-v[A-Za-z0-9._-]+$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/server" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "22.16.0"
+          cache: npm
+          cache-dependency-path: server/admin-ui/package-lock.json
+
+      - name: Build embedded admin UI
+        working-directory: server/admin-ui
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run build
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Authenticate to GitHub Container Registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and publish multi-platform image
+        id: publish
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: server
+          file: server/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.identity.outputs.version }}
+            COMMIT=${{ steps.identity.outputs.commit }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.identity.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.identity.outputs.commit }}
+            org.opencontainers.image.licenses=MIT
+          tags: |
+            ${{ steps.identity.outputs.image }}:${{ steps.identity.outputs.version }}
+            ${{ steps.identity.outputs.image }}:sha-${{ steps.identity.outputs.commit }}
+          provenance: true
+          sbom: true
+
+      - name: Verify published platform identities
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          SOURCE_SHA: ${{ steps.identity.outputs.commit }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          for platform in linux/amd64 linux/arm64; do
+            for component in control relay; do
+              actual=$(docker run --rm --platform "$platform" \
+                --entrypoint "/usr/local/bin/p2wlan-$component" "$IMAGE@$DIGEST" --version)
+              test "$actual" = "p2wlan-$component $VERSION ($SOURCE_SHA)"
+            done
+          done
+
+      - name: Write immutable image deployment metadata
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          SOURCE_SHA: ${{ steps.identity.outputs.commit }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re
+          image, digest = os.environ['IMAGE'], os.environ['DIGEST']
+          if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+              raise SystemExit('invalid published image digest')
+          directory = pathlib.Path('image-assets')
+          directory.mkdir()
+          reference = image + '@' + digest
+          metadata = {
+              'schema_version': 1,
+              'version': os.environ['VERSION'],
+              'source_sha': os.environ['SOURCE_SHA'],
+              'image': reference,
+              'digest': digest,
+              'platforms': ['linux/amd64', 'linux/arm64'],
+          }
+          manifest = directory / 'SERVER-IMAGE.json'
+          manifest.write_text(json.dumps(metadata, indent=2) + '\n')
+          checksum = hashlib.sha256(manifest.read_bytes()).hexdigest()
+          (directory / 'SERVER-IMAGE.json.sha256').write_text(checksum + '  SERVER-IMAGE.json\n')
+          print('Fixed deployment image: ' + reference)
+          PY
+
+      - name: Package Docker deployment entry point
+        run: |
+          set -euo pipefail
+          mkdir -p docker-deployment
+          install -m 0755 scripts/install-server-docker.sh docker-deployment/install-server-docker.sh
+          install -m 0644 deploy/selfhost/compose.production.yml docker-deployment/compose.production.yml
+          install -m 0644 image-assets/SERVER-IMAGE.json image-assets/SERVER-IMAGE.json.sha256 docker-deployment/
+          COPYFILE_DISABLE=1 tar -C docker-deployment -czf image-assets/p2wlan-server-docker.tar.gz \
+            install-server-docker.sh compose.production.yml SERVER-IMAGE.json SERVER-IMAGE.json.sha256
+          (cd image-assets && sha256sum p2wlan-server-docker.tar.gz > p2wlan-server-docker.tar.gz.sha256)
+
+      - name: Upload immutable image deployment metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-server-image-${{ github.sha }}
+          path: image-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
   stage:
     name: Deploy verified bundle to staging
     needs: build
@@ -281,7 +427,7 @@ jobs:
 
   release:
     name: Publish server release
-    needs: build
+    needs: [build, image]
     if: ${{ startsWith(github.ref, 'refs/tags/server-v') }}
     runs-on: ubuntu-22.04
     permissions:
@@ -293,6 +439,11 @@ jobs:
           pattern: p2wlan-server-linux-*-${{ github.sha }}
           path: release-assets
           merge-multiple: true
+      - name: Download verified image deployment metadata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: p2wlan-server-image-${{ github.sha }}
+          path: release-assets
       - name: Verify release assets
         working-directory: release-assets
         env:
@@ -300,11 +451,33 @@ jobs:
         run: |
           set -euo pipefail
           for checksum in *.tar.gz.sha256; do sha256sum -c "$checksum"; done
-          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 2
-          for archive in *.tar.gz; do
+          test "$(find . -maxdepth 1 -name 'p2wlan-server-linux-*.tar.gz' | wc -l)" -eq 2
+          test -f p2wlan-server-docker.tar.gz
+          for archive in p2wlan-server-linux-*.tar.gz; do
             actual_sha="$(tar -xOf "$archive" BUILD-METADATA.txt | awk -F= '/^commit=/{print $2; exit}')"
             test "$actual_sha" = "$EXPECTED_SHA"
           done
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, tarfile
+          manifest = pathlib.Path('SERVER-IMAGE.json')
+          metadata = json.loads(manifest.read_text())
+          expected_repository = 'ghcr.io/' + os.environ['GITHUB_REPOSITORY'].lower() + '/server'
+          assert metadata['schema_version'] == 1
+          assert metadata['source_sha'] == os.environ['EXPECTED_SHA']
+          assert metadata['version'] == os.environ['GITHUB_REF_NAME']
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}', metadata['digest'])
+          assert metadata['image'] == expected_repository + '@' + metadata['digest']
+          assert metadata['platforms'] == ['linux/amd64', 'linux/arm64']
+          checksum = hashlib.sha256(manifest.read_bytes()).hexdigest()
+          assert pathlib.Path('SERVER-IMAGE.json.sha256').read_text() == checksum + '  SERVER-IMAGE.json\n'
+          with tarfile.open('p2wlan-server-docker.tar.gz') as bundle:
+              members = bundle.getmembers()
+              assert len(members) == 4
+              assert {m.name for m in members} == {'install-server-docker.sh', 'compose.production.yml', 'SERVER-IMAGE.json', 'SERVER-IMAGE.json.sha256'}
+              assert all(m.isfile() for m in members)
+              assert bundle.extractfile('SERVER-IMAGE.json').read() == manifest.read_bytes()
+              assert bundle.extractfile('SERVER-IMAGE.json.sha256').read() == pathlib.Path('SERVER-IMAGE.json.sha256').read_bytes()
+          PY
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

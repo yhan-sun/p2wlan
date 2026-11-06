@@ -254,7 +254,7 @@ jobs:
           python3 scripts/docs/verify_repository.py
           python3 scripts/quality/check_code_health.py
           python3 scripts/quality/check_include_format.py
-          bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
+          bash -n scripts/bootstrap-server.sh scripts/install-server.sh scripts/install-server-docker.sh scripts/deploy-server.sh scripts/p2wlan-server
           sh -n scripts/install-linux-cli.sh scripts/install-openwrt.sh deploy/openwrt/files/p2wlan.init
           python3 -m py_compile scripts/docs/verify_repository.py scripts/quality/check_code_health.py scripts/quality/run_rust_tests.py scripts/quality/run_diagnostics_owner_test.py scripts/quality/check_required_gates.py scripts/quality/check_include_format.py scripts/dplpmtud/select_component_artifact.py scripts/dplpmtud/aggregate_evidence.py scripts/dplpmtud/collect_evidence.py scripts/nat-sim/select_attempt_evidence.py scripts/release/verify_release_set.py scripts/release/write_artifact_metadata.py
           python3 scripts/release/test_release_set.py

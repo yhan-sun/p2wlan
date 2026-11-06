@@ -7,6 +7,10 @@ on:
       - 'deploy/selfhost/**'
       - 'scripts/selfhost/**'
       - 'scripts/p2wlan-server'
+      - 'scripts/install-server.sh'
+      - 'scripts/install-server-docker.sh'
+      - 'scripts/bootstrap-server.sh'
+      - 'scripts/deploy-server.sh'
       - 'docs/guides/self-hosting.md'
       - '.github/workflows/selfhost.yml'
       - '.github/workflows/build-server.yml'
@@ -17,6 +21,10 @@ on:
       - 'deploy/selfhost/**'
       - 'scripts/selfhost/**'
       - 'scripts/p2wlan-server'
+      - 'scripts/install-server.sh'
+      - 'scripts/install-server-docker.sh'
+      - 'scripts/bootstrap-server.sh'
+      - 'scripts/deploy-server.sh'
       - '.github/workflows/selfhost.yml'
       - '.github/workflows/build-server.yml'
   workflow_dispatch:
@@ -80,9 +88,8 @@ jobs:
       - name: Manager and source contracts
         if: runner.os == 'Linux'
         run: |
-          bash -n scripts/p2wlan-server
-          python3 scripts/selfhost/test_manager.py
-          python3 scripts/selfhost/test_contract.py
+          bash -n scripts/bootstrap-server.sh scripts/install-server.sh scripts/install-server-docker.sh scripts/deploy-server.sh scripts/p2wlan-server
+          python3 -m unittest discover -s scripts/selfhost -p 'test_*.py'
   docker:
     name: Docker selfhost and static server compatibility
     runs-on: ubuntu-22.04
@@ -122,6 +129,43 @@ jobs:
           docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml exec -T relay curl -fsS --max-time 5 http://127.0.0.1:18082/readyz
       - name: Non-root private support logs and SQLite survive a container restart
         run: python3 scripts/selfhost/test_compose_persistence.py
+      - name: Stop source-build fixture before Docker installer regression
+        run: docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml down --remove-orphans
+      - name: Deploy and repeat the Docker installer with the exact local image
+        run: |
+          set -euo pipefail
+          image_id=$(docker image inspect p2wlan-selfhost:local --format '{{.Id}}')
+          deployment="$RUNNER_TEMP/selfhost-installer"
+          sudo bash scripts/install-server-docker.sh --local-image "$image_id" \
+            --dev-localhost --dir "$deployment" --non-interactive --wait-timeout 90
+          sudo docker compose --env-file "$deployment/.env" -f "$deployment/compose.yml" \
+            exec -T relay curl -fsS --max-time 5 http://127.0.0.1:18082/readyz
+          DEPLOYMENT_DIR="$deployment" TEST_IMAGE_ID="$image_id" python3 - <<'PY'
+          import hashlib, json, os, pathlib, secrets, subprocess, urllib.request
+          directory = pathlib.Path(os.environ['DEPLOYMENT_DIR'])
+          paths = [directory / 'config' / name for name in ('control.env', 'relay.env', 'tls.key')]
+          def fingerprint():
+              return [hashlib.sha256(subprocess.check_output(['sudo', 'cat', str(path)])).hexdigest() for path in paths]
+          original = fingerprint()
+          account = {'email': 'installer-' + secrets.token_hex(8) + '@example.test', 'password': secrets.token_hex(24)}
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          def authenticate(path):
+              request = urllib.request.Request('http://127.0.0.1:18080/api/v1/' + path,
+                  data=json.dumps(account).encode(), headers={'Content-Type': 'application/json'}, method='POST')
+              with opener.open(request, timeout=5) as response:
+                  result = json.load(response)
+              if not isinstance(result.get('token'), str) or not result['token']:
+                  raise SystemExit('installer persistence check did not receive authentication proof')
+          authenticate('register')
+          subprocess.run(['sudo', 'docker', 'compose', '--env-file', str(directory / '.env'),
+              '-f', str(directory / 'compose.yml'), 'down'], check=True, timeout=30)
+          subprocess.run(['sudo', 'bash', 'scripts/install-server-docker.sh', '--local-image', os.environ['TEST_IMAGE_ID'],
+              '--dev-localhost', '--dir', str(directory), '--non-interactive', '--wait-timeout', '90'], check=True, timeout=180)
+          if fingerprint() != original:
+              raise SystemExit('repeated Docker installation changed existing credentials')
+          authenticate('login')
+          print('PASS: real Docker installer retained credentials and authenticated database state after redeployment')
+          PY
       - name: Verify static ELF and Ubuntu 20.04 server loader compatibility
         working-directory: server
         run: |
@@ -138,4 +182,11 @@ jobs:
           done
       - name: Always clean test containers
         if: always()
-        run: docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml down --remove-orphans
+        run: |
+          status=0
+          docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml down --remove-orphans || status=1
+          deployment="$RUNNER_TEMP/selfhost-installer"
+          if sudo test -f "$deployment/compose.yml"; then
+            sudo docker compose --env-file "$deployment/.env" -f "$deployment/compose.yml" down --remove-orphans || status=1
+          fi
+          exit "$status"

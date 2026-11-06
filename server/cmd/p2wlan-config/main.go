@@ -28,6 +28,7 @@ import (
 
 type options struct {
 	output, mode, endpoint, cert, key string
+	configDir, dataDir                string
 	dev                               bool
 	controlPort, metricsPort          int
 }
@@ -36,6 +37,8 @@ func main() {
 	var o options
 	flag.StringVar(&o.output, "output", "", "New private configuration directory (must not exist)")
 	flag.StringVar(&o.mode, "mode", "native", "native or docker")
+	flag.StringVar(&o.configDir, "config-dir", "", "Final native configuration directory; only renders runtime paths")
+	flag.StringVar(&o.dataDir, "data-dir", "", "Final native data directory; only renders runtime paths")
 	flag.StringVar(&o.endpoint, "relay-endpoint", "tls://localhost:18081", "Public TLS relay endpoint, not a container service name")
 	flag.StringVar(&o.cert, "tls-cert", "", "Existing TLS certificate chain PEM")
 	flag.StringVar(&o.key, "tls-key", "", "Matching TLS private key PEM")
@@ -64,6 +67,16 @@ func generate(o options) (err error) {
 	}
 	if o.mode != "native" && o.mode != "docker" {
 		return errors.New("--mode must be native or docker")
+	}
+	if o.mode == "docker" && (o.configDir != "" || o.dataDir != "") {
+		return errors.New("--config-dir and --data-dir are only supported in native mode")
+	}
+	for name, path := range map[string]string{"--config-dir": o.configDir, "--data-dir": o.dataDir} {
+		if path != "" {
+			if err := validateRuntimeDirectory(path); err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+		}
 	}
 	if o.controlPort < 1 || o.controlPort > 65535 || o.metricsPort < 1 || o.metricsPort > 65535 {
 		return errors.New("ports must be between 1 and 65535")
@@ -165,6 +178,12 @@ func generate(o options) (err error) {
 		return err
 	}
 	runtimeDir, runtimeData := filepath.ToSlash(out), filepath.ToSlash(dataDir)
+	if o.configDir != "" {
+		runtimeDir = filepath.ToSlash(filepath.Clean(o.configDir))
+	}
+	if o.dataDir != "" {
+		runtimeData = filepath.ToSlash(filepath.Clean(o.dataDir))
+	}
 	controlHost, feedHost := "127.0.0.1", "127.0.0.1"
 	relayHost, publishHost := "", "127.0.0.1"
 	if o.dev {
@@ -205,6 +224,22 @@ func generate(o options) (err error) {
 		}); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// These paths are written as unquoted EnvironmentFile values. Keep explicit
+// installation paths absolute and free of quoting, expansion and whitespace
+// characters; generation must never interpret them or create those directories.
+func validateRuntimeDirectory(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("runtime directory must be an absolute path")
+	}
+	for _, c := range filepath.ToSlash(path) {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.ContainsRune("/._-:", c) {
+			continue
+		}
+		return errors.New("runtime directory contains characters unsafe for an EnvironmentFile")
 	}
 	return nil
 }

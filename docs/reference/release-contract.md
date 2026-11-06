@@ -20,9 +20,15 @@ daemon 构建脚本使用只读 Git 查询，避免身份检查自身刷新已�
 
 完整性检查通过后才生成公开的 `RELEASE-MANIFEST.json`、创建 draft Release、上传完整公开资产并发布。CI metadata sidecar 不作为下载资产公开；其身份字段会进入公开 manifest。服务端使用独立的 `server-vX.Y.Z` 标签，不与客户端 latest 混用。服务端归档内必须包含匹配的 Control、Relay、配置生成器、数据库快照工具、manager、安装器和 BUILD-METADATA。
 
+服务端 tag 构建还发布同一源码 SHA 的 `linux/amd64`、`linux/arm64` GHCR 镜像，并在两种平台上检查 Control/Relay 的嵌入版本与提交。`SERVER-IMAGE.json` 绑定服务端 tag、`source_sha`、多架构镜像摘要和平台，附同名 `.sha256`；独立的 `p2wlan-server-docker.tar.gz` 部署包包含该元数据、checksum、交互安装器和生产 Compose 模板。GitHub 服务端 Release 必须等待原生归档和镜像任务均成功，校验身份后一起发布；部署使用 `repository@sha256:...`，不依赖可变 tag 解析结果。
+
 Android 生产签名只在受保护的 release-signing 环境和版本 tag 中执行。分支构建不能取得生产签名秘密。Android 原生桥使用当前 Flutter SDK 声明的固定 NDK 版本；找不到该版本时发布失败，不扫描并选择 runner 上任意最新 NDK。
 
-客户端远程安装器必须显式接收 `vX.Y.Z`，并从同一个 tag 下载包和 checksum；服务端安装器同样必须显式接收 `server-vX.Y.Z`。`latest` 或可变 `main` 不是可复现部署输入。
+客户端远程安装器必须显式接收 `vX.Y.Z`，并从同一个 tag 下载包和 checksum。服务端实际部署也必须绑定一个固定 `server-vX.Y.Z`、相邻发布元数据或明确的镜像摘要；`latest` 或可变 `main` 不是可复现的服务端程序或镜像输入。
+
+`bootstrap-server.sh` 的公开 `main` URL 是可更新的方式选择、环境准备与发布发现入口。交互时先选择原生 systemd 或 Docker，再只准备对应依赖并发现正式 `server-vX.Y.Z`：原生方式要求当前主机架构的服务端归档和 checksum，Docker 方式要求完整部署包、镜像元数据及各自 checksum。一经选择，本次下载与验证全部使用该准确 tag 的包、checksum 和包内身份；Docker 还绑定固定镜像摘要，不从 `main` 补取 manager、Compose 或服务端程序。无人值守必须显式提供 `--version`，并应以 `--method native|docker` 明确部署方式。
+
+Docker 部署目录 `.env` 保存解析后的版本、提交和镜像引用；原生安装的 `current/BUILD-METADATA.txt` 保存版本、源码提交与架构。重新执行引导入口本身不代表重新部署了同一版本，需要复现时必须使用对应的固定身份。
 
 Linux CLI 远程安装器对 `--version TAG`、`--version=TAG` 和 `P2WLAN_VERSION` 使用同一校验：标签以 `v` 开头，后面至少一个字符，且完整标签只能包含 ASCII 字母、数字、点、下划线和连字符。路径分隔符、查询参数、片段和空白会在选择或下载包之前被拒绝，`--dry-run` 同样执行该校验。校验只约束标签格式，不证明标签存在或对应正式版本；正式安装仍应选择明确的 `vX.Y.Z` Release。随发布包提供的本地安装器不要求远程版本参数。
 

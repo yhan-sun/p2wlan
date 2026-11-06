@@ -308,7 +308,27 @@ P2WLAN 使用自包含的 **WireGuard-like Noise** 数据面，并使用 X25519�
 
 ## 自托管
 
-Control Plane 和 Relay 位于 [`server/`](server/)。固定服务端发布包使用 **`server-vX.Y.Z`** 标签，公开安装与升级路径为 **Linux + systemd**；普通部署不需要在服务器上安装 Go 或 Node.js。
+Control Plane 和 Relay 位于 [`server/`](server/)。固定服务端发布包使用 **`server-vX.Y.Z`** 标签，提供 Linux 原生 systemd 安装与 Docker Compose 部署；普通部署不需要在服务器上安装 Go 或 Node.js。
+
+登录 Linux 服务器后，复制下面一整行即可开始交互部署，无需下载源码：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/bootstrap-server.sh | sudo bash
+```
+
+运行后按以下顺序完成向导：
+
+1. 首屏选择 `1` 直接安装到系统、`2` Docker 部署（默认），或 `0` 退出。
+2. 检查并确认安装所选方式的缺失依赖；直接安装使用 systemd，Docker 方式准备 Engine / Compose。
+3. 从该方式可用的正式版本列表选择版本，或手动输入固定 `server-vX.Y.Z`，再下载校验发布包。
+4. 确认安装、配置和数据目录，再选择公网部署或本机测试；已有部署进入保留配置的升级分支。
+5. 公网部署填写 Relay 域名或 IP、端口、证书链和私钥路径，再确认内部端口；Docker 方式还可选择 Relay 绑定地址。
+6. 选择立即启动或只准备，检查完整摘要；可确认、重新填写或取消。
+7. 确认后自动安装已校验的二进制或拉取固定摘要镜像，为新部署生成配套配置；选择启动时等待健康检查，最后显示入口、凭据文件位置和管理命令。
+
+已有配置、凭据和数据库会保留；管理台令牌不打印到终端。详细字段、默认值和终端示例见[完整交互流程](docs/guides/self-hosting.md#完整交互流程)。
+
+入口需要 `curl`、`sudo`，以及已发布的引导脚本和所选方式的服务端 Release；root 终端可去掉 `sudo`。自动准备环境支持 Ubuntu 22.04 / 24.04 / 26.04、Debian 12 / 13 的 amd64 / arm64 systemd 主机。公网部署前准备好 Relay 可信证书和 Control HTTPS/WSS 反向代理；固定版本命令、路径选项和其他 Linux 环境见[自托管指南](docs/guides/self-hosting.md)。
 
 部署需要可信的 Control HTTPS/WSS 入口、Relay TLS 入口、持久化数据库和匹配的认证配置。仅启动服务端不会使服务器自动成为虚拟网络节点；需要作为节点时，还应安装并连接客户端。
 
