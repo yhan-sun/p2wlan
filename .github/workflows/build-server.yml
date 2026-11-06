@@ -136,7 +136,7 @@ jobs:
       packages: write
     steps:
       - name: Check out exact release source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -154,7 +154,7 @@ jobs:
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "22.16.0"
           cache: npm
@@ -167,6 +167,7 @@ jobs:
           npm ci --no-audit --no-fund
           npm run typecheck
           npm run build
+          python3 ../../scripts/quality/check_admin_assets.py ../admin/web
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
@@ -264,7 +265,7 @@ jobs:
           (cd image-assets && sha256sum p2wlan-server-docker.tar.gz > p2wlan-server-docker.tar.gz.sha256)
 
       - name: Upload immutable image deployment metadata
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: p2wlan-server-image-${{ github.sha }}
           path: image-assets/*
@@ -440,7 +441,7 @@ jobs:
           path: release-assets
           merge-multiple: true
       - name: Download verified image deployment metadata
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: p2wlan-server-image-${{ github.sha }}
           path: release-assets
@@ -477,6 +478,89 @@ jobs:
               assert all(m.isfile() for m in members)
               assert bundle.extractfile('SERVER-IMAGE.json').read() == manifest.read_bytes()
               assert bundle.extractfile('SERVER-IMAGE.json.sha256').read() == pathlib.Path('SERVER-IMAGE.json.sha256').read_bytes()
+          PY
+      - name: Verify anonymous access to the exact published image
+        working-directory: release-assets
+        timeout-minutes: 2
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import signal
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          class VerificationError(Exception):
+              pass
+
+          def deadline(*_):
+              raise VerificationError('anonymous registry verification exceeded its 90-second deadline')
+
+          signal.signal(signal.SIGALRM, deadline)
+          signal.alarm(90)
+          # Do not use Docker, its login configuration, or GITHUB_TOKEN. This
+          # independent client must have exactly the access a fresh VPS has.
+          client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+          def fetch(url, *, accept, bearer=None, limit=4 * 1024 * 1024):
+              headers = {'Accept': accept, 'Accept-Encoding': 'identity',
+                         'User-Agent': 'p2wlan-release-anonymous-check'}
+              if bearer is not None:
+                  headers['Authorization'] = 'Bearer ' + bearer
+              request = urllib.request.Request(url, headers=headers)
+              try:
+                  with client.open(request, timeout=30) as response:
+                      content = response.read(limit + 1)
+                      if len(content) > limit:
+                          raise VerificationError('anonymous registry response exceeded its size limit')
+                      return content, response.headers
+              except urllib.error.HTTPError as error:
+                  status = error.code
+                  error.close()
+                  raise VerificationError(f'anonymous GHCR request returned HTTP {status}') from None
+
+          try:
+              metadata = json.loads(Path('SERVER-IMAGE.json').read_text())
+              image, digest = metadata['image'], metadata['digest']
+              match = re.fullmatch(r'ghcr\.io/([a-z0-9][a-z0-9._/-]*)@(sha256:[a-f0-9]{64})', image)
+              if not match or match[2] != digest:
+                  raise VerificationError('release image is not an exact GHCR digest')
+              repository = match[1]
+              query = urllib.parse.urlencode({'service': 'ghcr.io', 'scope': f'repository:{repository}:pull'})
+              content, _ = fetch('https://ghcr.io/token?' + query, accept='application/json', limit=64 * 1024)
+              credentials = json.loads(content)
+              bearer = credentials.get('token') or credentials.get('access_token')
+              if not isinstance(bearer, str) or not bearer:
+                  raise VerificationError('GHCR did not issue an anonymous pull token')
+              index_types = ('application/vnd.oci.image.index.v1+json',
+                             'application/vnd.docker.distribution.manifest.list.v2+json')
+              content, headers = fetch(f'https://ghcr.io/v2/{repository}/manifests/{digest}',
+                                       accept=', '.join(index_types), bearer=bearer)
+              if headers.get('Docker-Content-Digest') != digest:
+                  raise VerificationError('anonymous image response digest does not match the release')
+              if 'sha256:' + hashlib.sha256(content).hexdigest() != digest:
+                  raise VerificationError('anonymous image index bytes do not match the release digest')
+              index = json.loads(content)
+              if (headers.get('Content-Type', '').split(';', 1)[0] not in index_types
+                      or index.get('schemaVersion') != 2 or index.get('mediaType') not in index_types):
+                  raise VerificationError('anonymous image response is not a multi-platform index')
+              platforms = {(item.get('platform', {}).get('os'), item.get('platform', {}).get('architecture'))
+                           for item in index.get('manifests', [])}
+              if not {('linux', 'amd64'), ('linux', 'arm64')}.issubset(platforms):
+                  raise VerificationError('anonymous image index is missing linux/amd64 or linux/arm64')
+              print('PASS: anonymous GHCR access verified for the exact digest and both Linux platforms')
+          except (VerificationError, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+              print('::error::Cannot publish the server Release: ' + str(error), file=sys.stderr)
+              print('The exact GHCR image digest must be publicly readable without Docker login. '
+                    'Check registry access, set the package visibility to public if needed, '
+                    'then rerun this failed release job.', file=sys.stderr)
+              sys.exit(1)
+          finally:
+              signal.alarm(0)
           PY
       - name: Create GitHub release
         env:
