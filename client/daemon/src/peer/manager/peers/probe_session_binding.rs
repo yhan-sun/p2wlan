@@ -229,6 +229,36 @@ fn prune_probe_session_bindings(conn: &mut PeerConnection, now: Instant) {
     }
 }
 
+fn probe_session_bindings_need_prune(conn: &PeerConnection, now: Instant) -> bool {
+    conn.pending_probe_bindings
+        .values()
+        .any(|pending| pending.expires_at <= now)
+        || conn
+            .previous_probe_binding
+            .as_ref()
+            .is_some_and(|previous| previous.expires_at <= now)
+}
+
+struct ProbeKeyBindings {
+    base_key: ProbeMacKey,
+    active: ProbeSessionBinding,
+    pending: HashMap<String, PendingProbeSessionBinding>,
+    previous: Option<RetainedProbeSessionBinding>,
+    session_generation: PeerSessionGeneration,
+}
+
+impl ProbeKeyBindings {
+    fn snapshot(conn: &PeerConnection, session_generation: PeerSessionGeneration) -> Option<Self> {
+        Some(Self {
+            base_key: conn.probe_mac_key?,
+            active: active_probe_binding(conn),
+            pending: conn.pending_probe_bindings.clone(),
+            previous: conn.previous_probe_binding.clone(),
+            session_generation,
+        })
+    }
+}
+
 fn stage_probe_session_binding_on_connection(
     conn: &mut PeerConnection,
     token: String,
@@ -690,29 +720,44 @@ impl PeerManager {
         &self,
         node_id: &str,
     ) -> Vec<ProbeKeyCandidate> {
-        let mut conns = self.connections.write().await;
-        let Some(conn) = conns.get_mut(node_id) else {
-            return Vec::new();
+        let bindings = {
+            let conns = self.connections.read().await;
+            let Some(conn) = conns.get(node_id) else {
+                return Vec::new();
+            };
+            let Some(generation) = self.probe_candidate_generation(node_id, conn) else {
+                return Vec::new();
+            };
+            if probe_session_bindings_need_prune(conn, Instant::now()) {
+                // Keep eager expiry removal for refresh and confirmation. The
+                // peer and membership may have changed while joining the writer queue.
+                drop(conns);
+                let mut conns = self.connections.write().await;
+                let Some(conn) = conns.get_mut(node_id) else {
+                    return Vec::new();
+                };
+                let Some(generation) = self.probe_candidate_generation(node_id, conn) else {
+                    return Vec::new();
+                };
+                prune_probe_session_bindings(conn, Instant::now());
+                ProbeKeyBindings::snapshot(conn, generation)
+            } else {
+                ProbeKeyBindings::snapshot(conn, generation)
+            }
         };
-        if !conn.online {
-            return Vec::new();
-        }
-        let Some(session_generation) = self
-            .peer_membership
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .active_generation(node_id)
+        // The candidate snapshot carries the original peer generation. MAC
+        // derivation can run after releasing the shared or exclusive map guard.
+        let Some(ProbeKeyBindings {
+            base_key,
+            active,
+            pending,
+            previous,
+            session_generation,
+        }) = bindings
         else {
             return Vec::new();
         };
-        prune_probe_session_bindings(conn, Instant::now());
-        let Some(base_key) = conn.probe_mac_key else {
-            return Vec::new();
-        };
 
-        let active = active_probe_binding(conn);
-        let pending = conn.pending_probe_bindings.clone();
-        let previous = conn.previous_probe_binding.clone();
         let mut candidates = Vec::new();
         push_unique_probe_key(
             &mut candidates,
@@ -780,6 +825,17 @@ impl PeerManager {
             session_generation,
         );
         candidates
+    }
+
+    fn probe_candidate_generation(
+        &self,
+        node_id: &str,
+        conn: &PeerConnection,
+    ) -> Option<PeerSessionGeneration> {
+        if !conn.online {
+            return None;
+        }
+        self.peer_session_generation_sync(node_id)
     }
 
     /// Return Probe v2 MAC keys to try for inbound compatibility.

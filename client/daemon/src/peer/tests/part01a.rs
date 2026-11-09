@@ -319,6 +319,79 @@ async fn multiple_probe_tokens_are_retained_until_exact_token_promotion() {
 }
 
 #[tokio::test]
+async fn probe_candidates_share_connection_reader_until_expiry_needs_pruning() {
+    use futures_util::FutureExt;
+
+    let manager = PeerManager::new(test_config());
+    let node_id = "peer-probe-candidate-reader";
+    let mut peer = test_peer(node_id, "8.8.8.8:12296".parse().unwrap());
+    peer.public_key = hex::encode(NodeIdentity::generate().public_key());
+    manager.add_peer(&peer).await;
+    for (token, shared) in [("expires", [2u8; 32]), ("live", [3u8; 32])] {
+        assert_eq!(
+            manager
+                .stage_probe_session_binding(
+                    node_id,
+                    token.to_string(),
+                    Some(token.to_string()),
+                    Some(shared),
+                    true,
+                )
+                .await,
+            ProbeBindingStage::Staged
+        );
+    }
+
+    let reader = manager.connections.read().await;
+    let candidates = manager
+        .probe_key_candidates_for_peer(node_id)
+        .now_or_never()
+        .expect("unexpired candidates must share an existing connection reader");
+    assert_eq!(candidates[0].role, ProbeKeyRole::Active);
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|candidate| matches!(candidate.role, ProbeKeyRole::Pending { .. }))
+            .count(),
+        2
+    );
+    drop(reader);
+
+    manager
+        .connections
+        .write()
+        .await
+        .get_mut(node_id)
+        .unwrap()
+        .pending_probe_bindings
+        .get_mut("expires")
+        .unwrap()
+        .expires_at = Instant::now();
+
+    let reader = manager.connections.read().await;
+    assert!(manager
+        .probe_key_candidates_for_peer(node_id)
+        .now_or_never()
+        .is_none());
+    drop(reader);
+
+    let candidates = manager.probe_key_candidates_for_peer(node_id).await;
+    let pending: Vec<_> = candidates
+        .iter()
+        .filter_map(|candidate| match &candidate.role {
+            ProbeKeyRole::Pending { token } => Some(token.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pending, ["live"]);
+    assert_eq!(
+        manager.try_refresh_pending_probe_session_binding_grace(node_id, "expires"),
+        PendingProbeBindingCommitOutcome::Missing,
+        "candidate lookup must still remove expired bindings from canonical state"
+    );
+}
+
+#[tokio::test]
 async fn failed_initiator_probe_stage_does_not_promote_on_inbound_match() {
     let config = test_config();
     let manager = PeerManager::new(config);
