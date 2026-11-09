@@ -100,13 +100,19 @@ async fn retired_direct_first_deadline_cannot_release_replacement_peer() {
             .await
     );
 
+    let epoch_gate = peers.network_epoch_gate();
+    let epoch = epoch_gate.try_lock().unwrap();
     assert_eq!(
-        peers
-            .try_advance_direct_first_deadlines_at(retired_deadline)
-            .expect("deadline commit must not contend"),
-        0,
-        "a retired peer timer must be fenced from the replacement lifecycle"
+        peers.try_advance_direct_first_deadlines_at(retired_deadline),
+        Ok(0),
+        "a retired timer must not acquire the epoch for the replacement peer"
     );
+    assert_eq!(
+        peers.try_advance_direct_first_deadlines_at(replacement_deadline),
+        Err(()),
+        "a live deadline still needs the exclusive epoch before committing"
+    );
+    drop(epoch);
     assert_eq!(
         peers
             .committed_business_path_snapshot_sync("node-b")

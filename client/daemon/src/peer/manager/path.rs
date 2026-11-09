@@ -27,6 +27,14 @@ impl PeerManager {
     /// try-only: the supervised owner retries after a short cancellable delay
     /// rather than adding another fair writer waiter during lifecycle churn.
     pub(crate) fn try_advance_direct_first_deadlines_at(&self, now: Instant) -> Result<usize, ()> {
+        // A sleeping timer can outlive the window that armed it. Check for
+        // work before contending with packet reads for the exclusive epoch.
+        if self
+            .try_next_direct_first_deadline()?
+            .is_none_or(|deadline| deadline > now)
+        {
+            return Ok(0);
+        }
         let _epoch_guard = self.network_epoch_gate.try_lock().map_err(|_| ())?;
         let mut connections = self.connections.try_write().map_err(|_| ())?;
         let generation = self.current_network_generation_sync();
