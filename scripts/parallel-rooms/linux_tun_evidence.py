@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import select
 import signal
 import subprocess
 import sys
@@ -170,6 +171,7 @@ def same_endpoint(before: dict, after: dict) -> None:
 
 def wait_child(child: subprocess.Popen, deadline: float, *, capture=None) -> int:
     # Reaping the measured child is safe: its original unreaped anchor pins PGID.
+    pipe_ready = None
     while time.monotonic() < deadline:
         if capture is not None:
             capture.drain()
@@ -178,12 +180,22 @@ def wait_child(child: subprocess.Popen, deadline: float, *, capture=None) -> int
         # Keep the original child unreaped until its owned pipe reaches EOF.
         # One read can leave a tail (the eight-write stream exceeds 4096 bytes);
         # polling first could retire the owner before live delivery sees it.
-        # Every iteration keeps the same read cap, sleep and absolute deadline.
+        # Keep the read cap and deadline while waking as soon as bytes arrive.
         stream_open = capture is not None and capture.reader is not None and capture.gap is None
         result = None if stream_open else child.poll()
         if result is not None:
             return result
-        time.sleep(.02)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        interval = min(.02, remaining)
+        if stream_open:
+            if pipe_ready is None:
+                pipe_ready = select.poll()
+                pipe_ready.register(capture.reader, select.POLLIN)
+            pipe_ready.poll(interval * 1000)
+        else:
+            time.sleep(interval)
     raise TimeoutError("original application child deadline")
 
 

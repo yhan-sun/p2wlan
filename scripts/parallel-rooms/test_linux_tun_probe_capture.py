@@ -71,8 +71,9 @@ class PipeReapOrderingControls(unittest.TestCase):
         capture.live_window_bridge = SimpleNamespace(
             observe=lambda owner, _now: states.append(bytes(owner.raw)), seal=lambda: None)
         child = SimpleNamespace(poll=unittest.mock.Mock(return_value=0))
-        with patch.object(harness.time, "sleep"), patch.object(captures.os, "read", wraps=os.read) as reads:
+        with patch.object(harness.time, "sleep") as sleep, patch.object(captures.os, "read", wraps=os.read) as reads:
             self.assertEqual(harness.wait_child(child, time.monotonic() + 1, capture=capture), 0)
+        sleep.assert_not_called()
         self.assertEqual(bytes(capture.raw), payload)
         self.assertTrue(capture.eof)
         self.assertIsNone(capture.reader)
@@ -85,9 +86,13 @@ class PipeReapOrderingControls(unittest.TestCase):
         child = SimpleNamespace(poll=unittest.mock.Mock(return_value=0))
         clock = [0.0]
         with patch.object(harness.time, "monotonic", side_effect=lambda: clock[0]), \
-                patch.object(harness.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                patch.object(harness.select, "poll") as poll, patch.object(harness.time, "sleep") as sleep:
+            poll.return_value.poll.side_effect = lambda ms: clock.__setitem__(0, clock[0] + ms / 1000)
             with self.assertRaisesRegex(TimeoutError, "original application child deadline"):
                 harness.wait_child(child, .05, capture=capture)
+            poll.return_value.register.assert_called_once_with(capture.reader, harness.select.POLLIN)
+            self.assertEqual(clock[0], .05)
+            sleep.assert_not_called()
         child.poll.assert_not_called()
         self.assertFalse(capture.eof)
         self.assertEqual(capture.raw, b"")
