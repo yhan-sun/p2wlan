@@ -56,7 +56,10 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     std::optional<LRESULT> result =
         flutter_controller_->HandleTopLevelWindowProc(hwnd, message, wparam,
                                                       lparam);
-    if (result) {
+    // window_manager handles this message even with no minimum configured.
+    // Also apply the runner's DPI-aware minimum, preserving any maximum sizes
+    // the plugin wrote into MINMAXINFO.
+    if (result && message != WM_GETMINMAXINFO) {
       return *result;
     }
   }

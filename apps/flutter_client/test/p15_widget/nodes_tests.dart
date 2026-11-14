@@ -105,6 +105,7 @@ void _registerNodesTests() {
         child: NodesPage(
           settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('android'),
         ),
       ),
     );

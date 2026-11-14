@@ -96,7 +96,7 @@ extension DaemonControllerElevation on DaemonController {
       if (activePassword == null || activePassword.isEmpty) {
         final promptedPassword = await credentials.promptPassword();
         if (promptedPassword == null || promptedPassword.isEmpty) {
-          throw '已取消保存管理员密码。';
+          throw const _MacosElevationCancelled();
         }
         activePassword = promptedPassword;
         shouldPersistPassword = true;
@@ -109,7 +109,7 @@ extension DaemonControllerElevation on DaemonController {
         await clearMacosAdminPassword?.call();
         final freshPassword = await credentials.promptPassword();
         if (freshPassword == null || freshPassword.isEmpty) {
-          throw '已取消保存管理员密码。';
+          throw const _MacosElevationCancelled();
         }
         activePassword = freshPassword;
         shouldPersistPassword = true;
@@ -218,6 +218,7 @@ extension DaemonControllerElevation on DaemonController {
   }
 
   String _startFailureMessage(Object error) {
+    if (error is _MacosElevationCancelled) return error.toString();
     final raw = error.toString().trim();
     final normalized = raw.toLowerCase();
     if (Platform.isWindows) {
@@ -340,6 +341,13 @@ class _MacosElevatedCommandResult {
 
   final String password;
   final int? childPid;
+}
+
+class _MacosElevationCancelled implements Exception {
+  const _MacosElevationCancelled();
+
+  @override
+  String toString() => '已取消管理员授权，p2wlan-daemon 未启动。';
 }
 
 class _MacosElevationException implements Exception {

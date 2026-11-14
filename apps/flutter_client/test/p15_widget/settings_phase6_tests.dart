@@ -19,6 +19,7 @@ void _registerSettingsPhase6Tests() {
     PlatformCapabilities? capabilities,
     Size? size,
     VoidCallback? onLogout,
+    TargetPlatform? platform,
   }) async {
     if (size != null) {
       tester.view.physicalSize = size;
@@ -26,15 +27,20 @@ void _registerSettingsPhase6Tests() {
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
     }
+    final page = SettingsPage(
+      settingsStore: stores.settingsStore,
+      statusStore: stores.statusStore,
+      capabilities: capabilities ?? PlatformCapabilities.fromPlatform('macos'),
+      onLogout: onLogout,
+    );
     await tester.pumpWidget(
       _TestApp(
-        child: SettingsPage(
-          settingsStore: stores.settingsStore,
-          statusStore: stores.statusStore,
-          capabilities:
-              capabilities ?? PlatformCapabilities.fromPlatform('macos'),
-          onLogout: onLogout,
-        ),
+        child: platform == null
+            ? page
+            : Theme(
+                data: AppTheme.lightTheme.copyWith(platform: platform),
+                child: page,
+              ),
       ),
     );
     await tester.pumpAndSettle();
@@ -136,7 +142,12 @@ void _registerSettingsPhase6Tests() {
     tester,
   ) async {
     final stores = await storesWith(tester, _FakeDiagnosticsApi(health: false));
-    await pump(tester, stores, size: const Size(1280, 900));
+    await pump(
+      tester,
+      stores,
+      size: const Size(1280, 900),
+      platform: TargetPlatform.macOS,
+    );
 
     // Rail exists with General selected by default (rail item + detail title).
     expect(find.text('General'), findsWidgets);
@@ -145,7 +156,14 @@ void _registerSettingsPhase6Tests() {
     expect(find.text('Diagnostics & About'), findsOneWidget);
     // General detail is inline (device name field visible), no dialog.
     expect(find.text('Device name'), findsOneWidget);
+    expect(find.text('Startup & window'), findsOneWidget);
     expect(find.byType(Dialog), findsNothing);
+
+    final themeControl = find.byKey(const ValueKey('settings-theme-select'));
+    expect(
+      tester.getCenter(themeControl).dx,
+      greaterThan(tester.getCenter(find.text('Theme Mode')).dx),
+    );
 
     // Switch categories inline.
     await tester.tap(find.text('Account & Connection'));
@@ -180,6 +198,123 @@ void _registerSettingsPhase6Tests() {
       await tester.pumpAndSettle();
     }
   });
+
+  testWidgets('macOS compact General aligns controls clear of the scrollbar', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+    try {
+      final stores = await _pumpSettingsShell(tester, const Size(704, 590));
+      addTearDown(stores.dispose);
+      await tester.runAsync(
+        () => stores.settingsStore.updateLanguageCode('zh-Hans'),
+      );
+      await tester.pumpAndSettle();
+      await _openCategory(tester, '通用');
+
+      final detail = find.byKey(const PageStorageKey('settings-general'));
+      final language = find.byKey(const ValueKey('settings-language-select'));
+      final theme = find.byKey(const ValueKey('settings-theme-select'));
+      final device = _settingsTextField('设备名称');
+      final close = find.byKey(
+        const ValueKey('settings-close-behavior-select'),
+      );
+      final viewport = tester.getRect(detail);
+      expect(tester.getSize(device).height, greaterThanOrEqualTo(36));
+      for (final control in [language, theme, device, close]) {
+        expect(control.hitTestable(), findsOneWidget);
+        final bounds = tester.getRect(control);
+        expect(bounds.left, closeTo(tester.getTopLeft(language).dx, 1));
+        expect(bounds.right, lessThanOrEqualTo(viewport.right - 16));
+        expect(bounds.bottom, lessThan(viewport.bottom));
+      }
+
+      await tester.enterText(device, 'Mac 调整预览');
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const Key('settings-save-button')).hitTestable(),
+        findsOneWidget,
+      );
+      await tester.binding.setSurfaceSize(const Size(680, 420));
+      tester.platformDispatcher.textScaleFactorTestValue = 2;
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<SegmentedButton<String>>(theme).direction,
+        Axis.vertical,
+      );
+      await tester.ensureVisible(close);
+      await tester.pumpAndSettle();
+      expect(close.hitTestable(), findsOneWidget);
+      expect(
+        find.byKey(const Key('settings-category-back')).hitTestable(),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const Key('settings-save-button')).hitTestable(),
+        findsOneWidget,
+      );
+      tester.platformDispatcher.textScaleFactorTestValue = 1;
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<SegmentedButton<String>>(theme).direction,
+        Axis.horizontal,
+      );
+      expect(tester.takeException(), isNull);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
+  testWidgets(
+    'macOS General exposes its field and keeps rows stable on theme save',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      final semantics = tester.ensureSemantics();
+      try {
+        final stores = await _pumpSettingsShell(tester, const Size(704, 590));
+        addTearDown(stores.dispose);
+        await _openCategory(tester, 'General');
+
+        final device = _settingsTextField('Device name');
+        final field = tester.getSemantics(device).getSemanticsData();
+        expect(field.flagsCollection.isTextField, isTrue);
+        expect(field.label, 'Device name');
+        expect(field.hasAction(SemanticsAction.tap), isTrue);
+        expect(find.text('Other devices see this name.'), findsOneWidget);
+
+        final close = find.byKey(
+          const ValueKey('settings-close-behavior-select'),
+        );
+        final previousPosition = tester.getTopLeft(close);
+        await tester.tap(find.text('Dark').hitTestable());
+        await tester.pump();
+        await _waitFor(
+          tester,
+          () => stores.settingsStore.settings.themeMode == 'dark',
+        );
+        await _waitForSaveComplete(
+          tester,
+          const ValueKey('settings-theme-select'),
+        );
+        final confirmation = find.bySemanticsLabel('Theme saved');
+        expect(confirmation, findsOneWidget);
+        expect(
+          tester
+              .getSemantics(confirmation)
+              .getSemanticsData()
+              .flagsCollection
+              .isLiveRegion,
+          isTrue,
+        );
+        expect(tester.getTopLeft(close), previousPosition);
+        expect(find.byKey(const Key('settings-save-button')), findsNothing);
+      } finally {
+        semantics.dispose();
+        debugDefaultTargetPlatformOverride = null;
+      }
+    },
+  );
 
   testWidgets('android: Settings detail is full-screen and back unwinds', (
     tester,
@@ -675,14 +810,8 @@ Future<_Stores> _pumpSettingsShell(
   await tester.pumpAndSettle();
   // Navigate to Settings (sidebar on expanded, rail on medium, bottom bar
   // on compact mobile).
-  final sidebar = find.descendant(
-    of: find.byType(DesktopSidebar),
-    matching: find.text('Settings'),
-  );
-  final rail = find.descendant(
-    of: find.byType(AppNavRail),
-    matching: find.text('Settings'),
-  );
+  final sidebar = find.byKey(const ValueKey('sidebar-settings'));
+  final rail = find.byKey(const ValueKey(P2WlanSection.settings));
   final bottom = find.descendant(
     of: find.byType(NavigationBar),
     matching: find.text('Settings'),

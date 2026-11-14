@@ -83,6 +83,13 @@ class _ButtonSpinner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (MediaQuery.disableAnimationsOf(context)) {
+      return Icon(
+        Icons.more_horiz_rounded,
+        size: AppTokens.iconSm,
+        color: color ?? Theme.of(context).colorScheme.onPrimary,
+      );
+    }
     return SizedBox.square(
       dimension: 14,
       child: CircularProgressIndicator(

@@ -239,6 +239,8 @@ class _PeerDetailsContent extends StatelessWidget {
     this.onEdit,
     this.onDelete,
     this.onSpeedTest,
+    this.inspector = false,
+    this.showDiagnostics = false,
   });
 
   final PeerSnapshot peer;
@@ -254,16 +256,35 @@ class _PeerDetailsContent extends StatelessWidget {
   final Future<void> Function(PeerSnapshot peer)? onEdit;
   final Future<bool> Function(PeerSnapshot peer)? onDelete;
   final Future<void> Function(PeerSnapshot peer)? onSpeedTest;
+  final bool inspector;
+  final bool showDiagnostics;
 
   @override
   Widget build(BuildContext context) {
     final error = peer.lastError?.trim();
+    final advanced = _AdvancedSection(
+      peer: peer,
+      strings: strings,
+      copiedKey: copiedKey,
+      onCopy: onCopy,
+      inspector: inspector,
+      initiallyExpanded: showDiagnostics,
+    );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _DetailHeader(peer: peer, strings: strings, current: current),
+        _DetailHeader(
+          peer: peer,
+          strings: strings,
+          current: current,
+          inspector: inspector,
+        ),
         const SizedBox(height: AppTokens.space12),
         _ConnectionSummary(peer: peer, strings: strings, current: current),
+        if (showDiagnostics) ...[
+          const SizedBox(height: AppTokens.space12),
+          advanced,
+        ],
         const SizedBox(height: AppTokens.space12),
         _PeerTrafficSection(
           counters: trafficCounters ?? TrafficCounters.fromPeer(peer),
@@ -274,12 +295,14 @@ class _PeerDetailsContent extends StatelessWidget {
           transferBytesPerSecond: transferBytesPerSecond,
           networkId: networkId,
           peerId: peer.nodeId,
+          inspector: inspector,
         ),
         const SizedBox(height: AppTokens.space12),
         _DetailSection(
           key: const Key('peer-detail-network-card'),
           icon: Icons.lan_outlined,
           title: strings.sectionNetwork,
+          inspector: inspector,
           rows: [
             _DetailLine(label: strings.lastSeen, value: _formatLastSeen(peer)),
             _networkLine(strings.virtualIp, peer.virtualIp, 'ip'),
@@ -304,13 +327,10 @@ class _PeerDetailsContent extends StatelessWidget {
           const SizedBox(height: AppTokens.space12),
           _DetailIssueNote(peer: peer, message: error, strings: strings),
         ],
-        const SizedBox(height: AppTokens.space12),
-        _AdvancedSection(
-          peer: peer,
-          strings: strings,
-          copiedKey: copiedKey,
-          onCopy: onCopy,
-        ),
+        if (!showDiagnostics) ...[
+          const SizedBox(height: AppTokens.space12),
+          advanced,
+        ],
         if (onCopy != null ||
             onEdit != null ||
             onDelete != null ||
@@ -325,6 +345,7 @@ class _PeerDetailsContent extends StatelessWidget {
             onEdit: onEdit,
             onDelete: onDelete,
             onSpeedTest: current ? onSpeedTest : null,
+            inspector: inspector,
           ),
         ],
       ],
@@ -351,11 +372,13 @@ class _DetailHeader extends StatelessWidget {
     required this.peer,
     required this.strings,
     required this.current,
+    this.inspector = false,
   });
 
   final PeerSnapshot peer;
   final AppStrings strings;
   final bool current;
+  final bool inspector;
 
   @override
   Widget build(BuildContext context) {
@@ -369,13 +392,17 @@ class _DetailHeader extends StatelessWidget {
     return Container(
       key: const Key('peer-detail-header'),
       width: double.infinity,
-      padding: const EdgeInsets.all(AppTokens.space16),
-      decoration: BoxDecoration(
-        color: colors.surface,
-        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-        border: Border.all(color: colors.border),
-        boxShadow: AppTokens.shadowBorder,
-      ),
+      padding: inspector
+          ? const EdgeInsets.symmetric(vertical: AppTokens.space8)
+          : const EdgeInsets.all(AppTokens.space16),
+      decoration: inspector
+          ? null
+          : BoxDecoration(
+              color: colors.surface,
+              borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+              border: Border.all(color: colors.border),
+              boxShadow: AppTokens.shadowBorder,
+            ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
@@ -447,19 +474,23 @@ class _AdvancedSection extends StatefulWidget {
     required this.strings,
     this.copiedKey,
     this.onCopy,
+    this.inspector = false,
+    this.initiallyExpanded = false,
   });
 
   final PeerSnapshot peer;
   final AppStrings strings;
   final String? copiedKey;
   final Future<void> Function(String value, String key)? onCopy;
+  final bool inspector;
+  final bool initiallyExpanded;
 
   @override
   State<_AdvancedSection> createState() => _AdvancedSectionState();
 }
 
 class _AdvancedSectionState extends State<_AdvancedSection> {
-  var _expanded = false;
+  late var _expanded = widget.initiallyExpanded;
 
   @override
   Widget build(BuildContext context) {
@@ -469,11 +500,15 @@ class _AdvancedSectionState extends State<_AdvancedSection> {
     final strings = widget.strings;
     return Container(
       width: double.infinity,
-      decoration: BoxDecoration(
-        color: colors.surface,
-        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-        border: Border.all(color: colors.border),
-      ),
+      decoration: widget.inspector
+          ? BoxDecoration(
+              border: Border(top: BorderSide(color: colors.divider)),
+            )
+          : BoxDecoration(
+              color: colors.surface,
+              borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+              border: Border.all(color: colors.border),
+            ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(AppTokens.radiusLg),
         child: Column(
@@ -511,7 +546,8 @@ class _AdvancedSectionState extends State<_AdvancedSection> {
                       ),
                       AnimatedRotation(
                         turns: _expanded ? 0.5 : 0,
-                        duration: AppTokens.durationMedium,
+                        duration: AppMotion.durationOf(context),
+                        curve: AppMotion.curve,
                         child: Icon(
                           Icons.expand_more_rounded,
                           size: 20,
@@ -524,8 +560,8 @@ class _AdvancedSectionState extends State<_AdvancedSection> {
               ),
             ),
             AnimatedSize(
-              duration: AppTokens.durationMedium,
-              curve: AppTokens.curveEase,
+              duration: AppMotion.durationOf(context),
+              curve: AppMotion.curve,
               alignment: Alignment.topCenter,
               child: _expanded
                   ? Column(
@@ -635,11 +671,13 @@ class _DetailSection extends StatelessWidget {
     required this.title,
     required this.rows,
     this.icon,
+    this.inspector = false,
   });
 
   final String title;
   final IconData? icon;
   final List<Widget> rows;
+  final bool inspector;
 
   @override
   Widget build(BuildContext context) {
@@ -647,12 +685,18 @@ class _DetailSection extends StatelessWidget {
     final colors = P2WlanColors.of(context);
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(AppTokens.space14),
-      decoration: BoxDecoration(
-        color: colors.surface,
-        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-        border: Border.all(color: colors.border),
-      ),
+      padding: inspector
+          ? const EdgeInsets.symmetric(vertical: AppTokens.space12)
+          : const EdgeInsets.all(AppTokens.space14),
+      decoration: inspector
+          ? BoxDecoration(
+              border: Border(top: BorderSide(color: colors.divider)),
+            )
+          : BoxDecoration(
+              color: colors.surface,
+              borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+              border: Border.all(color: colors.border),
+            ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -837,6 +881,7 @@ class _DetailActions extends StatelessWidget {
     this.onEdit,
     this.onDelete,
     this.onSpeedTest,
+    this.inspector = false,
   });
 
   final PeerSnapshot peer;
@@ -847,6 +892,7 @@ class _DetailActions extends StatelessWidget {
   final Future<void> Function(PeerSnapshot peer)? onEdit;
   final Future<bool> Function(PeerSnapshot peer)? onDelete;
   final Future<void> Function(PeerSnapshot peer)? onSpeedTest;
+  final bool inspector;
 
   @override
   Widget build(BuildContext context) {
@@ -863,12 +909,18 @@ class _DetailActions extends StatelessWidget {
     return Container(
       key: const Key('peer-detail-actions'),
       width: double.infinity,
-      padding: const EdgeInsets.all(AppTokens.space14),
-      decoration: BoxDecoration(
-        color: colors.surface,
-        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-        border: Border.all(color: colors.border),
-      ),
+      padding: inspector
+          ? const EdgeInsets.symmetric(vertical: AppTokens.space12)
+          : const EdgeInsets.all(AppTokens.space14),
+      decoration: inspector
+          ? BoxDecoration(
+              border: Border(top: BorderSide(color: colors.divider)),
+            )
+          : BoxDecoration(
+              color: colors.surface,
+              borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+              border: Border.all(color: colors.border),
+            ),
       child: LayoutBuilder(
         builder: (context, constraints) {
           final buttons = <Widget>[
@@ -907,7 +959,9 @@ class _DetailActions extends StatelessWidget {
                 label: Text(strings.removeDevice),
               ),
           ];
-          final narrow = constraints.maxWidth < 360;
+          final narrow =
+              constraints.maxWidth < 360 ||
+              MediaQuery.textScalerOf(context).scale(13) > 17;
           return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -963,10 +1017,14 @@ class DeviceDetailsDialog extends StatelessWidget {
     this.onDelete,
     this.onSpeedTest,
     this.fullScreen = false,
+    this.desktopInspector = false,
+    this.showDiagnostics = false,
   }) : assert(peer != null || content != null);
 
   final PeerSnapshot? peer;
   final bool fullScreen;
+  final bool desktopInspector;
+  final bool showDiagnostics;
   final Widget? content;
   final Widget? contextHeader;
   final AppStrings strings;
@@ -995,6 +1053,8 @@ class DeviceDetailsDialog extends StatelessWidget {
     final usableHeight = size.height > 96 ? size.height - 48 : size.height;
     final dialogWidth = usableWidth < 640 ? usableWidth : 640.0;
     final maxDialogHeight = usableHeight < 720 ? usableHeight : 720.0;
+    final alignAtEdge =
+        desktopInspector && size.width >= nodesInspectorMinWidth;
 
     Widget details(PeerSnapshot currentPeer) => _PeerDetailsContent(
       peer: currentPeer,
@@ -1023,6 +1083,8 @@ class DeviceDetailsDialog extends StatelessWidget {
           : (selected) =>
                 _closeDetailOnRemoved(context, () => onDelete!(selected)),
       onSpeedTest: onSpeedTest,
+      inspector: desktopInspector,
+      showDiagnostics: showDiagnostics,
     );
 
     final scrollContent = SingleChildScrollView(
@@ -1077,59 +1139,73 @@ class DeviceDetailsDialog extends StatelessWidget {
     return AppStringsScope(
       strings: strings,
       child: Dialog(
-        insetPadding: const EdgeInsets.symmetric(
-          horizontal: AppTokens.space16,
-          vertical: AppTokens.space24,
-        ),
+        alignment: alignAtEdge
+            ? AlignmentDirectional.centerEnd
+            : Alignment.center,
+        insetPadding: alignAtEdge
+            ? EdgeInsets.zero
+            : const EdgeInsets.symmetric(
+                horizontal: AppTokens.space16,
+                vertical: AppTokens.space24,
+              ),
+        constraints: alignAtEdge
+            ? const BoxConstraints.tightFor(width: 456)
+            : null,
         backgroundColor: Colors.transparent,
         surfaceTintColor: Colors.transparent,
         child: ConstrainedBox(
           constraints: BoxConstraints(
-            maxWidth: dialogWidth,
-            maxHeight: maxDialogHeight,
+            maxWidth: alignAtEdge ? 456 : dialogWidth,
+            maxHeight: alignAtEdge ? size.height : maxDialogHeight,
           ),
           child: DecoratedBox(
             decoration: BoxDecoration(
-              color: colors.surfaceMuted,
-              borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-              boxShadow: AppTokens.shadowBorder,
+              color: desktopInspector
+                  ? colors.surfaceElevated
+                  : colors.surfaceMuted,
+              border: alignAtEdge
+                  ? BorderDirectional(start: BorderSide(color: colors.border))
+                  : Border.all(color: colors.border),
+              borderRadius: alignAtEdge
+                  ? null
+                  : BorderRadius.circular(AppTokens.radiusLg),
             ),
             child: ClipRRect(
-              borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+              borderRadius: alignAtEdge
+                  ? BorderRadius.zero
+                  : BorderRadius.circular(AppTokens.radiusLg),
               child: Column(
-                mainAxisSize: MainAxisSize.min,
+                mainAxisSize: alignAtEdge ? MainAxisSize.max : MainAxisSize.min,
                 children: [
                   Padding(
                     padding: const EdgeInsets.fromLTRB(20, 12, 10, 12),
                     child: Row(
                       children: [
-                        Container(
-                          width: 34,
-                          height: 34,
-                          alignment: Alignment.center,
-                          decoration: BoxDecoration(
-                            color: colors.selectedSurface,
-                            borderRadius: BorderRadius.circular(
-                              AppTokens.radiusSm,
+                        if (!desktopInspector)
+                          Container(
+                            width: 34,
+                            height: 34,
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              color: colors.selectedSurface,
+                              borderRadius: BorderRadius.circular(
+                                AppTokens.radiusSm,
+                              ),
+                            ),
+                            child: Icon(
+                              Icons.devices_rounded,
+                              size: 18,
+                              color: theme.colorScheme.primary,
                             ),
                           ),
-                          child: Icon(
-                            Icons.devices_rounded,
-                            size: 18,
-                            color: theme.colorScheme.primary,
-                          ),
-                        ),
-                        const SizedBox(width: AppTokens.space10),
+                        if (!desktopInspector)
+                          const SizedBox(width: AppTokens.space10),
                         Expanded(
                           child: Text(
                             strings.deviceDetails,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: theme.colorScheme.onSurface,
-                              fontSize: 15,
-                              fontWeight: FontWeight.w700,
-                            ),
+                            style: theme.textTheme.titleMedium,
                           ),
                         ),
                         IconButton(

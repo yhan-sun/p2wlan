@@ -61,10 +61,10 @@ void main() {
       expect(_hueDistance(lightHue, darkHue), lessThan(20));
     });
 
-    test('light primary matches the approved UI reference', () {
-      expect(AppTokens.colorAccent, const Color(0xFF2563EB));
-      expect(AppTokens.colorBg, const Color(0xFFF5F7FB));
-      expect(AppTokens.colorSurface, const Color(0xFFFFFFFF));
+    test('light primary and surfaces match the desktop redesign', () {
+      expect(AppTokens.colorAccent, const Color(0xFF173E3C));
+      expect(AppTokens.colorBg, const Color(0xFFF7F7F4));
+      expect(AppTokens.colorSurface, const Color(0xFFFCFCF9));
     });
 
     test('light primary is a darker shade than dark primary (same hue)', () {

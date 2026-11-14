@@ -6,16 +6,14 @@
 ///
 /// Pages may refine their own internal layouts on top of this (e.g. a list
 /// flipping to master-detail). Desktop navigation has one additional
-/// platform-aware threshold: desktop windows at 800px and above use the full
+/// platform-aware threshold: desktop windows at 760px and above use the full
 /// sidebar even while page content is still in the medium band.
 enum AppBreakpoint { compact, medium, expanded }
 
 abstract final class AppBreakpoints {
   static const compactMaxWidth = 600.0;
 
-  /// Keep the labeled desktop sidebar on the smallest supported desktop
-  /// window. The native runners reserve a little space for their frame, so
-  /// this is intentionally below the native 800px minimum track width.
+  /// Below this width, desktop windows use the icon-only sidebar.
   static const desktopSidebarMinWidth = 760.0;
   static const expandedMinWidth = 1024.0;
 

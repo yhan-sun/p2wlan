@@ -1414,11 +1414,9 @@ impl UdpTransport {
                 && !self.peers.is_direct_sync(peer_id)
                 && self.peers.current_network_generation_sync() == generation
         };
-        if !path_valid() {
-            return false;
-        }
+        let allowed = path_valid();
         #[cfg(test)]
-        {
+        if allowed {
             let gate = self
                 .heartbeat_send_gate
                 .lock()
@@ -1427,12 +1425,10 @@ impl UdpTransport {
             if let Some(gate) = gate {
                 gate.reached.notify_one();
                 let _ = gate.release.wait().await;
-                if !path_valid() {
-                    return false;
-                }
+                return path_valid();
             }
         }
-        true
+        allowed
     }
 
     /// Emit diagnostics for exactly one relay-backoff heartbeat service beat.

@@ -153,8 +153,8 @@ impl CaptureSession {
             // carry no observations: the unchanged capture predicate decides
             // eligibility and rejects missing provenance before owner/once.
             for (flow, source) in self.sources.flows.iter().enumerate() {
-                for slot in 0..source.requests.len() {
-                    if missing || (window_pending && source.requests[slot].window.is_some()) {
+                for (slot, request) in source.requests.iter().enumerate() {
+                    if missing || (window_pending && request.window.is_some()) {
                         self.prepare_original_frames(flow, &[slot], &mut completion);
                     }
                 }

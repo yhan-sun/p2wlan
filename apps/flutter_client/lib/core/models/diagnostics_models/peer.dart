@@ -194,6 +194,12 @@ class PeerSnapshot {
     return null;
   }
 
+  /// Smoothed RTT variation for the same fresh, verified path as [latencyMs].
+  int? get jitterMs {
+    if (latencyMs == null) return null;
+    return isDirectVerified ? direct.jitterMs : relay.jitterMs;
+  }
+
   /// Candidate-probe RTT (UDP punch / STUN-style measurement).  This is NOT a
   /// connection latency: the peer's data path is not verified until
   /// [path] is `direct` or `relay`.  Used ONLY for the "探测中" label.
@@ -258,6 +264,7 @@ class PathHealthSnapshot {
     required this.lastErrorCode,
     required this.latencyMs,
     required this.rttEwmaMs,
+    this.jitterMs,
   });
 
   final int? lastSuccessAgeMs;
@@ -267,6 +274,7 @@ class PathHealthSnapshot {
   final String? lastErrorCode;
   final int? latencyMs;
   final int? rttEwmaMs;
+  final int? jitterMs;
 
   /// The UI shows the smoothed RTT for this verified path. The raw sample is
   /// only a compatibility fallback for older daemons. Once the daemon reports
@@ -295,6 +303,7 @@ class PathHealthSnapshot {
       lastErrorCode: _nullableString(json['last_error_code']),
       latencyMs: _intOrNull(json['latency_ms']),
       rttEwmaMs: _intOrNull(json['rtt_ewma_ms']),
+      jitterMs: _counterOrNull(json['jitter_ms']),
     );
   }
 }

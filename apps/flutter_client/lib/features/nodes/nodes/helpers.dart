@@ -153,14 +153,6 @@ int _compareByLatency(PeerSnapshot left, PeerSnapshot right) {
   return _compareByName(left, right);
 }
 
-int _filterCount(List<PeerSnapshot> peers, _NodeFilter filter) {
-  var count = 0;
-  for (final peer in peers) {
-    if (_filterMatches(filter, peer)) count += 1;
-  }
-  return count;
-}
-
 /// Cached room catalogs remain inspectable, but cannot satisfy a live filter.
 bool _networkFilterMatches(_NodeFilter filter, NetworkPeerSnapshot item) {
   if (filter == _NodeFilter.all) return true;

@@ -361,6 +361,7 @@ void main() {
     onStores,
     double textScale = 1,
     bool disableAnimations = false,
+    TargetPlatform? platform,
     String languageCode = 'zh-CN',
     String? initialRoomId,
     String? initialDeviceId,
@@ -439,6 +440,7 @@ void main() {
     });
     await tester.pumpWidget(
       MaterialApp(
+        theme: ThemeData(platform: platform),
         builder: (context, child) => MediaQuery(
           data: MediaQuery.of(context).copyWith(
             textScaler: TextScaler.linear(textScale),
@@ -965,7 +967,7 @@ void main() {
     },
   );
 
-  testWidgets('two room cards stay compact and left aligned on desktop', (
+  testWidgets('desktop rooms use full-width keyboard-selectable rows', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(1280, 900);
@@ -976,6 +978,7 @@ void main() {
     await pump(
       tester,
       enterRoom: false,
+      platform: TargetPlatform.macOS,
       configureApi: (api) =>
           api.pendingList = Completer<List<FriendRoom>>()
             ..complete([
@@ -990,29 +993,49 @@ void main() {
     );
     final first = find.byKey(const ValueKey('room-card-$_roomId'));
     final second = find.byKey(const ValueKey('room-card-$secondId'));
-    expect(tester.getSize(first).width, closeTo(460, 1));
+    expect(tester.getSize(first).width, closeTo(1232, 1));
+    expect(tester.getSize(first).height, lessThan(100));
     expect(tester.getSize(first).width, tester.getSize(second).width);
-    expect(tester.getTopLeft(first).dy, tester.getTopLeft(second).dy);
+    expect(tester.getTopLeft(first).dx, tester.getTopLeft(second).dx);
     expect(
-      tester.getTopLeft(second).dx - tester.getTopRight(first).dx,
-      closeTo(16, 1),
+      tester.getTopLeft(second).dy,
+      greaterThan(tester.getBottomLeft(first).dy),
     );
-    expect(tester.getTopRight(second).dx, lessThan(1000));
+    expect(find.ancestor(of: first, matching: find.byType(Card)), findsNothing);
+    final indicator = find
+        .descendant(of: second, matching: find.byType(AnimatedContainer))
+        .first;
+    Focus.of(tester.element(indicator)).requestFocus();
+    await tester.pumpAndSettle();
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pumpAndSettle();
+    expect(find.text('返回房间'), findsOneWidget);
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
-  testWidgets('a single room card keeps a readable width on a wide screen', (
+  testWidgets('compact desktop room row preserves the local connect action', (
     tester,
   ) async {
-    tester.view.physicalSize = const Size(1440, 900);
+    tester.view.physicalSize = const Size(604, 900);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
-    await pump(tester, enterRoom: false);
-    final card = find.byKey(const ValueKey('room-card-$_roomId'));
-    expect(tester.getSize(card).width, closeTo(460, 1));
-    expect(tester.getTopLeft(card).dx, closeTo(28, 1));
+    await pump(
+      tester,
+      enterRoom: false,
+      canConnect: true,
+      textScale: 1.5,
+      platform: TargetPlatform.macOS,
+    );
+    final row = find.byKey(const ValueKey('room-card-$_roomId'));
+    final connection = find.byKey(
+      const ValueKey('room-card-connection-$_roomId'),
+    );
+    expect(tester.getSize(row).width, closeTo(556, 1));
+    expect(tester.getTopLeft(row).dx, closeTo(24, 1));
+    expect(tester.getRect(row).contains(tester.getCenter(connection)), isTrue);
+    expect(tester.widget<FilledButton>(connection).onPressed, isNotNull);
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });

@@ -6,13 +6,13 @@ import 'package:p2wlan_flutter_client/app/app_tokens.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/app_select.dart';
 
 void main() {
-  testWidgets('AppSelect opens a branded menu and changes its value', (
+  testWidgets('desktop AppSelect uses compact controls and changes its value', (
     tester,
   ) async {
     var value = 'system';
     await tester.pumpWidget(
       MaterialApp(
-        theme: AppTheme.lightTheme,
+        theme: AppTheme.lightTheme.copyWith(platform: TargetPlatform.macOS),
         home: Scaffold(
           body: StatefulBuilder(
             builder: (context, setState) => Center(
@@ -32,19 +32,21 @@ void main() {
     );
 
     expect(find.byType(DropdownButton<String>), findsNothing);
-    await tester.tap(
-      find.descendant(
-        of: find.byKey(const ValueKey('theme-select')),
-        matching: find.byType(OutlinedButton),
-      ),
+    final trigger = find.descendant(
+      of: find.byKey(const ValueKey('theme-select')),
+      matching: find.byType(OutlinedButton),
     );
+    expect(tester.getSize(trigger).height, AppTokens.desktopControlHeight);
+    await tester.tap(trigger);
     await tester.pumpAndSettle();
     expect(find.text('Dark'), findsOneWidget);
 
     for (final option in ['system', 'dark']) {
-      final surface = tester.widget<Material>(
-        find.byKey(ValueKey<Object>(('app-select-option-surface', option))),
+      final entry = find.byKey(
+        ValueKey<Object>(('app-select-option-surface', option)),
       );
+      expect(tester.getSize(entry).height, AppTokens.desktopControlHeight);
+      final surface = tester.widget<Material>(entry);
       final shape = surface.shape! as RoundedRectangleBorder;
       expect(shape.borderRadius, BorderRadius.circular(AppTokens.radiusMd));
       expect(surface.clipBehavior, Clip.antiAlias);
@@ -100,6 +102,10 @@ void main() {
       final trigger = find.descendant(
         of: find.byKey(const ValueKey('mobile-theme-select')),
         matching: find.byType(OutlinedButton),
+      );
+      expect(
+        tester.getSize(trigger).height,
+        greaterThanOrEqualTo(AppTokens.minTouchTarget),
       );
       final semantics = tester.widget<Semantics>(
         find.ancestor(of: trigger, matching: find.byType(Semantics)).first,

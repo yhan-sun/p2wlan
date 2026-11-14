@@ -350,9 +350,15 @@ class _HeroSurface extends StatelessWidget {
 
 /// Virtual IP with a stable copy target and bounded inline confirmation.
 class _VirtualIpBlock extends StatefulWidget {
-  const _VirtualIpBlock({required this.virtualIp});
+  const _VirtualIpBlock({
+    required this.virtualIp,
+    this.compact = false,
+    this.stale = false,
+  });
 
   final String virtualIp;
+  final bool compact;
+  final bool stale;
 
   @override
   State<_VirtualIpBlock> createState() => _VirtualIpBlockState();
@@ -388,14 +394,16 @@ class _VirtualIpBlockState extends State<_VirtualIpBlock> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          strings.virtualIpLabel,
+          widget.stale
+              ? (strings.isZh ? '上次记录的虚拟 IP' : 'Last recorded virtual IP')
+              : strings.virtualIpLabel,
           style: TextStyle(
             color: theme.colorScheme.onSurfaceVariant,
             fontSize: 12,
             fontWeight: FontWeight.w500,
           ),
         ),
-        const SizedBox(height: AppTokens.space6),
+        SizedBox(height: widget.compact ? AppTokens.space2 : AppTokens.space6),
         Semantics(
           key: const Key('home-virtual-ip-feedback'),
           button: true,
@@ -412,8 +420,10 @@ class _VirtualIpBlockState extends State<_VirtualIpBlock> {
                 onTap: _copy,
                 borderRadius: BorderRadius.circular(AppTokens.radiusSm),
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(
-                    minHeight: AppTokens.minTouchTarget,
+                  constraints: BoxConstraints(
+                    minHeight: widget.compact
+                        ? AppTokens.space24
+                        : AppTokens.minTouchTarget,
                   ),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(vertical: 4),
@@ -426,14 +436,18 @@ class _VirtualIpBlockState extends State<_VirtualIpBlock> {
                             softWrap: true,
                             style: TextStyle(
                               color: theme.colorScheme.onSurface,
-                              fontSize: 24,
+                              fontSize: widget.compact ? 16 : 24,
                               fontWeight: FontWeight.w600,
                               height: 1.1,
                               fontFeatures: AppTokens.tabularFontFeatures,
                             ),
                           ),
                         ),
-                        const SizedBox(width: AppTokens.space12),
+                        SizedBox(
+                          width: widget.compact
+                              ? AppTokens.space8
+                              : AppTokens.space12,
+                        ),
                         AnimatedSwitcher(
                           duration: AppMotion.feedbackDurationOf(context),
                           child: Icon(
@@ -488,10 +502,12 @@ class _StopDaemonButton extends StatelessWidget {
   const _StopDaemonButton({
     required this.daemonBusy,
     required this.onStopDaemon,
+    this.compact = false,
   });
 
   final bool daemonBusy;
   final Future<void> Function() onStopDaemon;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
@@ -500,27 +516,35 @@ class _StopDaemonButton extends StatelessWidget {
     return OutlinedButton.icon(
       key: const Key('dashboard-stop-button'),
       onPressed: daemonBusy ? null : onStopDaemon,
-      style: OutlinedButton.styleFrom(
-        foregroundColor: Theme.of(context).colorScheme.onSurfaceVariant,
-        side: BorderSide(color: colors.border),
-        minimumSize: const Size(
-          AppTokens.minTouchTarget,
-          AppTokens.minTouchTarget,
-        ),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
-        visualDensity: VisualDensity.standard,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        ),
-        textStyle: Theme.of(context).textTheme.labelMedium
-            ?.copyWith(fontSize: 12, fontWeight: FontWeight.w600),
-      ),
+      style: compact
+          ? null
+          : OutlinedButton.styleFrom(
+              foregroundColor: Theme.of(context).colorScheme.onSurfaceVariant,
+              side: BorderSide(color: colors.border),
+              minimumSize: const Size(
+                AppTokens.minTouchTarget,
+                AppTokens.minTouchTarget,
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+              visualDensity: VisualDensity.standard,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+              ),
+              textStyle: Theme.of(context).textTheme.labelMedium
+                  ?.copyWith(fontSize: 12, fontWeight: FontWeight.w600),
+            ),
       icon: daemonBusy
           ? _ButtonSpinner(
               color: Theme.of(context).colorScheme.onSurfaceVariant,
             )
           : const Icon(Icons.stop_rounded, size: 17),
-      label: Text(daemonBusy ? strings.daemonWorking : strings.stopP2wlan),
+      label: Text(
+        daemonBusy
+            ? strings.daemonWorking
+            : compact
+            ? (strings.isZh ? '断开' : 'Disconnect')
+            : strings.stopP2wlan,
+      ),
     );
   }
 }

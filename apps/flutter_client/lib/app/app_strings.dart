@@ -657,7 +657,7 @@ class AppStrings {
 
   // General
   String get deviceNameHelper =>
-      isZh ? '留空保存时会使用当前主机名。' : 'If left empty, the current hostname is used.';
+      isZh ? '其他设备会看到此名称。' : 'Other devices see this name.';
   String get closeBehavior => isZh ? '关闭窗口行为' : 'Close window behavior';
   String get closeBehaviorHelper => isZh
       ? '关闭主窗口后，P2WLAN 是否继续保持后台运行。'
@@ -883,6 +883,12 @@ class AppStrings {
   String get windowsUacLaunchFailed => isZh
       ? 'Windows UAC 启动失败，请在系统提示中允许管理员授权后重试。'
       : 'Windows UAC could not start the daemon. Allow administrator authorization and try again.';
+  String get administratorAuthorizationCancelled => isZh
+      ? '已取消管理员授权，P2WLAN 未启动。可以重新启动以再次授权。'
+      : 'Administrator authorization was cancelled. Start P2WLAN again to retry.';
+  String get administratorLaunchFailed => isZh
+      ? '管理员授权启动失败，请检查本机权限后重试。'
+      : 'Could not start with administrator permissions. Check permissions and try again.';
   String get clientDaemonBuildMismatch => isZh
       ? '客户端与 daemon 不是同一次构建，已阻止启动。请重新安装同一个 clean Windows 包。'
       : 'The client and daemon are from different builds, so startup was blocked. Reinstall one clean Windows package.';

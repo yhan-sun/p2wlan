@@ -48,4 +48,7 @@ List<SettingsCategory> visibleSettingsCategories(PlatformCapabilities caps) {
 const _settingsDesktopSidebarBreakpoint = 800.0;
 const _settingsTouchSidebarBreakpoint = 880.0;
 
+bool _usesDesktopSettings(BuildContext context) =>
+    AppTokens.isDesktopPlatform(Theme.of(context).platform);
+
 enum _SettingsLayout { expanded, rootDetail }

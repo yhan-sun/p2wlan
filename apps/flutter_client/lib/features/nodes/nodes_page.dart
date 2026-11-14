@@ -26,8 +26,11 @@ import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
 import '../../shared/layout/app_breakpoints.dart';
 import '../../shared/widgets/app_back_button.dart';
+import '../../shared/widgets/app_motion.dart';
+import '../../shared/widgets/desktop_device_row.dart';
 import '../../shared/widgets/device_type_icon.dart';
 import '../../shared/widgets/info_card.dart';
+import '../../shared/widgets/page_heading.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
 import '../../shared/widgets/traffic_history_section.dart';
@@ -47,8 +50,7 @@ part 'nodes/speed_test_desktop_chart.dart';
 part 'nodes/speed_test_mobile.dart';
 part 'nodes/remote_only.dart';
 part 'nodes/network_scope.dart';
-
-enum _NodesLayout { compact, medium, expanded }
+part 'nodes/desktop_devices.dart';
 
 class NodesPage extends StatefulWidget {
   const NodesPage({
@@ -112,6 +114,7 @@ class _NodesPageState extends State<NodesPage> {
   String? _busyPeerId;
   String? _openedInitialPeerId;
   var _initialPeerOpenScheduled = false;
+  String? _selectedDesktopPeerId;
   late final ScrollController _scrollController;
 
   @override
@@ -184,7 +187,12 @@ class _NodesPageState extends State<NodesPage> {
   }
 
   void _focusSearch() {
-    _searchFocusNode.requestFocus();
+    if (_scrollController.hasClients) {
+      _scrollController.jumpTo(_scrollController.position.minScrollExtent);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _searchFocusNode.requestFocus();
+    });
   }
 
   void _scheduleInitialPeerOpen() {
@@ -264,6 +272,21 @@ class _NodesPageState extends State<NodesPage> {
                 (selectedId == null ||
                     selectedId == NetworkOverview.primaryScopeId) &&
                 scopes.any((scope) => scope.isPrimary);
+            if (capabilities.canUseSystemTray && !remoteOnly) {
+              return _DesktopDevices(
+                state: this,
+                overview: overview,
+                scopes: scopes,
+                selectedScopeId: selectedId,
+                allPeers: allPeers,
+                visiblePeers: visiblePeers,
+                snapshot: snapshot,
+                settings: settings,
+                showLocal:
+                    showPrimary && (!overview.hasRooms || snapshot != null),
+                primaryStale: showPrimary && primaryStale,
+              );
+            }
             return PageScaffold(
               scrollController: _scrollController,
               title: stringsOf(context).devices,
@@ -271,14 +294,7 @@ class _NodesPageState extends State<NodesPage> {
               showHeader: widget.showHeader,
               maxWidth: nodesPageMaxWidth,
               toolbar: overview.hasRooms
-                  ? NetworkScopePicker(
-                      overview: overview,
-                      selectedId: selectedId,
-                      onChanged: (id) => setState(() {
-                        _selectedScopeId = id;
-                        _saveUiState();
-                      }),
-                    )
+                  ? _scopePicker(overview, selectedId)
                   : null,
               children: [
                 if (remoteOnly)
@@ -291,30 +307,7 @@ class _NodesPageState extends State<NodesPage> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            _NodeToolbar(
-                              searchController: _searchController,
-                              searchFocusNode: _searchFocusNode,
-                              filter: _filter,
-                              sort: _sort,
-                              allPeers: [
-                                for (final item in allPeers) item.peer,
-                              ],
-                              onlineCount: allPeers
-                                  .where((item) => item.online)
-                                  .length,
-                              scopeConnections: overview.hasRooms,
-                              onFilterChanged: (filter) => setState(() {
-                                _filter = filter;
-                                _saveUiState();
-                              }),
-                              onSortChanged: (sort) => setState(() {
-                                _sort = sort;
-                                _saveUiState();
-                              }),
-                              onQueryChanged: () => setState(() {}),
-                              onClearSearch: () =>
-                                  setState(_searchController.clear),
-                            ),
+                            _toolbar(allPeers, overview.hasRooms),
                             if (showPrimary && primaryStale) ...[
                               const SizedBox(height: AppTokens.space8),
                               Row(
@@ -391,27 +384,18 @@ class _NodesPageState extends State<NodesPage> {
                               ? stringsOf(context).clearSearch
                               : stringsOf(context).clearFilter,
                           onAction: query.trim().isNotEmpty
-                              ? () => setState(_searchController.clear)
-                              : () => setState(() {
-                                  _filter = _NodeFilter.all;
-                                  _saveUiState();
-                                }),
+                              ? _clearPeerSearch
+                              : _clearPeerFilter,
                         )
                       else
                         LayoutBuilder(
                           builder: (context, constraints) {
-                            final largeText =
-                                MediaQuery.textScalerOf(context).scale(12) > 16;
-                            final layout = largeText
-                                ? _NodesLayout.compact
-                                : constraints.maxWidth >= nodesInspectorMinWidth
-                                ? _NodesLayout.expanded
-                                : constraints.maxWidth < 500
-                                ? _NodesLayout.compact
-                                : _NodesLayout.medium;
                             return _PeerList(
                               peers: visiblePeers,
-                              compact: layout == _NodesLayout.compact,
+                              compact:
+                                  constraints.maxWidth < 500 ||
+                                  MediaQuery.textScalerOf(context).scale(12) >
+                                      16,
                               showScope: overview.hasRooms,
                               onTap: _openNetworkPeer,
                             );
@@ -427,6 +411,48 @@ class _NodesPageState extends State<NodesPage> {
       ),
     );
   }
+
+  Widget _scopePicker(NetworkOverview overview, String? selectedId) =>
+      NetworkScopePicker(
+        overview: overview,
+        selectedId: selectedId,
+        onChanged: (id) => setState(() {
+          _selectedScopeId = id;
+          _saveUiState();
+        }),
+      );
+
+  Widget _toolbar(
+    List<NetworkPeerSnapshot> allPeers,
+    bool scopeConnections, {
+    bool desktop = false,
+  }) => _NodeToolbar(
+    searchController: _searchController,
+    searchFocusNode: _searchFocusNode,
+    filter: _filter,
+    sort: _sort,
+    totalCount: allPeers.length,
+    onlineCount: allPeers.where((item) => item.online).length,
+    scopeConnections: scopeConnections,
+    desktop: desktop,
+    onFilterChanged: (filter) => setState(() {
+      _filter = filter;
+      _saveUiState();
+    }),
+    onSortChanged: (sort) => setState(() {
+      _sort = sort;
+      _saveUiState();
+    }),
+    onQueryChanged: () => setState(() {}),
+    onClearSearch: _clearPeerSearch,
+  );
+
+  void _clearPeerSearch() => setState(_searchController.clear);
+
+  void _clearPeerFilter() => setState(() {
+    _filter = _NodeFilter.all;
+    _saveUiState();
+  });
 
   void _openNetworkPeer(NetworkPeerSnapshot item) {
     if (!item.isPrimary) {
@@ -445,14 +471,17 @@ class _NodesPageState extends State<NodesPage> {
     _openPeer(item.peer);
   }
 
-  void _openPeer(PeerSnapshot peer) {
+  void _openPeer(PeerSnapshot peer, {bool showDiagnostics = false}) {
     final capabilities = widget.capabilities ?? PlatformCapabilities.current();
+    final mobile =
+        !capabilities.canUseSystemTray ||
+        MediaQuery.sizeOf(context).width < 600;
+    if (!mobile) setState(() => _selectedDesktopPeerId = peer.nodeId);
     unawaited(
       _openPeerAndNotify(
         peer,
-        mobile:
-            !capabilities.canUseSystemTray ||
-            MediaQuery.sizeOf(context).width < 600,
+        mobile: mobile,
+        showDiagnostics: showDiagnostics,
       ),
     );
   }
@@ -460,9 +489,16 @@ class _NodesPageState extends State<NodesPage> {
   Future<void> _openPeerAndNotify(
     PeerSnapshot peer, {
     required bool mobile,
+    required bool showDiagnostics,
   }) async {
-    await _showPeerDetails(peer, mobile: mobile);
-    if (mounted) widget.onPeerDetailsClosed?.call();
+    await _showPeerDetails(
+      peer,
+      mobile: mobile,
+      showDiagnostics: showDiagnostics,
+    );
+    if (!mounted) return;
+    if (!mobile) setState(() => _selectedDesktopPeerId = null);
+    widget.onPeerDetailsClosed?.call();
   }
 
   Future<void> _copy(String value, String key) async {
@@ -627,6 +663,7 @@ class _NodesPageState extends State<NodesPage> {
   Future<void> _showPeerDetails(
     PeerSnapshot peer, {
     required bool mobile,
+    required bool showDiagnostics,
   }) async {
     final snapshot = widget.statusStore.snapshot;
     final networkId =
@@ -653,9 +690,25 @@ class _NodesPageState extends State<NodesPage> {
       );
       return;
     }
-    await showDialog<void>(
+    await showGeneralDialog<void>(
       context: context,
-      builder: (dialogContext) => DeviceDetailsDialog(
+      barrierDismissible: true,
+      barrierLabel: MaterialLocalizations.of(context).modalBarrierDismissLabel,
+      barrierColor: Theme.of(context).colorScheme.scrim.withValues(alpha: 0.25),
+      transitionDuration: AppMotion.durationOf(context),
+      transitionBuilder: (context, animation, _, child) {
+        final progress = animation.drive(CurveTween(curve: AppMotion.curve));
+        return FadeTransition(
+          opacity: progress,
+          child: SlideTransition(
+            position: progress.drive(
+              Tween(begin: const Offset(0.016, 0), end: Offset.zero),
+            ),
+            child: child,
+          ),
+        );
+      },
+      pageBuilder: (dialogContext, _, _) => DeviceDetailsDialog(
         peer: peer,
         strings: stringsOf(context),
         statusStore: widget.statusStore,
@@ -666,6 +719,8 @@ class _NodesPageState extends State<NodesPage> {
         onEdit: _editPeer,
         onDelete: _deletePeer,
         onSpeedTest: _showSpeedTest,
+        desktopInspector: true,
+        showDiagnostics: showDiagnostics,
       ),
     );
   }

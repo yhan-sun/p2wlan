@@ -216,10 +216,7 @@ void main() {
       );
       await tester.tap(find.text('Advanced Network'));
       await tester.pumpAndSettle();
-      final mtu = find.byWidgetPredicate(
-        (widget) =>
-            widget is TextField && widget.decoration?.labelText == 'MTU',
-      );
+      final mtu = find.byKey(const ValueKey('settings-field-MTU'));
       await tester.enterText(mtu, '1300');
       await tester.pump();
       final save = find.byKey(const Key('settings-save-button'));

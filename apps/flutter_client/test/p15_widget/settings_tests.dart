@@ -40,7 +40,10 @@ Future<_Stores> _pumpSettings(
 }
 
 Finder _settingsTextField(String label) => find.byWidgetPredicate(
-  (widget) => widget is TextField && widget.decoration?.labelText == label,
+  (widget) =>
+      widget is TextField &&
+      (widget.key == ValueKey('settings-field-$label') ||
+          widget.decoration?.labelText == label),
 );
 
 /// Opens a settings category. Works on the medium/compact root-detail layout

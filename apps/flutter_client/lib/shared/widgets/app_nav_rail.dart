@@ -1,7 +1,5 @@
 import 'package:flutter/material.dart';
 
-import 'app_motion.dart';
-
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/navigation_model.dart';
@@ -9,6 +7,7 @@ import '../../app/p2wlan_colors.dart';
 import '../../core/state/status_store.dart';
 import '../../core/presentation/network_overview.dart';
 import '../network_overview_presentation.dart';
+import 'sidebar_item.dart';
 import 'status_badge.dart';
 
 /// Compact desktop and medium non-desktop navigation.
@@ -26,13 +25,14 @@ class AppNavRail extends StatelessWidget {
     required this.statusStore,
     required this.onSelect,
     required this.onFooterTap,
+    this.shortcuts = const {},
   });
 
   /// Labeled width for non-desktop medium layouts.
   static const expandedWidth = 156.0;
 
   /// Compact desktop width: icon buttons and a bottom status entry.
-  static const compactWidth = 64.0;
+  static const compactWidth = 56.0;
 
   /// Current section; secondary/non-primary sections render no selection.
   final P2WlanSection? selected;
@@ -41,14 +41,14 @@ class AppNavRail extends StatelessWidget {
   final StatusStore statusStore;
   final ValueChanged<P2WlanSection> onSelect;
   final VoidCallback onFooterTap;
+  final Map<P2WlanSection, String> shortcuts;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     return Container(
       key: const Key('app-nav-rail-surface'),
       width: iconOnly ? compactWidth : expandedWidth,
-      color: theme.colorScheme.surface,
+      color: P2WlanColors.of(context).surfaceMuted,
       child: SafeArea(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -56,9 +56,11 @@ class AppNavRail extends StatelessWidget {
             _RailBrand(strings: strings, iconOnly: iconOnly),
             Expanded(
               child: ListView(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: AppTokens.space4,
-                  vertical: AppTokens.space6,
+                padding: const EdgeInsets.fromLTRB(
+                  AppTokens.space8,
+                  0,
+                  AppTokens.space8,
+                  AppTokens.space8,
                 ),
                 children: [
                   for (final (index, group)
@@ -69,8 +71,10 @@ class AppNavRail extends StatelessWidget {
                         child: Divider(indent: 8, endIndent: 8),
                       ),
                     for (final section in group)
-                      _NavRailItem(
-                        section: section,
+                      SidebarItem(
+                        key: ValueKey(section),
+                        icon: section.icon,
+                        shortcut: shortcuts[section],
                         iconOnly: iconOnly,
                         selected: selected == section,
                         label: strings.sectionLabel(section.name),
@@ -102,19 +106,7 @@ class _RailBrand extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final mark = Container(
-      width: 24,
-      height: 24,
-      decoration: BoxDecoration(
-        color: theme.colorScheme.primary,
-        borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-      ),
-      child: Icon(
-        Icons.hub_outlined,
-        size: 15,
-        color: theme.colorScheme.onPrimary,
-      ),
-    );
+    const mark = SidebarBrandMark();
     if (iconOnly) {
       return Tooltip(
         message: strings.appName,
@@ -143,135 +135,6 @@ class _RailBrand extends StatelessWidget {
               ),
             ),
           ],
-        ),
-      ),
-    );
-  }
-}
-
-class _NavRailItem extends StatelessWidget {
-  const _NavRailItem({
-    required this.section,
-    required this.iconOnly,
-    required this.selected,
-    required this.label,
-    required this.onTap,
-  });
-
-  final P2WlanSection section;
-  final bool iconOnly;
-  final bool selected;
-  final String label;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final item = _RailItemSurface(
-      icon: section.icon,
-      iconOnly: iconOnly,
-      selected: selected,
-      label: label,
-      onTap: onTap,
-    );
-    return Semantics(
-      button: true,
-      selected: selected,
-      label: label,
-      child: Tooltip(message: label, excludeFromSemantics: true, child: item),
-    );
-  }
-}
-
-class _RailItemSurface extends StatelessWidget {
-  const _RailItemSurface({
-    required this.icon,
-    required this.iconOnly,
-    required this.selected,
-    required this.label,
-    required this.onTap,
-  });
-
-  final IconData icon;
-  final bool iconOnly;
-  final bool selected;
-  final String label;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final colors = P2WlanColors.of(context);
-    final foreground = selected
-        ? theme.colorScheme.primary
-        : theme.colorScheme.onSurfaceVariant;
-    final labelStyle = TextStyle(
-      fontSize: 13,
-      fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
-      color: foreground,
-    );
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: AppTokens.space4),
-        child: AnimatedContainer(
-          duration: AppMotion.feedbackDurationOf(context),
-          curve: AppMotion.curve,
-          decoration: BoxDecoration(
-            color: selected ? colors.selectedSurface : Colors.transparent,
-            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          ),
-          child: Material(
-            type: MaterialType.transparency,
-            child: InkWell(
-              onTap: onTap,
-              borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-              hoverColor: selected ? null : colors.hoverSurface,
-              child: ExcludeSemantics(
-                child: SizedBox(
-                  height: 40,
-                  child: Stack(
-                    children: [
-                      if (selected)
-                        Align(
-                          alignment: Alignment.centerLeft,
-                          child: Container(
-                            width: 2,
-                            height: 18,
-                            decoration: BoxDecoration(
-                              color: theme.colorScheme.primary,
-                              borderRadius: BorderRadius.circular(2),
-                            ),
-                          ),
-                        ),
-                      if (iconOnly)
-                        Center(child: Icon(icon, size: 19, color: foreground))
-                      else
-                        Padding(
-                          padding: const EdgeInsets.only(
-                            left: AppTokens.space12,
-                            right: AppTokens.space8,
-                          ),
-                          child: Row(
-                            children: [
-                              Icon(icon, size: 19, color: foreground),
-                              const SizedBox(width: AppTokens.space10),
-                              Expanded(
-                                child: Text(
-                                  label,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: labelStyle,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
         ),
       ),
     );

@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 
+import '../../app/app_tokens.dart';
+
 /// The native Windows caption buttons rendered inside the Flutter client.
 ///
 /// Windows uses a hidden title bar so the app can share the same quiet,
@@ -12,7 +14,10 @@ import 'package:window_manager/window_manager.dart';
 /// window_manager package's platform-native glyphs and hover treatment, while
 /// keeping the tray controller in charge of the close behavior.
 class WindowsWindowControls extends StatefulWidget {
-  const WindowsWindowControls({super.key, this.height = 56});
+  const WindowsWindowControls({
+    super.key,
+    this.height = AppTokens.desktopToolbarHeight,
+  });
 
   /// The total width reserved by the three caption buttons.
   static const width = 138.0;

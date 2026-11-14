@@ -562,28 +562,40 @@ class _SettingsPageState extends State<SettingsPage> {
       builder: (context, constraints) {
         _lastLayoutWidth = constraints.maxWidth;
         final isNarrow = constraints.maxWidth < 480;
+        final desktop = _usesDesktopSettings(context);
+        final horizontalInset = isNarrow
+            ? AppTokens.space16
+            : AppTokens.desktopPagePadding;
         final layout = constraints.maxWidth >= _settingsLayoutBreakpoint
             ? _SettingsLayout.expanded
             : _SettingsLayout.rootDetail;
         return Padding(
           padding: EdgeInsets.fromLTRB(
-            isNarrow ? 16 : 28,
-            isNarrow ? 20 : 24,
-            isNarrow ? 16 : 28,
-            20,
+            horizontalInset,
+            desktop && layout == _SettingsLayout.rootDetail && selected != null
+                ? AppTokens.space16
+                : isNarrow
+                ? AppTokens.space20
+                : AppTokens.space24,
+            horizontalInset,
+            desktop ? AppTokens.space12 : AppTokens.space20,
           ),
-          child: Center(
+          child: Align(
+            alignment: desktop
+                ? AlignmentDirectional.topStart
+                : Alignment.center,
             child: ConstrainedBox(
               constraints: BoxConstraints(maxWidth: settingsPageMaxWidth),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   if (widget.showHeader &&
-                      layout == _SettingsLayout.rootDetail &&
-                      selected == null) ...[
+                      (desktop && layout == _SettingsLayout.expanded ||
+                          layout == _SettingsLayout.rootDetail &&
+                              selected == null)) ...[
                     PageHeading(
                       title: strings.settings,
-                      subtitle: strings.settingsSubtitle,
+                      subtitle: desktop ? '' : strings.settingsSubtitle,
                       compact: isNarrow,
                     ),
                     const SizedBox(height: AppTokens.space16),

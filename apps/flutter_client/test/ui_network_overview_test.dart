@@ -466,7 +466,6 @@ void main() {
         'room:$_roomTwo',
       );
       await selectPage(P2WlanSection.devices);
-      expect(tester.widget<TextField>(search).controller!.text, 'Shared');
       expect(deviceState.scopeId, 'room:$_roomOne');
       expect(deviceState.filter, 'direct');
       expect(deviceState.sort, 'latency');
@@ -479,6 +478,10 @@ void main() {
             .first,
       );
       expect(restoredDevices.controller!.offset, closeTo(deviceOffset, 1));
+      // The lazy list may recreate the search field only after scrolling back.
+      restoredDevices.controller!.jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(tester.widget<TextField>(search).controller!.text, 'Shared');
       tester.widget<NodesPage>(find.byType(NodesPage)).onOpenRoomDevice!(
         _roomOne,
         'room-peer-1',

@@ -18,14 +18,15 @@ class _ApplicationSection extends StatelessWidget {
             registration: state._startupRegistration,
             strings: strings,
           ),
-          const SizedBox(height: 16),
+          if (!_usesDesktopSettings(context))
+            const SizedBox(height: AppTokens.space16),
         ],
         _PreferenceRow(
           showDivider: false,
           label: strings.closeBehavior,
           subtitle: strings.closeBehaviorHelper,
           trailing: AppSelect<String>(
-            width: 248,
+            width: _settingsControlWidth,
             key: const ValueKey('settings-close-behavior-select'),
             menuTitle: strings.closeBehavior,
             value: state._closeBehavior,
@@ -120,6 +121,8 @@ class _StartupRegistrationPreferenceState
 
   @override
   Widget build(BuildContext context) {
+    final colors = P2WlanColors.of(context);
+    final desktop = _usesDesktopSettings(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -131,6 +134,19 @@ class _StartupRegistrationPreferenceState
             key: const ValueKey('settings-start-at-login-switch'),
             value: _enabled,
             onChanged: _loading ? null : _setEnabled,
+            materialTapTargetSize: desktop
+                ? MaterialTapTargetSize.shrinkWrap
+                : null,
+            inactiveThumbColor: desktop && !_loading ? colors.textMuted : null,
+            trackOutlineColor: desktop
+                ? WidgetStateProperty.resolveWith((states) {
+                    if (states.contains(WidgetState.disabled) ||
+                        states.contains(WidgetState.selected)) {
+                      return null;
+                    }
+                    return colors.textMuted;
+                  })
+                : null,
           ),
         ),
         if (_error != null) ...[

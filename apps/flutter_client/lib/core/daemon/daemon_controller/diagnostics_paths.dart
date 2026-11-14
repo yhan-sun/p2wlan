@@ -6,6 +6,8 @@ part of '../daemon_controller.dart';
 enum DaemonStartupFailureCode {
   uacCancelled,
   uacLaunchFailed,
+  administratorAuthorizationCancelled,
+  administratorLaunchFailed,
   daemonBinaryLoadFailed,
   daemonExitedDuringStartup,
   startupConfigInvalid,
@@ -33,6 +35,10 @@ extension DaemonStartupFailureCodeText on DaemonStartupFailureCode {
   String get value => switch (this) {
     DaemonStartupFailureCode.uacCancelled => 'UAC_CANCELLED',
     DaemonStartupFailureCode.uacLaunchFailed => 'UAC_LAUNCH_FAILED',
+    DaemonStartupFailureCode.administratorAuthorizationCancelled =>
+      'ADMINISTRATOR_AUTHORIZATION_CANCELLED',
+    DaemonStartupFailureCode.administratorLaunchFailed =>
+      'ADMINISTRATOR_LAUNCH_FAILED',
     DaemonStartupFailureCode.daemonBinaryLoadFailed =>
       'DAEMON_BINARY_LOAD_FAILED',
     DaemonStartupFailureCode.daemonExitedDuringStartup =>
