@@ -100,9 +100,16 @@ class DaemonGitWatcherTests(unittest.TestCase):
         binary = Path(binaries[0]["executable"])
         identity = self.command([str(binary)]).stdout.decode().strip().split("|")
         self.assertEqual(len(identity), 4)
-        output = (Path(builds[0]["out_dir"]).parent / "output").read_text(encoding="utf-8")
+        # Cargo 1.100 stores the captured stdout in run/stdout. Older Cargo
+        # stores it in output. Both are relative to this build script's OUT_DIR.
+        build_unit = Path(builds[0]["out_dir"]).parent
+        stdout_paths = [path for path in (build_unit / "run" / "stdout", build_unit / "output")
+                        if path.is_file()]
+        self.assertEqual(len(stdout_paths), 1, f"expected one build script stdout under {build_unit}")
+        output = stdout_paths[0].read_text(encoding="utf-8")
         watchers = [Path(line.split("=", 1)[1]) for line in output.splitlines()
                     if line.startswith("cargo:rerun-if-changed=")]
+        self.assertTrue(watchers, f"no file watchers in {stdout_paths[0]}")
         record = {
             "build": self.build_number, "fresh": binaries[0]["fresh"], "identity": identity,
             "binary": str(binary), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
