@@ -20,6 +20,7 @@ class _LocalNodePanel extends StatelessWidget {
     required this.snapshotStale,
     required this.daemonReachable,
     required this.onEdit,
+    this.desktop = false,
   });
 
   final DiagnosticsSnapshot? snapshot;
@@ -27,6 +28,7 @@ class _LocalNodePanel extends StatelessWidget {
   final bool snapshotStale;
   final bool daemonReachable;
   final VoidCallback onEdit;
+  final bool desktop;
 
   @override
   Widget build(BuildContext context) {
@@ -68,6 +70,7 @@ class _LocalNodePanel extends StatelessWidget {
       key: const Key('nodes-edit-local'),
       tooltip: strings.renameDevice,
       onPressed: onEdit,
+      visualDensity: desktop ? VisualDensity.compact : null,
       iconSize: 18,
       icon: const Icon(Icons.edit_outlined),
     );
@@ -99,10 +102,17 @@ class _LocalNodePanel extends StatelessWidget {
           child: InkWell(
             key: const Key('nodes-local-row'),
             onTap: onEdit,
-            child: Padding(
+            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+            child: Ink(
+              decoration: desktop
+                  ? BoxDecoration(
+                      color: c.surfaceMuted,
+                      borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+                    )
+                  : null,
               padding: const EdgeInsets.symmetric(
-                horizontal: AppTokens.space14,
-                vertical: 12,
+                horizontal: AppTokens.space12,
+                vertical: AppTokens.space8,
               ),
               child: LayoutBuilder(
                 builder: (context, constraints) {
@@ -128,7 +138,7 @@ class _LocalNodePanel extends StatelessWidget {
                           style: TextStyle(
                             fontSize: 14,
                             height: 1.3,
-                            fontWeight: FontWeight.w700,
+                            fontWeight: FontWeight.w600,
                             color: theme.colorScheme.onSurface,
                           ),
                         ),

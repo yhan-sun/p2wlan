@@ -17,6 +17,7 @@ class PathObservabilitySnapshot {
     required this.currentPath,
     required this.previousPath,
     required this.transitionReason,
+    this.lastPathChangeReason,
     required this.pathAgeMs,
     required this.pathStateRevision,
     required this.directState,
@@ -67,6 +68,7 @@ class PathObservabilitySnapshot {
       currentPath: _nullableString(json['current_path']),
       previousPath: _nullableString(json['previous_path']),
       transitionReason: _string(json['transition_reason'], 'unknown'),
+      lastPathChangeReason: _nullableString(json['last_path_change_reason']),
       pathAgeMs: _int(json['path_age_ms']),
       pathStateRevision: _int(json['path_state_revision']),
       directState: _string(json['direct_state'], 'unknown'),
@@ -99,6 +101,7 @@ class PathObservabilitySnapshot {
   final String? currentPath;
   final String? previousPath;
   final String transitionReason;
+  final String? lastPathChangeReason;
   final int pathAgeMs;
   final int pathStateRevision;
   final String directState;

@@ -10,10 +10,12 @@ class StatusBadge extends StatelessWidget {
     super.key,
     required this.label,
     this.tone = StatusTone.neutral,
+    this.compact = false,
   });
 
   final String label;
   final StatusTone tone;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
@@ -23,15 +25,19 @@ class StatusBadge extends StatelessWidget {
       excludeSemantics: true,
       child: Container(
         constraints: const BoxConstraints(minHeight: 24, maxWidth: 200),
-        padding: const EdgeInsets.symmetric(
-          horizontal: AppTokens.space8,
-          vertical: AppTokens.space4,
-        ),
-        decoration: BoxDecoration(
-          color: bg,
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          border: Border.all(color: border, width: 1),
-        ),
+        padding: compact
+            ? EdgeInsets.zero
+            : const EdgeInsets.symmetric(
+                horizontal: AppTokens.space8,
+                vertical: AppTokens.space4,
+              ),
+        decoration: compact
+            ? null
+            : BoxDecoration(
+                color: bg,
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+                border: Border.all(color: border, width: 1),
+              ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [

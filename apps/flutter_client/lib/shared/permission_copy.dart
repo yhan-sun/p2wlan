@@ -48,6 +48,10 @@ String daemonStartupFailurePresentation(
   return switch (code) {
     DaemonStartupFailureCode.uacCancelled => strings.windowsUacCancelled,
     DaemonStartupFailureCode.uacLaunchFailed => strings.windowsUacLaunchFailed,
+    DaemonStartupFailureCode.administratorAuthorizationCancelled =>
+      strings.administratorAuthorizationCancelled,
+    DaemonStartupFailureCode.administratorLaunchFailed =>
+      strings.administratorLaunchFailed,
     DaemonStartupFailureCode.clientDaemonBuildMismatch =>
       strings.clientDaemonBuildMismatch,
     DaemonStartupFailureCode.pidMarkerFailed => strings.windowsPidMarkerFailed,

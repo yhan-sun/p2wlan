@@ -11,6 +11,7 @@ class _PeerTrafficSection extends StatelessWidget {
     this.serviceUptimeMs,
     this.networkId,
     this.peerId,
+    this.inspector = false,
   });
 
   final TrafficCounters counters;
@@ -21,12 +22,14 @@ class _PeerTrafficSection extends StatelessWidget {
   final int? serviceUptimeMs;
   final String? networkId;
   final String? peerId;
+  final bool inspector;
 
   @override
   Widget build(BuildContext context) => _DetailSection(
     key: const Key('peer-detail-traffic-card'),
     title: strings.isZh ? '当前记录流量' : 'Current recorded traffic',
     icon: Icons.swap_vert_rounded,
+    inspector: inspector,
     rows: [
       Padding(
         padding: const EdgeInsets.symmetric(vertical: 8),

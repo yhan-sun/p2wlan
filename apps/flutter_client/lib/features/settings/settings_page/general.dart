@@ -9,17 +9,56 @@ class _GeneralSection extends StatelessWidget {
   Widget build(BuildContext context) {
     final settings = state.widget.settingsStore.settings;
     final saving = state._saving;
+    final desktop = _usesDesktopSettings(context);
+    final savedMessage = switch (state._immediateSaved) {
+      'language' => strings.languageSaved,
+      'theme' => strings.themeSaved,
+      _ => null,
+    };
+    final themeControl = LayoutBuilder(
+      builder: (context, constraints) {
+        final options = [
+          (AppThemeMode.system.code, strings.themeSystem),
+          (AppThemeMode.light.code, strings.themeLight),
+          (AppThemeMode.dark.code, strings.themeDark),
+        ];
+        final vertical =
+            constraints.maxWidth < (desktop ? 220 : 300) ||
+            MediaQuery.textScalerOf(context).scale(14) > 18;
+        // Recreate the render object when changing between bounded and
+        // shrink-wrapped layouts. SegmentedButton keeps its initial expansion.
+        return KeyedSubtree(
+          key: ValueKey(vertical),
+          child: SegmentedButton<String>(
+            key: const ValueKey('settings-theme-select'),
+            direction: vertical ? Axis.vertical : Axis.horizontal,
+            expandedInsets: vertical ? null : EdgeInsets.zero,
+            showSelectedIcon: false,
+            segments: [
+              for (final option in options)
+                ButtonSegment(value: option.$1, label: Text(option.$2)),
+            ],
+            selected: {AppThemeMode.fromCode(settings.themeMode).code},
+            onSelectionChanged: saving
+                ? null
+                : (values) => state._saveThemeMode(values.single),
+          ),
+        );
+      },
+    );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _SettingsGroup(
           title: strings.settingsPreferencesGroup,
+          headingStatus: desktop ? savedMessage : null,
           children: [
             _PreferenceRow(
               label: strings.language,
-              subtitle: strings.languageHelper,
+              subtitle: desktop ? null : strings.languageHelper,
+              showDivider: desktop,
               trailing: AppSelect<String>(
-                width: 248,
+                width: _settingsControlWidth,
                 key: const ValueKey('settings-language-select'),
                 menuTitle: strings.language,
                 value: AppLanguage.fromCode(settings.languageCode).code,
@@ -33,73 +72,34 @@ class _GeneralSection extends StatelessWidget {
                 onChanged: saving ? null : state._saveLanguage,
               ),
             ),
-            if (state._immediateSaved == 'language')
+            if (!desktop && state._immediateSaved == 'language')
               _PreferenceSaved(message: strings.languageSaved),
-            const SizedBox(height: 16),
-            Text(
-              strings.themeMode,
-              style: Theme.of(context).textTheme.titleSmall,
-            ),
-            const SizedBox(height: 4),
-            Text(
-              strings.themeModeHelper,
-              style: TextStyle(
-                fontSize: 12,
-                height: 1.45,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
+            if (desktop)
+              _PreferenceRow(
+                label: strings.themeMode,
+                trailing: SizedBox(
+                  width: _settingsControlWidth,
+                  child: themeControl,
+                ),
+                showDivider: false,
+              )
+            else ...[
+              const SizedBox(height: AppTokens.space16),
+              Text(
+                strings.themeMode,
+                style: Theme.of(context).textTheme.titleSmall,
               ),
-            ),
-            const SizedBox(height: 12),
-            LayoutBuilder(
-              builder: (context, constraints) {
-                final options = [
-                  (
-                    AppThemeMode.system.code,
-                    strings.themeSystem,
-                    Icons.brightness_auto_outlined,
-                  ),
-                  (
-                    AppThemeMode.light.code,
-                    strings.themeLight,
-                    Icons.light_mode_outlined,
-                  ),
-                  (
-                    AppThemeMode.dark.code,
-                    strings.themeDark,
-                    Icons.dark_mode_outlined,
-                  ),
-                ];
-                final vertical =
-                    constraints.maxWidth < 300 ||
-                    MediaQuery.textScalerOf(context).scale(14) > 18;
-                return SegmentedButton<String>(
-                  key: const ValueKey('settings-theme-select'),
-                  direction: vertical ? Axis.vertical : Axis.horizontal,
-                  expandedInsets: vertical ? null : EdgeInsets.zero,
-                  style: ButtonStyle(
-                    shape: WidgetStatePropertyAll(
-                      RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                    ),
-                  ),
-                  showSelectedIcon: false,
-                  segments: [
-                    for (final option in options)
-                      ButtonSegment(
-                        value: option.$1,
-                        label: Text(option.$2),
-                        icon: Icon(option.$3, size: 18),
-                      ),
-                  ],
-                  selected: {AppThemeMode.fromCode(settings.themeMode).code},
-                  onSelectionChanged: saving
-                      ? null
-                      : (values) => state._saveThemeMode(values.single),
-                );
-              },
-            ),
-            if (state._immediateSaved == 'theme')
+              const SizedBox(height: AppTokens.space4),
+              Text(
+                strings.themeModeHelper,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: AppTokens.space12),
+              themeControl,
+            ],
+            if (!desktop && state._immediateSaved == 'theme')
               _PreferenceSaved(message: strings.themeSaved),
             if (state._immediateError != null) ...[
               const SizedBox(height: 12),
@@ -118,17 +118,23 @@ class _GeneralSection extends StatelessWidget {
                   state._clearFieldError(state._deviceNameController),
               label: strings.deviceName,
               helper: strings.deviceNameHelper,
+              asPreference: true,
               textInputAction: TextInputAction.done,
               onSubmitted: saving
                   ? null
                   : (_) => state._saveCategory(SettingsCategory.general),
             ),
-            if (state._capabilities.canUseSystemTray) ...[
+            if (!desktop && state._capabilities.canUseSystemTray) ...[
               const SizedBox(height: 16),
               _ApplicationSection(state: state, strings: strings),
             ],
           ],
         ),
+        if (desktop && state._capabilities.canUseSystemTray)
+          _SettingsGroup(
+            title: strings.isZh ? '启动与窗口' : 'Startup & window',
+            children: [_ApplicationSection(state: state, strings: strings)],
+          ),
       ],
     );
   }

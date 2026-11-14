@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../app/app_strings.dart';
@@ -173,24 +174,35 @@ class _P2WlanShellState extends State<P2WlanShell> {
           onPopInvokedWithResult: (didPop, result) {
             if (!didPop) _handleSystemBack();
           },
-          child: Scaffold(
-            appBar: _buildTopBar(strings, useBottomNav, useDesktopSidebar),
-            body: Column(
-              children: [
-                if (widget.updateResult != null &&
-                    (widget.capabilities ?? PlatformCapabilities.current())
-                        .canOpenExternalUrls &&
-                    widget.onOpenUpdate != null &&
-                    widget.onDismissUpdate != null)
-                  UpdateBanner(
-                    result: widget.updateResult!,
-                    onOpen: widget.onOpenUpdate!,
-                    onDismiss: widget.onDismissUpdate!,
-                  ),
-                Expanded(child: shellBody),
-              ],
+          child: CallbackShortcuts(
+            bindings: _isDesktopShell ? _desktopBindings : const {},
+            child: Focus(
+              autofocus: _isDesktopShell,
+              skipTraversal: true,
+              child: Scaffold(
+                appBar: _isDesktopShell
+                    ? _buildDesktopToolbar(strings, useDesktopSidebar)
+                    : _buildTopBar(strings, useBottomNav, useDesktopSidebar),
+                body: Column(
+                  children: [
+                    if (widget.updateResult != null &&
+                        (widget.capabilities ?? PlatformCapabilities.current())
+                            .canOpenExternalUrls &&
+                        widget.onOpenUpdate != null &&
+                        widget.onDismissUpdate != null)
+                      UpdateBanner(
+                        result: widget.updateResult!,
+                        onOpen: widget.onOpenUpdate!,
+                        onDismiss: widget.onDismissUpdate!,
+                      ),
+                    Expanded(child: shellBody),
+                  ],
+                ),
+                bottomNavigationBar: useBottomNav
+                    ? _buildBottomNav(strings)
+                    : null,
+              ),
             ),
-            bottomNavigationBar: useBottomNav ? _buildBottomNav(strings) : null,
           ),
         );
       },
@@ -221,13 +233,102 @@ class _P2WlanShellState extends State<P2WlanShell> {
     });
   }
 
+  SingleActivator _desktopShortcut(LogicalKeyboardKey key) => SingleActivator(
+    key,
+    meta: defaultTargetPlatform == TargetPlatform.macOS,
+    control: defaultTargetPlatform != TargetPlatform.macOS,
+    includeRepeats: false,
+  );
+
+  static const _navigationKeys = [
+    LogicalKeyboardKey.digit1,
+    LogicalKeyboardKey.digit2,
+    LogicalKeyboardKey.digit3,
+    LogicalKeyboardKey.digit4,
+  ];
+
+  Map<ShortcutActivator, VoidCallback> get _desktopBindings => {
+    for (final (index, section) in P2WlanSection.primary.indexed)
+      _desktopShortcut(_navigationKeys[index]): () => _select(section),
+    _desktopShortcut(LogicalKeyboardKey.keyR): _refresh,
+    const SingleActivator(LogicalKeyboardKey.f5, includeRepeats: false):
+        _refresh,
+  };
+
+  String _shortcutLabel(String key) =>
+      defaultTargetPlatform == TargetPlatform.macOS ? '⌘$key' : 'Ctrl+$key';
+
+  void _refresh() {
+    if (!widget.statusStore.refreshActivityVisible) {
+      widget.statusStore.refresh();
+    }
+  }
+
+  PreferredSizeWidget _buildDesktopToolbar(
+    AppStrings strings,
+    bool hasLabeledSidebar,
+  ) {
+    final colors = P2WlanColors.of(context);
+    final theme = Theme.of(context);
+    return PreferredSize(
+      preferredSize: const Size.fromHeight(AppTokens.desktopToolbarHeight),
+      child: Material(
+        color: colors.surfaceMuted,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            border: Border(bottom: BorderSide(color: colors.border)),
+          ),
+          child: Padding(
+            padding: EdgeInsets.only(
+              left: _usesMacosChrome ? 88 : AppTokens.space16,
+              right: _usesWindowsChrome
+                  ? WindowsWindowControls.width + AppTokens.space8
+                  : AppTokens.space12,
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: _DesktopTitleRegion(
+                    child: hasLabeledSidebar
+                        ? const SizedBox.expand()
+                        : Align(
+                            alignment: AlignmentDirectional.centerStart,
+                            child: Text(
+                              strings.appName,
+                              style: theme.textTheme.labelMedium?.copyWith(
+                                color: colors.textSecondary,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                  ),
+                ),
+                _ShellRefresh(
+                  statusStore: widget.statusStore,
+                  tooltip: '${strings.refresh}  ${_shortcutLabel('R')}',
+                  showSampleTime: true,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildNavigation(AppStrings strings, bool useDesktopSidebar) {
     final selected = P2WlanSection.primary.contains(_section) ? _section : null;
+    final shortcuts = <P2WlanSection, String>{
+      if (_isDesktopShell)
+        for (final (index, section) in P2WlanSection.primary.indexed)
+          section: _shortcutLabel('${index + 1}'),
+    };
     if (useDesktopSidebar) {
       return DesktopSidebar(
         selected: selected,
         strings: strings,
         statusStore: widget.statusStore,
+        shortcuts: shortcuts,
         onSelect: _select,
         onFooterTap: () => _select(P2WlanSection.troubleshooting),
       );
@@ -239,6 +340,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
       iconOnly: _isDesktopShell,
       strings: strings,
       statusStore: widget.statusStore,
+      shortcuts: shortcuts,
       onSelect: _select,
       onFooterTap: () => _select(P2WlanSection.troubleshooting),
     );
@@ -256,12 +358,9 @@ class _P2WlanShellState extends State<P2WlanShell> {
     // desktop because they have no footer.
     final showStatusBadge = !hasSidebarFooter && _section != P2WlanSection.home;
     return AppBar(
-      toolbarHeight: _usesMacosChrome ? 32 : null,
       backgroundColor: isMobileLayout
           ? null
           : Theme.of(context).scaffoldBackgroundColor,
-      leading: _usesMacosChrome ? const SizedBox.shrink() : null,
-      leadingWidth: _usesMacosChrome ? 76 : null,
       title: isMobileLayout
           ? Text(_appBarTitle(strings))
           : Text(
@@ -272,10 +371,6 @@ class _P2WlanShellState extends State<P2WlanShell> {
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
               ),
             ),
-      centerTitle: !isMobileLayout && _usesMacosChrome,
-      flexibleSpace: _canDragWindowFromAppBar
-          ? const DragToMoveArea(child: SizedBox.expand())
-          : null,
       actions: isMobileLayout
           ? [
               _MobileShellMenu(
@@ -293,8 +388,6 @@ class _P2WlanShellState extends State<P2WlanShell> {
                     _select(P2WlanSection.troubleshooting),
               ),
               const SizedBox(width: 8),
-              if (_usesWindowsChrome)
-                const SizedBox(width: WindowsWindowControls.width),
             ],
     );
   }
@@ -375,7 +468,9 @@ class _P2WlanShellState extends State<P2WlanShell> {
     );
     return SizedBox.expand(
       child: AppEntrance(
+        key: const Key('shell-page-entrance'),
         identity: identity,
+        navigation: _isDesktopShell,
         child: KeyedSubtree(key: ValueKey(identity), child: page),
       ),
     );
@@ -570,17 +665,20 @@ class _P2WlanShellState extends State<P2WlanShell> {
 }
 
 bool get _isDesktopShell =>
-    !kIsWeb &&
-    (defaultTargetPlatform == TargetPlatform.macOS ||
-        defaultTargetPlatform == TargetPlatform.windows ||
-        defaultTargetPlatform == TargetPlatform.linux);
+    !kIsWeb && AppTokens.isDesktopPlatform(defaultTargetPlatform);
 
 bool get _usesMacosChrome => !kIsWeb && Platform.isMacOS;
 
 bool get _usesWindowsChrome => !kIsWeb && Platform.isWindows;
 
-bool get _canDragWindowFromAppBar {
-  return !kIsWeb && (Platform.isMacOS || Platform.isWindows);
+class _DesktopTitleRegion extends StatelessWidget {
+  const _DesktopTitleRegion({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) =>
+      _usesWindowsChrome ? DragToMoveArea(child: child) : child;
 }
 
 /// Compact mobile only: low-weight overflow menu in the top bar. Keeps the
@@ -695,26 +793,76 @@ class _ShellStatusActions extends StatelessWidget {
                 onPressed: onOpenTroubleshooting,
                 icon: Icon(P2WlanSection.troubleshooting.icon),
               ),
-            IconButton(
-              tooltip: strings.refresh,
-              onPressed: statusStore.refreshActivityVisible
-                  ? null
-                  : statusStore.refresh,
-              icon: statusStore.refreshActivityVisible
-                  ? SizedBox.square(
-                      dimension: 16,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        valueColor: AlwaysStoppedAnimation<Color>(
-                          P2WlanColors.of(context).textMuted,
-                        ),
-                      ),
-                    )
-                  : const Icon(Icons.refresh_rounded, size: 19),
-            ),
+            _ShellRefresh(statusStore: statusStore, tooltip: strings.refresh),
           ],
         );
       },
     );
   }
+}
+
+class _ShellRefresh extends StatelessWidget {
+  const _ShellRefresh({
+    required this.statusStore,
+    required this.tooltip,
+    this.showSampleTime = false,
+  });
+
+  final StatusStore statusStore;
+  final String tooltip;
+  final bool showSampleTime;
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: statusStore,
+    builder: (context, _) {
+      final refreshing = statusStore.refreshActivityVisible;
+      final refresh = IconButton(
+        key: const Key('shell-refresh'),
+        tooltip: tooltip,
+        onPressed: refreshing ? null : statusStore.refresh,
+        icon: refreshing
+            ? SizedBox.square(
+                dimension: AppTokens.iconSm,
+                child: MediaQuery.disableAnimationsOf(context)
+                    ? Icon(
+                        Icons.more_horiz,
+                        size: AppTokens.iconSm,
+                        color: P2WlanColors.of(context).progress,
+                      )
+                    : CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: P2WlanColors.of(context).progress,
+                      ),
+              )
+            : const Icon(Icons.refresh_rounded, size: AppTokens.iconMd),
+      );
+      final sampledAt = statusStore.lastSuccessfulStatusAt;
+      if (!showSampleTime ||
+          sampledAt == null ||
+          statusStore.snapshot == null ||
+          statusStore.snapshotStale) {
+        return refresh;
+      }
+      final strings = AppStringsScope.of(context);
+      final time = MaterialLocalizations.of(context).formatTimeOfDay(
+        TimeOfDay.fromDateTime(sampledAt.toLocal()),
+        alwaysUse24HourFormat: MediaQuery.alwaysUse24HourFormatOf(context),
+      );
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            strings.isZh ? '更新于 $time' : 'Updated $time',
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+              color: P2WlanColors.of(context).textMuted,
+              fontFeatures: AppTokens.tabularFontFeatures,
+            ),
+          ),
+          const SizedBox(width: AppTokens.space8),
+          refresh,
+        ],
+      );
+    },
+  );
 }

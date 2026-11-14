@@ -12,6 +12,7 @@ class _HomeIssueBanner extends StatelessWidget {
     this.actionLabel,
     this.actionKey,
     this.primaryAction = false,
+    this.compact = false,
   });
 
   final String message;
@@ -22,6 +23,7 @@ class _HomeIssueBanner extends StatelessWidget {
   final String? actionLabel;
   final Key? actionKey;
   final bool primaryAction;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
@@ -85,7 +87,12 @@ class _HomeIssueBanner extends StatelessWidget {
     return Semantics(
       liveRegion: true,
       child: Container(
-        padding: const EdgeInsets.all(AppTokens.space12),
+        padding: compact
+            ? const EdgeInsets.symmetric(
+                horizontal: AppTokens.space12,
+                vertical: AppTokens.space8,
+              )
+            : const EdgeInsets.all(AppTokens.space12),
         decoration: BoxDecoration(
           color: colors.bg,
           borderRadius: BorderRadius.circular(AppTokens.radiusSm),

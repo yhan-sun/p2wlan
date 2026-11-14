@@ -13,32 +13,38 @@ class _SettingsRoot extends StatelessWidget {
   final ValueChanged<SettingsCategory> onSelect;
 
   @override
-  Widget build(BuildContext context) => ListView(
-    padding: const EdgeInsets.symmetric(vertical: 2),
-    children: [
-      _SettingsSurface(
-        padding: EdgeInsets.zero,
-        child: Column(
-          children: [
-            for (var index = 0; index < categories.length; index++) ...[
-              if (index > 0)
-                Divider(
-                  height: 1,
-                  indent: 52,
-                  endIndent: 16,
-                  color: P2WlanColors.of(context).divider,
-                ),
-              _SettingsCategoryCard(
-                category: categories[index],
-                summary: summaryFor(categories[index]),
-                onTap: () => onSelect(categories[index]),
-              ),
-            ],
-          ],
-        ),
-      ),
-    ],
-  );
+  Widget build(BuildContext context) {
+    final desktop = _usesDesktopSettings(context);
+    final rows = Column(
+      children: [
+        if (desktop) const Divider(height: 1),
+        for (var index = 0; index < categories.length; index++) ...[
+          if (index > 0)
+            Divider(
+              height: 1,
+              indent: 52,
+              endIndent: 16,
+              color: P2WlanColors.of(context).divider,
+            ),
+          _SettingsCategoryCard(
+            category: categories[index],
+            summary: summaryFor(categories[index]),
+            onTap: () => onSelect(categories[index]),
+          ),
+        ],
+        if (desktop) const Divider(height: 1),
+      ],
+    );
+    return ListView(
+      padding: const EdgeInsets.symmetric(vertical: AppTokens.space4),
+      children: [
+        if (desktop)
+          rows
+        else
+          _SettingsSurface(padding: EdgeInsets.zero, child: rows),
+      ],
+    );
+  }
 }
 
 class _SettingsCategoryCard extends StatelessWidget {
@@ -56,6 +62,7 @@ class _SettingsCategoryCard extends StatelessWidget {
     final strings = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final largeText = MediaQuery.textScalerOf(context).scale(14) > 18;
+    final desktop = _usesDesktopSettings(context);
     return Semantics(
       container: true,
       button: true,
@@ -64,9 +71,12 @@ class _SettingsCategoryCard extends StatelessWidget {
         interactionKey: ValueKey('settings-category-card-${category.name}'),
         onTap: onTap,
         child: ConstrainedBox(
-          constraints: const BoxConstraints(minHeight: 76),
+          constraints: BoxConstraints(minHeight: desktop ? 60 : 76),
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            padding: EdgeInsets.symmetric(
+              horizontal: AppTokens.space12,
+              vertical: desktop ? AppTokens.space8 : AppTokens.space14,
+            ),
             child: Row(
               children: [
                 _SettingsCategoryIcon(category),
@@ -77,21 +87,14 @@ class _SettingsCategoryCard extends StatelessWidget {
                     children: [
                       Text(
                         category.label(strings),
-                        style: TextStyle(
-                          fontSize: 15,
-                          height: 1.3,
-                          fontWeight: FontWeight.w600,
-                          color: theme.colorScheme.onSurface,
-                        ),
+                        style: theme.textTheme.titleMedium,
                       ),
                       const SizedBox(height: 4),
                       Text(
                         summary,
                         maxLines: largeText ? 2 : 1,
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 13,
-                          height: 1.4,
+                        style: theme.textTheme.bodySmall?.copyWith(
                           color: theme.colorScheme.onSurfaceVariant,
                         ),
                       ),
@@ -147,13 +150,14 @@ class _SettingsCategoryRail extends StatelessWidget {
     final strings = AppStringsScope.of(context);
     return SizedBox(
       key: const Key('settings-category-rail'),
-      width: 184,
+      width: 180,
       child: ListView(
-        padding: const EdgeInsets.symmetric(vertical: AppTokens.space6),
+        padding: const EdgeInsetsDirectional.only(end: AppTokens.space12),
         children: [
           for (final category in categories)
             _CategoryRailItem(
               label: category.label(strings),
+              icon: category.icon,
               selected: category == selected,
               onTap: () => onSelect(category),
             ),
@@ -166,22 +170,25 @@ class _SettingsCategoryRail extends StatelessWidget {
 class _CategoryRailItem extends StatelessWidget {
   const _CategoryRailItem({
     required this.label,
+    required this.icon,
     required this.selected,
     required this.onTap,
   });
 
   final String label;
+  final IconData icon;
   final bool selected;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final colors = P2WlanColors.of(context);
+    final foreground = selected
+        ? theme.colorScheme.primary
+        : colors.textSecondary;
     return Padding(
-      padding: const EdgeInsets.symmetric(
-        vertical: 1,
-        horizontal: AppTokens.space6,
-      ),
+      padding: const EdgeInsets.only(bottom: AppTokens.space4),
       child: Semantics(
         container: true,
         selected: selected,
@@ -190,37 +197,27 @@ class _CategoryRailItem extends StatelessWidget {
         child: _SettingsTapSurface(
           onTap: onTap,
           selected: selected,
-          radius: AppTokens.radiusMd,
+          radius: AppTokens.radiusSm,
           child: Padding(
             padding: const EdgeInsets.symmetric(
-              horizontal: AppTokens.space12,
-              vertical: AppTokens.space10,
+              horizontal: AppTokens.space8,
+              vertical: AppTokens.space8,
             ),
             child: Row(
               children: [
+                Icon(icon, size: AppTokens.iconSm, color: foreground),
+                const SizedBox(width: AppTokens.space8),
                 Expanded(
                   child: Text(
                     label,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 13,
+                    style: theme.textTheme.bodyMedium?.copyWith(
                       fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
-                      color: selected
-                          ? theme.colorScheme.primary
-                          : theme.colorScheme.onSurfaceVariant,
+                      color: foreground,
                     ),
                   ),
                 ),
-                if (selected)
-                  Container(
-                    width: 3,
-                    height: 14,
-                    decoration: BoxDecoration(
-                      color: theme.colorScheme.primary,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
               ],
             ),
           ),
@@ -263,6 +260,9 @@ class _CategoryDetailView extends StatelessWidget {
   }
 
   Widget _buildDetail(BuildContext context) {
+    final desktop = _usesDesktopSettings(context);
+    // Flutter adds a desktop scrollbar inside the viewport's trailing edge.
+    final endInset = desktop ? AppTokens.space16 : AppTokens.space2;
     final dirty =
         state._categoryDirty(category) || state._savingCategory == category;
     final content = _categoryContent(category, state, strings, credentialState);
@@ -272,7 +272,12 @@ class _CategoryDetailView extends StatelessWidget {
       children: [
         if (showHeader)
           Padding(
-            padding: const EdgeInsets.fromLTRB(2, 2, 2, AppTokens.space8),
+            padding: EdgeInsetsDirectional.fromSTEB(
+              AppTokens.space2,
+              AppTokens.space2,
+              endInset,
+              AppTokens.space8,
+            ),
             child: _DetailHeader(
               title: category.label(strings),
               onBack: onBack,
@@ -282,21 +287,26 @@ class _CategoryDetailView extends StatelessWidget {
           child: ListView(
             key: PageStorageKey('settings-${category.name}'),
             keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-            padding: const EdgeInsets.fromLTRB(2, 2, 2, 16),
+            padding: EdgeInsetsDirectional.fromSTEB(
+              AppTokens.space2,
+              AppTokens.space2,
+              endInset,
+              desktop ? AppTokens.space4 : AppTokens.space16,
+            ),
             children: [
               // Keep Back reachable while long descriptions and forms scroll,
               // including short windows with accessibility text scaling.
               if (showHeader && subtitle != null && subtitle.isNotEmpty)
                 Padding(
                   padding: EdgeInsetsDirectional.only(
-                    start: onBack == null ? 0 : _DetailHeader.leadingExtent,
+                    start: onBack == null
+                        ? 0
+                        : _DetailHeader.leadingExtent(desktop: desktop),
                     bottom: AppTokens.space12,
                   ),
                   child: Text(
                     subtitle,
-                    style: TextStyle(
-                      fontSize: 12,
-                      height: 1.45,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       color: Theme.of(context).colorScheme.onSurfaceVariant,
                     ),
                   ),
@@ -351,11 +361,11 @@ class _CategoryDetailView extends StatelessWidget {
           key: const Key('settings-save-slot'),
           child: dirty
               ? Padding(
-                  padding: const EdgeInsets.fromLTRB(
-                    2,
+                  padding: EdgeInsetsDirectional.fromSTEB(
+                    AppTokens.space2,
                     AppTokens.space10,
-                    2,
-                    2,
+                    endInset,
+                    AppTokens.space2,
                   ),
                   child: AnimatedBuilder(
                     animation: state._statusViewNotifier,
@@ -521,7 +531,7 @@ class _SettingsShell extends StatelessWidget {
             width: 1,
             color: Theme.of(context).colorScheme.outlineVariant,
           ),
-          const SizedBox(width: AppTokens.space16),
+          const SizedBox(width: AppTokens.space24),
           Expanded(
             child: AppEntrance(
               identity: current,

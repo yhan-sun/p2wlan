@@ -4,92 +4,72 @@ import 'package:flutter/material.dart';
 /// Design tokens for P2WLAN Flutter Client UI/UX.
 /// Calm connectivity aesthetic: modern, reliable, precise, and platform-neutral.
 abstract final class AppTokens {
-  // --- Color Palette ---
-  // Reference-aligned light neutral background & surfaces.
-  static const colorBg = Color(0xFFF5F7FB);
-  static const colorSurface = Color(0xFFFFFFFF);
-  static const colorSurfaceSubtle = Color(0xFFF8FAFC);
-  static const colorBorder = Color(0xFFE2E7EF);
-  static const colorBorderSubtle = Color(0xFFEDF0F5);
+  // Light theme: warm canvas, quiet surfaces and deep green controls.
+  static const colorBg = Color(0xFFF7F7F4);
+  static const colorSurface = Color(0xFFFCFCF9);
+  static const colorSurfaceSubtle = Color(0xFFF0F1ED);
+  static const colorBorder = Color(0xFFDBDFD8);
+  static const colorBorderSubtle = Color(0xFFE6E8E2);
+  static const colorTextPrimary = Color(0xFF1E2926);
+  static const colorTextSecondary = Color(0xFF495752);
+  static const colorTextMuted = Color(0xFF5C6963);
+  static const colorAccent = Color(0xFF173E3C);
 
-  // Dark theme neutral background & surfaces
-  static const colorDarkBg = Color(0xFF0B1220);
-  static const colorDarkSurface = Color(0xFF111827);
-  static const colorDarkSurfaceSubtle = Color(0xFF172033);
-  static const colorDarkBorder = Color(0xFF2A3547);
-  static const colorDarkBorderSubtle = Color(0xFF202A3A);
+  // Dark theme: charcoal with a subtle green undertone.
+  static const colorDarkBg = Color(0xFF1B1F1E);
+  static const colorDarkSurface = Color(0xFF212624);
+  static const colorDarkSurfaceSubtle = Color(0xFF252B28);
+  static const colorDarkBorder = Color(0xFF363D38);
+  static const colorDarkBorderSubtle = Color(0xFF303732);
+  static const colorDarkTextPrimary = Color(0xFFF0F2ED);
+  static const colorDarkTextSecondary = Color(0xFFBCC7BF);
+  static const colorDarkTextMuted = Color(0xFF9EAEA3);
+  static const colorDarkAccent = Color(0xFF35B5AD);
 
-  // Text hierarchy
-  static const colorTextPrimary = Color(0xFF1B2940);
-  static const colorTextSecondary = Color(0xFF56647A);
-  static const colorTextMuted = Color(0xFF647087);
+  // Product semantics. Relay and warning both use amber with distinct roles.
+  static const colorGoodBg = Color(0xFFE9F4EE);
+  static const colorGoodBorder = Color(0xFFC8DFD2);
+  static const colorGoodText = Color(0xFF21644E);
+  static const colorWarnBg = Color(0xFFFAF1E4);
+  static const colorWarnBorder = Color(0xFFE6D6BC);
+  static const colorWarnText = Color(0xFF81531E);
+  static const colorBadBg = Color(0xFFF9EDE9);
+  static const colorBadBorder = Color(0xFFEACCC4);
+  static const colorBadText = Color(0xFF9A3C31);
+  static const colorNeutralBg = Color(0xFFEBEEE8);
+  static const colorNeutralBorder = Color(0xFFD9DED6);
+  static const colorNeutralText = colorTextMuted;
+  static const colorProgress = Color(0xFF285E98);
 
-  // Dark text hierarchy
-  static const colorDarkTextPrimary = Color(0xFFF7F9FC);
-  static const colorDarkTextSecondary = Color(0xFFB5C0D0);
-  static const colorDarkTextMuted = Color(0xFF7F8BA0);
+  static const colorDarkGoodBg = Color(0xFF213731);
+  static const colorDarkGoodBorder = Color(0xFF395A4D);
+  static const colorDarkGoodText = Color(0xFF81D7B8);
+  static const colorDarkGoodDot = Color(0xFF58C8A0);
+  static const colorDarkWarnBg = Color(0xFF372D20);
+  static const colorDarkWarnBorder = Color(0xFF5E4D35);
+  static const colorDarkWarnText = Color(0xFFF0C180);
+  static const colorDarkWarnDot = Color(0xFFDBA959);
+  static const colorDarkBadBg = Color(0xFF392825);
+  static const colorDarkBadBorder = Color(0xFF63413B);
+  static const colorDarkBadText = Color(0xFFF0A399);
+  static const colorDarkBadDot = Color(0xFFE58276);
+  static const colorDarkNeutralBg = Color(0xFF2B322E);
+  static const colorDarkNeutralBorder = Color(0xFF465049);
+  static const colorDarkNeutralText = colorDarkTextSecondary;
+  static const colorDarkNeutralDot = Color(0xFF89988F);
+  static const colorDarkProgress = Color(0xFF91BDFC);
 
-  // Brand blue from the approved visual reference.
-  static const colorAccent = Color(0xFF2563EB);
-  static const colorAccentMuted = Color(0xFF1D4ED8);
-
-  // Dark mode raises blue lightness for contrast while preserving brand hue.
-  static const colorDarkAccent = Color(0xFF60A5FA);
-  static const colorDarkAccentMuted = Color(0xFF1E3A8A);
-
-  // Status Tones (Semantic, strictly scoped)
-  // Good / Online / Direct
-  static const colorGoodBg = Color(0xFFF0FDF4);
-  static const colorGoodBorder = Color(0xFFBBF7D0);
-  static const colorGoodText = Color(0xFF15803D);
-
-  // Warning / Degraded / Probing
-  static const colorWarnBg = Color(0xFFFFFBEB);
-  static const colorWarnBorder = Color(0xFFFDE68A);
-  static const colorWarnText = Color(0xFFB45309);
-
-  // Bad / Unhealthy / Actual failures
-  static const colorBadBg = Color(0xFFFEF2F2);
-  static const colorBadBorder = Color(0xFFFECACA);
-  static const colorBadText = Color(0xFFB91C1C);
-
-  // Neutral / Offline / Skipped / Idle
-  static const colorNeutralBg = Color(0xFFF3F4F6);
-  static const colorNeutralBorder = Color(0xFFD1D5DB);
-  static const colorNeutralText = Color(0xFF647087);
-
-  // Dark status tones keep semantic color visible on dark surfaces without
-  // falling back to pale light-theme labels.
-  static const colorDarkGoodBg = Color(0xFF10241D);
-  static const colorDarkGoodBorder = Color(0xFF2F7A4F);
-  static const colorDarkGoodText = Color(0xFF8DE2B1);
-  static const colorDarkGoodDot = Color(0xFF35C46F);
-
-  static const colorDarkWarnBg = Color(0xFF2A2112);
-  static const colorDarkWarnBorder = Color(0xFF7A5D24);
-  static const colorDarkWarnText = Color(0xFFF1C96A);
-  static const colorDarkWarnDot = Color(0xFFE3A92F);
-
-  static const colorDarkBadBg = Color(0xFF2B1716);
-  static const colorDarkBadBorder = Color(0xFF8E423D);
-  static const colorDarkBadText = Color(0xFFFFA39A);
-  static const colorDarkBadDot = Color(0xFFEF5D54);
-
-  static const colorDarkNeutralBg = Color(0xFF1D293B);
-  static const colorDarkNeutralBorder = Color(0xFF3A4860);
-  static const colorDarkNeutralText = Color(0xFFB5C0D0);
-  static const colorDarkNeutralDot = Color(0xFF7F8BA0);
-
-  // Debug Console / Raw JSON
-  static const colorConsoleBg = Color(0xFF111817);
-  static const colorConsoleBorder = Color(0xFF26312F);
+  static const colorConsoleBg = Color(0xFF141918);
+  static const colorConsoleBorder = Color(0xFF2D3833);
   static const colorConsoleText = Color(0xFFE5ECE8);
 
-  static const shadowBorder = [
-    BoxShadow(color: Color(0x060F172A), offset: Offset(0, 2), blurRadius: 6),
-  ];
+  static const elevationFlat = 0.0;
+  static const elevationMenu = 4.0;
+  static const elevationDialog = 8.0;
+  static const shadowBorder = <BoxShadow>[];
 
   // --- Radius & Spacing ---
+  static const radiusXs = 4.0;
   static const radiusSm = 8.0;
   static const radiusMd = 10.0;
   static const radiusLg = 12.0;
@@ -113,10 +93,25 @@ abstract final class AppTokens {
 
   // Touch Targets
   static const minTouchTarget = 48.0;
+  static const desktopControlHeight = 36.0;
+  static const desktopToolbarHeight = 48.0;
+  static const desktopPagePadding = space24;
+  static const iconSm = 16.0;
+  static const iconMd = 20.0;
+  static const borderWidth = 1.0;
+
+  static bool isDesktopPlatform(TargetPlatform platform) => switch (platform) {
+    TargetPlatform.macOS ||
+    TargetPlatform.windows ||
+    TargetPlatform.linux => true,
+    _ => false,
+  };
 
   // --- Durations & Curves ---
   static const durationFast = Duration(milliseconds: 110);
   static const durationMedium = Duration(milliseconds: 160);
+  static const durationDisclosure = Duration(milliseconds: 180);
+  static const durationNavigation = Duration(milliseconds: 220);
   static const curveEase = Curves.easeOutQuart;
 
   // --- Tabular Figures TextStyle modifier ---

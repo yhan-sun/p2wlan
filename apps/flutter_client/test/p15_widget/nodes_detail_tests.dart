@@ -1,6 +1,95 @@
 part of '../p15_widget_test.dart';
 
 void _registerNodesDetailTests() {
+  testWidgets(
+    'Nodes desktop rows copy addresses and open the diagnostics inspector from the keyboard',
+    (tester) async {
+      tester.view.physicalSize = const Size(1280, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+        ),
+      ))!;
+      addTearDown(stores.dispose);
+      final copied = <String>[];
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        (call) async {
+          if (call.method == 'Clipboard.setData') {
+            copied.add((call.arguments as Map)['text'] as String);
+          }
+          return null;
+        },
+      );
+      addTearDown(
+        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          SystemChannels.platform,
+          null,
+        ),
+      );
+
+      await stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: NodesPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
+        ),
+      );
+      final row = find.byKey(const Key('node-row-peer-direct-001'));
+      final rowFocus = tester.widget<InkWell>(row).focusNode!;
+      rowFocus.requestFocus();
+      await tester.pump();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pumpAndSettle();
+      expect(copied, ['10.20.0.11']);
+
+      Future<void> openMenuWithKeyboard() async {
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.f10);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.pumpAndSettle();
+      }
+
+      final detailsAction = find.widgetWithText(
+        MenuItemButton,
+        'Device details',
+      );
+      await openMenuWithKeyboard();
+      expect(detailsAction, findsOneWidget);
+      expect(rowFocus.hasPrimaryFocus, isFalse);
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pumpAndSettle();
+      expect(detailsAction, findsNothing);
+      expect(rowFocus.hasPrimaryFocus, isTrue);
+
+      await openMenuWithKeyboard();
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pumpAndSettle();
+      final dialog = find.byType(Dialog);
+      final header = find.byKey(const Key('peer-detail-header'));
+      expect(dialog, findsOneWidget);
+      expect(tester.getTopLeft(header).dx, greaterThan(800));
+      expect(
+        find.descendant(of: dialog, matching: find.text('Node ID')),
+        findsOneWidget,
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
   testWidgets('Nodes detail copies connection values and full node identity', (
     tester,
   ) async {

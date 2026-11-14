@@ -22,6 +22,8 @@ import '../../shared/formatters.dart';
 import '../../shared/permission_copy.dart';
 import '../../shared/widgets/app_motion.dart';
 import '../../shared/widgets/app_notice.dart';
+import '../../shared/widgets/app_select.dart';
+import '../../shared/widgets/desktop_device_row.dart';
 import '../../shared/widgets/traffic_totals.dart';
 import '../../shared/widgets/traffic_history_scope.dart';
 import '../../shared/widgets/traffic_history_section.dart';
@@ -33,6 +35,9 @@ import '../rooms/room_strings.dart';
 part 'dashboard/actions.dart';
 part 'dashboard/components.dart';
 part 'dashboard/devices.dart';
+part 'dashboard/desktop_overview.dart';
+part 'dashboard/desktop_metrics.dart';
+part 'dashboard/desktop_diagnostics.dart';
 part 'dashboard/helpers.dart';
 part 'dashboard/hero.dart';
 part 'dashboard/issues.dart';
@@ -118,6 +123,16 @@ class _DashboardPageState extends State<DashboardPage> {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final capabilities = widget.capabilities ?? PlatformCapabilities.current();
+    final desktop = AppTokens.isDesktopPlatform(Theme.of(context).platform);
+    if (desktop && capabilities.canActAsLocalVpnNode) {
+      return _DesktopHome(
+        page: widget,
+        capabilities: capabilities,
+        scrollController: _scrollController,
+        scopeId: _selectedScopeId,
+        onScopeChanged: _selectScope,
+      );
+    }
     return AnimatedBuilder(
       animation: Listenable.merge([
         widget.settingsStore,
@@ -200,10 +215,7 @@ class _DashboardPageState extends State<DashboardPage> {
               ? NetworkScopePicker(
                   overview: overview,
                   selectedId: selectedId,
-                  onChanged: (id) => setState(() {
-                    _selectedScopeId = id;
-                    widget.uiState?.scopeId = id;
-                  }),
+                  onChanged: _selectScope,
                 )
               : null,
           showHeader: widget.showHeader,
@@ -315,5 +327,12 @@ class _DashboardPageState extends State<DashboardPage> {
         );
       },
     );
+  }
+
+  void _selectScope(String? id) {
+    setState(() {
+      _selectedScopeId = id;
+      widget.uiState?.scopeId = id;
+    });
   }
 }

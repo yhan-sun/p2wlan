@@ -1,11 +1,13 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/app_strings.dart';
 import 'package:p2wlan_flutter_client/app/app_theme.dart';
+import 'package:p2wlan_flutter_client/app/app_tokens.dart';
 import 'package:p2wlan_flutter_client/app/navigation.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/capabilities/platform_capabilities.dart';
@@ -82,6 +84,12 @@ class _Status extends StatusStore {
         enableFreshnessTimer: false,
       );
   DiagnosticsSnapshot? primary;
+
+  void updatePrimary(DiagnosticsSnapshot snapshot) {
+    primary = snapshot;
+    notifyListeners();
+  }
+
   @override
   DiagnosticsSnapshot? get snapshot => primary;
   @override
@@ -179,6 +187,131 @@ Widget _host(_Fixture fixture, bool phone, {TrafficHistoryStore? history}) {
 }
 
 void main() {
+  testWidgets('desktop Home diagnoses the selected verified path', (
+    tester,
+  ) async {
+    final fixture = (await tester.runAsync(() => _fixture('primary')))!;
+    addTearDown(fixture.dispose);
+    var devicesOpened = 0;
+    final raw = fixture.status.primary!.raw;
+    fixture.status.primary = DiagnosticsSnapshot.fromJson({
+      ...raw,
+      'peers': [
+        {
+          'node_id': 'verified-relay',
+          'device_name': 'Verified relay peer',
+          'virtual_ip': '10.21.9.12',
+          'online': true,
+          'state': 'relay',
+          'active_path': 'relay',
+          'relay_confirmed_endpoint': '127.0.0.1:8080',
+          'relay_confirmed_generation': 9,
+          'relay': {
+            'last_success_age_ms': 100,
+            'rtt_ewma_ms': 26,
+            'jitter_ms': 4,
+          },
+          'path_observability': {
+            'schema_version': 1,
+            'current_path': 'relay',
+            'last_path_change_reason': 'direct_first_deadline',
+            'transition_reason': 'relay_health_observed',
+            'direct_state': 'probing',
+            'transitions': [
+              {'event_kind': 'direct_probe_started', 'age_ms': 4100},
+            ],
+          },
+        },
+        {
+          'node_id': 'probing',
+          'device_name': 'Probing peer',
+          'virtual_ip': '10.21.9.13',
+          'online': true,
+          'state': 'hole_punching',
+          'direct': {'rtt_ewma_ms': 1, 'jitter_ms': 2},
+        },
+      ],
+    });
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: AppTheme.lightTheme.copyWith(platform: TargetPlatform.macOS),
+        home: AppStringsScope(
+          strings: AppStrings.fromCode('en'),
+          child: Scaffold(
+            body: DashboardPage(
+              settingsStore: fixture.settings,
+              statusStore: fixture.status,
+              capabilities: PlatformCapabilities.fromPlatform('macos'),
+              onOpenDevices: () => devicesOpened++,
+            ),
+          ),
+        ),
+      ),
+    );
+    final median = find.byKey(const Key('home-live-rtt'));
+    expect(
+      find.descendant(of: median, matching: find.text('26 ms')),
+      findsOneWidget,
+    );
+    final breakdown = find.byKey(const Key('home-path-breakdown'));
+    final segments = find.descendant(
+      of: breakdown,
+      matching: find.byType(ColoredBox),
+    );
+    expect(segments, findsNWidgets(2));
+    final segmentWidth = tester.getSize(breakdown).width / 2;
+    for (final segment in segments.evaluate()) {
+      final size = tester.getSize(find.byWidget(segment.widget));
+      expect(size.height, AppTokens.space4);
+      expect(size.width, closeTo(segmentWidth, 0.01));
+    }
+    final devicesAction = find.byKey(const Key('home-view-all-devices'));
+    expect(
+      find.descendant(of: devicesAction, matching: find.text('View devices')),
+      findsOneWidget,
+    );
+    await tester.tap(devicesAction);
+    expect(devicesOpened, 1);
+    expect(find.text('Jitter'), findsNothing);
+    final peer = NetworkOverview.read(fixture.status).peers.first;
+    final row = find.byKey(Key('home-device-row-${peer.identity}'));
+    await tester.tap(row, buttons: kSecondaryMouseButton);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Diagnostics'));
+    await tester.pumpAndSettle();
+    expect(find.text('4 ms'), findsOneWidget);
+    expect(find.text('2 ms'), findsNothing);
+    expect(find.text('Direct connection timed out'), findsOneWidget);
+    expect(find.text('Direct probe started'), findsOneWidget);
+    expect(find.text('Packet loss'), findsOneWidget);
+
+    final observed = fixture.status.primary!.raw;
+    final peers = (observed['peers'] as List).cast<Map<String, dynamic>>();
+    fixture.status.updatePrimary(
+      DiagnosticsSnapshot.fromJson({
+        ...observed,
+        'peers': [
+          {
+            ...peers.first,
+            'path_observability': {
+              'schema_version': 1,
+              'current_path': 'relay',
+              'last_path_change_reason': 'relay_peer_confirmed',
+              'transition_reason': 'relay_health_observed',
+            },
+          },
+          peers.last,
+        ],
+      }),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Relay fallback reason'), findsOneWidget);
+    expect(find.text('Direct connection timed out'), findsNothing);
+    expect(find.text('Relay peer confirmed'), findsNothing);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets('Home invitation action names and opens its selected room', (
     tester,
   ) async {

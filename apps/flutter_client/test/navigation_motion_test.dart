@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/app_strings.dart';
 import 'package:p2wlan_flutter_client/app/app_theme.dart';
+import 'package:p2wlan_flutter_client/app/app_tokens.dart';
 import 'package:p2wlan_flutter_client/app/navigation.dart';
 import 'package:p2wlan_flutter_client/app/navigation_model.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
@@ -20,6 +21,8 @@ import 'package:p2wlan_flutter_client/features/rooms/rooms_page.dart';
 import 'package:p2wlan_flutter_client/features/settings/settings_page.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/app_motion.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/desktop_sidebar.dart';
+
+Finder _shellEntrance() => find.byKey(const Key('shell-page-entrance'));
 
 Widget _motionHost({
   required Object identity,
@@ -36,11 +39,15 @@ Widget _motionHost({
   ),
 );
 
-Opacity _opacity(WidgetTester tester) => tester.widget<Opacity>(
-  find
-      .descendant(of: find.byType(AppEntrance), matching: find.byType(Opacity))
-      .first,
-);
+Opacity _opacity(WidgetTester tester, {Finder? entrance}) =>
+    tester.widget<Opacity>(
+      find
+          .descendant(
+            of: entrance ?? find.byType(AppEntrance),
+            matching: find.byType(Opacity),
+          )
+          .first,
+    );
 
 double _offset(WidgetTester tester) => tester
     .widget<Transform>(
@@ -287,18 +294,21 @@ void main() {
       (tester) => _asDesktop(() async {
         final harness = await mount(tester);
         expect(find.byType(DashboardPage), findsOneWidget);
-        expect(_opacity(tester).opacity, 1);
-        final bounds = tester.getRect(find.byType(AppEntrance));
+        expect(_opacity(tester, entrance: _shellEntrance()).opacity, 1);
+        final bounds = tester.getRect(_shellEntrance());
         _select(tester, P2WlanSection.devices);
         await tester.pump();
         expect(find.byType(DashboardPage), findsNothing);
         expect(find.byType(NodesPage), findsOneWidget);
-        expect(_opacity(tester).opacity, greaterThan(0));
+        expect(
+          _opacity(tester, entrance: _shellEntrance()).opacity,
+          greaterThan(0),
+        );
         final currentListeners = harness.status.listeners;
-        await tester.pump(const Duration(milliseconds: 180));
+        await tester.pump(AppTokens.durationNavigation);
         expect(harness.status.listeners, currentListeners);
-        expect(tester.getRect(find.byType(AppEntrance)), bounds);
-        expect(_opacity(tester).opacity, 1);
+        expect(tester.getRect(_shellEntrance()), bounds);
+        expect(_opacity(tester, entrance: _shellEntrance()).opacity, 1);
         expect(tester.takeException(), isNull);
       }),
     );
@@ -328,7 +338,7 @@ void main() {
         await tester.pump();
         expect(find.byType(RoomsPage), findsNothing);
         expect(find.byType(DashboardPage), findsOneWidget);
-        expect(find.byType(AppEntrance), findsOneWidget);
+        expect(_shellEntrance(), findsOneWidget);
         await tester.pumpAndSettle();
         expect(FocusManager.instance.primaryFocus, isNot(same(focus)));
         expect(tester.takeException(), isNull);
@@ -342,15 +352,27 @@ void main() {
         _select(tester, P2WlanSection.devices);
         await tester.pump();
         final previous = tester.state(find.byType(NodesPage));
-        expect(_opacity(tester).opacity, 1);
+        expect(_opacity(tester, entrance: _shellEntrance()).opacity, 1);
         expect(_offset(tester), 0);
         harness.status.revision++;
         await tester.pumpWidget(_shell(harness, reduceMotion: true));
         expect(find.byType(NodesPage), findsOneWidget);
         expect(tester.state(find.byType(NodesPage)), isNot(same(previous)));
         expect(find.byType(DashboardPage), findsNothing);
-        expect(_opacity(tester).opacity, 1);
+        expect(_opacity(tester, entrance: _shellEntrance()).opacity, 1);
         expect(_offset(tester), 0);
+        expect(tester.takeException(), isNull);
+      }),
+    );
+    testWidgets(
+      'desktop accelerators work from a fresh window',
+      (tester) => _asDesktop(() async {
+        await mount(tester);
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.digit2);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pumpAndSettle();
+        expect(find.byType(NodesPage), findsOneWidget);
         expect(tester.takeException(), isNull);
       }),
     );

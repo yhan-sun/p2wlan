@@ -29,6 +29,8 @@ import '../../core/rooms/parallel_rooms.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 
+part 'room_overview.dart';
+
 class RoomsPage extends StatefulWidget {
   const RoomsPage({
     super.key,
@@ -1086,6 +1088,14 @@ class _RoomsPageState extends State<RoomsPage> {
     );
   }
 
+  Widget _roomSection(Widget child) {
+    if (!_isDesktop(context)) return _surfaceCard(child: child);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [const Divider(height: 1), child, const Divider(height: 1)],
+    );
+  }
+
   Future<void> _selectRoom(String id) async {
     final isCurrent = _sessionGuard();
     if (!isCurrent()) return;
@@ -1104,8 +1114,14 @@ class _RoomsPageState extends State<RoomsPage> {
 
   Widget _roomList() {
     if (_rooms.isEmpty) {
-      if (_loading || _authenticationError != null) {
+      if (_loading || _authenticationError != null || _error != null) {
         return const SizedBox.shrink();
+      }
+      if (_isDesktop(context)) {
+        return _DesktopRoomsEmpty(
+          title: _s("和好友连接到同一房间"),
+          message: _s("输入好友发来的房间号或邀请链接。也可以创建房间，邀请其他设备加入。"),
+        );
       }
       final palette = P2WlanColors.of(context);
       return _surfaceCard(
@@ -1150,6 +1166,26 @@ class _RoomsPageState extends State<RoomsPage> {
             ],
           ),
         ),
+      );
+    }
+    if (_isDesktop(context)) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Semantics(
+            header: true,
+            child: Text(
+              _s("我的房间 · {0}", [_rooms.length]),
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+          ),
+          const SizedBox(height: AppTokens.space8),
+          const Divider(height: 1),
+          for (final room in _rooms) ...[
+            _roomCard(room),
+            const Divider(height: 1),
+          ],
+        ],
       );
     }
     return LayoutBuilder(
@@ -1199,6 +1235,41 @@ class _RoomsPageState extends State<RoomsPage> {
     final session = _parallel.session(room.id);
     final snapshot = _roomSnapshot(room);
     final colors = P2WlanColors.of(context);
+    final ownerLabel = _s("房主 · {0}", [owner.isEmpty ? _s("未设置用户名") : owner]);
+    final onlineMembers = '${online ?? '—'} / ${total ?? '—'}';
+    if (_isDesktop(context)) {
+      return _RoomActionSurface(
+        key: ValueKey('room-card-${room.id}'),
+        label: _s("查看房间 {0}", [room.name]),
+        onTap: _busy ? null : () => _selectRoom(room.id),
+        borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+        child: _DesktopRoomRow(
+          name: room.name,
+          code: _s("房间号 {0}", [room.code]),
+          owner: ownerLabel,
+          lockedLabel: room.locked ? _s("已锁定新成员加入") : null,
+          status: _connectionBadge(room, compact: true),
+          members: _RoomRowMetric(label: _s("在线 / 总人数"), value: onlineMembers),
+          latency: room.isOwner
+              ? null
+              : Tooltip(
+                  message: _s("本机到房主在线设备的实测延迟；多台设备取最低值。"),
+                  child: _RoomRowMetric(
+                    label: _s("房主延迟"),
+                    value: _ownerLatency(room, roster),
+                  ),
+                ),
+          notes: [
+            if (_rosterErrors.containsKey(room.id))
+              roster == null ? _s("成员信息暂不可用，点击房间可重试") : _s("成员信息更新失败，显示上次结果"),
+            if (snapshot != null && _snapshotStale(snapshot)) _s("链路信息待更新"),
+            if (session?.message case final message?)
+              _strings.runtimeText(message),
+          ],
+          action: _canConnect ? _connectionButton(room, card: true) : null,
+        ),
+      );
+    }
     return _surfaceCard(
       child: _RoomActionSurface(
         key: ValueKey('room-card-${room.id}'),
@@ -1240,19 +1311,13 @@ class _RoomsPageState extends State<RoomsPage> {
                 ],
               ),
               const SizedBox(height: 4),
-              Text(
-                _s("房主 · {0}", [owner.isEmpty ? _s("未设置用户名") : owner]),
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
+              Text(ownerLabel, style: Theme.of(context).textTheme.bodySmall),
               const SizedBox(height: 10),
               Wrap(
                 spacing: 24,
                 runSpacing: 8,
                 children: [
-                  _roomMetric(
-                    _s("在线 / 总人数"),
-                    '${online ?? '—'} / ${total ?? '—'}',
-                  ),
+                  _roomMetric(_s("在线 / 总人数"), onlineMembers),
                   if (!room.isOwner)
                     Tooltip(
                       message: _s("本机到房主在线设备的实测延迟；多台设备取最低值。"),
@@ -1323,7 +1388,7 @@ class _RoomsPageState extends State<RoomsPage> {
   bool get _connectionBusy =>
       _busy || _parallel.busy || widget.statusStore.daemonBusy;
 
-  Widget _connectionBadge(FriendRoom room) {
+  Widget _connectionBadge(FriendRoom room, {bool compact = false}) {
     final session = _parallel.session(room.id);
     final snapshot = _roomSnapshot(room);
     final tone = session?.phase == RoomConnectionPhase.failed
@@ -1345,6 +1410,7 @@ class _RoomsPageState extends State<RoomsPage> {
     return StatusBadge(
       label: primaryStarting ? _s("本机启动") : _connectionLabel(session, snapshot),
       tone: tone,
+      compact: compact,
     );
   }
 
@@ -1504,14 +1570,16 @@ class _RoomsPageState extends State<RoomsPage> {
         'online': true,
       });
     }
-    final users = <String>{
-      ...roster.members.map((member) => member['user_id'] as String? ?? ''),
-      ...devices.map((device) => device['user_id'] as String? ?? ''),
+    final devicesByUser = <String, List<Map<String, dynamic>>>{
+      for (final member in roster.members)
+        member['user_id'] as String? ?? '': [],
     };
+    for (final device in devices) {
+      (devicesByUser[device['user_id'] as String? ?? ''] ??= []).add(device);
+    }
+    final users = devicesByUser.keys;
     bool onlyLocalDevices(String user) {
-      final owned = devices.where(
-        (device) => (device['user_id'] ?? '') == user,
-      );
+      final owned = devicesByUser[user]!;
       return owned.isNotEmpty &&
           owned.every(
             (device) =>
@@ -1526,24 +1594,24 @@ class _RoomsPageState extends State<RoomsPage> {
             ...users.where(onlyLocalDevices),
           ]
         : users;
-    bool hasDevices(String user) =>
-        devices.any((device) => (device['user_id'] ?? '') == user);
+    bool hasDevices(String user) => devicesByUser[user]!.isNotEmpty;
     final orderedUsers = [
       ...prioritizedUsers.where(hasDevices),
       ...prioritizedUsers.where((user) => !hasDevices(user)),
     ];
     final palette = P2WlanColors.of(context);
-    return _surfaceCard(
-      child: LayoutBuilder(
+    return _roomSection(
+      LayoutBuilder(
         builder: (context, constraints) => Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(18, 18, 18, 14),
+              padding: _isDesktop(context)
+                  ? const EdgeInsets.all(AppTokens.space12)
+                  : const EdgeInsets.fromLTRB(18, 18, 18, 14),
               child: Text(
                 _s("设备与连接 · {0}", [devices.length]),
-                style: Theme.of(context).textTheme.titleMedium
-                    ?.copyWith(fontSize: 15, fontWeight: FontWeight.w700),
+                style: Theme.of(context).textTheme.titleMedium,
               ),
             ),
             if (constraints.maxWidth >= 748 &&
@@ -1575,7 +1643,9 @@ class _RoomsPageState extends State<RoomsPage> {
               ),
             for (final user in orderedUsers) ...[
               Container(
-                padding: const EdgeInsets.fromLTRB(18, 16, 18, 8),
+                padding: _isDesktop(context)
+                    ? const EdgeInsets.fromLTRB(12, 8, 12, 8)
+                    : const EdgeInsets.fromLTRB(18, 16, 18, 8),
                 child: DefaultTextStyle.merge(
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
                     color: palette.textSecondary,
@@ -1586,9 +1656,7 @@ class _RoomsPageState extends State<RoomsPage> {
                           _s("{0} · {1} · {2} 台设备", [
                             user.isEmpty ? _s("成员信息同步中") : _memberLabel(user),
                             user == roster.room.ownerId ? _s("房主") : _s("成员"),
-                            devices
-                                .where((d) => (d['user_id'] ?? '') == user)
-                                .length,
+                            devicesByUser[user]!.length,
                           ]),
                         )
                       : Wrap(
@@ -1601,20 +1669,12 @@ class _RoomsPageState extends State<RoomsPage> {
                             Text(
                               user == roster.room.ownerId ? _s("房主") : _s("成员"),
                             ),
-                            Text(
-                              _s("{0} 台设备", [
-                                devices
-                                    .where((d) => (d['user_id'] ?? '') == user)
-                                    .length,
-                              ]),
-                            ),
+                            Text(_s("{0} 台设备", [devicesByUser[user]!.length])),
                           ],
                         ),
                 ),
               ),
-              for (final device in devices.where(
-                (d) => (d['user_id'] ?? '') == user,
-              ))
+              for (final device in devicesByUser[user]!)
                 _deviceCard(
                   roster.room,
                   device,
@@ -1958,7 +2018,9 @@ class _RoomsPageState extends State<RoomsPage> {
           )
         : null;
     final staleRoster = _rosterErrors.containsKey(room.id);
+    final desktop = _isDesktop(context);
     final status = StatusBadge(
+      compact: desktop,
       label: state == 'blocked'
           ? _s("已禁止")
           : state == 'pending'
@@ -1984,7 +2046,10 @@ class _RoomsPageState extends State<RoomsPage> {
         Flexible(
           child: SelectableText(
             ip.isEmpty ? _s("待分配") : ip,
-            style: const TextStyle(fontWeight: FontWeight.w600),
+            style: const TextStyle(
+              fontFeatures: AppTokens.tabularFontFeatures,
+              fontWeight: FontWeight.w500,
+            ),
           ),
         ),
         if (ip.isNotEmpty)
@@ -1993,7 +2058,9 @@ class _RoomsPageState extends State<RoomsPage> {
             iconSize: 16,
             style: _desktopLayout(context)
                 ? IconButton.styleFrom(
-                    minimumSize: const Size(40, 40),
+                    minimumSize: const Size.square(
+                      AppTokens.desktopControlHeight,
+                    ),
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   )
                 : null,
@@ -2007,7 +2074,8 @@ class _RoomsPageState extends State<RoomsPage> {
     final latencyWidget = Text(
       latencyLabel,
       style: TextStyle(
-        fontWeight: FontWeight.w600,
+        fontFeatures: AppTokens.tabularFontFeatures,
+        fontWeight: FontWeight.w500,
         color: latency == null
             ? colors.onSurfaceVariant
             : latency < 80
@@ -2020,7 +2088,18 @@ class _RoomsPageState extends State<RoomsPage> {
     final pathLabel = staleRoster && peer == null && !local
         ? _s("成员信息待更新")
         : path;
-    final pathWidget = Text(pathLabel);
+    final palette = P2WlanColors.of(context);
+    final pathColor = !local && online && !mappingMismatch
+        ? switch (peer?.path) {
+            'direct' => palette.direct,
+            'relay' => palette.relay,
+            _ => palette.textSecondary,
+          }
+        : palette.textSecondary;
+    final pathWidget = Text(
+      pathLabel,
+      style: desktop ? TextStyle(color: pathColor) : null,
+    );
     final dataLabel = _deviceDataLabel(device, snapshot);
     final dataWidget = Text(dataLabel);
     final content = _RoomActionSurface(
@@ -2219,7 +2298,10 @@ class _RoomsPageState extends State<RoomsPage> {
     Widget? action,
     bool actionBesideSubtitle = false,
   }) => Padding(
-    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+    padding: EdgeInsets.symmetric(
+      horizontal: AppTokens.space16,
+      vertical: _isDesktop(context) ? AppTokens.space8 : AppTokens.space14,
+    ),
     child: LayoutBuilder(
       builder: (context, constraints) {
         final heading = DefaultTextStyle.merge(
@@ -2323,10 +2405,10 @@ class _RoomsPageState extends State<RoomsPage> {
         ? const TrafficCounters()
         : TrafficCounters.fromSnapshot(snapshot);
     final rate = _roomTransferRate(scope);
-    return _surfaceCard(
-      child: Padding(
+    return _roomSection(
+      Padding(
         key: ValueKey('room-traffic-${room.id}'),
-        padding: const EdgeInsets.all(18),
+        padding: EdgeInsets.all(_isDesktop(context) ? AppTokens.space12 : 18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -2472,6 +2554,7 @@ class _RoomsPageState extends State<RoomsPage> {
   Widget _roomDetails(RoomRoster roster) {
     final room = roster.room;
     final compact = MediaQuery.sizeOf(context).width < 700;
+    final desktop = _isDesktop(context);
     final connection = _parallel.session(room.id);
     final snapshot = _roomSnapshot(room);
     final primaryConnected = connection == null && snapshot != null;
@@ -2503,12 +2586,8 @@ class _RoomsPageState extends State<RoomsPage> {
           runSpacing: 8,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
-            Text(
-              room.name,
-              style: Theme.of(context).textTheme.headlineSmall
-                  ?.copyWith(fontSize: 26, fontWeight: FontWeight.w700),
-            ),
-            _connectionBadge(room),
+            Text(room.name, style: Theme.of(context).textTheme.headlineSmall),
+            _connectionBadge(room, compact: desktop),
           ],
         ),
         const SizedBox(height: 6),
@@ -2565,7 +2644,7 @@ class _RoomsPageState extends State<RoomsPage> {
             children: [
               LayoutBuilder(
                 builder: (context, constraints) {
-                  if (constraints.maxWidth >= 900 &&
+                  if (constraints.maxWidth >= (desktop ? 680 : 900) &&
                       MediaQuery.textScalerOf(context).scale(14) < 20) {
                     return Row(
                       crossAxisAlignment: CrossAxisAlignment.center,
@@ -2615,7 +2694,7 @@ class _RoomsPageState extends State<RoomsPage> {
             ],
           ),
         ),
-        const SizedBox(height: 12),
+        SizedBox(height: desktop ? AppTokens.space4 : AppTokens.space12),
         _roomWorkspace(roster),
         if (roster.members.any((member) => !member.containsKey('username')))
           Padding(
@@ -2628,6 +2707,10 @@ class _RoomsPageState extends State<RoomsPage> {
         const SizedBox(height: 12),
         ExpansionTile(
           key: ValueKey('room-members-${room.id}'),
+          dense: desktop,
+          tilePadding: desktop
+              ? const EdgeInsets.symmetric(horizontal: AppTokens.space12)
+              : null,
           expansionAnimationStyle: expansionMotion,
           title: Text(
             '${room.isOwner ? _s("成员管理") : _s("房间成员")} · ${roster.members.length}',
@@ -2681,6 +2764,10 @@ class _RoomsPageState extends State<RoomsPage> {
         if (room.isOwner)
           ExpansionTile(
             key: ValueKey('room-settings-${room.id}'),
+            dense: desktop,
+            tilePadding: desktop
+                ? const EdgeInsets.symmetric(horizontal: AppTokens.space12)
+                : null,
             expansionAnimationStyle: expansionMotion,
             title: Text(_s("房间设置")),
             children: [
@@ -2763,6 +2850,10 @@ class _RoomsPageState extends State<RoomsPage> {
         if (room.isOwner)
           ExpansionTile(
             key: ValueKey('room-invites-${room.id}'),
+            dense: desktop,
+            tilePadding: desktop
+                ? const EdgeInsets.symmetric(horizontal: AppTokens.space12)
+                : null,
             expansionAnimationStyle: expansionMotion,
             title: Text(_s("邀请管理")),
             children: [
@@ -2925,8 +3016,10 @@ class _RoomsPageState extends State<RoomsPage> {
   Widget _overviewHeader() => LayoutBuilder(
     builder: (context, constraints) {
       final owned = _rooms.where((room) => room.isOwner).firstOrNull;
+      final desktop = _isDesktop(context);
+      final emphasizeJoin = desktop || owned != null;
       final createAction =
-          (owned == null ? FilledButton.icon : OutlinedButton.icon)(
+          (emphasizeJoin ? OutlinedButton.icon : FilledButton.icon)(
             onPressed: _serverActionsBusy || _loading || owned != null
                 ? null
                 : _create,
@@ -2934,7 +3027,7 @@ class _RoomsPageState extends State<RoomsPage> {
             label: Text(_s("创建房间")),
           );
       final joinAction =
-          (owned == null ? OutlinedButton.icon : FilledButton.icon)(
+          (emphasizeJoin ? FilledButton.icon : OutlinedButton.icon)(
             onPressed: _serverActionsBusy ? null : () => _join(),
             icon: const Icon(Icons.meeting_room_outlined),
             label: Text(_s("加入房间")),
@@ -2943,24 +3036,29 @@ class _RoomsPageState extends State<RoomsPage> {
         spacing: 8,
         runSpacing: 8,
         children: [
-          if (owned != null) joinAction,
+          if (desktop && widget.embedded) _roomRefreshButton(),
+          if (!desktop && owned != null) joinAction,
           createAction,
-          if (owned == null) joinAction,
+          if (desktop || owned == null) joinAction,
         ],
       );
       final title = Text(
         _s("房间"),
-        style: Theme.of(context).textTheme.titleLarge
-            ?.copyWith(fontSize: 24, fontWeight: FontWeight.w700),
+        style: Theme.of(context).textTheme.headlineSmall,
       );
       return Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           if (!widget.showHeader || !widget.embedded)
             actions
-          else if (constraints.maxWidth >= 600 &&
+          else if (constraints.maxWidth >= (desktop ? 520 : 600) &&
               MediaQuery.textScalerOf(context).scale(14) < 20)
-            Row(children: [title, const Spacer(), actions])
+            Row(
+              children: [
+                Expanded(child: title),
+                actions,
+              ],
+            )
           else ...[
             title,
             const SizedBox(height: 8),
@@ -2986,6 +3084,12 @@ class _RoomsPageState extends State<RoomsPage> {
         ],
       );
     },
+  );
+
+  Widget _roomRefreshButton() => IconButton(
+    tooltip: _s("刷新房间"),
+    onPressed: _busy || _refreshing ? null : () => _refresh(),
+    icon: const Icon(Icons.refresh_rounded, size: AppTokens.iconMd),
   );
 
   Widget _authenticationIssue() => _surfaceCard(
@@ -3032,13 +3136,11 @@ class _RoomsPageState extends State<RoomsPage> {
     ),
   );
 
+  bool _isDesktop(BuildContext context) =>
+      AppTokens.isDesktopPlatform(Theme.of(context).platform);
+
   bool _desktopLayout(BuildContext context) =>
-      switch (Theme.of(context).platform) {
-        TargetPlatform.macOS ||
-        TargetPlatform.windows ||
-        TargetPlatform.linux => true,
-        _ => MediaQuery.sizeOf(context).width >= 900,
-      };
+      _isDesktop(context) || MediaQuery.sizeOf(context).width >= 900;
 
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
@@ -3048,25 +3150,27 @@ class _RoomsPageState extends State<RoomsPage> {
       child: Scaffold(
         appBar: widget.embedded
             ? null
-            : AppBar(
-                title: Text(_s("房间")),
-                actions: [
-                  IconButton(
-                    tooltip: _s("刷新房间"),
-                    onPressed: _busy ? null : () => _refresh(),
-                    icon: const Icon(Icons.refresh_rounded),
-                  ),
-                ],
-              ),
+            : AppBar(title: Text(_s("房间")), actions: [_roomRefreshButton()]),
         body: SafeArea(
           child: RefreshIndicator(
             onRefresh: _refresh,
             child: ListView(
+              key: _isDesktop(context)
+                  ? PageStorageKey(('rooms', _selectedId))
+                  : null,
               padding: EdgeInsets.fromLTRB(
-                _desktopLayout(context) ? 28 : 20,
-                _desktopLayout(context) ? 24 : 16,
-                _desktopLayout(context) ? 28 : 20,
-                24,
+                _isDesktop(context)
+                    ? AppTokens.desktopPagePadding
+                    : _desktopLayout(context)
+                    ? 28
+                    : 20,
+                _desktopLayout(context) ? AppTokens.space24 : AppTokens.space16,
+                _isDesktop(context)
+                    ? AppTokens.desktopPagePadding
+                    : _desktopLayout(context)
+                    ? 28
+                    : 20,
+                AppTokens.space24,
               ),
               children: [
                 Center(
@@ -3078,23 +3182,29 @@ class _RoomsPageState extends State<RoomsPage> {
                         if (_selectedId == null) _overviewHeader(),
                         const SizedBox(height: 12),
                         if (_selectedId != null)
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: TextButton.icon(
-                              onPressed: _busy
-                                  ? null
-                                  : () {
-                                      setState(() {
-                                        _selectedId = null;
-                                        _roster = null;
-                                        _loading = false;
-                                      });
-                                      _generation++;
-                                      widget.onRoomSelected?.call(null);
-                                    },
-                              icon: const Icon(Icons.arrow_back_rounded),
-                              label: Text(_s("返回房间")),
-                            ),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Flexible(
+                                child: TextButton.icon(
+                                  onPressed: _busy
+                                      ? null
+                                      : () {
+                                          setState(() {
+                                            _selectedId = null;
+                                            _roster = null;
+                                            _loading = false;
+                                          });
+                                          _generation++;
+                                          widget.onRoomSelected?.call(null);
+                                        },
+                                  icon: const Icon(Icons.arrow_back_rounded),
+                                  label: Text(_s("返回房间")),
+                                ),
+                              ),
+                              if (widget.embedded && _isDesktop(context))
+                                _roomRefreshButton(),
+                            ],
                           ),
                         if (_busy || _loading)
                           Padding(

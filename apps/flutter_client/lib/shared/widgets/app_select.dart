@@ -54,6 +54,7 @@ class AppSelect<T> extends StatelessWidget {
 
     final theme = Theme.of(context);
     final colors = P2WlanColors.of(context);
+    final desktop = AppTokens.isDesktopPlatform(theme.platform);
     final selected = options.firstWhere((option) => option.value == value);
     final enabled = onChanged != null;
 
@@ -67,9 +68,16 @@ class AppSelect<T> extends StatelessWidget {
         Widget result = OutlinedButton(
           onPressed: enabled ? openMenu : null,
           style: ButtonStyle(
-            minimumSize: const WidgetStatePropertyAll(
-              Size(0, AppTokens.minTouchTarget),
+            minimumSize: WidgetStatePropertyAll(
+              Size(
+                0,
+                desktop
+                    ? AppTokens.desktopControlHeight
+                    : AppTokens.minTouchTarget,
+              ),
             ),
+            tapTargetSize: desktop ? MaterialTapTargetSize.shrinkWrap : null,
+            visualDensity: desktop ? VisualDensity.standard : null,
             padding: const WidgetStatePropertyAll(
               EdgeInsets.symmetric(horizontal: AppTokens.space12),
             ),
@@ -98,7 +106,9 @@ class AppSelect<T> extends StatelessWidget {
             }),
             shape: WidgetStatePropertyAll(
               RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+                borderRadius: BorderRadius.circular(
+                  desktop ? AppTokens.radiusSm : AppTokens.radiusMd,
+                ),
               ),
             ),
             elevation: const WidgetStatePropertyAll(0),
@@ -115,9 +125,9 @@ class AppSelect<T> extends StatelessWidget {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   textAlign: TextAlign.left,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 13,
-                    fontWeight: FontWeight.w600,
+                    fontWeight: desktop ? FontWeight.w500 : FontWeight.w600,
                   ),
                 ),
               ),
@@ -225,6 +235,8 @@ class AppSelect<T> extends StatelessWidget {
       anchorRect,
       Offset.zero & overlay.size,
     );
+    final theme = Theme.of(context);
+    final desktop = AppTokens.isDesktopPlatform(theme.platform);
 
     return showMenu<T>(
       context: context,
@@ -232,8 +244,7 @@ class AppSelect<T> extends StatelessWidget {
       position: position,
       color: colors.surfaceElevated,
       surfaceTintColor: Colors.transparent,
-      shadowColor: const Color(0x240F172A),
-      elevation: 10,
+      elevation: desktop ? AppTokens.elevationMenu : 10,
       menuPadding: const EdgeInsets.all(AppTokens.space6),
       clipBehavior: Clip.antiAlias,
       constraints: BoxConstraints.tightFor(
@@ -246,6 +257,9 @@ class AppSelect<T> extends StatelessWidget {
       items: [
         for (final option in options)
           _AppSelectPopoverItem<T>(
+            minHeight: desktop
+                ? AppTokens.desktopControlHeight
+                : AppTokens.minTouchTarget,
             optionKey: ValueKey<Object>(('app-select-option', option.value)),
             value: option.value,
             selected: option.value == value,
@@ -300,6 +314,7 @@ class AppSelect<T> extends StatelessWidget {
 /// which visibly cuts through a rounded product menu.
 class _AppSelectPopoverItem<T> extends PopupMenuEntry<T> {
   const _AppSelectPopoverItem({
+    required this.minHeight,
     required this.optionKey,
     required this.value,
     required this.selected,
@@ -311,6 +326,7 @@ class _AppSelectPopoverItem<T> extends PopupMenuEntry<T> {
   });
 
   final Key optionKey;
+  final double minHeight;
   final T value;
   final bool selected;
   final Color selectedColor;
@@ -320,7 +336,7 @@ class _AppSelectPopoverItem<T> extends PopupMenuEntry<T> {
   final Widget child;
 
   @override
-  double get height => AppTokens.minTouchTarget + AppTokens.space4;
+  double get height => minHeight + AppTokens.space4;
 
   @override
   bool represents(T? value) => value == this.value;
@@ -356,9 +372,7 @@ class _AppSelectPopoverItemState<T> extends State<_AppSelectPopoverItem<T>> {
             focusColor: widget.hoverColor,
             splashColor: widget.splashColor,
             child: ConstrainedBox(
-              constraints: const BoxConstraints(
-                minHeight: AppTokens.minTouchTarget,
-              ),
+              constraints: BoxConstraints(minHeight: widget.minHeight),
               child: Padding(
                 padding: const EdgeInsets.symmetric(
                   horizontal: AppTokens.space12,

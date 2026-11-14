@@ -107,10 +107,11 @@ Future<void> _pumpHome(
   VoidCallback? onOpenTroubleshooting,
   double textScale = 1,
   bool desktopFrame = false,
+  TargetPlatform? platform,
 }) async {
   await tester.pumpWidget(
     MaterialApp(
-      theme: AppTheme.lightTheme,
+      theme: AppTheme.lightTheme.copyWith(platform: platform),
       builder: (context, child) => MediaQuery(
         data: MediaQuery.of(context)
             .copyWith(textScaler: TextScaler.linear(textScale)),
@@ -141,6 +142,43 @@ Future<void> _pumpHome(
 }
 
 void main() {
+  testWidgets('cancelled macOS authorization keeps the start action', (
+    tester,
+  ) async {
+    final harness = (await tester.runAsync(_harness))!;
+    addTearDown(harness.dispose);
+    await _pumpHome(
+      tester,
+      harness,
+      platform: TargetPlatform.macOS,
+      onOpenRooms: () {},
+      onOpenTroubleshooting: () {},
+    );
+    final first = Completer<DaemonCommandResult>();
+    harness.controller.pendingStart = first;
+    final start = find.byKey(const Key('dashboard-start-button'));
+    await tester.tap(start);
+    await tester.pump();
+    first.complete(
+      const DaemonCommandResult(
+        ok: false,
+        message: 'authorization cancelled',
+        failureCode:
+            DaemonStartupFailureCode.administratorAuthorizationCancelled,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.textContaining('Administrator authorization was cancelled'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('Windows UAC'), findsNothing);
+    expect(tester.widget<OutlinedButton>(start).onPressed, isNotNull);
+    await tester.tap(start);
+    await tester.pumpAndSettle();
+    expect(harness.controller.starts, hasLength(2));
+  });
+
   testWidgets(
     'stopped Home prioritizes room selection without starting a network',
     (tester) async {

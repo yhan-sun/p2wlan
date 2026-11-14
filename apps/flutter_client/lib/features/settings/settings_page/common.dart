@@ -1,5 +1,7 @@
 part of '../settings_page.dart';
 
+const _settingsControlWidth = 248.0;
+
 /// A preference row: label + optional description on the left, value/control on
 /// the right, with a hairline divider below. The whole row is the touch target
 /// (>= 44px), and a chevron hints that it opens a detail/edit surface.
@@ -12,6 +14,7 @@ class _PreferenceRow extends StatelessWidget {
     this.trailing,
     this.showDivider = true,
     this.inlineControl = false,
+    this.controlHasLabel = false,
   });
 
   final String label;
@@ -26,41 +29,37 @@ class _PreferenceRow extends StatelessWidget {
   final Widget? trailing;
   final bool showDivider;
   final bool inlineControl;
+  final bool controlHasLabel;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final desktop = _usesDesktopSettings(context);
+    final titleStyle = theme.textTheme.bodyMedium?.copyWith(
+      fontWeight: FontWeight.w500,
+    );
+    final descriptionStyle = theme.textTheme.bodySmall?.copyWith(
+      color: theme.colorScheme.onSurfaceVariant,
+    );
     final hasTrailing = trailing != null;
-    final labelContent = Row(
-      crossAxisAlignment: CrossAxisAlignment.center,
+    final labelContent = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
       children: [
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                  color: theme.colorScheme.onSurface,
-                ),
-              ),
-              if (subtitle != null && subtitle!.isNotEmpty) ...[
-                const SizedBox(height: 4),
-                Text(
-                  subtitle!,
-                  style: TextStyle(
-                    fontSize: 12,
-                    height: 1.45,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ],
+        ExcludeSemantics(
+          excluding: controlHasLabel,
+          child: Semantics(
+            container: true,
+            child: Text(label, style: titleStyle),
           ),
         ),
+        if (subtitle != null && subtitle!.isNotEmpty) ...[
+          const SizedBox(height: AppTokens.space4),
+          Semantics(
+            container: true,
+            child: Text(subtitle!, style: descriptionStyle),
+          ),
+        ],
       ],
     );
 
@@ -103,56 +102,53 @@ class _PreferenceRow extends StatelessWidget {
           borderRadius: BorderRadius.circular(AppTokens.radiusMd),
         ),
         child: Container(
-          constraints: const BoxConstraints(minHeight: 60),
-          padding: const EdgeInsets.symmetric(vertical: AppTokens.space12),
+          constraints: BoxConstraints(minHeight: desktop ? 48 : 60),
+          padding: EdgeInsets.symmetric(
+            vertical: desktop ? AppTokens.space6 : AppTokens.space12,
+          ),
           child: LayoutBuilder(
             builder: (context, constraints) {
               if (inlineControl) {
+                if (desktop) {
+                  return MergeSemantics(
+                    child: Row(
+                      children: [
+                        Expanded(child: labelContent),
+                        const SizedBox(width: AppTokens.space12),
+                        trailingContent,
+                      ],
+                    ),
+                  );
+                }
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     MergeSemantics(
                       child: Row(
                         children: [
-                          Expanded(
-                            child: Text(
-                              label,
-                              style: TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.w600,
-                                color: theme.colorScheme.onSurface,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 12),
+                          Expanded(child: Text(label, style: titleStyle)),
+                          const SizedBox(width: AppTokens.space12),
                           trailingContent,
                         ],
                       ),
                     ),
                     if (subtitle != null && subtitle!.isNotEmpty)
-                      Text(
-                        subtitle!,
-                        style: TextStyle(
-                          fontSize: 12,
-                          height: 1.45,
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                      ),
+                      Text(subtitle!, style: descriptionStyle),
                   ],
                 );
               }
               final largeText = MediaQuery.textScalerOf(context).scale(14) > 18;
               final stack = trailing != null
-                  ? constraints.maxWidth < 500 || largeText
+                  ? constraints.maxWidth < (desktop ? 420 : 500) || largeText
                   : value != null && (constraints.maxWidth < 300 || largeText);
               if (stack) {
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     labelContent,
-                    const SizedBox(height: 12),
+                    const SizedBox(height: AppTokens.space12),
                     Align(
-                      alignment: Alignment.centerLeft,
+                      alignment: AlignmentDirectional.centerStart,
                       child: trailingContent,
                     ),
                   ],
@@ -164,7 +160,9 @@ class _PreferenceRow extends StatelessWidget {
                   const SizedBox(width: AppTokens.space12),
                   if (hasTrailing)
                     ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 248),
+                      constraints: const BoxConstraints(
+                        maxWidth: _settingsControlWidth,
+                      ),
                       child: trailingContent,
                     )
                   else
@@ -183,7 +181,10 @@ class _PreferenceRow extends StatelessWidget {
     );
     return Column(
       children: [
-        content,
+        if (desktop)
+          Material(type: MaterialType.transparency, child: content)
+        else
+          content,
         if (showDivider)
           Divider(height: 1, color: theme.colorScheme.outlineVariant),
       ],
@@ -223,7 +224,14 @@ class _SettingsSurface extends StatelessWidget {
 class _DetailHeader extends StatelessWidget {
   const _DetailHeader({required this.title, this.onBack});
 
-  static const leadingExtent = AppTokens.minTouchTarget + AppTokens.space8;
+  static double leadingExtent({required bool desktop}) =>
+      _backSize(desktop) + _backGap(desktop);
+
+  static double _backSize(bool desktop) =>
+      desktop ? AppTokens.desktopControlHeight : AppTokens.minTouchTarget;
+
+  static double _backGap(bool desktop) =>
+      desktop ? AppTokens.space4 : AppTokens.space8;
 
   final String title;
   final VoidCallback? onBack;
@@ -231,29 +239,27 @@ class _DetailHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final desktop = _usesDesktopSettings(context);
     return Row(
       children: [
         if (onBack != null) ...[
           SizedBox.square(
-            dimension: AppTokens.minTouchTarget,
+            dimension: _backSize(desktop),
             child: AppBackButton(
               key: const Key('settings-category-back'),
               onPressed: onBack,
             ),
           ),
-          const SizedBox(width: AppTokens.space8),
+          SizedBox(width: _backGap(desktop)),
         ],
         Expanded(
           child: Semantics(
             header: true,
             child: Text(
               title,
-              style: TextStyle(
-                fontSize: 16,
-                height: 1.3,
-                fontWeight: FontWeight.w600,
-                color: theme.colorScheme.onSurface,
-              ),
+              style: desktop
+                  ? theme.textTheme.titleLarge
+                  : theme.textTheme.titleMedium,
             ),
           ),
         ),
@@ -262,19 +268,82 @@ class _DetailHeader extends StatelessWidget {
   }
 }
 
-/// A lightweight heading and one bordered group, with consistent spacing.
+/// Groups related preferences under a heading and a shared boundary.
 class _SettingsGroup extends StatelessWidget {
   const _SettingsGroup({
     required this.title,
     required this.children,
     this.subtitle,
+    this.headingStatus,
   });
   final String title;
   final String? subtitle;
+  final String? headingStatus;
   final List<Widget> children;
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final desktop = _usesDesktopSettings(context);
+    final titleStyle = desktop
+        ? theme.textTheme.titleSmall
+        : theme.textTheme.titleMedium;
+    final heading = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (headingStatus case final message?)
+          Row(
+            children: [
+              Expanded(
+                child: Semantics(
+                  header: true,
+                  child: Text(title, style: titleStyle),
+                ),
+              ),
+              const SizedBox(width: AppTokens.space8),
+              Flexible(
+                child: Semantics(
+                  container: true,
+                  liveRegion: true,
+                  child: Text(
+                    message,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: titleStyle?.copyWith(
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          )
+        else
+          Semantics(header: true, child: Text(title, style: titleStyle)),
+        if (subtitle != null) ...[
+          const SizedBox(height: AppTokens.space4),
+          Text(
+            subtitle!,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ],
+    );
+    if (desktop) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: AppTokens.space16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            heading,
+            const SizedBox(height: AppTokens.space6),
+            const Divider(height: 1),
+            const SizedBox(height: AppTokens.space4),
+            ...children,
+          ],
+        ),
+      );
+    }
     return Padding(
       padding: const EdgeInsets.only(bottom: 16),
       child: _SettingsSurface(
@@ -283,30 +352,7 @@ class _SettingsGroup extends StatelessWidget {
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text(
-              title,
-              style: TextStyle(
-                fontSize: 15,
-                height: 1.3,
-                fontWeight: FontWeight.w600,
-                color: theme.colorScheme.onSurface,
-              ),
-            ),
-            if (subtitle != null) ...[
-              const SizedBox(height: 4),
-              Text(
-                subtitle!,
-                style: TextStyle(
-                  fontSize: 12,
-                  height: 1.45,
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
-              ),
-            ],
-            const SizedBox(height: 16),
-            ...children,
-          ],
+          children: [heading, const SizedBox(height: 16), ...children],
         ),
       ),
     );
@@ -371,6 +417,7 @@ class _SettingsField extends StatelessWidget {
     this.textInputAction,
     this.focusNode,
     this.onChanged,
+    this.asPreference = false,
   });
 
   final TextEditingController controller;
@@ -384,49 +431,83 @@ class _SettingsField extends StatelessWidget {
   final TextInputAction? textInputAction;
   final FocusNode? focusNode;
   final ValueChanged<String>? onChanged;
+  final bool asPreference;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final desktop = _usesDesktopSettings(context);
+    // The macOS Flutter bridge uses a native editable view that doesn't expose
+    // the Flutter field label. Keep the adjacent static text discoverable too.
+    final keepVisibleLabelInSemantics = theme.platform == TargetPlatform.macOS;
+    final field = TextField(
+      key: ValueKey('settings-field-$label'),
+      controller: controller,
+      focusNode: focusNode,
+      onChanged: onChanged,
+      keyboardType: keyboardType,
+      textInputAction: textInputAction,
+      obscureText: obscureText,
+      autocorrect: false,
+      enableSuggestions: false,
+      smartDashesType: SmartDashesType.disabled,
+      smartQuotesType: SmartQuotesType.disabled,
+      onSubmitted: onSubmitted,
+      onTapOutside: (_) => FocusManager.instance.primaryFocus?.unfocus(),
+      decoration: InputDecoration(
+        labelText: desktop ? null : label,
+        floatingLabelBehavior: FloatingLabelBehavior.always,
+        floatingLabelStyle: const TextStyle(
+          fontSize: 16,
+          fontWeight: FontWeight.w600,
+        ),
+        constraints: desktop
+            ? const BoxConstraints(minHeight: AppTokens.desktopControlHeight)
+            : null,
+        visualDensity: desktop ? VisualDensity.standard : null,
+        hintText: hintText,
+        helper: helper == null || (desktop && asPreference)
+            ? null
+            : Text(
+                helper!,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+        errorText: errorText,
+        errorMaxLines: 3,
+      ),
+    );
+    final labeledField = Semantics(container: true, label: label, child: field);
+    if (desktop && asPreference) {
+      return _PreferenceRow(
+        label: label,
+        subtitle: errorText == null ? helper : null,
+        controlHasLabel: !keepVisibleLabelInSemantics,
+        trailing: SizedBox(width: _settingsControlWidth, child: labeledField),
+        showDivider: false,
+      );
+    }
     return Align(
-      alignment: Alignment.centerLeft,
+      alignment: AlignmentDirectional.centerStart,
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 640),
-        child: TextField(
-          controller: controller,
-          focusNode: focusNode,
-          onChanged: onChanged,
-          keyboardType: keyboardType,
-          textInputAction: textInputAction,
-          obscureText: obscureText,
-          autocorrect: false,
-          enableSuggestions: false,
-          smartDashesType: SmartDashesType.disabled,
-          smartQuotesType: SmartQuotesType.disabled,
-          onSubmitted: onSubmitted,
-          onTapOutside: (_) => FocusManager.instance.primaryFocus?.unfocus(),
-          decoration: InputDecoration(
-            labelText: label,
-            floatingLabelBehavior: FloatingLabelBehavior.always,
-            floatingLabelStyle: const TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-            ),
-            hintText: hintText,
-            helper: helper == null
-                ? null
-                : Text(
-                    helper!,
-                    style: TextStyle(
-                      fontSize: 12,
-                      height: 1.45,
-                      color: theme.colorScheme.onSurfaceVariant,
+        child: desktop
+            ? Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  ExcludeSemantics(
+                    excluding: !keepVisibleLabelInSemantics,
+                    child: Semantics(
+                      container: true,
+                      child: Text(label, style: theme.textTheme.titleSmall),
                     ),
                   ),
-            errorText: errorText,
-            errorMaxLines: 3,
-          ),
-        ),
+                  const SizedBox(height: AppTokens.space4),
+                  labeledField,
+                ],
+              )
+            : field,
       ),
     );
   }

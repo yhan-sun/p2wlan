@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_tokens.dart';
+
 /// Restrained timing shared by navigation, feedback and disclosure surfaces.
 abstract final class AppMotion {
   static const Curve curve = Curves.easeOutCubic;
@@ -7,12 +9,17 @@ abstract final class AppMotion {
   static Duration durationOf(BuildContext context) =>
       MediaQuery.disableAnimationsOf(context)
       ? Duration.zero
-      : const Duration(milliseconds: 180);
+      : AppTokens.durationDisclosure;
 
   static Duration feedbackDurationOf(BuildContext context) =>
       MediaQuery.disableAnimationsOf(context)
       ? Duration.zero
-      : const Duration(milliseconds: 110);
+      : AppTokens.durationFast;
+
+  static Duration navigationDurationOf(BuildContext context) =>
+      MediaQuery.disableAnimationsOf(context)
+      ? Duration.zero
+      : AppTokens.durationNavigation;
 
   static AnimationStyle expansionStyleOf(BuildContext context) =>
       AnimationStyle(
@@ -26,9 +33,15 @@ abstract final class AppMotion {
 /// Animate the current child without retaining an outgoing interactive tree.
 /// The caller owns child keys and any lifecycle or session identity boundary.
 class AppEntrance extends StatefulWidget {
-  const AppEntrance({super.key, required this.identity, required this.child});
+  const AppEntrance({
+    super.key,
+    required this.identity,
+    required this.child,
+    this.navigation = false,
+  });
 
   final Object identity;
+  final bool navigation;
   final Widget child;
 
   @override
@@ -42,14 +55,18 @@ class _AppEntranceState extends State<AppEntrance>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _controller.duration = AppMotion.durationOf(context);
+    _controller.duration = widget.navigation
+        ? AppMotion.navigationDurationOf(context)
+        : AppMotion.durationOf(context);
     if (_controller.duration == Duration.zero) _controller.value = 1;
   }
 
   @override
   void didUpdateWidget(covariant AppEntrance oldWidget) {
     super.didUpdateWidget(oldWidget);
-    _controller.duration = AppMotion.durationOf(context);
+    _controller.duration = widget.navigation
+        ? AppMotion.navigationDurationOf(context)
+        : AppMotion.durationOf(context);
     if (_controller.duration == Duration.zero) {
       _controller.value = 1;
     } else if (oldWidget.identity != widget.identity) {

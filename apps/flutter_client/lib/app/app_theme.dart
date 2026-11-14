@@ -1,561 +1,321 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import 'app_tokens.dart';
 import 'p2wlan_colors.dart';
 
 abstract final class AppTheme {
-  static ThemeData get lightTheme {
-    return ThemeData(
-      useMaterial3: true,
-      brightness: Brightness.light,
-      fontFamily: AppTokens.primaryFontFamily,
-      fontFamilyFallback: AppTokens.fontFamilyFallback,
-      scaffoldBackgroundColor: AppTokens.colorBg,
-      colorScheme: const ColorScheme.light(
-        surface: AppTokens.colorSurface,
-        onSurface: AppTokens.colorTextPrimary,
-        onSurfaceVariant: AppTokens.colorTextSecondary,
-        outline: AppTokens.colorBorder,
-        outlineVariant: AppTokens.colorBorderSubtle,
-        primary: AppTokens.colorAccent,
-        onPrimary: AppTokens.colorSurface,
-        secondary: AppTokens.colorAccent,
-        onSecondary: AppTokens.colorSurface,
-        secondaryContainer: Color(0xFFEAF1FF),
-        onSecondaryContainer: AppTokens.colorAccentMuted,
-        error: AppTokens.colorBadText,
-        surfaceContainerHighest: AppTokens.colorNeutralBg,
-      ),
-      extensions: const [P2WlanColors.light],
-      hoverColor: P2WlanColors.light.hoverSurface,
-      focusColor: Color(0x1A2563EB),
-      appBarTheme: const AppBarTheme(
-        backgroundColor: AppTokens.colorSurface,
-        foregroundColor: AppTokens.colorTextPrimary,
-        elevation: 0,
-        surfaceTintColor: Colors.transparent,
-        titleSpacing: 16,
-        titleTextStyle: TextStyle(
-          color: AppTokens.colorTextPrimary,
-          fontSize: 16,
-          fontWeight: FontWeight.w700,
-          letterSpacing: 0,
-        ),
-      ),
-      inputDecorationTheme: InputDecorationTheme(
-        filled: true,
-        fillColor: AppTokens.colorSurface,
-        contentPadding: const EdgeInsets.symmetric(
-          horizontal: AppTokens.space14,
-          vertical: AppTokens.space12,
-        ),
-        labelStyle: TextStyle(
-          color: AppTokens.colorTextSecondary,
-          fontSize: 14,
-        ),
-        hintStyle: const TextStyle(
-          color: AppTokens.colorTextMuted,
-          fontSize: 14,
-        ),
-        helperStyle: const TextStyle(
-          color: AppTokens.colorTextMuted,
-          fontSize: 12,
-        ),
-        errorStyle: const TextStyle(
-          color: AppTokens.colorBadText,
-          fontSize: 12,
-        ),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          borderSide: const BorderSide(color: AppTokens.colorBorder),
-        ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          borderSide: const BorderSide(color: AppTokens.colorBorder),
-        ),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          borderSide: const BorderSide(
-            color: AppTokens.colorAccent,
-            width: 1.5,
-          ),
-        ),
-        errorBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          borderSide: const BorderSide(color: AppTokens.colorBadBorder),
-        ),
-      ),
-      filledButtonTheme: FilledButtonThemeData(
-        style:
-            FilledButton.styleFrom(
-              backgroundColor: AppTokens.colorAccent,
-              foregroundColor: AppTokens.colorSurface,
-              disabledBackgroundColor: AppTokens.colorBorder,
-              disabledForegroundColor: AppTokens.colorTextMuted,
-              enabledMouseCursor: SystemMouseCursors.click,
-              disabledMouseCursor: SystemMouseCursors.basic,
-              minimumSize: const Size(
-                AppTokens.minTouchTarget,
-                AppTokens.minTouchTarget,
-              ),
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppTokens.space16,
-                vertical: AppTokens.space10,
-              ),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-              ),
-              textStyle: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-              ),
-            ).copyWith(
-              side: _buttonFocusSide(AppTokens.colorDarkBg),
-              overlayColor: _buttonOverlay(AppTokens.colorSurface),
-            ),
-      ),
-      outlinedButtonTheme: OutlinedButtonThemeData(
-        style:
-            OutlinedButton.styleFrom(
-              foregroundColor: AppTokens.colorTextPrimary,
-              disabledForegroundColor: AppTokens.colorTextMuted,
-              disabledBackgroundColor: Colors.transparent,
-              enabledMouseCursor: SystemMouseCursors.click,
-              disabledMouseCursor: SystemMouseCursors.basic,
-              minimumSize: const Size(
-                AppTokens.minTouchTarget,
-                AppTokens.minTouchTarget,
-              ),
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppTokens.space14,
-                vertical: AppTokens.space10,
-              ),
-              side: const BorderSide(color: AppTokens.colorBorder),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-              ),
-              textStyle: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-              ),
-            ).copyWith(
-              side: _buttonFocusSide(
-                AppTokens.colorAccent,
-                resting: BorderSide(color: AppTokens.colorBorder),
-              ),
-              overlayColor: _buttonOverlay(AppTokens.colorAccent),
-            ),
-      ),
-      textButtonTheme: _textButtonTheme(
-        AppTokens.colorAccent,
-        AppTokens.colorTextMuted,
-      ),
-      iconButtonTheme: IconButtonThemeData(
-        style:
-            IconButton.styleFrom(
-              enabledMouseCursor: SystemMouseCursors.click,
-              disabledMouseCursor: SystemMouseCursors.basic,
-              minimumSize: const Size(
-                AppTokens.minTouchTarget,
-                AppTokens.minTouchTarget,
-              ),
-              foregroundColor: AppTokens.colorTextSecondary,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-              ),
-            ).copyWith(
-              side: _buttonFocusSide(AppTokens.colorAccent),
-              overlayColor: _buttonOverlay(AppTokens.colorAccent),
-            ),
-      ),
-      chipTheme: _lightChipTheme,
-      dialogTheme: DialogThemeData(
-        backgroundColor: P2WlanColors.light.surfaceElevated,
-        surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-          side: const BorderSide(color: AppTokens.colorBorder),
-        ),
-      ),
-      switchTheme: SwitchThemeData(
-        mouseCursor: WidgetStateProperty.resolveWith((states) {
-          if (states.contains(WidgetState.disabled)) {
-            return SystemMouseCursors.basic;
-          }
-          return SystemMouseCursors.click;
-        }),
-      ),
-      snackBarTheme: SnackBarThemeData(
-        behavior: SnackBarBehavior.floating,
-        backgroundColor: AppTokens.colorConsoleBg,
-        contentTextStyle: const TextStyle(
-          color: AppTokens.colorConsoleText,
-          fontSize: 13,
-        ),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-        ),
-      ),
-      navigationBarTheme: NavigationBarThemeData(
-        backgroundColor: AppTokens.colorSurface,
-        elevation: 0,
-        indicatorColor: P2WlanColors.light.selectedSurface,
-        height: 64,
-        labelTextStyle: WidgetStateProperty.resolveWith((states) {
-          if (states.contains(WidgetState.selected)) {
-            return const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w700,
-              color: AppTokens.colorAccent,
-            );
-          }
-          return const TextStyle(
-            fontSize: 12,
-            fontWeight: FontWeight.w500,
-            color: AppTokens.colorTextSecondary,
-          );
-        }),
-        iconTheme: WidgetStateProperty.resolveWith((states) {
-          if (states.contains(WidgetState.selected)) {
-            return const IconThemeData(color: AppTokens.colorAccent, size: 22);
-          }
-          return const IconThemeData(
-            color: AppTokens.colorTextSecondary,
-            size: 22,
-          );
-        }),
-      ),
-      dividerTheme: const DividerThemeData(
-        color: AppTokens.colorBorder,
-        thickness: 1,
-        space: 1,
-      ),
-    );
-  }
+  static ThemeData get lightTheme => _theme(Brightness.light);
+  static ThemeData get darkTheme => _theme(Brightness.dark);
 
-  static ThemeData get darkTheme {
-    return ThemeData(
-      useMaterial3: true,
-      brightness: Brightness.dark,
-      fontFamily: AppTokens.primaryFontFamily,
-      fontFamilyFallback: AppTokens.fontFamilyFallback,
-      scaffoldBackgroundColor: AppTokens.colorDarkBg,
-      colorScheme: const ColorScheme.dark(
-        surface: AppTokens.colorDarkSurface,
-        onSurface: AppTokens.colorDarkTextPrimary,
-        onSurfaceVariant: AppTokens.colorDarkTextSecondary,
-        outline: AppTokens.colorDarkBorder,
-        outlineVariant: AppTokens.colorDarkBorderSubtle,
-        primary: AppTokens.colorDarkAccent,
-        onPrimary: AppTokens.colorDarkBg,
-        secondary: AppTokens.colorDarkAccent,
-        onSecondary: AppTokens.colorDarkBg,
-        secondaryContainer: Color(0xFF1E3A8A),
-        onSecondaryContainer: Color(0xFFDBEAFE),
-        error: AppTokens.colorDarkBadText,
-        surfaceContainerHighest: AppTokens.colorDarkSurfaceSubtle,
-      ),
-      extensions: const [P2WlanColors.dark],
-      hoverColor: P2WlanColors.dark.hoverSurface,
-      focusColor: Color(0x4060A5FA),
-      appBarTheme: const AppBarTheme(
-        backgroundColor: AppTokens.colorDarkSurface,
-        foregroundColor: AppTokens.colorDarkTextPrimary,
-        elevation: 0,
-        surfaceTintColor: Colors.transparent,
-        titleSpacing: 16,
-        titleTextStyle: TextStyle(
-          color: AppTokens.colorDarkTextPrimary,
-          fontSize: 16,
-          fontWeight: FontWeight.w700,
-          letterSpacing: 0,
-        ),
-      ),
-      inputDecorationTheme: InputDecorationTheme(
-        filled: true,
-        fillColor: AppTokens.colorDarkSurface,
-        contentPadding: const EdgeInsets.symmetric(
-          horizontal: AppTokens.space14,
-          vertical: AppTokens.space12,
-        ),
-        labelStyle: TextStyle(
-          color: AppTokens.colorDarkTextSecondary,
-          fontSize: 14,
-        ),
-        hintStyle: const TextStyle(
-          color: AppTokens.colorDarkTextMuted,
-          fontSize: 14,
-        ),
-        helperStyle: const TextStyle(
-          color: AppTokens.colorDarkTextMuted,
-          fontSize: 12,
-        ),
-        errorStyle: const TextStyle(
-          color: AppTokens.colorDarkBadText,
-          fontSize: 12,
-        ),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          borderSide: const BorderSide(color: AppTokens.colorDarkBorder),
-        ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          borderSide: const BorderSide(color: AppTokens.colorDarkBorder),
-        ),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          borderSide: const BorderSide(
-            color: AppTokens.colorDarkAccent,
-            width: 1.5,
-          ),
-        ),
-        errorBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          borderSide: const BorderSide(color: AppTokens.colorDarkBadBorder),
-        ),
-      ),
-      filledButtonTheme: FilledButtonThemeData(
-        style:
-            FilledButton.styleFrom(
-              backgroundColor: AppTokens.colorDarkAccent,
-              foregroundColor: AppTokens.colorDarkBg,
-              disabledBackgroundColor: AppTokens.colorDarkBorder,
-              disabledForegroundColor: AppTokens.colorDarkTextMuted,
-              enabledMouseCursor: SystemMouseCursors.click,
-              disabledMouseCursor: SystemMouseCursors.basic,
-              minimumSize: const Size(
-                AppTokens.minTouchTarget,
-                AppTokens.minTouchTarget,
-              ),
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppTokens.space16,
-                vertical: AppTokens.space10,
-              ),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-              ),
-              textStyle: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-              ),
-            ).copyWith(
-              side: _buttonFocusSide(AppTokens.colorDarkBg),
-              overlayColor: _buttonOverlay(AppTokens.colorDarkBg),
-            ),
-      ),
-      outlinedButtonTheme: OutlinedButtonThemeData(
-        style:
-            OutlinedButton.styleFrom(
-              foregroundColor: AppTokens.colorDarkTextPrimary,
-              disabledForegroundColor: AppTokens.colorDarkTextMuted,
-              disabledBackgroundColor: Colors.transparent,
-              enabledMouseCursor: SystemMouseCursors.click,
-              disabledMouseCursor: SystemMouseCursors.basic,
-              minimumSize: const Size(
-                AppTokens.minTouchTarget,
-                AppTokens.minTouchTarget,
-              ),
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppTokens.space14,
-                vertical: AppTokens.space10,
-              ),
-              side: const BorderSide(color: AppTokens.colorDarkBorder),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-              ),
-              textStyle: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-              ),
-            ).copyWith(
-              side: _buttonFocusSide(
-                AppTokens.colorDarkAccent,
-                resting: BorderSide(color: AppTokens.colorDarkBorder),
-              ),
-              overlayColor: _buttonOverlay(AppTokens.colorDarkAccent),
-            ),
-      ),
-      textButtonTheme: _textButtonTheme(
-        AppTokens.colorDarkAccent,
-        AppTokens.colorDarkTextMuted,
-      ),
-      iconButtonTheme: IconButtonThemeData(
-        style:
-            IconButton.styleFrom(
-              enabledMouseCursor: SystemMouseCursors.click,
-              disabledMouseCursor: SystemMouseCursors.basic,
-              minimumSize: const Size(
-                AppTokens.minTouchTarget,
-                AppTokens.minTouchTarget,
-              ),
-              foregroundColor: AppTokens.colorDarkTextSecondary,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-              ),
-            ).copyWith(
-              side: _buttonFocusSide(AppTokens.colorDarkAccent),
-              overlayColor: _buttonOverlay(AppTokens.colorDarkAccent),
-            ),
-      ),
-      chipTheme: _darkChipTheme,
-      dialogTheme: DialogThemeData(
-        backgroundColor: P2WlanColors.dark.surfaceElevated,
-        surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-          side: const BorderSide(color: AppTokens.colorDarkBorder),
-        ),
-      ),
-      switchTheme: SwitchThemeData(
-        mouseCursor: WidgetStateProperty.resolveWith((states) {
-          if (states.contains(WidgetState.disabled)) {
-            return SystemMouseCursors.basic;
-          }
-          return SystemMouseCursors.click;
-        }),
-      ),
-      snackBarTheme: SnackBarThemeData(
-        behavior: SnackBarBehavior.floating,
-        backgroundColor: AppTokens.colorConsoleBg,
-        contentTextStyle: const TextStyle(
-          color: AppTokens.colorConsoleText,
-          fontSize: 13,
-        ),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-        ),
-      ),
-      navigationBarTheme: NavigationBarThemeData(
-        backgroundColor: AppTokens.colorDarkSurface,
-        elevation: 0,
-        indicatorColor: P2WlanColors.dark.selectedSurface,
-        height: 64,
-        labelTextStyle: WidgetStateProperty.resolveWith((states) {
-          if (states.contains(WidgetState.selected)) {
-            return const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w700,
-              color: AppTokens.colorDarkAccent,
-            );
-          }
-          return const TextStyle(
-            fontSize: 12,
-            fontWeight: FontWeight.w500,
-            color: AppTokens.colorDarkTextSecondary,
-          );
-        }),
-        iconTheme: WidgetStateProperty.resolveWith((states) {
-          if (states.contains(WidgetState.selected)) {
-            return const IconThemeData(
-              color: AppTokens.colorDarkAccent,
-              size: 22,
-            );
-          }
-          return const IconThemeData(
-            color: AppTokens.colorDarkTextSecondary,
-            size: 22,
-          );
-        }),
-      ),
-      dividerTheme: const DividerThemeData(
-        color: AppTokens.colorDarkBorder,
-        thickness: 1,
-        space: 1,
-      ),
+  static ThemeData _theme(Brightness brightness) {
+    final dark = brightness == Brightness.dark;
+    final desktop = AppTokens.isDesktopPlatform(defaultTargetPlatform);
+    final colors = dark ? P2WlanColors.dark : P2WlanColors.light;
+    final canvas = dark ? AppTokens.colorDarkBg : AppTokens.colorBg;
+    final primary = dark ? AppTokens.colorDarkAccent : AppTokens.colorAccent;
+    final onPrimary = dark ? canvas : colors.surfaceElevated;
+    final scheme = ColorScheme(
+      brightness: brightness,
+      surface: colors.surface,
+      onSurface: colors.textPrimary,
+      onSurfaceVariant: colors.textSecondary,
+      outline: colors.border,
+      outlineVariant: colors.divider,
+      primary: primary,
+      onPrimary: onPrimary,
+      primaryContainer: colors.selectedSurface,
+      onPrimaryContainer: colors.textPrimary,
+      secondary: primary,
+      onSecondary: onPrimary,
+      secondaryContainer: colors.selectedSurface,
+      onSecondaryContainer: colors.textPrimary,
+      error: colors.dangerText,
+      onError: dark ? canvas : colors.surfaceElevated,
+      surfaceContainerHighest: colors.surfaceMuted,
+      surfaceContainerHigh: colors.surfaceElevated,
+      surfaceContainer: colors.surface,
+      surfaceContainerLow: canvas,
+      surfaceContainerLowest: canvas,
     );
-  }
+    final radius = BorderRadius.circular(AppTokens.radiusSm);
+    final shape = RoundedRectangleBorder(borderRadius: radius);
+    final controlHeight = desktop
+        ? AppTokens.desktopControlHeight
+        : AppTokens.minTouchTarget;
+    final controlText = TextStyle(
+      fontSize: desktop ? 13 : 14,
+      fontWeight: desktop ? FontWeight.w500 : FontWeight.w600,
+    );
 
-  static TextButtonThemeData _textButtonTheme(Color accent, Color disabled) =>
-      TextButtonThemeData(
-        style:
-            TextButton.styleFrom(
-              foregroundColor: accent,
-              disabledForegroundColor: disabled,
-              enabledMouseCursor: SystemMouseCursors.click,
-              disabledMouseCursor: SystemMouseCursors.basic,
-              minimumSize: const Size(
-                AppTokens.minTouchTarget,
-                AppTokens.minTouchTarget,
-              ),
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-              ),
-              textStyle: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-              ),
-            ).copyWith(
-              side: _buttonFocusSide(accent),
-              overlayColor: _buttonOverlay(accent),
-            ),
+    ButtonStyle button({
+      required Color foreground,
+      Color? background,
+      Color? disabledBackground,
+      Color? focus,
+      bool outlined = false,
+      bool icon = false,
+    }) {
+      final resting = outlined
+          ? BorderSide(color: colors.border)
+          : BorderSide.none;
+      return ButtonStyle(
+        foregroundColor: WidgetStateProperty.resolveWith(
+          (states) => states.contains(WidgetState.disabled)
+              ? colors.textMuted
+              : foreground,
+        ),
+        backgroundColor: WidgetStateProperty.resolveWith(
+          (states) => states.contains(WidgetState.disabled)
+              ? disabledBackground
+              : background,
+        ),
+        mouseCursor: WidgetStateProperty.resolveWith(
+          (states) => states.contains(WidgetState.disabled)
+              ? SystemMouseCursors.basic
+              : SystemMouseCursors.click,
+        ),
+        side: WidgetStateProperty.resolveWith(
+          (states) =>
+              states.contains(WidgetState.focused) &&
+                  !states.contains(WidgetState.disabled)
+              ? BorderSide(color: focus ?? primary, width: 2)
+              : resting,
+        ),
+        overlayColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.disabled)) return Colors.transparent;
+          if (states.contains(WidgetState.pressed)) {
+            return foreground.withValues(alpha: .12);
+          }
+          if (states.contains(WidgetState.hovered) ||
+              states.contains(WidgetState.focused)) {
+            return foreground.withValues(alpha: .08);
+          }
+          return Colors.transparent;
+        }),
+        minimumSize: WidgetStatePropertyAll(Size.square(controlHeight)),
+        padding: WidgetStatePropertyAll(
+          icon
+              ? const EdgeInsets.all(AppTokens.space8)
+              : EdgeInsets.symmetric(
+                  horizontal: AppTokens.space12,
+                  vertical: desktop ? AppTokens.space8 : AppTokens.space10,
+                ),
+        ),
+        tapTargetSize: desktop ? MaterialTapTargetSize.shrinkWrap : null,
+        visualDensity: desktop ? VisualDensity.standard : null,
+        textStyle: WidgetStatePropertyAll(controlText),
+        shape: WidgetStatePropertyAll(shape),
+        animationDuration: AppTokens.durationFast,
+        splashFactory: desktop ? NoSplash.splashFactory : null,
       );
-
-  static WidgetStateProperty<BorderSide?> _buttonFocusSide(
-    Color color, {
-    BorderSide resting = BorderSide.none,
-  }) => WidgetStateProperty.resolveWith((states) {
-    if (!states.contains(WidgetState.disabled) &&
-        states.contains(WidgetState.focused)) {
-      return BorderSide(color: color, width: 2);
     }
-    return resting;
-  });
 
-  static WidgetStateProperty<Color?> _buttonOverlay(Color color) =>
-      WidgetStateProperty.resolveWith((states) {
-        if (states.contains(WidgetState.disabled)) return Colors.transparent;
-        if (states.contains(WidgetState.pressed)) {
-          return color.withValues(alpha: .12);
-        }
-        if (states.contains(WidgetState.hovered) ||
-            states.contains(WidgetState.focused)) {
-          return color.withValues(alpha: .07);
-        }
-        return Colors.transparent;
-      });
+    OutlineInputBorder inputBorder(
+      Color color, {
+      double width = AppTokens.borderWidth,
+    }) => OutlineInputBorder(
+      borderRadius: radius,
+      borderSide: BorderSide(color: color, width: width),
+    );
+
+    return ThemeData(
+      useMaterial3: true,
+      brightness: brightness,
+      fontFamily: AppTokens.primaryFontFamily,
+      fontFamilyFallback: AppTokens.fontFamilyFallback,
+      scaffoldBackgroundColor: canvas,
+      colorScheme: scheme,
+      textTheme: desktop ? _desktopTypography : null,
+      extensions: [colors],
+      hoverColor: colors.hoverSurface,
+      splashFactory: desktop ? NoSplash.splashFactory : null,
+      highlightColor: primary.withValues(alpha: .08),
+      focusColor: primary.withValues(alpha: .15),
+      appBarTheme: AppBarTheme(
+        backgroundColor: colors.surface,
+        foregroundColor: colors.textPrimary,
+        elevation: AppTokens.elevationFlat,
+        scrolledUnderElevation: AppTokens.elevationFlat,
+        surfaceTintColor: Colors.transparent,
+        titleSpacing: AppTokens.space16,
+        titleTextStyle: TextStyle(
+          color: colors.textPrimary,
+          fontSize: 16,
+          fontWeight: FontWeight.w600,
+          letterSpacing: 0,
+          fontFamily: AppTokens.primaryFontFamily,
+          fontFamilyFallback: AppTokens.fontFamilyFallback,
+        ),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: colors.surface,
+        isDense: desktop,
+        contentPadding: EdgeInsets.symmetric(
+          horizontal: AppTokens.space12,
+          vertical: desktop ? AppTokens.space8 : AppTokens.space12,
+        ),
+        labelStyle: TextStyle(
+          color: colors.textSecondary,
+          fontSize: desktop ? 13 : 14,
+        ),
+        hintStyle: TextStyle(
+          color: colors.textMuted,
+          fontSize: desktop ? 13 : 14,
+        ),
+        helperStyle: TextStyle(color: colors.textMuted, fontSize: 12),
+        errorStyle: TextStyle(color: colors.dangerText, fontSize: 12),
+        border: inputBorder(colors.border),
+        enabledBorder: inputBorder(colors.border),
+        focusedBorder: inputBorder(primary, width: 1.5),
+        errorBorder: inputBorder(colors.dangerText),
+        focusedErrorBorder: inputBorder(colors.dangerText, width: 1.5),
+      ),
+      filledButtonTheme: FilledButtonThemeData(
+        style: button(
+          foreground: onPrimary,
+          background: primary,
+          disabledBackground: colors.border,
+          focus: onPrimary,
+        ),
+      ),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: button(foreground: colors.textPrimary, outlined: true),
+      ),
+      textButtonTheme: TextButtonThemeData(style: button(foreground: primary)),
+      iconButtonTheme: IconButtonThemeData(
+        style: button(foreground: colors.textSecondary, icon: true),
+      ),
+      segmentedButtonTheme: SegmentedButtonThemeData(
+        style: button(foreground: colors.textPrimary, outlined: true).copyWith(
+          backgroundColor: WidgetStateProperty.resolveWith(
+            (states) => states.contains(WidgetState.selected)
+                ? colors.selectedSurface
+                : null,
+          ),
+        ),
+      ),
+      chipTheme: ChipThemeData(
+        backgroundColor: colors.surfaceMuted,
+        selectedColor: colors.selectedSurface,
+        secondarySelectedColor: colors.selectedSurface,
+        side: BorderSide(color: colors.border),
+        shape: shape,
+        labelStyle: TextStyle(fontSize: 12, color: colors.textPrimary),
+        secondaryLabelStyle: TextStyle(fontSize: 12, color: primary),
+        checkmarkColor: primary,
+        padding: const EdgeInsets.symmetric(horizontal: AppTokens.space8),
+      ),
+      dialogTheme: DialogThemeData(
+        elevation: AppTokens.elevationDialog,
+        backgroundColor: colors.surfaceElevated,
+        surfaceTintColor: Colors.transparent,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+          side: BorderSide(color: colors.border),
+        ),
+      ),
+      popupMenuTheme: PopupMenuThemeData(
+        color: colors.surfaceElevated,
+        elevation: AppTokens.elevationMenu,
+        surfaceTintColor: Colors.transparent,
+        shape: RoundedRectangleBorder(
+          borderRadius: radius,
+          side: BorderSide(color: colors.border),
+        ),
+      ),
+      switchTheme: SwitchThemeData(
+        mouseCursor: WidgetStateProperty.resolveWith(
+          (states) => states.contains(WidgetState.disabled)
+              ? SystemMouseCursors.basic
+              : SystemMouseCursors.click,
+        ),
+      ),
+      snackBarTheme: SnackBarThemeData(
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: colors.consoleSurface,
+        contentTextStyle: TextStyle(color: colors.consoleText, fontSize: 13),
+        shape: shape,
+      ),
+      navigationBarTheme: NavigationBarThemeData(
+        backgroundColor: colors.surface,
+        elevation: AppTokens.elevationFlat,
+        indicatorColor: colors.selectedSurface,
+        height: 64,
+        labelTextStyle: WidgetStateProperty.resolveWith(
+          (states) => TextStyle(
+            fontSize: 12,
+            fontWeight: states.contains(WidgetState.selected)
+                ? FontWeight.w600
+                : FontWeight.w500,
+            color: states.contains(WidgetState.selected)
+                ? primary
+                : colors.textSecondary,
+          ),
+        ),
+        iconTheme: WidgetStateProperty.resolveWith(
+          (states) => IconThemeData(
+            color: states.contains(WidgetState.selected)
+                ? primary
+                : colors.textSecondary,
+            size: 22,
+          ),
+        ),
+      ),
+      dividerTheme: DividerThemeData(
+        color: colors.divider,
+        thickness: AppTokens.borderWidth,
+        space: AppTokens.borderWidth,
+      ),
+    );
+  }
+
+  static const _desktopTypography = TextTheme(
+    headlineSmall: TextStyle(
+      fontSize: 24,
+      height: 1.25,
+      fontWeight: FontWeight.w600,
+      letterSpacing: -.35,
+    ),
+    titleLarge: TextStyle(
+      fontSize: 20,
+      height: 1.3,
+      fontWeight: FontWeight.w600,
+      letterSpacing: -.2,
+    ),
+    titleMedium: TextStyle(
+      fontSize: 15,
+      height: 1.35,
+      fontWeight: FontWeight.w600,
+      letterSpacing: 0,
+    ),
+    titleSmall: TextStyle(
+      fontSize: 13,
+      height: 1.35,
+      fontWeight: FontWeight.w600,
+      letterSpacing: 0,
+    ),
+    bodyLarge: TextStyle(fontSize: 14, height: 1.45, letterSpacing: 0),
+    bodyMedium: TextStyle(fontSize: 13, height: 1.45, letterSpacing: 0),
+    bodySmall: TextStyle(fontSize: 12, height: 1.4, letterSpacing: 0),
+    labelLarge: TextStyle(
+      fontSize: 13,
+      height: 1.35,
+      fontWeight: FontWeight.w500,
+      letterSpacing: 0,
+    ),
+    labelMedium: TextStyle(
+      fontSize: 12,
+      height: 1.35,
+      fontWeight: FontWeight.w500,
+      letterSpacing: 0,
+    ),
+    labelSmall: TextStyle(
+      fontSize: 11,
+      height: 1.35,
+      fontWeight: FontWeight.w500,
+      letterSpacing: .1,
+    ),
+  );
 }
-
-final _lightChipTheme = ChipThemeData(
-  backgroundColor: P2WlanColors.light.surfaceMuted,
-  selectedColor: P2WlanColors.light.selectedSurface,
-  secondarySelectedColor: P2WlanColors.light.selectedSurface,
-  side: BorderSide(color: P2WlanColors.light.border),
-  shape: RoundedRectangleBorder(
-    borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-  ),
-  labelStyle: TextStyle(
-    fontSize: 12,
-    fontWeight: FontWeight.w600,
-    color: P2WlanColors.light.textPrimary,
-  ),
-  secondaryLabelStyle: TextStyle(
-    fontSize: 12,
-    fontWeight: FontWeight.w600,
-    color: P2WlanColors.light.relay,
-  ),
-  checkmarkColor: P2WlanColors.light.relay,
-  padding: const EdgeInsets.symmetric(horizontal: AppTokens.space10),
-);
-
-final _darkChipTheme = ChipThemeData(
-  backgroundColor: P2WlanColors.dark.surfaceMuted,
-  selectedColor: P2WlanColors.dark.selectedSurface,
-  secondarySelectedColor: P2WlanColors.dark.selectedSurface,
-  side: BorderSide(color: P2WlanColors.dark.border),
-  shape: RoundedRectangleBorder(
-    borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-  ),
-  labelStyle: TextStyle(
-    fontSize: 12,
-    fontWeight: FontWeight.w600,
-    color: P2WlanColors.dark.textPrimary,
-  ),
-  secondaryLabelStyle: TextStyle(
-    fontSize: 12,
-    fontWeight: FontWeight.w600,
-    color: P2WlanColors.dark.relay,
-  ),
-  checkmarkColor: P2WlanColors.dark.relay,
-  padding: const EdgeInsets.symmetric(horizontal: AppTokens.space10),
-);

@@ -618,7 +618,9 @@ class DaemonController {
       return _startupFailure(
         startupTrace,
         stage: 7,
-        code: rawCode == DaemonStartupFailureCode.uacLaunchFailed
+        code:
+            rawCode == DaemonStartupFailureCode.uacLaunchFailed ||
+                rawCode == DaemonStartupFailureCode.administratorLaunchFailed
             ? DaemonStartupFailureCode.aclFailure
             : rawCode,
         message: _startFailureMessage(error),
@@ -943,6 +945,9 @@ class DaemonController {
   }
 
   DaemonStartupFailureCode _failureCodeForError(Object error) {
+    if (error is _MacosElevationCancelled) {
+      return DaemonStartupFailureCode.administratorAuthorizationCancelled;
+    }
     if (error is PosixLaunchPathProtectionException ||
         error is UnsafeLaunchPathException ||
         error is RuntimeDirectoryRepairException ||
@@ -959,6 +964,6 @@ class DaemonController {
     if (normalized.contains('pid marker')) {
       return DaemonStartupFailureCode.pidMarkerFailed;
     }
-    return DaemonStartupFailureCode.uacLaunchFailed;
+    return DaemonStartupFailureCode.administratorLaunchFailed;
   }
 }

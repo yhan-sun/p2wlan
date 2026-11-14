@@ -1,7 +1,5 @@
 import 'package:flutter/material.dart';
 
-import 'app_motion.dart';
-
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/navigation_model.dart';
@@ -9,6 +7,7 @@ import '../../app/p2wlan_colors.dart';
 import '../../core/state/status_store.dart';
 import '../../core/presentation/network_overview.dart';
 import '../network_overview_presentation.dart';
+import 'sidebar_item.dart';
 import 'status_badge.dart';
 
 /// Expanded desktop side navigation: brand header, primary sections grouped
@@ -24,23 +23,24 @@ class DesktopSidebar extends StatelessWidget {
     required this.statusStore,
     required this.onSelect,
     required this.onFooterTap,
+    this.shortcuts = const {},
   });
 
-  static const width = 208.0;
+  static const width = 176.0;
 
   final P2WlanSection? selected;
   final AppStrings strings;
   final StatusStore statusStore;
   final ValueChanged<P2WlanSection> onSelect;
   final VoidCallback onFooterTap;
+  final Map<P2WlanSection, String> shortcuts;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     return Container(
       key: const Key('desktop-sidebar-surface'),
       width: width,
-      color: theme.colorScheme.surface,
+      color: P2WlanColors.of(context).surfaceMuted,
       child: SafeArea(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -48,21 +48,32 @@ class DesktopSidebar extends StatelessWidget {
             _SidebarBrandHeader(strings: strings),
             Expanded(
               child: ListView(
-                padding: const EdgeInsets.symmetric(vertical: AppTokens.space8),
+                padding: const EdgeInsets.fromLTRB(
+                  AppTokens.space12,
+                  0,
+                  AppTokens.space12,
+                  AppTokens.space8,
+                ),
                 children: [
                   for (final (index, group)
                       in P2WlanSection.sidebarGroups.indexed) ...[
                     if (index > 0)
                       const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 12),
-                        child: Divider(height: 1, indent: 20, endIndent: 20),
+                        padding: EdgeInsets.symmetric(
+                          vertical: AppTokens.space12,
+                        ),
+                        child: Divider(
+                          indent: AppTokens.space4,
+                          endIndent: AppTokens.space4,
+                        ),
                       ),
                     for (final section in group)
-                      _SidebarItem(
+                      SidebarItem(
                         key: ValueKey('sidebar-${section.name}'),
                         icon: section.icon,
                         label: strings.sectionLabel(section.name),
                         selected: selected == section,
+                        shortcut: shortcuts[section],
                         onTap: () => onSelect(section),
                       ),
                   ],
@@ -89,159 +100,27 @@ class _SidebarBrandHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return ConstrainedBox(
+    return Padding(
       key: const Key('desktop-sidebar-brand'),
-      constraints: const BoxConstraints(minHeight: 68),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(
-          horizontal: AppTokens.space20,
-          vertical: 16,
-        ),
-        child: Wrap(
-          spacing: AppTokens.space10,
-          runSpacing: 8,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: [
-            Container(
-              width: 32,
-              height: 32,
-              decoration: BoxDecoration(
-                color: theme.colorScheme.primary,
-                borderRadius: BorderRadius.circular(AppTokens.radiusSm + 1),
-              ),
-              child: Icon(
-                Icons.hub_outlined,
-                size: 20,
-                color: theme.colorScheme.onPrimary,
-              ),
-            ),
-            Text(
-              strings.appName,
-              style: TextStyle(
-                fontSize: 15,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 0,
-                color: theme.colorScheme.onSurface,
-              ),
-            ),
-          ],
-        ),
+      padding: const EdgeInsets.fromLTRB(
+        AppTokens.space20,
+        AppTokens.space16,
+        AppTokens.space12,
+        AppTokens.space20,
       ),
-    );
-  }
-}
-
-class _SidebarItem extends StatefulWidget {
-  const _SidebarItem({
-    super.key,
-    required this.icon,
-    required this.label,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final IconData icon;
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  State<_SidebarItem> createState() => _SidebarItemState();
-}
-
-class _SidebarItemState extends State<_SidebarItem> {
-  var _focused = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final selected = widget.selected;
-    final label = widget.label;
-    final icon = widget.icon;
-    final colors = P2WlanColors.of(context);
-    final foreground = selected
-        ? theme.colorScheme.primary
-        : theme.colorScheme.onSurfaceVariant;
-    return Semantics(
-      button: true,
-      selected: selected,
-      label: label,
-      child: Tooltip(
-        message: label,
-        excludeFromSemantics: true,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 2, 12, 2),
-          child: AnimatedContainer(
-            duration: AppMotion.feedbackDurationOf(context),
-            curve: AppMotion.curve,
-            decoration: BoxDecoration(
-              color: selected ? colors.selectedSurface : Colors.transparent,
-              borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-              border: Border.all(
-                color: _focused
-                    ? theme.colorScheme.primary
-                    : Colors.transparent,
-                width: 2,
-              ),
-            ),
-            child: Material(
-              type: MaterialType.transparency,
-              child: MouseRegion(
-                cursor: SystemMouseCursors.click,
-                child: InkWell(
-                  onTap: widget.onTap,
-                  onFocusChange: (focused) =>
-                      setState(() => _focused = focused),
-                  borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-                  hoverColor: selected ? null : colors.hoverSurface,
-                  child: ExcludeSemantics(
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(minHeight: 44),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 10),
-                        child: Row(
-                          children: [
-                            const SizedBox(width: AppTokens.space8),
-                            AnimatedContainer(
-                              duration: AppMotion.feedbackDurationOf(context),
-                              width: 2,
-                              height: selected ? 18 : 0,
-                              decoration: BoxDecoration(
-                                color: selected
-                                    ? theme.colorScheme.primary
-                                    : Colors.transparent,
-                                borderRadius: BorderRadius.circular(2),
-                              ),
-                            ),
-                            const SizedBox(width: AppTokens.space8),
-                            if (MediaQuery.textScalerOf(context).scale(14) <=
-                                18) ...[
-                              Icon(icon, size: 20, color: foreground),
-                              const SizedBox(width: AppTokens.space10),
-                            ],
-                            Expanded(
-                              child: Text(
-                                label,
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  fontWeight: selected
-                                      ? FontWeight.w600
-                                      : FontWeight.w500,
-                                  color: foreground,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: AppTokens.space8),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
+      child: Row(
+        children: [
+          const SidebarBrandMark(),
+          const SizedBox(width: AppTokens.space8),
+          Expanded(
+            child: Text(
+              strings.appName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.titleMedium,
             ),
           ),
-        ),
+        ],
       ),
     );
   }
@@ -277,89 +156,65 @@ class _SidebarFooter extends StatelessWidget {
           label: description,
           hint: strings.openTroubleshooting,
           button: true,
-          child: Padding(
-            padding: const EdgeInsets.all(AppTokens.space12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Container(
-                  key: const Key('desktop-sidebar-status'),
-                  decoration: BoxDecoration(
-                    color: colors.surfaceMuted,
-                    border: Border.all(color: colors.border),
-                    borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-                  ),
-                  child: Tooltip(
-                    message: '$label\n$detail\n${strings.openTroubleshooting}',
-                    excludeFromSemantics: true,
-                    child: Material(
-                      type: MaterialType.transparency,
-                      child: InkWell(
-                        onTap: onTap,
-                        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-                        hoverColor: colors.hoverSurface,
-                        child: ExcludeSemantics(
-                          child: Padding(
-                            padding: const EdgeInsets.fromLTRB(
-                              AppTokens.space14,
-                              AppTokens.space10,
-                              AppTokens.space10,
-                              AppTokens.space10,
+          child: Container(
+            key: const Key('desktop-sidebar-status'),
+            decoration: BoxDecoration(
+              border: Border(top: BorderSide(color: colors.border)),
+            ),
+            child: Tooltip(
+              message: '$label\n$detail\n${strings.openTroubleshooting}',
+              excludeFromSemantics: true,
+              child: Material(
+                type: MaterialType.transparency,
+                child: InkWell(
+                  onTap: onTap,
+                  mouseCursor: SystemMouseCursors.click,
+                  hoverColor: colors.hoverSurface,
+                  child: ExcludeSemantics(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: AppTokens.space16,
+                        vertical: AppTokens.space12,
+                      ),
+                      child: Row(
+                        children: [
+                          SizedBox.square(
+                            dimension: AppTokens.space8,
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                color: dotColor,
+                                shape: BoxShape.circle,
+                              ),
                             ),
-                            child: Row(
+                          ),
+                          const SizedBox(width: AppTokens.space8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Container(
-                                  width: 7,
-                                  height: 7,
-                                  decoration: BoxDecoration(
-                                    color: dotColor,
-                                    shape: BoxShape.circle,
+                                Text(label, style: theme.textTheme.labelLarge),
+                                const SizedBox(height: AppTokens.space2),
+                                Text(
+                                  detail,
+                                  style: theme.textTheme.labelSmall?.copyWith(
+                                    color: colors.textSecondary,
                                   ),
                                 ),
-                                const SizedBox(width: AppTokens.space8),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        label,
-                                        style: TextStyle(
-                                          fontSize: 13,
-                                          fontWeight: FontWeight.w600,
-                                          color: theme.colorScheme.onSurface,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 2),
-                                      Text(
-                                        detail,
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: theme
-                                              .colorScheme
-                                              .onSurfaceVariant,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                if (MediaQuery.textScalerOf(context)
-                                        .scale(13) <=
-                                    18)
-                                  Icon(
-                                    Icons.chevron_right_rounded,
-                                    size: 16,
-                                    color: theme.colorScheme.onSurfaceVariant,
-                                  ),
                               ],
                             ),
                           ),
-                        ),
+                          if (MediaQuery.textScalerOf(context).scale(13) <= 18)
+                            Icon(
+                              Icons.chevron_right_rounded,
+                              size: AppTokens.iconSm,
+                              color: colors.textMuted,
+                            ),
+                        ],
                       ),
                     ),
                   ),
                 ),
-              ],
+              ),
             ),
           ),
         );

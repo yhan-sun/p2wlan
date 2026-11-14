@@ -171,6 +171,7 @@ class RoomStrings {
     "房主延迟": "Owner latency",
     "房主离线": "Owner offline",
     "房间": "Rooms",
+    "我的房间 · {0}": "My rooms · {0}",
     "房间信息更新失败，当前显示上次数据{0}。":
         "Could not update room information. Showing the last data{0}.",
     "房间号": "Room code",
