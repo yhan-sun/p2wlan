@@ -45,50 +45,41 @@ impl CaptureSession {
             if !self.is_live(Instant::now()) {
                 return Err(CaptureFailure::Expired);
             }
-            let ready = {
-                let state = self.state.lock_until(end).await?;
-                let index = {
-                    let mut matches = state
-                        .flows
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, flow)| flow.producer_scope == producer);
-                    let (index, _) = matches.next().ok_or(CaptureFailure::InvalidPlan)?;
-                    if matches.next().is_some() {
-                        return Err(CaptureFailure::InvalidPlan);
-                    }
-                    index
-                };
-                if state.flows[index].plan.protocol != Protocol::Tcp
-                    || state.flows[index].requests.len() != 8
-                {
-                    return Err(CaptureFailure::InvalidPlan);
-                }
-                // Eight metadata handles only, never a scope/descriptor or
-                // daemon owner. No terminal/native work holds the input lock.
-                let outcomes = std::array::from_fn::<_, 8, _>(|slot| {
-                    state.flows[index].requests[slot].native_credit.shared()
-                });
-                drop(state);
-                // Only the existing bounded real-Full markers are drained.
-                // Some terminal outcome, including every refusal, is enough.
-                let mut completion = self.prepare_pending_fulls();
-                if !self.read_complete.load(Ordering::Acquire)
-                    || !self.full_complete.load(Ordering::Acquire)
-                    || !self.inbound_complete.load(Ordering::Acquire)
-                {
-                    // These flags never recover. The existing capture
-                    // predicate returns Unknown(OriginalPublication) before
-                    // any native owner/once check. Preserve recorded rows;
-                    // a lost input need not have a real-Full marker to wake us.
-                    self.prepare_original_frames(index, &[0, 1, 2, 3, 4, 5, 6, 7], &mut completion);
-                }
-                completion.finish(self);
-                outcomes.iter().all(|outcome| outcome.is_some())
-            };
-            if ready {
+            // Registration publishes the same outcome slots used by the input
+            // registry. Reading those handles must not exclude a TUN read.
+            let mut matches = self
+                .sources
+                .flows
+                .iter()
+                .enumerate()
+                .filter(|(_, flow)| flow.producer_scope == producer);
+            let (index, flow) = matches.next().ok_or(CaptureFailure::InvalidPlan)?;
+            if matches.next().is_some()
+                || flow.plan.protocol != Protocol::Tcp
+                || flow.requests.len() != 8
+            {
+                return Err(CaptureFailure::InvalidPlan);
+            }
+            // Only the existing bounded real-Full markers are drained.
+            // Some terminal outcome, including every refusal, is enough.
+            let mut completion = self.prepare_pending_fulls();
+            if !self.read_complete.load(Ordering::Acquire)
+                || !self.full_complete.load(Ordering::Acquire)
+                || !self.inbound_complete.load(Ordering::Acquire)
+            {
+                // These flags never recover. The existing capture
+                // predicate returns Unknown(OriginalPublication) before
+                // any native owner/once check. Preserve recorded rows;
+                // a lost input need not have a real-Full marker to wake us.
+                self.prepare_original_frames(index, &[0, 1, 2, 3, 4, 5, 6, 7], &mut completion);
+            }
+            completion.finish(self);
+            if flow.all_native_outcomes_present() {
                 if tokio::time::Instant::now() >= end {
                     return Err(CaptureFailure::ControlNotReady);
+                }
+                if !self.is_live(Instant::now()) {
+                    return Err(CaptureFailure::Expired);
                 }
                 return Ok(TerminalMetadataReceipt {
                     scope: "original_window_terminal_metadata_only",
@@ -110,8 +101,8 @@ impl CaptureSession {
                     observed = current;
                     break;
                 }
-                // A metadata reader's own unlock may wake this once. Without
-                // new terminal rows it waits again, without reacquiring/spinning.
+                // Without new terminal rows or pending Full markers, a
+                // metadata release notification does not repeat the lookup.
                 tokio::select! {
                     _ = self.full_completion_ready() => break,
                     _ = self.full_metadata_released() => {},

@@ -8,21 +8,31 @@ use std::time::Duration;
 
 const PRODUCER: [u8; 16] = [0x33; 16];
 
+fn flow(protocol: &str, count: u16, bind_port: u16) -> serde_json::Value {
+    json!({
+        "protocol":protocol,"kind":"request","peer_id":"terminal-metadata-peer",
+        "run_nonce":"44".repeat(16),"round_nonce":"55".repeat(16),
+        "bind_ip":"10.21.1.2","bind_port":bind_port,"target_ip":"10.21.1.3","target_port":43210,
+        "payload_bytes":128,"request_nonces":(1..=count)
+            .map(|i|format!("{:032x}",u32::from(bind_port)*16+u32::from(i)))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn register(session: &CaptureSession, producer: [u8; 16], flows: Vec<serde_json::Value>) {
+    let document = json!({"schema_version":1,"capture_id":"11".repeat(16),
+        "producer_scope":hex::encode(producer),"flows":flows});
+    session
+        .register(RegistrationPlan::decode(&serde_json::to_vec(&document).unwrap()).unwrap())
+        .unwrap();
+}
+
 async fn scope() -> (
     crate::os_request_capture::control::CaptureSetup,
     std::os::unix::net::UnixStream,
 ) {
     let (setup, parent) = super::super::full::tests::descriptor_scope().await;
-    let document = json!({"schema_version":1,"capture_id":"11".repeat(16),
-        "producer_scope":"33".repeat(16),"flows":[{
-            "protocol":"tcp","kind":"request","peer_id":"terminal-metadata-peer",
-            "run_nonce":"44".repeat(16),"round_nonce":"55".repeat(16),
-            "bind_ip":"10.21.1.2","bind_port":32123,"target_ip":"10.21.1.3","target_port":43210,
-            "payload_bytes":128,"request_nonces":(1..=8).map(|i|format!("{i:032x}")).collect::<Vec<_>>()}]});
-    setup
-        .session
-        .register(RegistrationPlan::decode(&serde_json::to_vec(&document).unwrap()).unwrap())
-        .unwrap();
+    register(&setup.session, PRODUCER, vec![flow("tcp", 8, 32123)]);
     (setup, parent)
 }
 
@@ -260,18 +270,45 @@ async fn terminal_handoff_keeps_recorded_failure_and_once_false_across_later_met
 }
 
 #[tokio::test]
-async fn terminal_handoff_wrong_scope_capacity_and_retirement_never_grant_receipt() {
+async fn terminal_handoff_validates_published_plans_without_locking_capture_input() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
     let (setup, _parent) = scope().await;
+    let wrong_count = [0x45; 16];
+    let wrong_protocol = [0x46; 16];
+    let ambiguous = [0x47; 16];
+    register(&setup.session, wrong_count, vec![flow("tcp", 7, 32124)]);
+    register(&setup.session, wrong_protocol, vec![flow("udp", 8, 32125)]);
+    register(
+        &setup.session,
+        ambiguous,
+        vec![flow("tcp", 8, 32126), flow("tcp", 8, 32127)],
+    );
+    refuse_all(&setup.session);
     let end = tokio::time::Instant::now() + Duration::from_secs(1);
-    assert!(matches!(
-        setup.session.wait_original_outcomes([0x44; 16], end).await,
-        Err(CaptureFailure::InvalidPlan)
-    ));
-    setup.session.state.lock().unwrap().flows[0].requests.pop();
-    assert!(matches!(
-        setup.session.wait_original_outcomes(PRODUCER, end).await,
-        Err(CaptureFailure::InvalidPlan)
-    ));
+    {
+        let _input = setup.session.state.lock().unwrap();
+        let poll = |producer| {
+            let mut waiter = std::pin::pin!(setup.session.wait_original_outcomes(producer, end));
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+        };
+        let Poll::Ready(Ok(receipt)) = poll(PRODUCER) else {
+            panic!("registered terminal outcomes must be readable with capture input locked");
+        };
+        assert_eq!(
+            serde_json::to_value(receipt).unwrap()["completed_requests"],
+            8
+        );
+        for invalid in [[0x44; 16], wrong_count, wrong_protocol, ambiguous] {
+            assert!(matches!(
+                poll(invalid),
+                Poll::Ready(Err(CaptureFailure::InvalidPlan))
+            ));
+        }
+    }
     setup.session.retire();
     assert!(matches!(
         setup.session.wait_original_outcomes(PRODUCER, end).await,

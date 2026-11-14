@@ -17,6 +17,10 @@ pub(in crate::os_request_capture::registry) struct FlowSources {
     pub(in crate::os_request_capture::registry) requests: Vec<RequestSources>,
 }
 impl FlowSources {
+    pub(in crate::os_request_capture::registry) fn all_native_outcomes_present(&self) -> bool {
+        self.requests.iter().all(|request| request.credit.is_some())
+    }
+
     pub(in crate::os_request_capture::registry) fn capture(
         flow: &FlowState,
     ) -> Result<Arc<Self>, CaptureFailure> {
