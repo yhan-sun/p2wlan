@@ -27,7 +27,9 @@ import '../../shared/formatters.dart';
 import '../../shared/layout/app_breakpoints.dart';
 import '../../shared/widgets/app_back_button.dart';
 import '../../shared/widgets/app_motion.dart';
+import '../../shared/widgets/desktop_card.dart';
 import '../../shared/widgets/desktop_device_row.dart';
+import '../../shared/widgets/desktop_icon.dart';
 import '../../shared/widgets/device_type_icon.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_heading.dart';
@@ -246,6 +248,7 @@ class _NodesPageState extends State<NodesPage> {
             final capabilities =
                 widget.capabilities ?? PlatformCapabilities.current();
             final remoteOnly = !capabilities.canActAsLocalVpnNode;
+            final desktop = capabilities.canUseSystemTray && !remoteOnly;
             final snapshot = widget.statusStore.snapshot;
             final overview = NetworkOverview.read(widget.statusStore);
             final selectedId = overview.selected(_selectedScopeId).isEmpty
@@ -264,15 +267,16 @@ class _NodesPageState extends State<NodesPage> {
                     item,
             ];
             final query = _searchController.text;
+            final filter = _visibleFilter(desktop);
             final visiblePeers = _applySort(
               _applySearch(allPeers, query),
               _sort,
-            ).where((item) => _networkFilterMatches(_filter, item)).toList();
+            ).where((item) => _networkFilterMatches(filter, item)).toList();
             final showPrimary =
                 (selectedId == null ||
                     selectedId == NetworkOverview.primaryScopeId) &&
                 scopes.any((scope) => scope.isPrimary);
-            if (capabilities.canUseSystemTray && !remoteOnly) {
+            if (desktop) {
               return _DesktopDevices(
                 state: this,
                 overview: overview,
@@ -282,6 +286,7 @@ class _NodesPageState extends State<NodesPage> {
                 visiblePeers: visiblePeers,
                 snapshot: snapshot,
                 settings: settings,
+                canManageDevices: capabilities.canManageRemoteDevices,
                 showLocal:
                     showPrimary && (!overview.hasRooms || snapshot != null),
                 primaryStale: showPrimary && primaryStale,
@@ -429,7 +434,7 @@ class _NodesPageState extends State<NodesPage> {
   }) => _NodeToolbar(
     searchController: _searchController,
     searchFocusNode: _searchFocusNode,
-    filter: _filter,
+    filter: _visibleFilter(desktop),
     sort: _sort,
     totalCount: allPeers.length,
     onlineCount: allPeers.where((item) => item.online).length,
@@ -446,6 +451,11 @@ class _NodesPageState extends State<NodesPage> {
     onQueryChanged: () => setState(() {}),
     onClearSearch: _clearPeerSearch,
   );
+
+  _NodeFilter _visibleFilter(bool desktop) =>
+      desktop && !_desktopNodeFilters.contains(_filter)
+      ? _NodeFilter.all
+      : _filter;
 
   void _clearPeerSearch() => setState(_searchController.clear);
 
@@ -576,7 +586,10 @@ class _NodesPageState extends State<NodesPage> {
     }
   }
 
-  Future<void> _editPeer(PeerSnapshot peer) async {
+  Future<void> _editPeer(
+    PeerSnapshot peer, {
+    bool Function()? acceptsPeer,
+  }) async {
     if (_busyPeerId != null) return;
     final strings = stringsOf(context);
     final settings = widget.settingsStore.settings;
@@ -584,7 +597,12 @@ class _NodesPageState extends State<NodesPage> {
       initialName: peer.displayName,
       title: strings.renameDevice,
     );
-    if (result == null || !_acceptsAccount(settings)) return;
+    if (result == null ||
+        !_acceptsAccount(settings) ||
+        acceptsPeer?.call() == false ||
+        _busyPeerId != null) {
+      return;
+    }
     setState(() => _busyPeerId = peer.nodeId);
     try {
       final savedName = await _controlApi.renameDevice(
@@ -603,6 +621,35 @@ class _NodesPageState extends State<NodesPage> {
       if (mounted && _busyPeerId == peer.nodeId) {
         setState(() => _busyPeerId = null);
       }
+    }
+  }
+
+  void _editDesktopPeer(NetworkPeerSnapshot selected) {
+    bool acceptsPeer() {
+      final settings = widget.settingsStore.settings;
+      if (!settings.hasAuthenticatedConnection ||
+          isRoomNetwork(settings.networkId)) {
+        return false;
+      }
+      return NetworkOverview.read(widget.statusStore).scopes.any(
+        (scope) =>
+            scope.isPrimary &&
+            scope.roomId == null &&
+            scope.snapshot?.networkId == settings.networkId &&
+            scope.peers.any(
+              (peer) =>
+                  peer.current &&
+                  peer.identity == selected.identity &&
+                  peer.ownerRevision == selected.ownerRevision &&
+                  peer.networkGeneration == selected.networkGeneration &&
+                  peer.runtimeIncarnation == selected.runtimeIncarnation &&
+                  peer.processId == selected.processId,
+            ),
+      );
+    }
+
+    if (acceptsPeer()) {
+      unawaited(_editPeer(selected.peer, acceptsPeer: acceptsPeer));
     }
   }
 

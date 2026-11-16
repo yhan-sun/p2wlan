@@ -8,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/app_strings.dart';
 import 'package:p2wlan_flutter_client/app/app_theme.dart';
 import 'package:p2wlan_flutter_client/app/app_tokens.dart';
+import 'package:p2wlan_flutter_client/app/p2wlan_colors.dart';
 import 'package:p2wlan_flutter_client/app/navigation.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/capabilities/platform_capabilities.dart';
@@ -84,8 +85,12 @@ class _Status extends StatusStore {
         enableFreshnessTimer: false,
       );
   DiagnosticsSnapshot? primary;
+  Map<String, PeerTransferRate> rates = const {};
 
-  void updatePrimary(DiagnosticsSnapshot snapshot) {
+  @override
+  Map<String, PeerTransferRate> get peerDirectionalTransferRates => rates;
+
+  void updatePrimary(DiagnosticsSnapshot? snapshot) {
     primary = snapshot;
     notifyListeners();
   }
@@ -232,6 +237,16 @@ void main() {
         },
       ],
     });
+    fixture.status.rates = const {
+      'verified-relay': PeerTransferRate(
+        uploadBytesPerSecond: 1024,
+        downloadBytesPerSecond: 2048,
+      ),
+      'probing': PeerTransferRate(
+        uploadBytesPerSecond: 1024,
+        downloadBytesPerSecond: 4096,
+      ),
+    };
     await tester.pumpWidget(
       MaterialApp(
         theme: AppTheme.lightTheme.copyWith(platform: TargetPlatform.macOS),
@@ -253,18 +268,30 @@ void main() {
       find.descendant(of: median, matching: find.text('26 ms')),
       findsOneWidget,
     );
-    final breakdown = find.byKey(const Key('home-path-breakdown'));
-    final segments = find.descendant(
-      of: breakdown,
-      matching: find.byType(ColoredBox),
+    final relay = find.byKey(const Key('home-live-relay'));
+    final relayReading = tester.widget<Text>(
+      find.descendant(of: relay, matching: find.text('1')),
     );
-    expect(segments, findsNWidgets(2));
-    final segmentWidth = tester.getSize(breakdown).width / 2;
-    for (final segment in segments.evaluate()) {
-      final size = tester.getSize(find.byWidget(segment.widget));
-      expect(size.height, AppTokens.space4);
-      expect(size.width, closeTo(segmentWidth, 0.01));
-    }
+    expect(relayReading.style!.color, P2WlanColors.light.relay);
+    expect(relayReading.style!.fontFeatures, AppTokens.tabularFontFeatures);
+    final rate = find.byKey(const Key('home-live-rate'));
+    expect(
+      find.descendant(of: rate, matching: find.text('8 KB/s')),
+      findsOneWidget,
+    );
+    final split = find.byKey(const Key('home-traffic-rate-split'));
+    final segments = find
+        .descendant(of: split, matching: find.byType(DecoratedBox))
+        .evaluate()
+        .map((e) => find.byWidget(e.widget))
+        .toList();
+    expect(segments, hasLength(2));
+    expect(tester.getSize(segments.first).height, 5);
+    expect(
+      tester.getSize(segments.last).width,
+      greaterThan(tester.getSize(segments.first).width * 2),
+    );
+    expect(find.byKey(const Key('home-path-breakdown')), findsNothing);
     final devicesAction = find.byKey(const Key('home-view-all-devices'));
     expect(
       find.descendant(of: devicesAction, matching: find.text('View devices')),
@@ -309,6 +336,72 @@ void main() {
     expect(find.text('Direct connection timed out'), findsNothing);
     expect(find.text('Relay peer confirmed'), findsNothing);
     expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('Home relay zero is neutral; reduced motion keeps a static dot', (
+    tester,
+  ) async {
+    final fixture = (await tester.runAsync(() => _fixture('primary')))!;
+    addTearDown(fixture.dispose);
+    Widget host({required bool reduceMotion}) => MaterialApp(
+      theme: AppTheme.lightTheme.copyWith(platform: TargetPlatform.macOS),
+      home: AppStringsScope(
+        strings: AppStrings.fromCode('en'),
+        child: Builder(
+          builder: (context) => MediaQuery(
+            data: MediaQuery.of(context)
+                .copyWith(disableAnimations: reduceMotion),
+            child: Scaffold(
+              body: DashboardPage(
+                settingsStore: fixture.settings,
+                statusStore: fixture.status,
+                capabilities: PlatformCapabilities.fromPlatform('macos'),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.pumpWidget(host(reduceMotion: false));
+    final relay = find.byKey(const Key('home-live-relay'));
+    final zero = tester.widget<Text>(
+      find.descendant(of: relay, matching: find.text('0')),
+    );
+    expect(zero.style!.color, P2WlanColors.light.textPrimary);
+    final halo = find.byKey(const Key('home-connection-halo'));
+    final dot = find.byKey(const Key('home-connection-solid-dot'));
+    final start = tester.getSize(halo);
+    await tester.pump(const Duration(milliseconds: 450));
+    expect(tester.getSize(halo).width, greaterThan(start.width));
+    expect(tester.getSize(dot), const Size.square(11));
+
+    await tester.pumpWidget(host(reduceMotion: true));
+    final staticHalo = tester.getSize(halo);
+    await tester.pump(const Duration(seconds: 3));
+    expect(tester.getSize(halo), staticHalo);
+
+    final stop = tester.widget<TextButton>(
+      find.descendant(
+        of: find.byKey(const Key('dashboard-stop-button')),
+        matching: find.byType(TextButton),
+      ),
+    );
+    final foreground = stop.style!.foregroundColor!;
+    expect(foreground.resolve({}), P2WlanColors.light.textSecondary);
+    expect(
+      foreground.resolve({WidgetState.hovered}),
+      P2WlanColors.light.dangerText,
+    );
+
+    fixture.status.updatePrimary(null);
+    await tester.pump();
+    expect(
+      find.descendant(of: relay, matching: find.text('—')),
+      findsOneWidget,
+    );
+    expect(dot, findsNothing);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 

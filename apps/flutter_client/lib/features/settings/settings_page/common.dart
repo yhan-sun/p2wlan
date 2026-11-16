@@ -598,6 +598,25 @@ class _SaveBar extends StatelessWidget {
             child: Text(strings.settingsUndo),
           );
           final largeText = MediaQuery.textScalerOf(context).scale(14) > 18;
+          if (largeText &&
+              _usesDesktopSettings(context) &&
+              constraints.maxWidth >= 400) {
+            // Preserve space for the form at large text sizes. The buttons
+            // can still wrap if a translated label needs a wider target.
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                label,
+                const SizedBox(height: AppTokens.space8),
+                Wrap(
+                  alignment: WrapAlignment.end,
+                  spacing: AppTokens.space8,
+                  runSpacing: AppTokens.space4,
+                  children: [undo, save],
+                ),
+              ],
+            );
+          }
           if (constraints.maxWidth < 400 || largeText) {
             return Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,

@@ -79,19 +79,23 @@ class _DesktopHomeState extends State<_DesktopHome> {
         final rate = trafficScopes.length == 1
             ? _scopeRate(trafficScopes.single, store)
             : null;
+        final devicePreview = _DesktopOnlineDevices(
+          peers: peers.take(5).toList(growable: false),
+          onOpenDevices: page.onOpenDevices,
+          onOpenPeer: _peerAction,
+          onDiagnostics: _openDiagnostics,
+          scopeLabels: focus == null,
+          hasCurrentData: running.isNotEmpty,
+        );
+        final components = representative?.isRunning == true
+            ? _DesktopNetworkComponents(scope: representative!)
+            : null;
         return PageScaffold(
           scrollController: widget.scrollController,
           title: strings.isZh ? '网络概览' : 'Network overview',
-          subtitle: '',
-          toolbar: overview.hasRooms
-              ? NetworkScopePicker(
-                  overview: overview,
-                  selectedId: selectedId,
-                  onChanged: widget.onScopeChanged,
-                )
-              : null,
+          subtitle: strings.isZh ? '查看虚拟局域网的连接状态、设备与传输活动。' : 'See your virtual network, connected devices and transfer activity.',
           showHeader: page.showHeader,
-          maxWidth: dashboardPageMaxWidth,
+          maxWidth: AppTokens.desktopPageMaxWidth,
           children: [
             _DesktopConnection(
               page: page,
@@ -101,26 +105,71 @@ class _DesktopHomeState extends State<_DesktopHome> {
               focus: focus,
               representative: representative,
             ),
-            const SizedBox(height: AppTokens.space12),
+            SizedBox(
+              height: MediaQuery.sizeOf(context).width < 900
+                  ? AppTokens.space12
+                  : AppTokens.space20,
+            ),
             _DesktopLiveMetrics(
               counts: counts,
               peers: peers,
               complete:
                   running.isNotEmpty &&
                   trafficScopes.every((scope) => scope.isRunning),
-              bytesPerSecond: rate == null
-                  ? null
-                  : rate.uploadBytesPerSecond + rate.downloadBytesPerSecond,
+              rate: rate,
+              scopePicker: overview.hasRooms
+                  ? NetworkScopePicker(
+                      overview: overview,
+                      selectedId: selectedId,
+                      onChanged: widget.onScopeChanged,
+                    )
+                  : null,
             ),
+            SizedBox(
+              height: MediaQuery.sizeOf(context).width < 900
+                  ? AppTokens.space8
+                  : AppTokens.space16,
+            ),
+            if (components == null)
+              devicePreview
+            else
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final scale = MediaQuery.textScalerOf(context).scale(13) / 13;
+                  if (constraints.maxWidth < 720 * scale) {
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        devicePreview,
+                        const SizedBox(height: AppTokens.space16),
+                        components,
+                      ],
+                    );
+                  }
+                  return Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(child: devicePreview),
+                      const SizedBox(width: AppTokens.space14),
+                      SizedBox(
+                        width: (constraints.maxWidth / 3)
+                            .clamp(250, 346)
+                            .toDouble(),
+                        child: components,
+                      ),
+                    ],
+                  );
+                },
+              ),
             const SizedBox(height: AppTokens.space16),
-            _DesktopOnlineDevices(
-              peers: peers.take(5).toList(growable: false),
-              onOpenDevices: page.onOpenDevices,
-              onOpenPeer: _peerAction,
-              onDiagnostics: _openDiagnostics,
-              scopeLabels: focus == null,
-              hasCurrentData: running.isNotEmpty,
-            ),
+            if (trafficScopes.any((scope) => scope.snapshot != null))
+              _DesktopTrafficSummary(
+                statusStore: store,
+                scopes: trafficScopes,
+                selectedId: selectedId,
+              )
+            else
+              _TrafficHistoryEntry(statusStore: store, selectedId: selectedId),
             const SizedBox(height: AppTokens.space16),
             _DesktopHomeDiagnostics(
               key: _diagnosticsAnchor,
@@ -133,14 +182,6 @@ class _DesktopHomeState extends State<_DesktopHome> {
               onOpenRoom: page.onOpenRoom,
               onOpenDevices: page.onOpenDevices,
             ),
-            if (trafficScopes.any((scope) => scope.snapshot != null))
-              _DesktopTrafficSummary(
-                statusStore: store,
-                scopes: trafficScopes,
-                selectedId: selectedId,
-              )
-            else
-              _TrafficHistoryEntry(statusStore: store, selectedId: selectedId),
           ],
         );
       },
@@ -246,11 +287,10 @@ class _DesktopConnection extends StatelessWidget {
           compact: true,
         ),
       if (canStopRoom && room != null)
-        OutlinedButton.icon(
+        _DesktopGhostDanger(
           key: const Key('home-disconnect-room'),
           onPressed: () => _disconnectRoom(context, focus!),
-          icon: const Icon(Icons.link_off_rounded, size: AppTokens.iconSm),
-          label: Text(strings.isZh ? '断开房间' : 'Disconnect room'),
+          label: strings.isZh ? '断开房间' : 'Disconnect room',
         ),
       if (canChooseRoom && roomAction != null && issue == null)
         FilledButton(
@@ -288,14 +328,25 @@ class _DesktopConnection extends StatelessWidget {
             virtualIp: virtualIp,
             compact: true,
             stale: showLastIp,
+            inline: true,
           )
         : null;
     final manualCommand = page.settingsStore.settings.authToken.trim().isEmpty
         ? store.lastDaemonManualCommand
         : null;
+    final online = tone == StatusTone.good && !transitioning;
+    final scopeLabel = !online || focus == null
+        ? null
+        : focus!.isPrimary && focus!.roomId == null
+        ? (strings.isZh ? '主网络' : 'Main network')
+        : networkScopeLabel(strings, focus!);
+    final deviceName = representative?.isPrimary == true
+        ? page.settingsStore.settings.deviceName.trim()
+        : '';
     final connection = Semantics(
       liveRegion: true,
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
           _ConnectionMark(
             tone: tone,
@@ -309,17 +360,50 @@ class _DesktopConnection extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    title,
-                    key: const Key('home-connection-heading'),
-                    style: Theme.of(context).textTheme.titleLarge,
+                  Wrap(
+                    spacing: AppTokens.space8,
+                    runSpacing: AppTokens.space2,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text(
+                        title,
+                        key: const Key('home-connection-heading'),
+                        style: Theme.of(context).textTheme.titleMedium
+                            ?.copyWith(
+                              color: online
+                                  ? Theme.of(context).colorScheme.primary
+                                  : null,
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                            ),
+                      ),
+                      if (scopeLabel != null && focus!.isPrimary)
+                        _ConnectionScopeLabel(label: scopeLabel),
+                    ],
                   ),
-                  const SizedBox(height: AppTokens.space4),
-                  Text(
-                    detail,
-                    style: Theme.of(context).textTheme.bodySmall
-                        ?.copyWith(color: colors.textSecondary),
-                  ),
+                  if (!online || ip == null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: AppTokens.space4),
+                      child: Text(
+                        detail,
+                        style: Theme.of(context).textTheme.bodySmall
+                            ?.copyWith(color: colors.textSecondary),
+                      ),
+                    ),
+                  if (ip != null)
+                    Wrap(
+                      spacing: AppTokens.space8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        ip,
+                        if (online && deviceName.isNotEmpty)
+                          Text(
+                            '·  $deviceName',
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: colors.textSecondary),
+                          ),
+                      ],
+                    ),
                 ],
               ),
             ),
@@ -336,53 +420,34 @@ class _DesktopConnection extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        DecoratedBox(
-          decoration: BoxDecoration(
-            color: tone == StatusTone.good
-                ? colors.selectedSurface
-                : colors.surfaceMuted,
-            border: Border.all(
-              color: tone == StatusTone.good
-                  ? colors.successBorder
-                  : colors.border,
+        DesktopCard(
+          borderColor: online ? colors.successBorder : null,
+          padding: const EdgeInsets.all(AppTokens.space16),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              minHeight: MediaQuery.sizeOf(context).width < 900 ? 0 : 60,
             ),
-            borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.all(AppTokens.space16),
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final scale = MediaQuery.textScalerOf(context).scale(13) / 13;
-                if (constraints.maxWidth >= (ip == null ? 620 : 680) * scale &&
-                    actions.length <= 1 &&
+                if (actions.isEmpty) return connection;
+                if (constraints.maxWidth >= 465 * scale &&
+                    actions.length == 1 &&
                     !canStartPrimary) {
                   return Row(
                     children: [
                       Expanded(child: connection),
-                      if (ip != null) ...[
-                        const SizedBox(width: AppTokens.space16),
-                        ip,
-                      ],
-                      if (actions.isNotEmpty) ...[
-                        const SizedBox(width: AppTokens.space16),
-                        commands,
-                      ],
+                      const SizedBox(width: AppTokens.space12),
+                      commands,
                     ],
                   );
                 }
-                if (ip == null && actions.isEmpty) return connection;
                 return Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     connection,
-                    const SizedBox(height: AppTokens.space12),
-                    Wrap(
-                      spacing: AppTokens.space16,
-                      runSpacing: AppTokens.space8,
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      alignment: WrapAlignment.spaceBetween,
-                      children: [?ip, if (actions.isNotEmpty) commands],
-                    ),
+                    const SizedBox(height: AppTokens.space8),
+                    commands,
                   ],
                 );
               },
@@ -564,6 +629,9 @@ class _ConnectionMark extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (tone == StatusTone.good && !transitioning) {
+      return const _ConnectedPulse();
+    }
     final icon = switch (tone) {
       StatusTone.good => Icons.check_rounded,
       StatusTone.warn => Icons.priority_high_rounded,
@@ -591,6 +659,186 @@ class _ConnectionMark extends StatelessWidget {
   }
 }
 
+class _ConnectionScopeLabel extends StatelessWidget {
+  const _ConnectionScopeLabel({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = P2WlanColors.of(context);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        color: colors.selectedSurface,
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        child: Text(
+          label,
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+            color: colors.successText,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The solid connection dot stays still; only the halo breathes. Leave a
+/// short rest between cycles so an idle page does not schedule every frame.
+class _ConnectedPulse extends StatefulWidget {
+  const _ConnectedPulse();
+
+  @override
+  State<_ConnectedPulse> createState() => _ConnectedPulseState();
+}
+
+class _ConnectedPulseState extends State<_ConnectedPulse>
+    with SingleTickerProviderStateMixin {
+  static const _sweep = Duration(milliseconds: 900);
+  static const _cycle = Duration(milliseconds: 2450);
+  late final AnimationController _halo = AnimationController(
+    vsync: this,
+    duration: _sweep,
+  );
+  Timer? _timer;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final animate =
+        !MediaQuery.disableAnimationsOf(context) &&
+        TickerMode.valuesOf(context).enabled;
+    if (!animate) {
+      _timer?.cancel();
+      _timer = null;
+      _halo.reset();
+    } else if (_timer == null) {
+      _breath();
+      _timer = Timer.periodic(_cycle, (_) => _breath());
+    }
+  }
+
+  void _breath() {
+    _halo.value = 0;
+    _halo.repeat(reverse: true, count: 2);
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _halo.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = P2WlanColors.of(context);
+    return ExcludeSemantics(
+      child: RepaintBoundary(
+        child: SizedBox.square(
+          dimension: 38,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  color: colors.successSurface,
+                  shape: BoxShape.circle,
+                ),
+                child: const SizedBox.expand(),
+              ),
+              AnimatedBuilder(
+                animation: _halo,
+                builder: (context, _) {
+                  final fraction = Curves.easeInOut.transform(_halo.value);
+                  return DecoratedBox(
+                    key: const Key('home-connection-halo'),
+                    decoration: BoxDecoration(
+                      color: Color.lerp(
+                        colors.successBorder,
+                        colors.selectedSurface,
+                        fraction,
+                      ),
+                      shape: BoxShape.circle,
+                    ),
+                    child: SizedBox.square(dimension: 19 + 8 * fraction),
+                  );
+                },
+              ),
+              DecoratedBox(
+                key: const Key('home-connection-solid-dot'),
+                decoration: BoxDecoration(
+                  color: colors.successDot,
+                  shape: BoxShape.circle,
+                ),
+                child: const SizedBox.square(dimension: 11),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DesktopGhostDanger extends StatelessWidget {
+  const _DesktopGhostDanger({
+    super.key,
+    required this.onPressed,
+    required this.label,
+    this.pending = false,
+  });
+
+  final VoidCallback? onPressed;
+  final String label;
+  final bool pending;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = P2WlanColors.of(context);
+    return TextButton.icon(
+      onPressed: onPressed,
+      style: ButtonStyle(
+        minimumSize: const WidgetStatePropertyAll(
+          Size(64, AppTokens.desktopControlHeight),
+        ),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        foregroundColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.disabled)) return colors.textMuted;
+          if (states.contains(WidgetState.hovered)) return colors.dangerText;
+          return colors.textSecondary;
+        }),
+        overlayColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.hovered)) return colors.dangerSurface;
+          if (states.contains(WidgetState.focused)) {
+            return colors.selectedSurface;
+          }
+          if (states.contains(WidgetState.pressed)) return colors.surfaceMuted;
+          return Colors.transparent;
+        }),
+        shape: WidgetStatePropertyAll(
+          RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+          ),
+        ),
+      ),
+      icon: Builder(
+        builder: (context) {
+          final color = IconTheme.of(context).color;
+          return pending
+              ? _ButtonSpinner(color: color ?? colors.textMuted)
+              : DesktopIcon('power', size: AppTokens.iconSm, color: color);
+        },
+      ),
+      label: Text(label),
+    );
+  }
+}
+
 class _DesktopOnlineDevices extends StatelessWidget {
   const _DesktopOnlineDevices({
     required this.peers,
@@ -613,85 +861,90 @@ class _DesktopOnlineDevices extends StatelessWidget {
     final strings = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final colors = P2WlanColors.of(context);
-    return Column(
+    return DesktopCard(
       key: const Key('home-devices-panel'),
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Wrap(
-          alignment: WrapAlignment.spaceBetween,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: [
-            Semantics(
-              header: true,
-              child: Text(
-                strings.isZh ? '设备连接' : 'Device connections',
-                style: theme.textTheme.titleMedium,
-              ),
-            ),
-            if (onOpenDevices != null)
-              TextButton.icon(
-                key: const Key('home-view-all-devices'),
-                onPressed: onOpenDevices,
-                label: Text(strings.openDevices),
-                icon: const Icon(
-                  Icons.arrow_forward_rounded,
-                  size: AppTokens.iconSm,
+      padding: EdgeInsets.fromLTRB(
+        16,
+        MediaQuery.sizeOf(context).width < 900 ? 8 : 12,
+        16,
+        8,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Wrap(
+            alignment: WrapAlignment.spaceBetween,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              Semantics(
+                header: true,
+                child: Text(
+                  strings.isZh ? '在线设备' : 'Online devices',
+                  style: theme.textTheme.titleMedium,
                 ),
-                iconAlignment: IconAlignment.end,
               ),
-          ],
-        ),
-        if (peers.isEmpty)
-          DecoratedBox(
-            decoration: BoxDecoration(
-              border: Border(top: BorderSide(color: colors.divider)),
-            ),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: AppTokens.space20),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Icon(
-                    Icons.devices_outlined,
-                    size: AppTokens.iconMd,
-                    color: colors.textMuted,
+              if (onOpenDevices != null)
+                TextButton.icon(
+                  key: const Key('home-view-all-devices'),
+                  onPressed: onOpenDevices,
+                  label: Text(strings.openDevices),
+                  icon: const Icon(
+                    Icons.arrow_forward_rounded,
+                    size: AppTokens.iconSm,
                   ),
-                  const SizedBox(width: AppTokens.space12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          hasCurrentData
-                              ? strings.noDevicesOnline
-                              : strings.unavailable,
-                          style: theme.textTheme.titleSmall,
-                        ),
-                        const SizedBox(height: AppTokens.space4),
-                        Text(
-                          hasCurrentData
-                              ? strings.noDevicesOnlineDetail
-                              : (strings.isZh
-                                    ? '连接网络后可查看在线设备。'
-                                    : 'Online devices appear once the network is connected.'),
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: colors.textSecondary,
-                          ),
-                        ),
-                      ],
+                  iconAlignment: IconAlignment.end,
+                ),
+            ],
+          ),
+          if (peers.isEmpty)
+            DecoratedBox(
+              decoration: BoxDecoration(
+                border: Border(top: BorderSide(color: colors.divider)),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  vertical: AppTokens.space20,
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(
+                      Icons.devices_outlined,
+                      size: AppTokens.iconMd,
+                      color: colors.textMuted,
                     ),
-                  ),
-                ],
+                    const SizedBox(width: AppTokens.space12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            hasCurrentData
+                                ? strings.noDevicesOnline
+                                : strings.unavailable,
+                            style: theme.textTheme.titleSmall,
+                          ),
+                          const SizedBox(height: AppTokens.space4),
+                          Text(
+                            hasCurrentData
+                                ? strings.noDevicesOnlineDetail
+                                : (strings.isZh
+                                      ? '连接网络后可查看在线设备。'
+                                      : 'Online devices appear once the network is connected.'),
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: colors.textSecondary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
               ),
-            ),
-          )
-        else ...[
-          const DesktopDeviceListHeader(),
-          AnimatedSize(
-            duration: AppMotion.durationOf(context),
-            curve: AppMotion.curve,
-            alignment: Alignment.topCenter,
-            child: Column(
+            )
+          else ...[
+            const DesktopDeviceListHeader(),
+            Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 for (final item in peers)
@@ -715,9 +968,9 @@ class _DesktopOnlineDevices extends StatelessWidget {
                   ),
               ],
             ),
-          ),
+          ],
         ],
-      ],
+      ),
     );
   }
 }

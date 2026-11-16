@@ -45,6 +45,8 @@ void _registerNodesDetailTests() {
       final rowFocus = tester.widget<InkWell>(row).focusNode!;
       rowFocus.requestFocus();
       await tester.pump();
+      expect(find.byTooltip('Copy virtual IP'), findsOneWidget);
+      expect(find.byTooltip('Rename'), findsNothing);
       await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
       await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
       await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
@@ -89,6 +91,96 @@ void _registerNodesDetailTests() {
       await tester.pumpWidget(const SizedBox.shrink());
     },
   );
+
+  testWidgets('Nodes desktop hover and keyboard actions keep the row aligned', (
+    tester,
+  ) async {
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+        authToken: 'account-token',
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+    final control = _RenameDeviceControlApi();
+    final messenger = tester.binding.defaultBinaryMessenger;
+    final copies = <String>[];
+    messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+      if (call.method == 'Clipboard.setData') {
+        copies.add((call.arguments as Map)['text'] as String);
+      }
+      return null;
+    });
+    addTearDown(
+      () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
+    );
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+          controlApi: control,
+        ),
+      ),
+    );
+    final row = find.byKey(const Key('node-row-peer-direct-001'));
+    final copy = find.descendant(
+      of: row,
+      matching: find.byTooltip('Copy virtual IP'),
+    );
+    final rename = find.descendant(of: row, matching: find.byTooltip('Rename'));
+    final name = find.descendant(of: row, matching: find.text('direct-laptop'));
+    final address = find.descendant(of: row, matching: find.text('10.20.0.11'));
+    final initialName = tester.getRect(name);
+    final initialAddress = tester.getRect(address);
+    final initialRow = tester.getRect(row);
+    expect(copy, findsNothing);
+    expect(rename, findsNothing);
+
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    addTearDown(mouse.removePointer);
+    await mouse.addPointer(location: Offset.zero);
+    await mouse.moveTo(initialRow.center);
+    await tester.pumpAndSettle();
+    expect(copy, findsOneWidget);
+    expect(rename, findsOneWidget);
+    expect(tester.getRect(name), initialName);
+    expect(tester.getRect(address), initialAddress);
+    expect(tester.getRect(row), initialRow);
+    await tester.tap(copy);
+    await tester.pumpAndSettle();
+    expect(copies, ['10.20.0.11']);
+    expect(find.text('Copied'), findsOneWidget);
+    expect(find.byType(Dialog), findsNothing);
+
+    FocusManager.instance.primaryFocus?.unfocus();
+    await mouse.moveTo(Offset.zero);
+    await tester.pumpAndSettle();
+    expect(copy, findsNothing);
+    expect(rename, findsNothing);
+
+    tester.widget<InkWell>(row).focusNode!.requestFocus();
+    await tester.pumpAndSettle();
+    expect(copy, findsOneWidget);
+    expect(rename, findsOneWidget);
+    await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+    await tester.pumpAndSettle();
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pumpAndSettle();
+    final dialog = find.byType(AlertDialog);
+    expect(dialog, findsOneWidget);
+    await tester.enterText(
+      find.descendant(of: dialog, matching: find.byType(TextField)),
+      'Travel Laptop',
+    );
+    await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+    await tester.pumpAndSettle();
+    expect(control.renames, [('peer-direct-001', 'Travel Laptop')]);
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('Nodes detail copies connection values and full node identity', (
     tester,
@@ -319,6 +411,21 @@ void _registerNodesDetailTests() {
         expect(tester.takeException(), isNull);
       },
     );
+  }
+}
+
+class _RenameDeviceControlApi extends ControlApi {
+  final renames = <(String, String)>[];
+
+  @override
+  Future<String> renameDevice({
+    required String controlServer,
+    required String authToken,
+    required String deviceId,
+    required String deviceName,
+  }) async {
+    renames.add((deviceId, deviceName));
+    return deviceName;
   }
 }
 

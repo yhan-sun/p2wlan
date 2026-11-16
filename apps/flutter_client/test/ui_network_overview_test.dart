@@ -403,24 +403,23 @@ void main() {
       await selectScope('Room 1');
       final search = find.byKey(const Key('nodes-search-field'));
       await tester.enterText(search, 'Shared');
-      for (final spec in [
-        ('nodes-filter-button', 'nodes-filter-direct'),
-        ('nodes-sort-button', 'nodes-sort-latency'),
-      ]) {
-        final menu = find.byKey(Key(spec.$1));
-        await tester.ensureVisible(menu);
-        await tester.tap(menu);
-        await tester.pumpAndSettle();
-        await tester.tap(find.byKey(Key(spec.$2)));
-        await tester.pumpAndSettle();
-      }
+      final online = find.byKey(const Key('nodes-filter-online'));
+      await tester.ensureVisible(online);
+      await tester.tap(online);
+      await tester.pumpAndSettle();
+      final sort = find.byKey(const Key('nodes-sort-button'));
+      await tester.ensureVisible(sort);
+      await tester.tap(sort);
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('nodes-sort-latency')));
+      await tester.pumpAndSettle();
       final deviceState = tester
           .widget<NodesPage>(find.byType(NodesPage))
           .uiState!;
       final deviceList = find
           .descendant(
             of: find.byType(NodesPage),
-            matching: find.byType(ListView),
+            matching: find.byType(CustomScrollView),
           )
           .first;
       await tester.drag(deviceList, const Offset(0, -180));
@@ -467,13 +466,13 @@ void main() {
       );
       await selectPage(P2WlanSection.devices);
       expect(deviceState.scopeId, 'room:$_roomOne');
-      expect(deviceState.filter, 'direct');
+      expect(deviceState.filter, 'online');
       expect(deviceState.sort, 'latency');
-      final restoredDevices = tester.widget<ListView>(
+      final restoredDevices = tester.widget<CustomScrollView>(
         find
             .descendant(
               of: find.byType(NodesPage),
-              matching: find.byType(ListView),
+              matching: find.byType(CustomScrollView),
             )
             .first,
       );
@@ -1130,7 +1129,8 @@ void main() {
         ),
       );
       expect(find.byKey(const Key('nodes-local-row')), findsNothing);
-      expect(find.text('2 device connections · 2 online'), findsOneWidget);
+      expect(find.text('Device connections'), findsOneWidget);
+      expect(find.text('2 online  ·  0 offline'), findsOneWidget);
       final overview = NetworkOverview.read(harness.store);
       for (final item in overview.peers) {
         final row = find.byKey(Key('node-row-${item.identity}'));
@@ -1225,19 +1225,16 @@ void main() {
         findsOneWidget,
       );
       Future<void> selectFilter(String name) async {
-        await tester.ensureVisible(
-          find.byKey(const Key('nodes-filter-button')),
-        );
+        final filter = find.byKey(Key('nodes-filter-$name'));
+        await tester.ensureVisible(filter);
         await tester.pumpAndSettle();
-        await tester.tap(find.byKey(const Key('nodes-filter-button')));
-        await tester.pumpAndSettle();
-        await tester.tap(find.byKey(Key('nodes-filter-$name')));
+        await tester.tap(filter);
         await tester.pumpAndSettle();
       }
 
-      await selectFilter('direct');
+      await selectFilter('offline');
       expect(row, findsNothing);
-      await selectFilter('attention');
+      await selectFilter('online');
       expect(row, findsOneWidget);
       await tester.ensureVisible(row);
       await tester.pumpAndSettle();
@@ -1363,33 +1360,40 @@ void main() {
     },
   );
 
-  testWidgets('large phone text keeps the local identity and IP complete', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(390, 844);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
-    final harness = (await tester.runAsync(() => _harness(rooms: 0)))!;
-    addTearDown(harness.dispose);
-    harness.store.primary = _snapshot(harness.settings.settings.networkId, 9);
-    await tester.pumpWidget(
-      _app(
-        NodesPage(settingsStore: harness.settings, statusStore: harness.store),
-        textScale: 2,
-      ),
-    );
-    final local = find.byKey(const Key('nodes-local-row'));
-    for (final value in ['Work laptop', '10.21.9.2', 'connected']) {
-      final text = find.descendant(of: local, matching: find.text(value));
-      expect(text, findsOneWidget);
-      expect(
-        tester.renderObject<RenderParagraph>(text).didExceedMaxLines,
-        isFalse,
+  for (final platform in ['android', 'macos']) {
+    testWidgets('narrow $platform at large text keeps local device and IP', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final harness = (await tester.runAsync(() => _harness(rooms: 0)))!;
+      addTearDown(harness.dispose);
+      harness.store.primary = _snapshot(harness.settings.settings.networkId, 9);
+      await tester.pumpWidget(
+        _app(
+          NodesPage(
+            settingsStore: harness.settings,
+            statusStore: harness.store,
+            capabilities: PlatformCapabilities.fromPlatform(platform),
+          ),
+          textScale: 2,
+        ),
       );
-    }
-    expect(tester.takeException(), isNull);
-  });
+      final local = find.byKey(const Key('nodes-local-row'));
+      final status = platform == 'macos' ? 'Online' : 'connected';
+      for (final value in ['Work laptop', '10.21.9.2', status]) {
+        final text = find.descendant(of: local, matching: find.text(value));
+        expect(text, findsOneWidget);
+        expect(
+          tester.renderObject<RenderParagraph>(text).didExceedMaxLines,
+          isFalse,
+        );
+      }
+      expect(tester.takeException(), isNull);
+    });
+  }
 
   for (final platform in ['ios', 'web']) {
     testWidgets(

@@ -192,6 +192,89 @@ class _FakeRoomApi extends RoomApi {
   }
 }
 
+class _RoomCatalogClient implements HttpClient {
+  var listCalls = 0;
+  @override
+  Duration? connectionTimeout;
+  @override
+  set findProxy(String Function(Uri)? callback) {}
+
+  @override
+  Future<HttpClientRequest> openUrl(String method, Uri url) async {
+    if (method != 'GET' || url.path != '/api/v1/rooms') {
+      throw StateError('Unexpected catalog request: $method ${url.path}');
+    }
+    listCalls++;
+    return _RoomCatalogRequest({
+      'room_protocol_version': 1,
+      'user_id': 'member',
+      'rooms': [
+        {
+          ..._room('member'),
+          'name': '联机房间 $listCalls',
+          'member_count': 2,
+          'online_member_count': 1,
+        },
+      ],
+    });
+  }
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _RoomCatalogRequest implements HttpClientRequest {
+  _RoomCatalogRequest(this.body);
+
+  final Map<String, dynamic> body;
+  @override
+  bool followRedirects = true;
+  @override
+  final HttpHeaders headers = _RoomCatalogHeaders();
+
+  @override
+  Future<HttpClientResponse> close() async => _RoomCatalogResponse(body);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _RoomCatalogHeaders implements HttpHeaders {
+  @override
+  void set(String name, Object value, {bool preserveHeaderCase = false}) {}
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _RoomCatalogResponse extends Stream<List<int>>
+    implements HttpClientResponse {
+  _RoomCatalogResponse(this.body);
+
+  final Map<String, dynamic> body;
+  @override
+  int get statusCode => HttpStatus.ok;
+
+  @override
+  StreamSubscription<List<int>> listen(
+    void Function(List<int>)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) => Stream<List<int>>.value(utf8.encode(jsonEncode(body))).listen(
+    onData,
+    onError: onError,
+    onDone: onDone,
+    cancelOnError: cancelOnError,
+  );
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
 class _PulsingStatusStore extends StatusStore {
   _PulsingStatusStore({
     required super.parallelRooms,
@@ -344,9 +427,11 @@ void main() {
     Uri? invitation,
     DiagnosticsSnapshot? snapshot,
     bool shell = false,
+    bool embedded = false,
     bool enterRoom = true,
     bool settleInitial = true,
     VoidCallback? onReauthenticate,
+    ValueChanged<DateTime>? onRoomRefreshed,
     bool enableDaemonPolling = false,
     bool controls = false,
     bool canConnect = false,
@@ -468,7 +553,9 @@ void main() {
                 settingsStore: settings,
                 statusStore: status,
                 api: api,
+                embedded: embedded,
                 onReauthenticate: onReauthenticate,
+                onRoomRefreshed: onRoomRefreshed,
                 capabilities: PlatformCapabilities.fromPlatform(
                   canConnect ? 'linux' : 'ios',
                 ),
@@ -967,7 +1054,7 @@ void main() {
     },
   );
 
-  testWidgets('desktop rooms use full-width keyboard-selectable rows', (
+  testWidgets('desktop room cards cap width and align connection actions', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(1280, 900);
@@ -979,6 +1066,9 @@ void main() {
       tester,
       enterRoom: false,
       platform: TargetPlatform.macOS,
+      role: 'member',
+      canConnect: true,
+      snapshot: _snapshot(),
       configureApi: (api) =>
           api.pendingList = Completer<List<FriendRoom>>()
             ..complete([
@@ -993,15 +1083,30 @@ void main() {
     );
     final first = find.byKey(const ValueKey('room-card-$_roomId'));
     final second = find.byKey(const ValueKey('room-card-$secondId'));
-    expect(tester.getSize(first).width, closeTo(1232, 1));
+    expect(tester.getSize(first).width, closeTo(1040, 1));
     expect(tester.getSize(first).height, lessThan(100));
     expect(tester.getSize(first).width, tester.getSize(second).width);
-    expect(tester.getTopLeft(first).dx, tester.getTopLeft(second).dx);
+    expect(tester.getTopLeft(first).dx, closeTo(120, 1));
+    expect(tester.getTopLeft(second).dx, closeTo(120, 1));
     expect(
       tester.getTopLeft(second).dy,
       greaterThan(tester.getBottomLeft(first).dy),
     );
-    expect(find.ancestor(of: first, matching: find.byType(Card)), findsNothing);
+    final disconnect = find.byKey(
+      const ValueKey('room-card-connection-$_roomId'),
+    );
+    final connect = find.byKey(
+      const ValueKey('room-card-connection-$secondId'),
+    );
+    expect(tester.widget(disconnect), isA<OutlinedButton>());
+    expect(tester.widget(connect), isA<FilledButton>());
+    expect(tester.getSize(disconnect).width, closeTo(114, 1));
+    expect(tester.getSize(connect).width, closeTo(114, 1));
+    expect(tester.getTopLeft(disconnect).dx, tester.getTopLeft(connect).dx);
+    expect(
+      find.descendant(of: second, matching: find.text('房主离线')),
+      findsOneWidget,
+    );
     final indicator = find
         .descendant(of: second, matching: find.byType(AnimatedContainer))
         .first;
@@ -1013,6 +1118,68 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
+
+  testWidgets('embedded rooms refresh without an inline button', (
+    tester,
+  ) async {
+    final updates = <DateTime>[];
+    final api = await pump(
+      tester,
+      enterRoom: false,
+      embedded: true,
+      onRoomRefreshed: updates.add,
+      platform: TargetPlatform.macOS,
+    );
+    final rooms = tester.state<RoomsPageState>(find.byType(RoomsPage));
+    expect(find.byTooltip('刷新房间'), findsNothing);
+    expect(updates, [rooms.lastRoomRefreshAt]);
+    final calls = api.listCalls;
+    await rooms.refreshRooms();
+    await tester.pumpAndSettle();
+    expect(api.listCalls, calls + 1);
+    expect(updates, hasLength(2));
+    final lastSuccessfulRefresh = rooms.lastRoomRefreshAt;
+
+    api.listError = '房间列表暂时不可用';
+    await rooms.refreshRooms();
+    await tester.pumpAndSettle();
+    expect(api.listCalls, calls + 2);
+    expect(updates, hasLength(2));
+    expect(rooms.lastRoomRefreshAt, lastSuccessfulRefresh);
+    expect(find.byTooltip('重试加载房间列表'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('desktop shell refresh and F5 load the active room catalog', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final catalog = _RoomCatalogClient();
+    await HttpOverrides.runZoned(() async {
+      await pump(tester, shell: true, platform: TargetPlatform.macOS);
+      await tester.tap(find.byKey(const Key('sidebar-interconnect')));
+      await tester.pumpAndSettle();
+      expect(find.text('联机房间 1'), findsOneWidget);
+      expect(find.byTooltip('刷新房间'), findsNothing);
+
+      final refresh = find.byKey(const Key('shell-refresh'));
+      expect(refresh, findsOneWidget);
+      await tester.tap(refresh);
+      await tester.pumpAndSettle();
+      expect(find.text('联机房间 1'), findsNothing);
+      expect(find.text('联机房间 2'), findsOneWidget);
+
+      await tester.sendKeyEvent(LogicalKeyboardKey.f5);
+      await tester.pumpAndSettle();
+      expect(find.text('联机房间 2'), findsNothing);
+      expect(find.text('联机房间 3'), findsOneWidget);
+      expect(catalog.listCalls, 3);
+      await tester.pumpWidget(const SizedBox.shrink());
+    }, createHttpClient: (_) => catalog);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
 
   testWidgets('compact desktop room row preserves the local connect action', (
     tester,
@@ -2072,23 +2239,28 @@ void main() {
     },
   );
 
-  testWidgets('room card measures owner RTT only from verified room peers', (
-    tester,
-  ) async {
-    final api = await pump(
-      tester,
-      role: 'member',
-      enterRoom: false,
-      snapshot: _snapshot(),
-    );
-    expect(find.text('房主离线'), findsOneWidget);
-    api.ownerOnline = true;
-    await tester.pump(const Duration(seconds: 6));
-    await tester.pumpAndSettle();
-    expect(find.text('18 ms'), findsOneWidget);
-    expect(find.text('3 ms'), findsNothing);
-    await tester.pumpWidget(const SizedBox.shrink());
-  });
+  testWidgets(
+    'room card measures owner RTT only from verified room peers',
+    (tester) async {
+      final api = await pump(
+        tester,
+        role: 'member',
+        enterRoom: false,
+        snapshot: _snapshot(),
+      );
+      expect(find.text('房主离线'), findsOneWidget);
+      api.ownerOnline = true;
+      await tester.pump(const Duration(seconds: 6));
+      await tester.pumpAndSettle();
+      expect(find.text('18 ms'), findsOneWidget);
+      expect(find.text('3 ms'), findsNothing);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+    variant: TargetPlatformVariant({
+      TargetPlatform.android,
+      TargetPlatform.macOS,
+    }),
+  );
 
   testWidgets('offline device has a muted badge and no misleading latency', (
     tester,

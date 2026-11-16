@@ -80,6 +80,12 @@ String _formatLastSeen(PeerSnapshot peer) {
 
 enum _NodeFilter { all, online, direct, relay, attention, offline }
 
+const _desktopNodeFilters = [
+  _NodeFilter.all,
+  _NodeFilter.online,
+  _NodeFilter.offline,
+];
+
 enum _NodeSort { recommended, name, latency }
 
 bool _filterMatches(_NodeFilter filter, PeerSnapshot peer) {

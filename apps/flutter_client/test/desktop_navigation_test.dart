@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/app_strings.dart';
 import 'package:p2wlan_flutter_client/app/app_theme.dart';
+import 'package:p2wlan_flutter_client/app/navigation.dart';
 import 'package:p2wlan_flutter_client/app/navigation_model.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
@@ -24,6 +25,14 @@ class _NavigationStatusStore extends StatusStore {
         enableFreshnessTimer: false,
         enableEventPolling: false,
       );
+
+  int refreshCalls = 0;
+
+  @override
+  DateTime? get lastSuccessfulStatusAt => DateTime(2026, 1, 1, 14, 32);
+
+  @override
+  Future<void> refresh({bool silent = false}) async => refreshCalls++;
 
   final _snapshot = DiagnosticsSnapshot.fromJson({
     'network_id': 'demo-network',
@@ -146,6 +155,74 @@ void main() {
       }
     });
   }
+
+  testWidgets(
+    'desktop shell puts refresh beside the title and opens settings overview',
+    (tester) async {
+      tester.view.physicalSize = const Size(1440, 840);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final (status, dispose) = await _stores(tester);
+      addTearDown(dispose);
+      await tester.runAsync(
+        () => status.settingsStore.updateLanguageCode('en'),
+      );
+      final strings = AppStrings.fromCode('en');
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.lightTheme,
+          home: AppStringsScope(
+            strings: strings,
+            child: P2WlanShell(
+              settingsStore: status.settingsStore,
+              statusStore: status,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final heading = find.byKey(const Key('desktop-page-heading'));
+      final refresh = find.descendant(
+        of: heading,
+        matching: find.byKey(const Key('shell-refresh')),
+      );
+      final sidebar = find.byKey(const Key('desktop-sidebar-surface'));
+      expect(find.byType(AppBar), findsNothing);
+      expect(tester.getSize(heading).width, 1040);
+      expect(
+        tester.getRect(heading).left,
+        greaterThan(tester.getRect(sidebar).right),
+      );
+      final calls = status.refreshCalls;
+      await tester.tap(refresh);
+      await tester.pump();
+      expect(status.refreshCalls, calls + 1);
+
+      await tester.tap(find.byKey(const ValueKey('sidebar-settings')));
+      await tester.pumpAndSettle();
+      final settings = find.byKey(const Key('desktop-settings-overview'));
+      expect(settings, findsOneWidget);
+      expect(tester.getRect(settings).left, tester.getRect(heading).left);
+      expect(tester.getSize(settings).width, tester.getSize(heading).width);
+      expect(
+        find.byKey(const Key('desktop-settings-shortcuts')),
+        findsOneWidget,
+      );
+      final category = find.byKey(
+        const ValueKey('settings-category-card-general'),
+      );
+      await tester.tap(category);
+      await tester.pumpAndSettle();
+      expect(settings, findsNothing);
+      await tester.tap(find.byKey(const Key('settings-category-back')));
+      await tester.pumpAndSettle();
+      expect(settings, findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.macOS),
+  );
 
   testWidgets('800px sidebar footer keeps complete status at 200 percent', (
     tester,

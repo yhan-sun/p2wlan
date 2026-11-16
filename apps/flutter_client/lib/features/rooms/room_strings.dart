@@ -144,6 +144,7 @@ class RoomStrings {
     "已退出房间": "Left room",
     "已锁定新成员加入": "New members cannot join",
     "延迟": "Latency",
+    "延迟 / 状态": "Latency / status",
     "建立连接中": "Establishing connection",
     "当前上传速率": "Current upload rate",
     "当前下载速率": "Current download rate",
@@ -171,7 +172,7 @@ class RoomStrings {
     "房主延迟": "Owner latency",
     "房主离线": "Owner offline",
     "房间": "Rooms",
-    "我的房间 · {0}": "My rooms · {0}",
+    "我的房间": "My rooms",
     "房间信息更新失败，当前显示上次数据{0}。":
         "Could not update room information. Showing the last data{0}.",
     "房间号": "Room code",

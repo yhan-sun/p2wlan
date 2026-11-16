@@ -8,6 +8,7 @@ class _SettingsTapSurface extends StatefulWidget {
     required this.onTap,
     this.interactionKey,
     this.selected = false,
+    this.overviewRow = false,
     this.radius = 12,
   });
 
@@ -15,6 +16,7 @@ class _SettingsTapSurface extends StatefulWidget {
   final VoidCallback onTap;
   final Key? interactionKey;
   final bool selected;
+  final bool overviewRow;
   final double radius;
 
   @override
@@ -31,7 +33,7 @@ class _SettingsTapSurfaceState extends State<_SettingsTapSurface> {
     final radius = BorderRadius.circular(widget.radius);
     final border = _focused
         ? Theme.of(context).colorScheme.primary
-        : _hovered
+        : _hovered && !widget.overviewRow
         ? colors.borderStrong
         : Colors.transparent;
     return Material(
@@ -39,7 +41,10 @@ class _SettingsTapSurfaceState extends State<_SettingsTapSurface> {
       color: widget.selected
           ? colors.selectedSurface
           : _hovered
-          ? colors.hoverSurface
+          ? (widget.overviewRow &&
+                    Theme.of(context).brightness == Brightness.light
+                ? AppTokens.colorDesktopHover
+                : colors.hoverSurface)
           : Colors.transparent,
       shape: RoundedRectangleBorder(
         borderRadius: radius,

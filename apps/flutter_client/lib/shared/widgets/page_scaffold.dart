@@ -32,8 +32,13 @@ class PageScaffold extends StatelessWidget {
     return SafeArea(
       child: LayoutBuilder(
         builder: (context, constraints) {
+          final desktop = AppTokens.isDesktopPlatform(
+            Theme.of(context).platform,
+          );
           final isNarrow = constraints.maxWidth < 480;
-          final horizontalPadding = isNarrow
+          final horizontalPadding = desktop
+              ? AppTokens.desktopPageGutter(constraints.maxWidth)
+              : isNarrow
               ? AppTokens.space16
               : AppTokens.space24;
           final verticalPadding = isNarrow
@@ -51,7 +56,11 @@ class PageScaffold extends StatelessWidget {
             children: [
               Center(
                 child: ConstrainedBox(
-                  constraints: BoxConstraints(maxWidth: maxWidth),
+                  constraints: BoxConstraints(
+                    maxWidth: desktop
+                        ? AppTokens.desktopPageMaxWidth
+                        : maxWidth,
+                  ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [

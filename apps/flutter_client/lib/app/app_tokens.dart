@@ -5,6 +5,9 @@ import 'package:flutter/material.dart';
 /// Calm connectivity aesthetic: modern, reliable, precise, and platform-neutral.
 abstract final class AppTokens {
   // Light theme: warm canvas, quiet surfaces and deep green controls.
+  static const colorDesktopCanvas = Color(0xFFF5F6F5);
+  static const colorDesktopBorder = Color(0xFFE5E7EB);
+  static const colorDesktopHover = Color(0xFFF3F7F3);
   static const colorBg = Color(0xFFF7F7F4);
   static const colorSurface = Color(0xFFFCFCF9);
   static const colorSurfaceSubtle = Color(0xFFF0F1ED);
@@ -96,6 +99,9 @@ abstract final class AppTokens {
   static const desktopControlHeight = 36.0;
   static const desktopToolbarHeight = 48.0;
   static const desktopPagePadding = space24;
+  static const desktopPageMaxWidth = 1040.0;
+  static double desktopPageGutter(double width) =>
+      width < 480 ? space16 : space32;
   static const iconSm = 16.0;
   static const iconMd = 20.0;
   static const borderWidth = 1.0;

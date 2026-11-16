@@ -12,7 +12,11 @@ abstract final class AppTheme {
     final dark = brightness == Brightness.dark;
     final desktop = AppTokens.isDesktopPlatform(defaultTargetPlatform);
     final colors = dark ? P2WlanColors.dark : P2WlanColors.light;
-    final canvas = dark ? AppTokens.colorDarkBg : AppTokens.colorBg;
+    final canvas = dark
+        ? AppTokens.colorDarkBg
+        : desktop
+        ? AppTokens.colorDesktopCanvas
+        : AppTokens.colorBg;
     final primary = dark ? AppTokens.colorDarkAccent : AppTokens.colorAccent;
     final onPrimary = dark ? canvas : colors.surfaceElevated;
     final scheme = ColorScheme(
@@ -44,6 +48,9 @@ abstract final class AppTheme {
         ? AppTokens.desktopControlHeight
         : AppTokens.minTouchTarget;
     final controlText = TextStyle(
+      fontFamily: AppTokens.primaryFontFamily,
+      fontFamilyFallback: AppTokens.fontFamilyFallback,
+      fontFeatures: desktop ? AppTokens.tabularFontFeatures : null,
       fontSize: desktop ? 13 : 14,
       fontWeight: desktop ? FontWeight.w500 : FontWeight.w600,
     );
@@ -273,45 +280,67 @@ abstract final class AppTheme {
 
   static const _desktopTypography = TextTheme(
     headlineSmall: TextStyle(
+      fontFeatures: AppTokens.tabularFontFeatures,
       fontSize: 24,
       height: 1.25,
       fontWeight: FontWeight.w600,
       letterSpacing: -.35,
     ),
     titleLarge: TextStyle(
+      fontFeatures: AppTokens.tabularFontFeatures,
       fontSize: 20,
       height: 1.3,
       fontWeight: FontWeight.w600,
       letterSpacing: -.2,
     ),
     titleMedium: TextStyle(
+      fontFeatures: AppTokens.tabularFontFeatures,
       fontSize: 15,
       height: 1.35,
       fontWeight: FontWeight.w600,
       letterSpacing: 0,
     ),
     titleSmall: TextStyle(
+      fontFeatures: AppTokens.tabularFontFeatures,
       fontSize: 13,
       height: 1.35,
       fontWeight: FontWeight.w600,
       letterSpacing: 0,
     ),
-    bodyLarge: TextStyle(fontSize: 14, height: 1.45, letterSpacing: 0),
-    bodyMedium: TextStyle(fontSize: 13, height: 1.45, letterSpacing: 0),
-    bodySmall: TextStyle(fontSize: 12, height: 1.4, letterSpacing: 0),
+    bodyLarge: TextStyle(
+      fontFeatures: AppTokens.tabularFontFeatures,
+      fontSize: 14,
+      height: 1.45,
+      letterSpacing: 0,
+    ),
+    bodyMedium: TextStyle(
+      fontFeatures: AppTokens.tabularFontFeatures,
+      fontSize: 13,
+      height: 1.45,
+      letterSpacing: 0,
+    ),
+    bodySmall: TextStyle(
+      fontFeatures: AppTokens.tabularFontFeatures,
+      fontSize: 12,
+      height: 1.4,
+      letterSpacing: 0,
+    ),
     labelLarge: TextStyle(
+      fontFeatures: AppTokens.tabularFontFeatures,
       fontSize: 13,
       height: 1.35,
       fontWeight: FontWeight.w500,
       letterSpacing: 0,
     ),
     labelMedium: TextStyle(
+      fontFeatures: AppTokens.tabularFontFeatures,
       fontSize: 12,
       height: 1.35,
       fontWeight: FontWeight.w500,
       letterSpacing: 0,
     ),
     labelSmall: TextStyle(
+      fontFeatures: AppTokens.tabularFontFeatures,
       fontSize: 11,
       height: 1.35,
       fontWeight: FontWeight.w500,

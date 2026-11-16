@@ -26,6 +26,8 @@ import '../../core/update/update_service.dart';
 import '../../shared/widgets/app_back_button.dart';
 import '../../shared/widgets/app_motion.dart';
 import '../../shared/widgets/app_select.dart';
+import '../../shared/widgets/desktop_card.dart';
+import '../../shared/widgets/desktop_icon.dart';
 import '../../shared/widgets/local_connection_restart_feedback.dart';
 import '../../shared/widgets/page_heading.dart';
 
@@ -192,9 +194,7 @@ class _SettingsPageState extends State<SettingsPage> {
   /// concrete category (defaulting to the first visible one). Not persisted.
   SettingsCategory? _selectedCategory;
 
-  /// Width of the last rendered Settings body. It is read only for a system
-  /// back request so desktop's persistent category rail is never mistaken for
-  /// a pushed detail page.
+  /// Lets the touch layout distinguish in-place details from its wide rail.
   var _lastLayoutWidth = double.infinity;
 
   void _updateState(VoidCallback fn) {
@@ -412,7 +412,8 @@ class _SettingsPageState extends State<SettingsPage> {
 
   bool _handleBackRequest() {
     if (!mounted ||
-        _lastLayoutWidth >= _settingsLayoutBreakpoint ||
+        (!_usesDesktopSettings(context) &&
+            _lastLayoutWidth >= _settingsLayoutBreakpoint) ||
         _selectedCategory == null) {
       return false;
     }
@@ -563,7 +564,9 @@ class _SettingsPageState extends State<SettingsPage> {
         _lastLayoutWidth = constraints.maxWidth;
         final isNarrow = constraints.maxWidth < 480;
         final desktop = _usesDesktopSettings(context);
-        final horizontalInset = isNarrow
+        final horizontalInset = desktop
+            ? AppTokens.desktopPageGutter(constraints.maxWidth)
+            : isNarrow
             ? AppTokens.space16
             : AppTokens.desktopPagePadding;
         final layout = constraints.maxWidth >= _settingsLayoutBreakpoint
@@ -572,7 +575,7 @@ class _SettingsPageState extends State<SettingsPage> {
         return Padding(
           padding: EdgeInsets.fromLTRB(
             horizontalInset,
-            desktop && layout == _SettingsLayout.rootDetail && selected != null
+            desktop
                 ? AppTokens.space16
                 : isNarrow
                 ? AppTokens.space20
@@ -581,21 +584,23 @@ class _SettingsPageState extends State<SettingsPage> {
             desktop ? AppTokens.space12 : AppTokens.space20,
           ),
           child: Align(
-            alignment: desktop
-                ? AlignmentDirectional.topStart
-                : Alignment.center,
+            alignment: const Alignment(0, -1),
             child: ConstrainedBox(
-              constraints: BoxConstraints(maxWidth: settingsPageMaxWidth),
+              constraints: BoxConstraints(
+                maxWidth: desktop
+                    ? AppTokens.desktopPageMaxWidth
+                    : settingsPageMaxWidth,
+              ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   if (widget.showHeader &&
-                      (desktop && layout == _SettingsLayout.expanded ||
+                      (desktop ||
                           layout == _SettingsLayout.rootDetail &&
                               selected == null)) ...[
                     PageHeading(
                       title: strings.settings,
-                      subtitle: desktop ? '' : strings.settingsSubtitle,
+                      subtitle: strings.settingsSubtitle,
                       compact: isNarrow,
                     ),
                     const SizedBox(height: AppTokens.space16),
@@ -629,8 +634,7 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  /// Resolves the currently effective category. In the desktop rail layout a
-  /// null selection maps to the first visible category (default: General).
+  /// Resolves the current selection against the available capabilities.
   SettingsCategory? _normalizeSelection(List<SettingsCategory> categories) {
     final selected = _selectedCategory;
     if (selected != null && categories.contains(selected)) return selected;
