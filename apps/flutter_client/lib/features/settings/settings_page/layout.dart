@@ -6,24 +6,25 @@ class _SettingsRoot extends StatelessWidget {
     required this.categories,
     required this.summaryFor,
     required this.onSelect,
+    required this.version,
   });
 
   final List<SettingsCategory> categories;
   final String Function(SettingsCategory category) summaryFor;
   final ValueChanged<SettingsCategory> onSelect;
+  final String version;
 
   @override
   Widget build(BuildContext context) {
     final desktop = _usesDesktopSettings(context);
     final rows = Column(
       children: [
-        if (desktop) const Divider(height: 1),
         for (var index = 0; index < categories.length; index++) ...[
           if (index > 0)
             Divider(
               height: 1,
-              indent: 52,
-              endIndent: 16,
+              indent: desktop ? 0 : 52,
+              endIndent: desktop ? 0 : 16,
               color: P2WlanColors.of(context).divider,
             ),
           _SettingsCategoryCard(
@@ -32,16 +33,19 @@ class _SettingsRoot extends StatelessWidget {
             onTap: () => onSelect(categories[index]),
           ),
         ],
-        if (desktop) const Divider(height: 1),
       ],
     );
     return ListView(
       padding: const EdgeInsets.symmetric(vertical: AppTokens.space4),
       children: [
         if (desktop)
-          rows
+          DesktopCard(key: const Key('desktop-settings-overview'), child: rows)
         else
           _SettingsSurface(padding: EdgeInsets.zero, child: rows),
+        if (desktop) ...[
+          const SizedBox(height: AppTokens.space16),
+          _SettingsOverviewFooter(version: version),
+        ],
       ],
     );
   }
@@ -70,17 +74,22 @@ class _SettingsCategoryCard extends StatelessWidget {
       child: _SettingsTapSurface(
         interactionKey: ValueKey('settings-category-card-${category.name}'),
         onTap: onTap,
+        overviewRow: desktop,
+        radius: desktop ? 0 : AppTokens.radiusLg,
         child: ConstrainedBox(
-          constraints: BoxConstraints(minHeight: desktop ? 60 : 76),
+          constraints: const BoxConstraints(minHeight: 76),
           child: Padding(
             padding: EdgeInsets.symmetric(
-              horizontal: AppTokens.space12,
-              vertical: desktop ? AppTokens.space8 : AppTokens.space14,
+              horizontal: desktop ? AppTokens.space20 : AppTokens.space12,
+              vertical: desktop ? AppTokens.space12 : AppTokens.space14,
             ),
             child: Row(
               children: [
-                _SettingsCategoryIcon(category),
-                const SizedBox(width: 12),
+                if (desktop)
+                  _SettingsOverviewIcon(category)
+                else
+                  _SettingsCategoryIcon(category),
+                SizedBox(width: desktop ? 14 : 12),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -92,8 +101,12 @@ class _SettingsCategoryCard extends StatelessWidget {
                       const SizedBox(height: 4),
                       Text(
                         summary,
-                        maxLines: largeText ? 2 : 1,
-                        overflow: TextOverflow.ellipsis,
+                        maxLines: desktop
+                            ? null
+                            : largeText
+                            ? 2
+                            : 1,
+                        overflow: desktop ? null : TextOverflow.ellipsis,
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: theme.colorScheme.onSurfaceVariant,
                         ),
@@ -102,11 +115,14 @@ class _SettingsCategoryCard extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 12),
-                Icon(
-                  Icons.chevron_right_rounded,
-                  size: 20,
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
+                if (desktop)
+                  const DesktopIcon('chevron-right', size: 17)
+                else
+                  Icon(
+                    Icons.chevron_right_rounded,
+                    size: 20,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
               ],
             ),
           ),
@@ -115,6 +131,128 @@ class _SettingsCategoryCard extends StatelessWidget {
     );
   }
 }
+
+class _SettingsOverviewIcon extends StatelessWidget {
+  const _SettingsOverviewIcon(this.category);
+
+  final SettingsCategory category;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = P2WlanColors.of(context);
+    final dark = theme.brightness == Brightness.dark;
+    final (name, background, foreground) = switch (category) {
+      SettingsCategory.general => (
+        'sliders',
+        colors.selectedSurface,
+        theme.colorScheme.primary,
+      ),
+      SettingsCategory.accountNetwork => (
+        'shield',
+        dark ? colors.surfaceMuted : const Color(0xFFEAF2F7),
+        dark ? colors.probing : const Color(0xFF35688B),
+      ),
+      SettingsCategory.advancedNetwork => (
+        'network',
+        colors.warningSurface,
+        colors.relay,
+      ),
+      SettingsCategory.developer => (
+        'activity',
+        dark ? colors.surfaceMuted : AppTokens.colorDesktopHover,
+        colors.textMuted,
+      ),
+    };
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+      ),
+      child: SizedBox.square(
+        dimension: 40,
+        child: Center(child: DesktopIcon(name, color: foreground)),
+      ),
+    );
+  }
+}
+
+class _SettingsOverviewFooter extends StatelessWidget {
+  const _SettingsOverviewFooter({required this.version});
+
+  final String version;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    final colors = P2WlanColors.of(context);
+    final mac = theme.platform == TargetPlatform.macOS;
+    final style = theme.textTheme.bodySmall?.copyWith(color: colors.textMuted);
+
+    Widget keycap(String text) => DecoratedBox(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(5),
+        border: Border.all(color: DesktopCard.borderOf(context)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        child: Text(text, style: style),
+      ),
+    );
+
+    return DesktopCard(
+      key: const Key('desktop-settings-shortcuts'),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Wrap(
+        alignment: WrapAlignment.spaceBetween,
+        runSpacing: AppTokens.space8,
+        spacing: AppTokens.space16,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          Wrap(
+            spacing: AppTokens.space8,
+            runSpacing: AppTokens.space6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              const DesktopIcon('keyboard', size: 17),
+              keycap(mac ? '⌘ 1–4' : 'Ctrl+1–4'),
+              Text(strings.isZh ? '切换页面' : 'Switch pages', style: style),
+              keycap(mac ? '⌘ R' : 'Ctrl+R'),
+              Text(strings.refresh, style: style),
+            ],
+          ),
+          Text(
+            '$p2wlanAppName  $version',
+            style: style?.copyWith(fontFeatures: AppTokens.tabularFontFeatures),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _desktopSettingsDescription(
+  SettingsCategory category,
+  AppStrings strings,
+) => switch (category) {
+  SettingsCategory.general =>
+    strings.isZh
+        ? '应用外观、语言和启动行为'
+        : 'Appearance, language, and startup behavior',
+  SettingsCategory.accountNetwork =>
+    strings.isZh
+        ? '登录账户、设备名称和连接偏好'
+        : 'Sign-in, device name, and connection preferences',
+  SettingsCategory.advancedNetwork =>
+    strings.isZh
+        ? '虚拟网段、UDP 和中继设置'
+        : 'Virtual subnets, UDP, and relay settings',
+  SettingsCategory.developer =>
+    strings.isZh
+        ? '诊断日志、版本信息和更新'
+        : 'Diagnostic logs, version information, and updates',
+};
 
 class _SettingsCategoryIcon extends StatelessWidget {
   const _SettingsCategoryIcon(this.category);
@@ -517,7 +655,8 @@ class _SettingsShell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (layout == _SettingsLayout.expanded) {
+    final desktop = _usesDesktopSettings(context);
+    if (layout == _SettingsLayout.expanded && (!desktop || selected != null)) {
       final current = selected ?? categories.first;
       return Row(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -540,6 +679,7 @@ class _SettingsShell extends StatelessWidget {
                 state: state,
                 strings: strings,
                 credentialState: credentialState,
+                onBack: desktop ? onBack : null,
               ),
             ),
           ),
@@ -552,8 +692,11 @@ class _SettingsShell extends StatelessWidget {
         identity: 'root',
         child: _SettingsRoot(
           categories: categories,
-          summaryFor: (category) => state._categorySummary(category, strings),
+          summaryFor: (category) => desktop
+              ? _desktopSettingsDescription(category, strings)
+              : state._categorySummary(category, strings),
           onSelect: onSelect,
+          version: state._clientVersionLabel(strings),
         ),
       );
     }

@@ -28,8 +28,9 @@ import '../shared/network_overview_presentation.dart';
 import '../shared/widgets/app_nav_rail.dart';
 import '../shared/widgets/app_motion.dart';
 import '../shared/widgets/desktop_sidebar.dart';
+import '../shared/widgets/desktop_card.dart';
+import '../shared/widgets/desktop_icon.dart';
 import '../shared/widgets/status_badge.dart';
-import '../shared/widgets/windows_window_controls.dart';
 
 class P2WlanShell extends StatefulWidget {
   const P2WlanShell({
@@ -77,6 +78,10 @@ class _P2WlanShellState extends State<P2WlanShell> {
   String? _pendingRoomDeviceId;
   P2WlanSection? _roomDeviceReturnSection;
   final _uiState = SessionUiState();
+  var _roomsPageKey = GlobalKey<RoomsPageState>();
+  (StatusStore, int)? _roomsOwner;
+  DateTime? _roomsSampledAt;
+  bool _roomsRefreshRequested = false;
 
   /// Home opens a peer through the canonical Devices detail flow. Remember
   /// the originating section so dismissing that detail returns to Home rather
@@ -140,6 +145,15 @@ class _P2WlanShellState extends State<P2WlanShell> {
       widget.statusStore.sessionRevision,
       owner: widget.statusStore,
     );
+    final roomsOwner = (widget.statusStore, widget.statusStore.sessionRevision);
+    if (_roomsOwner != roomsOwner) {
+      // Scope the refresh handle to the same owner as the page. A GlobalKey
+      // reused across shell epochs would reparent the old room state.
+      _roomsOwner = roomsOwner;
+      _roomsPageKey = GlobalKey<RoomsPageState>();
+      _roomsSampledAt = null;
+      _roomsRefreshRequested = false;
+    }
     final strings = AppStrings.fromCode(
       widget.settingsStore.settings.languageCode,
     );
@@ -160,7 +174,13 @@ class _P2WlanShellState extends State<P2WlanShell> {
         final useBottomNav =
             breakpoint == AppBreakpoint.compact && !_isDesktopShell;
 
-        final shellBody = useBottomNav
+        final shellBody = _isDesktopShell
+            ? _buildDesktopWorkspace(
+                strings,
+                useDesktopSidebar,
+                shortWindow: constraints.maxHeight < 540,
+              )
+            : useBottomNav
             ? _buildBody(showPageHeader: false)
             : Row(
                 children: [
@@ -181,23 +201,16 @@ class _P2WlanShellState extends State<P2WlanShell> {
               skipTraversal: true,
               child: Scaffold(
                 appBar: _isDesktopShell
-                    ? _buildDesktopToolbar(strings, useDesktopSidebar)
+                    ? null
                     : _buildTopBar(strings, useBottomNav, useDesktopSidebar),
-                body: Column(
-                  children: [
-                    if (widget.updateResult != null &&
-                        (widget.capabilities ?? PlatformCapabilities.current())
-                            .canOpenExternalUrls &&
-                        widget.onOpenUpdate != null &&
-                        widget.onDismissUpdate != null)
-                      UpdateBanner(
-                        result: widget.updateResult!,
-                        onOpen: widget.onOpenUpdate!,
-                        onDismiss: widget.onDismissUpdate!,
+                body: _isDesktopShell
+                    ? shellBody
+                    : Column(
+                        children: [
+                          ?_updateBanner(),
+                          Expanded(child: shellBody),
+                        ],
                       ),
-                    Expanded(child: shellBody),
-                  ],
-                ),
                 bottomNavigationBar: useBottomNav
                     ? _buildBottomNav(strings)
                     : null,
@@ -228,6 +241,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
       _pendingRoomDeviceId = null;
       _roomDeviceReturnSection = null;
       _selectedRoomId = null;
+      _roomsSampledAt = null;
       _peerDetailsReturnSection = null;
       _settingsDirty = false;
     });
@@ -259,58 +273,202 @@ class _P2WlanShellState extends State<P2WlanShell> {
       defaultTargetPlatform == TargetPlatform.macOS ? '⌘$key' : 'Ctrl+$key';
 
   void _refresh() {
-    if (!widget.statusStore.refreshActivityVisible) {
+    if (_isDesktopShell && _section == P2WlanSection.interconnect) {
+      _refreshRooms();
+    } else if (!widget.statusStore.refreshActivityVisible) {
       widget.statusStore.refresh();
     }
   }
 
-  PreferredSizeWidget _buildDesktopToolbar(
+  Future<void> _refreshRooms() async {
+    final pageKey = _roomsPageKey;
+    final page = pageKey.currentState;
+    if (page == null || _roomsRefreshRequested) return;
+    setState(() => _roomsRefreshRequested = true);
+    try {
+      await page.refreshRooms();
+    } finally {
+      if (mounted && pageKey == _roomsPageKey) {
+        setState(() => _roomsRefreshRequested = false);
+      }
+    }
+  }
+
+  Widget? _updateBanner() {
+    final result = widget.updateResult;
+    final onOpen = widget.onOpenUpdate;
+    final onDismiss = widget.onDismissUpdate;
+    if (result == null ||
+        onOpen == null ||
+        onDismiss == null ||
+        !(widget.capabilities ?? PlatformCapabilities.current())
+            .canOpenExternalUrls) {
+      return null;
+    }
+    return UpdateBanner(result: result, onOpen: onOpen, onDismiss: onDismiss);
+  }
+
+  Widget _buildDesktopWorkspace(
     AppStrings strings,
-    bool hasLabeledSidebar,
-  ) {
+    bool labeled, {
+    required bool shortWindow,
+  }) {
     final colors = P2WlanColors.of(context);
-    final theme = Theme.of(context);
-    return PreferredSize(
-      preferredSize: const Size.fromHeight(AppTokens.desktopToolbarHeight),
-      child: Material(
-        color: colors.surfaceMuted,
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            border: Border(bottom: BorderSide(color: colors.border)),
-          ),
-          child: Padding(
-            padding: EdgeInsets.only(
-              left: _usesMacosChrome ? 88 : AppTokens.space16,
-              right: _usesWindowsChrome
-                  ? WindowsWindowControls.width + AppTokens.space8
-                  : AppTokens.space12,
-            ),
-            child: Row(
+    final sidebarWidth = labeled
+        ? DesktopSidebar.width
+        : _usesMacosChrome
+        ? 80.0
+        : AppNavRail.compactWidth;
+    final update = _updateBanner();
+    return Row(
+      children: [
+        SizedBox(
+          width: sidebarWidth,
+          child: ColoredBox(
+            color: colors.surfaceMuted,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Expanded(
-                  child: _DesktopTitleRegion(
-                    child: hasLabeledSidebar
-                        ? const SizedBox.expand()
-                        : Align(
-                            alignment: AlignmentDirectional.centerStart,
-                            child: Text(
-                              strings.appName,
-                              style: theme.textTheme.labelMedium?.copyWith(
-                                color: colors.textSecondary,
-                              ),
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
+                // AppKit draws its real traffic lights over this reserved area.
+                if (_usesMacosChrome)
+                  const SizedBox(
+                    key: Key('desktop-native-chrome-slot'),
+                    height: 44,
                   ),
-                ),
-                _ShellRefresh(
-                  statusStore: widget.statusStore,
-                  tooltip: '${strings.refresh}  ${_shortcutLabel('R')}',
-                  showSampleTime: true,
-                ),
+                if (_usesWindowsChrome)
+                  const DragToMoveArea(child: SizedBox(height: 28)),
+                Expanded(child: _buildNavigation(strings, labeled)),
               ],
             ),
           ),
+        ),
+        VerticalDivider(width: 1, color: DesktopCard.borderOf(context)),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildDesktopHeader(strings, shortWindow: shortWindow),
+              if (update != null) _DesktopHeaderWidth(child: update),
+              Expanded(child: _buildBody(showPageHeader: false)),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildDesktopHeader(AppStrings strings, {required bool shortWindow}) {
+    final (title, subtitle) = switch (_section) {
+      P2WlanSection.home => (
+        strings.isZh ? '网络概览' : 'Network overview',
+        strings.isZh
+            ? '查看虚拟局域网的连接状态、设备与传输活动。'
+            : 'View your virtual network, devices, and transfer activity.',
+      ),
+      P2WlanSection.devices => (
+        strings.devices,
+        strings.isZh
+            ? '查看和管理当前网络中的本机与其他设备。'
+            : 'View and manage this device and other devices on the network.',
+      ),
+      P2WlanSection.interconnect => (
+        strings.sectionLabel(_section.name),
+        strings.isZh
+            ? '管理联机房间，以及本机与每个房间的连接。'
+            : 'Manage rooms and this device’s connection to each room.',
+      ),
+      P2WlanSection.settings => (
+        strings.settings,
+        strings.isZh
+            ? '管理应用偏好、账户与网络配置。'
+            : 'Manage app preferences, your account, and network settings.',
+      ),
+      P2WlanSection.troubleshooting => (
+        strings.troubleshooting,
+        strings.diagnosticsSubtitle,
+      ),
+    };
+    final colors = P2WlanColors.of(context);
+    final theme = Theme.of(context);
+    final rooms = _section == P2WlanSection.interconnect;
+    return Padding(
+      padding: EdgeInsets.only(
+        top: !shortWindow
+            ? AppTokens.space32
+            : _usesWindowsChrome
+            ? AppTokens.desktopToolbarHeight
+            : AppTokens.space12,
+      ),
+      child: _DesktopHeaderWidth(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final compact = constraints.maxWidth < 440;
+            final largeText = MediaQuery.textScalerOf(context).scale(14) > 18;
+            final lines = !shortWindow && (compact || largeText) ? 2 : 1;
+            final heading = Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Semantics(
+                    header: true,
+                    child: Text(
+                      title,
+                      maxLines: lines,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.headlineSmall?.copyWith(
+                        color: colors.textPrimary,
+                        fontSize: shortWindow
+                            ? 24
+                            : compact
+                            ? 26
+                            : 33,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0,
+                        height: 1.24,
+                      ),
+                    ),
+                  ),
+                  if (!shortWindow) ...[
+                    const SizedBox(height: AppTokens.space4),
+                    Text(
+                      subtitle,
+                      maxLines: lines,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodyLarge?.copyWith(
+                        color: colors.textSecondary,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            );
+            return ConstrainedBox(
+              key: const Key('desktop-page-heading'),
+              constraints: BoxConstraints(minHeight: shortWindow ? 42 : 66),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: _usesWindowsChrome
+                        ? DragToMoveArea(child: heading)
+                        : heading,
+                  ),
+                  const SizedBox(width: AppTokens.space12),
+                  _ShellRefresh(
+                    statusStore: widget.statusStore,
+                    tooltip: '${strings.refresh}  ${_shortcutLabel('R')}',
+                    desktop: true,
+                    showSampleTime: !compact && !largeText && !shortWindow,
+                    onRefresh: _refresh,
+                    forRooms: rooms,
+                    roomsSampledAt: _roomsSampledAt,
+                    roomsRefreshing: _roomsRefreshRequested,
+                  ),
+                ],
+              ),
+            );
+          },
         ),
       ),
     );
@@ -393,6 +551,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
   }
 
   Widget _buildBody({required bool showPageHeader}) {
+    final roomsKey = _roomsPageKey;
     final page = switch (_section) {
       P2WlanSection.home => DashboardPage(
         uiState: _uiState.home,
@@ -433,6 +592,15 @@ class _P2WlanShellState extends State<P2WlanShell> {
         onOpenRoom: _openRoom,
       ),
       P2WlanSection.interconnect => RoomsPage(
+        key: roomsKey,
+        onRoomRefreshed: (sampledAt) {
+          if (!mounted ||
+              _section != P2WlanSection.interconnect ||
+              roomsKey != _roomsPageKey) {
+            return;
+          }
+          setState(() => _roomsSampledAt = sampledAt);
+        },
         initialInvitation: widget.roomInvitation,
         initialRoomId: _selectedRoomId,
         initialDeviceId: _pendingRoomDeviceId,
@@ -500,6 +668,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
       }
       _section = section;
       if (section != P2WlanSection.interconnect) {
+        _roomsSampledAt = null;
         _pendingRoomDeviceId = null;
         _roomDeviceReturnSection = null;
       }
@@ -671,14 +840,28 @@ bool get _usesMacosChrome => !kIsWeb && Platform.isMacOS;
 
 bool get _usesWindowsChrome => !kIsWeb && Platform.isWindows;
 
-class _DesktopTitleRegion extends StatelessWidget {
-  const _DesktopTitleRegion({required this.child});
+class _DesktopHeaderWidth extends StatelessWidget {
+  const _DesktopHeaderWidth({required this.child});
 
   final Widget child;
 
   @override
-  Widget build(BuildContext context) =>
-      _usesWindowsChrome ? DragToMoveArea(child: child) : child;
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) => Padding(
+      padding: EdgeInsets.symmetric(
+        horizontal: AppTokens.desktopPageGutter(constraints.maxWidth),
+      ),
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(
+            maxWidth: AppTokens.desktopPageMaxWidth,
+          ),
+          child: SizedBox(width: double.infinity, child: child),
+        ),
+      ),
+    ),
+  );
 }
 
 /// Compact mobile only: low-weight overflow menu in the top bar. Keeps the
@@ -806,21 +989,48 @@ class _ShellRefresh extends StatelessWidget {
     required this.statusStore,
     required this.tooltip,
     this.showSampleTime = false,
+    this.desktop = false,
+    this.onRefresh,
+    this.forRooms = false,
+    this.roomsSampledAt,
+    this.roomsRefreshing = false,
   });
 
   final StatusStore statusStore;
   final String tooltip;
   final bool showSampleTime;
+  final bool desktop;
+  final VoidCallback? onRefresh;
+  final bool forRooms;
+  final DateTime? roomsSampledAt;
+  final bool roomsRefreshing;
 
   @override
   Widget build(BuildContext context) => ListenableBuilder(
     listenable: statusStore,
     builder: (context, _) {
-      final refreshing = statusStore.refreshActivityVisible;
+      final colors = P2WlanColors.of(context);
+      final refreshing = forRooms
+          ? roomsRefreshing
+          : statusStore.refreshActivityVisible;
       final refresh = IconButton(
         key: const Key('shell-refresh'),
         tooltip: tooltip,
-        onPressed: refreshing ? null : statusStore.refresh,
+        onPressed: refreshing ? null : onRefresh ?? statusStore.refresh,
+        style: desktop
+            ? IconButton.styleFrom(
+                fixedSize: const Size.square(34),
+                minimumSize: const Size.square(34),
+                padding: EdgeInsets.zero,
+                foregroundColor: colors.textPrimary,
+                backgroundColor: colors.surfaceElevated,
+                side: BorderSide(color: DesktopCard.borderOf(context)),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              )
+            : null,
         icon: refreshing
             ? SizedBox.square(
                 dimension: AppTokens.iconSm,
@@ -835,13 +1045,16 @@ class _ShellRefresh extends StatelessWidget {
                         color: P2WlanColors.of(context).progress,
                       ),
               )
+            : desktop
+            ? DesktopIcon('refresh', size: 15, color: colors.textPrimary)
             : const Icon(Icons.refresh_rounded, size: AppTokens.iconMd),
       );
-      final sampledAt = statusStore.lastSuccessfulStatusAt;
-      if (!showSampleTime ||
-          sampledAt == null ||
-          statusStore.snapshot == null ||
-          statusStore.snapshotStale) {
+      final sampledAt = forRooms
+          ? roomsSampledAt
+          : statusStore.snapshot == null || statusStore.snapshotStale
+          ? null
+          : statusStore.lastSuccessfulStatusAt;
+      if (!showSampleTime || sampledAt == null) {
         return refresh;
       }
       final strings = AppStringsScope.of(context);

@@ -1,7 +1,7 @@
 part of '../nodes_page.dart';
 
-/// Search and distinct filter/sort controls share the available panel width.
-/// A single summary describes the peer catalog; local identity stays separate.
+/// The desktop status segment fits next to search and sort. Mobile keeps its
+/// space-saving menu, including the path and attention filters.
 class _NodeToolbar extends StatelessWidget {
   const _NodeToolbar({
     required this.searchController,
@@ -37,7 +37,7 @@ class _NodeToolbar extends StatelessWidget {
     final theme = Theme.of(context);
     final colors = P2WlanColors.of(context);
     final controlHeight = desktop
-        ? AppTokens.desktopControlHeight
+        ? AppTokens.space40
         : AppTokens.minTouchTarget;
     final search = ConstrainedBox(
       constraints: BoxConstraints(minHeight: controlHeight),
@@ -49,8 +49,17 @@ class _NodeToolbar extends StatelessWidget {
         textInputAction: TextInputAction.search,
         style: const TextStyle(fontSize: 13),
         decoration: InputDecoration(
-          hintText: strings.searchDevicesPlaceholder,
-          prefixIcon: const Icon(Icons.search_rounded, size: 18),
+          hintText: desktop
+              ? (strings.isZh
+                    ? '搜索设备名称或虚拟 IP'
+                    : 'Search device name or virtual IP')
+              : strings.searchDevicesPlaceholder,
+          prefixIcon: desktop
+              ? const Center(
+                  widthFactor: 1,
+                  child: DesktopIcon('search', size: 16),
+                )
+              : const Icon(Icons.search_rounded, size: 18),
           prefixIconConstraints: BoxConstraints(
             minWidth: controlHeight,
             minHeight: controlHeight,
@@ -67,18 +76,76 @@ class _NodeToolbar extends StatelessWidget {
                   icon: const Icon(Icons.close_rounded, size: 17),
                 ),
           isDense: true,
-          fillColor: colors.surfaceMuted,
+          filled: desktop ? true : null,
+          fillColor: desktop ? colors.surfaceElevated : colors.surfaceMuted,
           contentPadding: EdgeInsets.symmetric(
             horizontal: AppTokens.space12,
             vertical: desktop ? AppTokens.space8 : AppTokens.space12,
           ),
           enabledBorder: OutlineInputBorder(
             borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-            borderSide: BorderSide(color: colors.border),
+            borderSide: BorderSide(
+              color: desktop ? DesktopCard.borderOf(context) : colors.border,
+            ),
           ),
         ),
       ),
     );
+    final sortButton = _MenuButton<_NodeSort>(
+      buttonKey: const Key('nodes-sort-button'),
+      icon: Icons.sort_rounded,
+      tooltip: _sortLabel(strings, sort),
+      desktop: desktop,
+      initialValue: sort,
+      label: desktop && sort == _NodeSort.recommended
+          ? (strings.isZh ? '默认排序' : 'Default sort')
+          : _sortLabel(strings, sort),
+      onSelected: onSortChanged,
+      itemBuilder: (context) => [
+        for (final item in _NodeSort.values)
+          CheckedPopupMenuItem(
+            key: Key('nodes-sort-${item.name}'),
+            value: item,
+            checked: sort == item,
+            child: Text(_sortLabel(strings, item)),
+          ),
+      ],
+    );
+    if (desktop) {
+      return LayoutBuilder(
+        builder: (context, constraints) {
+          final segment = _DeviceStatusSegment(
+            filter: filter,
+            onChanged: onFilterChanged,
+          );
+          final scaledLabel = MediaQuery.textScalerOf(context).scale(13);
+          if (constraints.maxWidth >= 516 * (scaledLabel / 13).clamp(1, 1.3) &&
+              scaledLabel <= 17) {
+            return Row(
+              children: [
+                Expanded(child: search),
+                const SizedBox(width: AppTokens.space12),
+                segment,
+                const SizedBox(width: AppTokens.space12),
+                sortButton,
+              ],
+            );
+          }
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              search,
+              const SizedBox(height: AppTokens.space8),
+              Wrap(
+                spacing: AppTokens.space12,
+                runSpacing: AppTokens.space8,
+                children: [segment, sortButton],
+              ),
+            ],
+          );
+        },
+      );
+    }
     final summary = Text(
       scopeConnections
           ? (strings.isZh
@@ -112,40 +179,12 @@ class _NodeToolbar extends StatelessWidget {
               ),
           ],
         ),
-        _MenuButton<_NodeSort>(
-          buttonKey: const Key('nodes-sort-button'),
-          icon: Icons.sort_rounded,
-          tooltip: _sortLabel(strings, sort),
-          desktop: desktop,
-          initialValue: sort,
-          label: _sortLabel(strings, sort),
-          onSelected: onSortChanged,
-          itemBuilder: (context) => [
-            for (final item in _NodeSort.values)
-              CheckedPopupMenuItem(
-                key: Key('nodes-sort-${item.name}'),
-                value: item,
-                checked: sort == item,
-                child: Text(_sortLabel(strings, item)),
-              ),
-          ],
-        ),
+        sortButton,
       ],
     );
     return LayoutBuilder(
       builder: (context, constraints) {
         final largeText = MediaQuery.textScalerOf(context).scale(13) > 17;
-        if (desktop && constraints.maxWidth >= 760 && !largeText) {
-          return Row(
-            children: [
-              Flexible(flex: 2, child: search),
-              const SizedBox(width: AppTokens.space8),
-              menus,
-              const Spacer(),
-              summary,
-            ],
-          );
-        }
         if (constraints.maxWidth >= 500 && !largeText) {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -186,6 +225,83 @@ class _NodeToolbar extends StatelessWidget {
   }
 }
 
+class _DeviceStatusSegment extends StatelessWidget {
+  const _DeviceStatusSegment({required this.filter, required this.onChanged});
+
+  final _NodeFilter filter;
+  final ValueChanged<_NodeFilter> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = stringsOf(context);
+    final colors = P2WlanColors.of(context);
+    final border = DesktopCard.borderOf(context);
+    final primary = Theme.of(context).colorScheme.primary;
+    final scaledLabel = MediaQuery.textScalerOf(context).scale(13);
+    final fixedSize = scaledLabel <= 17
+        ? Size(62 * (scaledLabel / 13).clamp(1, 1.3), 32)
+        : null;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: colors.surfaceMuted,
+        borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+        border: Border.all(color: border),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(AppTokens.space4),
+        child: Wrap(
+          spacing: AppTokens.space2,
+          runSpacing: AppTokens.space2,
+          children: [
+            for (final item in _desktopNodeFilters)
+              Semantics(
+                selected: filter == item,
+                child: TextButton(
+                  key: Key('nodes-filter-${item.name}'),
+                  onPressed: () => onChanged(item),
+                  style: TextButton.styleFrom(
+                    minimumSize: const Size(62, 32),
+                    fixedSize: fixedSize,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: AppTokens.space8,
+                    ),
+                    foregroundColor: filter == item
+                        ? primary
+                        : colors.textSecondary,
+                    backgroundColor: filter == item
+                        ? colors.surfaceElevated
+                        : null,
+                    textStyle: TextStyle(
+                      fontSize: 13,
+                      fontFamily: AppTokens.primaryFontFamily,
+                      fontFamilyFallback: AppTokens.fontFamilyFallback,
+                      fontWeight: filter == item
+                          ? FontWeight.w600
+                          : FontWeight.w500,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(6),
+                      side: filter == item
+                          ? BorderSide(color: border)
+                          : BorderSide.none,
+                    ),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    visualDensity: VisualDensity.standard,
+                  ),
+                  child: Text(
+                    _filterLabel(strings, item),
+                    maxLines: fixedSize == null ? null : 1,
+                    overflow: fixedSize == null ? null : TextOverflow.ellipsis,
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// Quiet label button that opens a checked popup menu.
 class _MenuButton<T> extends StatelessWidget {
   const _MenuButton({
@@ -212,6 +328,8 @@ class _MenuButton<T> extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = P2WlanColors.of(context);
+    final fixedWidth =
+        desktop && MediaQuery.textScalerOf(context).scale(13) <= 17;
     return PopupMenuButton<T>(
       key: buttonKey,
       tooltip: tooltip,
@@ -228,34 +346,48 @@ class _MenuButton<T> extends StatelessWidget {
       ),
       child: ConstrainedBox(
         constraints: BoxConstraints(
-          minHeight: desktop
-              ? AppTokens.desktopControlHeight
-              : AppTokens.minTouchTarget,
-          minWidth: desktop
-              ? AppTokens.desktopControlHeight
-              : AppTokens.minTouchTarget,
+          minHeight: desktop ? AppTokens.space40 : AppTokens.minTouchTarget,
+          minWidth: desktop ? 120 : AppTokens.minTouchTarget,
+          maxWidth: fixedWidth ? 120 : double.infinity,
         ),
         child: MouseRegion(
           cursor: SystemMouseCursors.click,
           child: Container(
             decoration: desktop
                 ? BoxDecoration(
+                    color: colors.surfaceElevated,
                     borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-                    border: Border.all(color: colors.border),
+                    border: Border.all(color: DesktopCard.borderOf(context)),
                   )
                 : null,
             padding: EdgeInsets.symmetric(
-              horizontal: AppTokens.space8,
+              horizontal: desktop ? AppTokens.space12 : AppTokens.space8,
               vertical: desktop ? AppTokens.space8 : AppTokens.space12,
             ),
             child: Row(
               mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: desktop
+                  ? MainAxisAlignment.center
+                  : MainAxisAlignment.start,
               children: [
-                Icon(icon, size: 16, color: theme.colorScheme.onSurfaceVariant),
+                if (desktop)
+                  DesktopIcon(
+                    'chevron-down',
+                    size: 14,
+                    color: colors.textPrimary,
+                  )
+                else
+                  Icon(
+                    icon,
+                    size: 16,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
                 const SizedBox(width: AppTokens.space6),
                 Flexible(
                   child: Text(
                     label,
+                    maxLines: fixedWidth ? 1 : null,
+                    overflow: fixedWidth ? TextOverflow.ellipsis : null,
                     style: theme.textTheme.bodySmall!.copyWith(
                       fontWeight: FontWeight.w500,
                       color: colors.textPrimary,

@@ -105,7 +105,7 @@ void main() {
   });
 
   testWidgets('uses three-tier responsive navigation', (tester) async {
-    // Compact phone: exactly three bottom destinations, no rail.
+    // Compact phone: exactly four bottom destinations, no rail.
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -154,10 +154,17 @@ void main() {
     // Medium has no sidebar footer; Home itself carries the strong status, so
     // the top bar hides its duplicate badge: only the hero badge remains.
     expect(find.byType(StatusBadge), findsOneWidget);
-    // Other sections keep the global badge in the top bar.
+    // Other sections keep the global badge in the top bar. Devices can
+    // independently show a connection badge for the local device.
     await tester.tap(find.text('设备'));
     await tester.pumpAndSettle();
-    expect(find.byType(StatusBadge), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(AppBar),
+        matching: find.byType(StatusBadge),
+      ),
+      findsOneWidget,
+    );
     await tester.tap(find.text('首页'));
     await tester.pumpAndSettle();
     expect(find.byType(StatusBadge), findsOneWidget);

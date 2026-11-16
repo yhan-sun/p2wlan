@@ -51,18 +51,19 @@ void _registerNodesTests() {
       ),
     );
 
-    // Compact local-device section: name, IP, status — no Node ID, no sync
-    // text, no big panel.
+    // The local card stays separate from the other devices.
     expect(find.text('This device'), findsOneWidget);
     expect(find.text('studio-mac'), findsOneWidget);
     expect(find.byKey(const Key('nodes-local-row')), findsOneWidget);
 
-    // Toolbar: search + summary + filter/sort menus, never six chips.
+    // Desktop uses a status segment next to search and sort.
     expect(find.byKey(const Key('nodes-search-field')), findsOneWidget);
-    expect(find.byKey(const Key('nodes-filter-button')), findsOneWidget);
+    for (final name in ['all', 'online', 'offline']) {
+      expect(find.byKey(Key('nodes-filter-$name')), findsOneWidget);
+    }
+    expect(find.byKey(const Key('nodes-filter-button')), findsNothing);
     expect(find.byKey(const Key('nodes-sort-button')), findsOneWidget);
-    expect(find.byType(ChoiceChip), findsNothing);
-    expect(find.text('2 other devices · 2 online'), findsOneWidget);
+    expect(find.text('2 online  ·  0 offline'), findsOneWidget);
 
     // Continuous list: no group headers, judgment columns only.
     expect(find.text('direct-laptop'), findsOneWidget);
@@ -208,7 +209,9 @@ void _registerNodesTests() {
           'device_name': 'offline-with-error',
           'virtual_ip': '10.20.0.20',
           'online': false,
-          'last_seen': 1784710187,
+          'last_seen': DateTime.now()
+              .subtract(const Duration(hours: 2, minutes: 30))
+              .millisecondsSinceEpoch,
           'state': 'closed',
           'active_path': null,
           'direct_type': 'unknown',
@@ -224,7 +227,7 @@ void _registerNodesTests() {
           'device_name': 'offline-plain',
           'virtual_ip': '10.20.0.21',
           'online': false,
-          'last_seen': 1784710100,
+          'last_seen': 0,
           'state': 'closed',
           'active_path': null,
           'direct_type': 'unknown',
@@ -259,16 +262,32 @@ void _registerNodesTests() {
 
     // Offline wins: the cover never carries a stale Direct/Relay claim or a
     // fabricated latency.
-    expect(find.text('Offline'), findsNWidgets(2));
-    // Offline rows omit traffic and latency placeholders entirely.
+    // Unavailable path and latency columns keep the same alignment.
     for (final id in ['offline-errored-001', 'offline-plain-002']) {
       final row = find.byKey(Key('node-row-$id'));
-      expect(find.descendant(of: row, matching: find.text('—')), findsNothing);
+      expect(
+        find.descendant(of: row, matching: find.text('Offline')),
+        findsOneWidget,
+      );
+      expect(find.descendant(of: row, matching: find.text('—')), findsWidgets);
       expect(
         find.descendant(of: row, matching: find.textContaining('KB/s')),
         findsNothing,
       );
     }
+    expect(
+      tester
+          .widget<Text>(
+            find.byKey(const Key('node-last-seen-offline-errored-001')),
+          )
+          .data,
+      '2 hours ago',
+    );
+    final unknown = tester.widget<Text>(
+      find.byKey(const Key('node-last-seen-offline-plain-002')),
+    );
+    expect(unknown.data, '—');
+    expect(unknown.semanticsLabel, 'Last seen: Unavailable');
     expect(find.text('Direct'), findsOneWidget);
     expect(find.text('Relay'), findsOneWidget);
     expect(find.text('10 ms'), findsNothing);
@@ -713,7 +732,7 @@ void _registerNodesTests() {
     expect(find.byKey(const Key('node-row-node-office')), findsOneWidget);
   });
 
-  testWidgets('Nodes filter menu offers all six filters and narrows the set', (
+  testWidgets('Nodes mobile filter menu still offers all six filters', (
     tester,
   ) async {
     final base = (await tester.runAsync(_loadFixtureSnapshot))!;
@@ -731,6 +750,7 @@ void _registerNodesTests() {
         child: NodesPage(
           settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('android'),
         ),
       ),
     );
@@ -815,7 +835,8 @@ void _registerNodesTests() {
     await tester.tap(find.byKey(const Key('nodes-sort-button')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('nodes-sort-recommended')), findsOneWidget);
-    expect(find.text('Online first'), findsNWidgets(2));
+    expect(find.text('Online first'), findsOneWidget);
+    expect(find.text('Default sort'), findsOneWidget);
     expect(find.byKey(const Key('nodes-sort-name')), findsOneWidget);
     expect(find.byKey(const Key('nodes-sort-latency')), findsOneWidget);
 
@@ -1165,10 +1186,8 @@ void _registerNodesTests() {
     await tester.pump();
     expect(find.byKey(const Key('node-row-node-laptop')), findsOneWidget);
 
-    // Filter with no matches, via the filter menu.
-    await tester.tap(find.byKey(const Key('nodes-filter-button')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('nodes-filter-attention')));
+    // None of these peers are offline.
+    await tester.tap(find.byKey(const Key('nodes-filter-offline')));
     await tester.pumpAndSettle();
     expect(find.text('No devices match this filter'), findsOneWidget);
     await tester.tap(find.text('Clear filters'));
@@ -1214,18 +1233,15 @@ void _registerNodesTests() {
     await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
 
-    // Filter to Direct via the menu: the Relay row disappears cleanly.
-    await tester.tap(find.byKey(const Key('nodes-filter-button')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('nodes-filter-direct')));
+    // Filter to Offline: the online rows disappear cleanly.
+    await tester.tap(find.byKey(const Key('nodes-filter-offline')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('node-row-node-relay')), findsNothing);
-    expect(find.byKey(const Key('node-row-node-direct')), findsOneWidget);
+    expect(find.byKey(const Key('node-row-node-direct')), findsNothing);
+    expect(find.byKey(const Key('node-row-node-offline')), findsOneWidget);
     expect(find.byType(Dialog), findsNothing);
 
     // Clearing the filter restores the list without an old detail surface.
-    await tester.tap(find.byKey(const Key('nodes-filter-button')));
-    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('nodes-filter-all')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('node-row-node-relay')), findsOneWidget);
@@ -1448,10 +1464,8 @@ void _registerNodesTests() {
     // Roster online-ness is authoritative even before a usable path is
     // verified. Summary and the Online filter must agree without presenting
     // the peer as offline.
-    expect(find.text('2 other devices · 2 online'), findsOneWidget);
+    expect(find.text('2 online  ·  0 offline'), findsOneWidget);
 
-    await tester.tap(find.byKey(const Key('nodes-filter-button')));
-    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('nodes-filter-online')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('node-row-node-laptop')), findsOneWidget);
@@ -1494,7 +1508,7 @@ void _registerNodesTests() {
       ),
       findsOneWidget,
     );
-    expect(find.text('2 other devices · 0 online'), findsOneWidget);
+    expect(find.text('0 online  ·  0 offline  ·  2 stale'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

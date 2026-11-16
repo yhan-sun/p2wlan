@@ -20,7 +20,6 @@ class _LocalNodePanel extends StatelessWidget {
     required this.snapshotStale,
     required this.daemonReachable,
     required this.onEdit,
-    this.desktop = false,
   });
 
   final DiagnosticsSnapshot? snapshot;
@@ -28,7 +27,6 @@ class _LocalNodePanel extends StatelessWidget {
   final bool snapshotStale;
   final bool daemonReachable;
   final VoidCallback onEdit;
-  final bool desktop;
 
   @override
   Widget build(BuildContext context) {
@@ -70,7 +68,6 @@ class _LocalNodePanel extends StatelessWidget {
       key: const Key('nodes-edit-local'),
       tooltip: strings.renameDevice,
       onPressed: onEdit,
-      visualDensity: desktop ? VisualDensity.compact : null,
       iconSize: 18,
       icon: const Icon(Icons.edit_outlined),
     );
@@ -104,12 +101,6 @@ class _LocalNodePanel extends StatelessWidget {
             onTap: onEdit,
             borderRadius: BorderRadius.circular(AppTokens.radiusSm),
             child: Ink(
-              decoration: desktop
-                  ? BoxDecoration(
-                      color: c.surfaceMuted,
-                      borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-                    )
-                  : null,
               padding: const EdgeInsets.symmetric(
                 horizontal: AppTokens.space12,
                 vertical: AppTokens.space8,

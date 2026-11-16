@@ -46,10 +46,8 @@ class _DesktopHomeDiagnostics extends StatelessWidget {
                   ? '$confirmed / ${peers.length} 条链路已确认'
                   : '$confirmed / ${peers.length} verified paths',
           ].join(' · ');
-    return Container(
-      decoration: BoxDecoration(
-        border: Border(top: BorderSide(color: colors.divider)),
-      ),
+    return DesktopCard(
+      padding: const EdgeInsets.symmetric(horizontal: AppTokens.space16),
       child: ExpansionTile(
         controller: controller,
         key: Key(
@@ -77,6 +75,7 @@ class _DesktopHomeDiagnostics extends StatelessWidget {
           key: const Key('home-connection-details-summary'),
           style: theme.textTheme.bodySmall?.copyWith(
             color: colors.textSecondary,
+            fontFeatures: AppTokens.tabularFontFeatures,
           ),
         ),
         children: [
@@ -126,6 +125,95 @@ class _DesktopHomeDiagnostics extends StatelessWidget {
                 label: Text(strings.isZh ? '打开故障排查' : 'Open Troubleshooting'),
               ),
             ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Plain-language component readout for the same scope as the connection
+/// banner. Diagnosis remains available separately below the traffic summary.
+class _DesktopNetworkComponents extends StatelessWidget {
+  const _DesktopNetworkComponents({required this.scope});
+
+  final NetworkScopeSnapshot scope;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final colors = P2WlanColors.of(context);
+    final theme = Theme.of(context);
+    final snapshot = scope.snapshot;
+    final overlay = snapshot == null ? null : _overlayTone(snapshot);
+    final online = scope.peers.where((item) => item.online).toList();
+    final reachable = online.where((item) => item.available).length;
+    final fields = [
+      (
+        strings.componentControlServer,
+        snapshot == null
+            ? strings.unavailable
+            : _controlStatusLabel(strings, snapshot),
+        snapshot == null
+            ? StatusTone.neutral
+            : snapshot.health.controlConnected
+            ? StatusTone.good
+            : StatusTone.warn,
+      ),
+      (
+        strings.componentOverlayRoute,
+        overlay == null ? strings.unavailable : _overlayLabel(strings, overlay),
+        overlay ?? StatusTone.neutral,
+      ),
+      (
+        strings.componentPeerConnectivity,
+        strings.isZh
+            ? '$reachable / ${online.length} 可达'
+            : '$reachable / ${online.length} reachable',
+        online.isEmpty
+            ? StatusTone.neutral
+            : reachable == online.length
+            ? StatusTone.good
+            : StatusTone.warn,
+      ),
+    ];
+    return DesktopCard(
+      key: const Key('home-components-panel'),
+      padding: const EdgeInsets.fromLTRB(16, 15, 16, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Semantics(
+            header: true,
+            child: Text(
+              strings.isZh ? '网络组件状态' : 'Network components',
+              style: theme.textTheme.titleMedium,
+            ),
+          ),
+          const SizedBox(height: AppTokens.space10),
+          Text(
+            scope.isPrimary && scope.roomId == null
+                ? (strings.isZh
+                      ? '主网络 · 当前会话'
+                      : 'Main network · Current session')
+                : networkScopeLabel(strings, scope),
+            style: theme.textTheme.bodySmall?.copyWith(
+              fontSize: 11,
+              color: colors.textMuted,
+            ),
+          ),
+          const SizedBox(height: AppTokens.space6),
+          for (final (label, value, tone) in fields) ...[
+            Divider(height: 1, color: colors.divider),
+            ConstrainedBox(
+              constraints: BoxConstraints(
+                minHeight: MediaQuery.sizeOf(context).width < 900 ? 46 : 55,
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: _ComponentRow(label: label, value: value, tone: tone),
+              ),
+            ),
+          ],
         ],
       ),
     );

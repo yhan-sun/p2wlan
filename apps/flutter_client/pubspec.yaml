@@ -33,6 +33,7 @@ dependencies:
   crypto: ^3.0.8
   flutter:
     sdk: flutter
+  flutter_svg: ^2.4.0
   tray_manager: ^0.5.3
   url_launcher: ^6.3.3
   window_manager: ^0.5.2
@@ -67,6 +68,7 @@ flutter:
     - assets/tray_icon_macos_off.png
     - assets/tray_icon_macos_on.png
     - assets/p2wlan_icon.svg
+    - assets/desktop_icons/
 
   # To add assets to your application, add an assets section, like this:
   # assets:

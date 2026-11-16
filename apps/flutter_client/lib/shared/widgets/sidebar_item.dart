@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
 import 'app_motion.dart';
+import 'desktop_icon.dart';
 
 /// The navigation interaction used by the labeled sidebar and the compact rail.
 class SidebarItem extends StatefulWidget {
@@ -14,6 +15,7 @@ class SidebarItem extends StatefulWidget {
     required this.onTap,
     this.iconOnly = false,
     this.shortcut,
+    this.desktopIcon,
   });
 
   final IconData icon;
@@ -21,6 +23,7 @@ class SidebarItem extends StatefulWidget {
   final bool selected;
   final bool iconOnly;
   final String? shortcut;
+  final String? desktopIcon;
   final VoidCallback onTap;
 
   @override
@@ -39,7 +42,7 @@ class _SidebarItemState extends State<SidebarItem> {
     final foreground = widget.selected
         ? theme.colorScheme.primary
         : colors.textSecondary;
-    final radius = BorderRadius.circular(AppTokens.radiusSm);
+    final radius = BorderRadius.circular(AppTokens.radiusMd);
     final background = widget.selected
         ? colors.selectedSurface
         : _hovered
@@ -78,62 +81,60 @@ class _SidebarItemState extends State<SidebarItem> {
               onTap: widget.onTap,
               child: ExcludeSemantics(
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(
-                    minHeight: AppTokens.desktopControlHeight,
+                  constraints: BoxConstraints(
+                    minHeight: widget.desktopIcon != null
+                        ? 42
+                        : AppTokens.desktopControlHeight,
                   ),
-                  child: Stack(
-                    alignment: AlignmentDirectional.centerStart,
-                    children: [
-                      if (widget.iconOnly)
-                        Center(
-                          child: Icon(
-                            widget.icon,
-                            size: AppTokens.iconMd,
-                            color: foreground,
-                          ),
-                        )
-                      else
-                        Padding(
+                  child: widget.iconOnly
+                      ? Center(child: _icon(foreground, AppTokens.iconMd))
+                      : Padding(
                           padding: const EdgeInsets.symmetric(
                             horizontal: AppTokens.space12,
                             vertical: AppTokens.space4,
                           ),
                           child: Row(
                             children: [
-                              Icon(
-                                widget.icon,
-                                size: AppTokens.iconSm,
-                                color: foreground,
+                              _icon(
+                                foreground,
+                                widget.desktopIcon == null
+                                    ? AppTokens.iconSm
+                                    : 17,
                               ),
-                              const SizedBox(width: AppTokens.space8),
+                              const SizedBox(width: AppTokens.space10),
                               Expanded(
                                 child: Text(
                                   widget.label,
                                   style: theme.textTheme.labelLarge?.copyWith(
                                     color: foreground,
+                                    fontSize: widget.desktopIcon == null
+                                        ? null
+                                        : 14,
                                     fontWeight: widget.selected
-                                        ? FontWeight.w600
+                                        ? FontWeight.w700
                                         : FontWeight.w500,
                                   ),
                                 ),
                               ),
+                              if (widget.shortcut != null &&
+                                  MediaQuery.textScalerOf(context).scale(11) <=
+                                      14)
+                                Padding(
+                                  padding: const EdgeInsetsDirectional.only(
+                                    start: 4,
+                                  ),
+                                  child: Text(
+                                    widget.shortcut!,
+                                    style: theme.textTheme.labelSmall?.copyWith(
+                                      color: colors.textMuted,
+                                      fontFeatures:
+                                          AppTokens.tabularFontFeatures,
+                                    ),
+                                  ),
+                                ),
                             ],
                           ),
                         ),
-                      AnimatedContainer(
-                        duration: AppMotion.feedbackDurationOf(context),
-                        curve: AppMotion.curve,
-                        width: 2,
-                        height: widget.selected ? AppTokens.space16 : 0,
-                        decoration: BoxDecoration(
-                          color: foreground,
-                          borderRadius: BorderRadius.circular(
-                            AppTokens.radiusXs,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
                 ),
               ),
             ),
@@ -142,51 +143,22 @@ class _SidebarItemState extends State<SidebarItem> {
       ),
     );
   }
+
+  Widget _icon(Color color, double size) => widget.desktopIcon == null
+      ? Icon(widget.icon, size: size, color: color)
+      : DesktopIcon(widget.desktopIcon!, size: size, color: color);
 }
 
 /// The P2WLAN loop from the app icon, rendered in a single color at small sizes.
 class SidebarBrandMark extends StatelessWidget {
-  const SidebarBrandMark({super.key});
+  const SidebarBrandMark({super.key, this.size = 28});
+
+  final double size;
 
   @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: scheme.primary,
-        borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-      ),
-      child: CustomPaint(
-        size: const Size.square(28),
-        painter: _BrandLoop(scheme.onPrimary),
-      ),
-    );
-  }
-}
-
-class _BrandLoop extends CustomPainter {
-  const _BrandLoop(this.color);
-
-  final Color color;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    canvas.scale(size.width / 28, size.height / 28);
-    final paint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.2
-      ..strokeCap = StrokeCap.round
-      ..color = color;
-    final loop = Path()
-      ..moveTo(14, 14)
-      ..cubicTo(16, 7, 23, 8, 23, 14)
-      ..cubicTo(23, 20, 16, 21, 14, 14)
-      ..cubicTo(12, 7, 5, 8, 5, 14)
-      ..cubicTo(5, 20, 12, 21, 14, 14)
-      ..close();
-    canvas.drawPath(loop, paint);
-  }
-
-  @override
-  bool shouldRepaint(_BrandLoop oldDelegate) => oldDelegate.color != color;
+  Widget build(BuildContext context) => DesktopIcon(
+    'infinity',
+    size: size,
+    color: Theme.of(context).colorScheme.primary,
+  );
 }

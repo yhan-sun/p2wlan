@@ -105,7 +105,7 @@ void _registerSettingsNavigationRegressionTests() {
       await tester.binding.setSurfaceSize(const Size(1280, 900));
       await tester.pumpAndSettle();
       expect(find.byKey(const Key('settings-category-rail')), findsOneWidget);
-      expect(find.byTooltip('Back'), findsNothing);
+      expect(find.byTooltip('Back').hitTestable(), findsOneWidget);
       expect(
         tester.widget<TextField>(_settingsTextField('MTU')).controller!.text,
         '1333',

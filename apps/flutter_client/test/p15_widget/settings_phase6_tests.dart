@@ -138,7 +138,7 @@ void _registerSettingsPhase6Tests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('expanded desktop: rail + inline detail, category switching', (
+  testWidgets('expanded desktop opens grouped settings before inline details', (
     tester,
   ) async {
     final stores = await storesWith(tester, _FakeDiagnosticsApi(health: false));
@@ -149,12 +149,20 @@ void _registerSettingsPhase6Tests() {
       platform: TargetPlatform.macOS,
     );
 
-    // Rail exists with General selected by default (rail item + detail title).
+    // The grouped overview is the first view on a wide desktop, too.
     expect(find.text('General'), findsWidgets);
     expect(find.text('Account & Connection'), findsOneWidget);
     expect(find.text('Advanced Network'), findsOneWidget);
     expect(find.text('Diagnostics & About'), findsOneWidget);
-    // General detail is inline (device name field visible), no dialog.
+    expect(find.byKey(const Key('desktop-settings-overview')), findsOneWidget);
+    expect(find.text('Device name'), findsNothing);
+    await tester.tap(
+      find.byKey(const ValueKey('settings-category-card-general')),
+    );
+    await tester.pumpAndSettle();
+
+    // After opening a category, the secondary rail and form are inline.
+    expect(find.byKey(const Key('settings-category-rail')), findsOneWidget);
     expect(find.text('Device name'), findsOneWidget);
     expect(find.text('Startup & window'), findsOneWidget);
     expect(find.byType(Dialog), findsNothing);

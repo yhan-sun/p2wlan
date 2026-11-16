@@ -107,6 +107,7 @@ class _NetworkScopesSummaryState extends State<_NetworkScopesSummary> {
                       style: TextStyle(
                         fontSize: 12,
                         color: colors.textSecondary,
+                        fontFeatures: AppTokens.tabularFontFeatures,
                       ),
                     ),
                   ),
@@ -150,6 +151,7 @@ class _NetworkScopesSummaryState extends State<_NetworkScopesSummary> {
                 summary,
                 style: TextStyle(
                   fontSize: 12,
+                  fontFeatures: AppTokens.tabularFontFeatures,
                   color: attention > 0
                       ? colors.warningText
                       : colors.textSecondary,
@@ -219,7 +221,11 @@ class _RoomNodeScopeSummary extends StatelessWidget {
             if (scope.snapshot?.virtualIp.isNotEmpty == true)
               '${strings.isZh ? '本机' : 'This device'}: ${scope.snapshot!.virtualIp}',
           ].join(' · '),
-          style: const TextStyle(fontSize: 12, height: 1.4),
+          style: const TextStyle(
+            fontSize: 12,
+            height: 1.4,
+            fontFeatures: AppTokens.tabularFontFeatures,
+          ),
         ),
         trailing: const Icon(Icons.chevron_right_rounded, size: 20),
         onTap: onOpenRoom == null ? null : () => onOpenRoom!(scope.roomId!),
