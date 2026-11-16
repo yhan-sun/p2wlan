@@ -13,12 +13,12 @@ name = "p2wlan-daemon"
 path = "src/main.rs"
 
 [dependencies]
-p2pnet-tun = { path = "../tun", version = "0.1.147" }
-p2pnet-crypto = { path = "../crypto", version = "0.1.147" }
-p2pnet-wireguard = { path = "../wireguard", version = "0.1.147" }
-p2pnet-nat = { path = "../nat", version = "0.1.147" }
-p2pnet-netbind = { path = "../netbind", version = "0.1.147" }
-p2pnet-relay = { path = "../relay", version = "0.1.147" }
+p2pnet-tun = { path = "../tun", version = "1.0.1" }
+p2pnet-crypto = { path = "../crypto", version = "1.0.1" }
+p2pnet-wireguard = { path = "../wireguard", version = "1.0.1" }
+p2pnet-nat = { path = "../nat", version = "1.0.1" }
+p2pnet-netbind = { path = "../netbind", version = "1.0.1" }
+p2pnet-relay = { path = "../relay", version = "1.0.1" }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
