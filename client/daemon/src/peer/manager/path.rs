@@ -348,11 +348,17 @@ impl PeerManager {
     }
 
     pub(crate) async fn direct_committed_since(
-        &self, node: &str, epoch: PathEpoch, original: Option<u64>,
+        &self,
+        node: &str,
+        epoch: PathEpoch,
+        original: Option<u64>,
     ) -> bool {
-        self.connections.read().await.get(node).is_some_and(|conn|
-            conn.path_state_machine.active_direct_validation().is_some_and(|active| active.epoch == epoch)
-                && original != Some(conn.direct_commit_seq))
+        self.connections.read().await.get(node).is_some_and(|conn| {
+            conn.path_state_machine
+                .active_direct_validation()
+                .is_some_and(|active| active.epoch == epoch)
+                && original != Some(conn.direct_commit_seq)
+        })
     }
 
     /// Whether a peer is still eligible to receive a newly allocated

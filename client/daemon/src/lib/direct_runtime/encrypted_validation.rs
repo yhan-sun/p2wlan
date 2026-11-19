@@ -695,7 +695,11 @@ async fn run_direct_encrypted_validation_session_inner(
     let lease_target = *target_rx.borrow();
     let generation = lease_target.generation;
     let lease_endpoint = lease_target.endpoint;
-    let epoch = crate::peer::PathEpoch::new(generation, lease_target.peer_session_generation, lease_target.remote_candidate_epoch);
+    let epoch = crate::peer::PathEpoch::new(
+        generation,
+        lease_target.peer_session_generation,
+        lease_target.remote_candidate_epoch,
+    );
     let completed = || peers.direct_committed_since(&peer_id, epoch, lease.initial_direct_commit);
 
     let Ok(local_ip) = local_virtual_ip.parse::<Ipv4Addr>() else {
@@ -1341,7 +1345,9 @@ async fn run_direct_encrypted_validation_session_inner(
                         break;
                     };
                     if current.generation != generation
-                        || !peers.is_direct_validation_eligible_for_endpoint(&peer_id, current.endpoint).await
+                        || !peers
+                            .is_direct_validation_eligible_for_endpoint(&peer_id, current.endpoint)
+                            .await
                     {
                         if completed().await {
                             terminal_stage = "direct_validation_completed";

@@ -22,9 +22,16 @@ impl PeerManager {
         };
         let current = conn.path_state_machine.active_direct_validation();
         let event = match current {
-            Some(current) if validation.request_endpoint().is_some_and(|endpoint|
-                conn.may_validate_alternate(validation.epoch.network_generation, endpoint)) =>
-                PathEvent::DirectAlternateValidationStarted { current, validation },
+            Some(current)
+                if validation.request_endpoint().is_some_and(|endpoint| {
+                    conn.may_validate_alternate(validation.epoch.network_generation, endpoint)
+                }) =>
+            {
+                PathEvent::DirectAlternateValidationStarted {
+                    current,
+                    validation,
+                }
+            }
             _ => PathEvent::DirectValidationStarted { validation },
         };
         let alternate = matches!(event, PathEvent::DirectAlternateValidationStarted { .. });

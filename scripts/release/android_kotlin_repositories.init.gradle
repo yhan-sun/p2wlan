@@ -8,7 +8,10 @@ if (flutterRoot) {
             repositories.maven {
                 name = 'P2wlanKotlinPluginCentralMirror'
                 url = uri('https://maven-central.storage-download.googleapis.com/maven2/')
-                content { includeGroup('org.jetbrains.kotlin') }
+                // Resolve the plugin's Central libraries here before the portal
+                // redirects their requests to the same rate-limited endpoint.
+                // Gradle plugin marker modules still use the plugin portal.
+                content { excludeModuleByRegex('.*', '.*[.]gradle[.]plugin') }
             }
             repositories.gradlePluginPortal {
                 content { excludeGroup('org.jetbrains.kotlin') }
