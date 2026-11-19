@@ -36,6 +36,22 @@ mod tests {
     }
 
     #[test]
+    fn session_keys_clones_have_independent_zeroizing_lifetimes() {
+        fn requires_zeroizing_drop<T: ZeroizeOnDrop>(_: &T) {}
+
+        let mut keys = SessionKeys::new([0x42; 32], [0x73; 32]);
+        let mut clone = keys.clone();
+        requires_zeroizing_drop(&keys);
+        requires_zeroizing_drop(&clone);
+        keys.zeroize();
+        assert_eq!(keys.send_key, [0; 32]);
+        assert_eq!(keys.recv_key, [0; 32]);
+        assert_eq!(clone.send_key, [0x42; 32]);
+        assert_eq!(clone.recv_key, [0x73; 32]);
+        assert_eq!(clone.next_nonce().unwrap(), 0);
+    }
+
+    #[test]
     fn test_response_roundtrip() {
         let msg = MessageResponse {
             sender_index: 0xAAAAAAAA,

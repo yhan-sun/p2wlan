@@ -226,7 +226,12 @@ fn read_support_log(path: &Path, max_bytes: u64) -> SupportLogTail {
         };
     }
     let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
+    // A concurrently growing log must not exceed the requested read budget.
+    if file
+        .take(length.saturating_sub(start))
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
         return SupportLogTail {
             content: format!("could not read log file: {}", path.display()),
             truncated,
@@ -251,69 +256,6 @@ fn support_status_summary(config: &Config, status: Option<&Value>) -> String {
         "status": status,
     });
     redact_support_text(&serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string()))
-}
-
-fn redact_support_text(input: &str) -> String {
-    let mut output = input.to_string();
-    for prefix in [
-        "Bearer ",
-        "token=",
-        "token:",
-        "auth_token=",
-        "auth_token:",
-        "device_credential=",
-        "device_credential:",
-        "invite_token=",
-        "invite_token:",
-        "private_key=",
-        "private_key:",
-        "ed25519_private_key=",
-        "ed25519_private_key:",
-        "password=",
-        "password:",
-        "secret=",
-        "secret:",
-        "authorization=",
-        "authorization:",
-        "\"token\": \"",
-        "\"auth_token\": \"",
-        "\"device_credential\": \"",
-        "\"invite_token\": \"",
-        "\"private_key\": \"",
-        "\"ed25519_private_key\": \"",
-        "\"password\": \"",
-        "\"secret\": \"",
-        "\"authorization\": \"",
-    ] {
-        output = redact_after_prefix(&output, prefix);
-    }
-    output
-}
-
-fn redact_after_prefix(input: &str, prefix: &str) -> String {
-    let lower = input.to_ascii_lowercase();
-    let prefix_lower = prefix.to_ascii_lowercase();
-    let mut output = String::with_capacity(input.len());
-    let mut cursor = 0;
-    while let Some(relative) = lower[cursor..].find(&prefix_lower) {
-        let start = cursor + relative;
-        let value_start = start + prefix.len();
-        output.push_str(&input[cursor..value_start]);
-        let value_end = input[value_start..]
-            .char_indices()
-            .find(|(_, ch)| ch.is_whitespace() || matches!(*ch, ',' | ';' | '"' | '\'' | '}' | ']'))
-            .map(|(index, _)| value_start + index)
-            .unwrap_or(input.len());
-        if value_end > value_start {
-            output.push_str("<redacted>");
-        }
-        cursor = value_end;
-        if cursor == input.len() {
-            break;
-        }
-    }
-    output.push_str(&input[cursor..]);
-    output
 }
 
 fn gzip_bytes(content: &[u8]) -> Result<Vec<u8>, String> {
@@ -410,6 +352,35 @@ fn support_unix_timestamp() -> String {
 
 #[cfg(test)]
 mod support_tests {
+    #[test]
+    fn log_tail_keeps_the_read_budget_and_redacts_credentials() {
+        use std::io::Write;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "p2wlan-support-tail-{}-{unique}",
+            std::process::id()
+        ));
+        let tail = r#"{"private_key":"support-test-secret"}"#;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all("older log line\n".repeat(100).as_bytes())
+            .unwrap();
+        file.write_all(tail.as_bytes()).unwrap();
+        drop(file);
+        let result = super::read_support_log(&path, tail.len() as u64);
+        std::fs::remove_file(path).unwrap();
+        assert!(result.truncated);
+        assert!(!result.content.contains("older log line"));
+        assert!(!result.content.contains("support-test-secret"));
+        assert!(result.content.contains("<redacted>"));
+    }
+
     #[test]
     fn redacts_common_support_secrets() {
         let redacted = super::redact_support_text(

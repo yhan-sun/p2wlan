@@ -37,6 +37,28 @@ Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemet
 
 配置生成器会检查目录、证书、签票关系和随机秘密。正式启动还必须拒绝占位符、弱默认值和缺失证书。
 
+客户端的 `relay.allow_insecure_plaintext` 默认是 `false`。HTTP Control 或服务端下发的明文 Relay 地址不会自动开启它。隔离开发测试可在本地配置中显式设为 `true`，也可以向 daemon 传入 `--allow-insecure-plaintext-relay`。公网部署保持关闭。
+
+## 对端身份与本地私钥
+
+在指定 profile 的 `network` 下设置 `peer_trust` 可启用严格对端验证。以下为示例字段，需替换为独立核验后的设备数据：
+
+```json
+{
+  "peer_trust": {
+    "mode": "strict",
+    "network_id": "example-network",
+    "peers": [{
+      "node_id": "node-example",
+      "public_key": "119923bc9a827521e55af245bd2a27f7fa339675fd7135e93ec39c535f00d6b3",
+      "virtual_ip": "10.20.0.2"
+    }]
+  }
+}
+```
+
+名单最多包含 1024 台设备，网络 ID 必须与该 profile 一致。空的严格名单会拒绝所有对端。默认 `control` 模式按 Control 提供的身份映射工作。对端管理员可在自己的设备上通过 `p2wlan config show` 读取 `device-public-key`，通过 `p2wlan status --json` 读取注册后的 `node_id` 和 `virtual_ip`，然后经独立可信渠道确认这些值。更换设备、公钥或虚拟地址时，停止该 profile，核对新字段，更新条目后再启动。设备私钥封装的操作见[客户端指南](../guides/client.md#保护本地设备私钥)。
+
 ## 客户端资源观测
 
 客户端软件缓冲观测由 `diagnostics.resource_capture` 控制，缺省为 `false`。只有它与 `diagnostics.enabled` 同为 `true` 时，daemon 才为本次进程建立观测。CLI 可设置并保存：
@@ -46,6 +68,12 @@ Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemet
 该命令同时启用本地诊断；重新启动对应 daemon 后生效。读取使用 `p2wlan status --resources`，经原有实例诊断令牌访问 `GET /resources`。关闭使用 `p2wlan config set resource-capture false` 后重启，不会关闭其他诊断。资源观测的单位、不可用状态和覆盖限制见[路径可观测性](path-observability.md#软件缓冲资源观测)。
 
 ## 客户端路径策略
+
+`network.business_padding_16` 默认关闭。开启后，满足条件的 IPv4 和 IPv6 业务报文在加密前最多补 15 字节，长度向上对齐至 16 字节。Direct 只在有当前业务 MTU 预算时填充，Relay 填充后的内部 IP 报文最多为 1168 字节。原包可发送而填充超预算时，仍按原长发送。保活、控制及 MTU 探针继续使用原长度。
+
+    p2wlan config set business-padding-16 true
+
+重启对应 profile 后生效。填充降低长度精度，端点、时序及包量仍可观察。
 
 `relay.path_policy` 缺省值为 `direct-first`。首次在线 peer 生命周期保留 5 秒直连窗口；健康的加密确认 Direct 保持优先。Relay 可提前建立和认证，但窗口到期前不承载本端首个业务包。确认 Direct 失活后立即允许已认证 Relay 兜底，不为已建立连接重跑冷启动等待。
 

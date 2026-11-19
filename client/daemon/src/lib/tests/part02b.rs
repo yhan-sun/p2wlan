@@ -221,69 +221,60 @@ fn test_infer_default_relay_servers_never_uses_control_host() {
 }
 
 #[test]
-fn test_effective_relay_plaintext_policy_for_legacy_http_control() {
-    let legacy_servers = vec!["default@tcp://control.example.com:18081".to_string()];
-    assert!(effective_relay_allow_insecure_plaintext(
-        "http://control.example.com:18080",
-        &[],
-        &legacy_servers,
-        false,
-    ));
-    assert!(effective_relay_allow_insecure_plaintext(
-        "https://ctrl.example.com",
-        &[],
-        &legacy_servers,
-        true,
-    ));
-    assert!(!effective_relay_allow_insecure_plaintext(
-        "https://ctrl.example.com",
-        &[],
-        &legacy_servers,
-        false,
-    ));
-
-    let catalog = vec![RelayCatalogEntry {
-        region: "cn".to_string(),
-        audience: "relay-cn-1".to_string(),
-        endpoint: "tls://relay.example.com:18081".to_string(),
-        udp_observer_endpoint: None,
-        udp_observer_endpoints: Vec::new(),
-    }];
-    assert!(!effective_relay_allow_insecure_plaintext(
-        "http://control.example.com:18080",
-        &catalog,
-        &legacy_servers,
-        false,
-    ));
-
-    let plaintext_catalog = vec![RelayCatalogEntry {
-        region: "cn".to_string(),
-        audience: "relay-cn-1".to_string(),
-        endpoint: "tcp://control.example.com:18081".to_string(),
-        udp_observer_endpoint: None,
-        udp_observer_endpoints: Vec::new(),
-    }];
-    assert!(effective_relay_allow_insecure_plaintext(
-        "http://control.example.com:18080",
-        &plaintext_catalog,
-        &[],
-        false,
-    ));
-    assert!(!effective_relay_allow_insecure_plaintext(
-        "https://ctrl.example.com",
-        &plaintext_catalog,
-        &[],
-        false,
-    ));
+fn relay_plaintext_policy_requires_explicit_local_permission() {
+    assert_relay_plaintext_policy(false);
 }
 
 #[test]
-fn test_relay_spec_plaintext_detection() {
-    assert!(relay_spec_is_plaintext("default@control.example.com:18081"));
-    assert!(relay_spec_is_plaintext(
-        "default@tcp://control.example.com:18081"
-    ));
-    assert!(!relay_spec_is_plaintext("cn@tls://relay.example.com:18081"));
+fn relay_plaintext_policy_preserves_explicit_development_permission() {
+    assert_relay_plaintext_policy(true);
+}
+
+fn assert_relay_plaintext_policy(configured: bool) {
+    let endpoint_specs = [
+        "relay.example.com:18081",
+        "tcp://relay.example.com:18081",
+        "tls://relay.example.com:18081",
+        "custom://relay.example.com:18081",
+    ];
+    for control_url in [
+        "http://control.example.com:18080",
+        "https://control.example.com",
+        "ws://control.example.com:18080",
+        "wss://control.example.com",
+    ] {
+        assert_eq!(
+            effective_relay_allow_insecure_plaintext(control_url, &[], &[], configured),
+            configured,
+            "empty catalog must preserve the local policy",
+        );
+        for endpoint in endpoint_specs {
+            let servers = vec![format!("default@{endpoint}")];
+            let catalog = vec![RelayCatalogEntry {
+                region: "cn".to_string(),
+                audience: "relay-cn-1".to_string(),
+                endpoint: endpoint.to_string(),
+                udp_observer_endpoint: None,
+                udp_observer_endpoints: Vec::new(),
+            }];
+            for (catalog, servers) in [
+                (&[][..], servers.as_slice()),
+                (catalog.as_slice(), &[][..]),
+                (catalog.as_slice(), servers.as_slice()),
+            ] {
+                assert_eq!(
+                    effective_relay_allow_insecure_plaintext(
+                        control_url,
+                        catalog,
+                        servers,
+                        configured,
+                    ),
+                    configured,
+                    "remote Control/catalog or legacy endpoints must not change the local policy: control={control_url}, endpoint={endpoint}",
+                );
+            }
+        }
+    }
 }
 
 #[test]

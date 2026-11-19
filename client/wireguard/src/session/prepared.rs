@@ -10,11 +10,41 @@ const HEADER_SIZE: usize = TRANSPORT_MSG_MIN_SIZE - AEAD_TAG_SIZE;
 /// Preparing it neither encrypts plaintext nor consumes a session counter.
 pub struct PreparedTransportBuffer {
     wire: Vec<u8>,
+    plaintext_len: usize,
+    padded_plaintext_len: usize,
 }
 
 impl PreparedTransportBuffer {
     pub fn new(plaintext_len: usize) -> Result<Self> {
-        let wire_len = plaintext_len
+        Self::with_length(plaintext_len, plaintext_len)
+    }
+
+    /// Opt in to sixteen-byte length buckets only for one complete IPv4 or
+    /// IPv6 packet. Invalid, already-trailed or non-IP inputs stay unpadded.
+    /// This reads the IP length without copying plaintext or allocating a nonce.
+    pub fn new_with_ip_padding(packet: &[u8]) -> Result<Self> {
+        if super::padding::complete_ip_len(packet) != Some(packet.len()) {
+            return Self::new(packet.len());
+        }
+        let bucket = super::padding::IP_PADDING_BUCKET;
+        let padded =
+            packet.len().checked_add(bucket - 1).ok_or_else(|| {
+                WireGuardError::InvalidPacket("IP padding length overflow".into())
+            })? / bucket
+                * bucket;
+        Self::with_length(packet.len(), padded)
+    }
+
+    /// Padding never displaces an otherwise admissible original packet. If
+    /// its next bucket exceeds the current path budget, send the original size.
+    pub fn limit_ip_padding(&mut self, max_plaintext_len: usize) {
+        if self.padded_plaintext_len > max_plaintext_len {
+            self.padded_plaintext_len = self.plaintext_len;
+        }
+    }
+
+    fn with_length(plaintext_len: usize, padded_plaintext_len: usize) -> Result<Self> {
+        let wire_len = padded_plaintext_len
             .checked_add(TRANSPORT_MSG_MIN_SIZE)
             .ok_or_else(|| {
                 WireGuardError::InvalidPacket("transport buffer length overflow".into())
@@ -24,7 +54,11 @@ impl PreparedTransportBuffer {
             WireGuardError::InvalidPacket(format!("transport buffer allocation failed: {error}"))
         })?;
         wire.resize(wire_len, 0);
-        Ok(Self { wire })
+        Ok(Self {
+            wire,
+            plaintext_len,
+            padded_plaintext_len,
+        })
     }
 
     /// Read-only access for observing the concrete allocation's length/capacity.
@@ -42,14 +76,25 @@ impl TransportSession {
         mut prepared: PreparedTransportBuffer,
     ) -> Result<Vec<u8>> {
         let ((), counter) = self.encrypt_payload(|key, counter| {
-            if prepared.wire.len().checked_sub(TRANSPORT_MSG_MIN_SIZE) != Some(packet.len()) {
+            if prepared.plaintext_len != packet.len() {
                 return Err(WireGuardError::InvalidPacket(
                     "prepared transport buffer length mismatch".into(),
                 ));
             }
-            let payload_end = HEADER_SIZE + packet.len();
+            // Revalidate the actual encryption input rather than trusting the
+            // earlier preparation snapshot. No allocation occurs under crypto.
+            let payload_len = if prepared.padded_plaintext_len > prepared.plaintext_len
+                && super::padding::complete_ip_len(packet) == Some(packet.len())
+            {
+                prepared.padded_plaintext_len
+            } else {
+                packet.len()
+            };
+            prepared.wire.truncate(payload_len + TRANSPORT_MSG_MIN_SIZE);
+            let payload_end = HEADER_SIZE + payload_len;
             let payload = &mut prepared.wire[HEADER_SIZE..payload_end];
-            payload.copy_from_slice(packet);
+            payload[..packet.len()].copy_from_slice(packet);
+            payload[packet.len()..].fill(0);
             let tag = encrypt_in_place_with_counter(key, counter, b"", payload)?;
             prepared.wire[payload_end..].copy_from_slice(&tag);
             Ok(())

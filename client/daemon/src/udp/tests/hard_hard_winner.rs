@@ -37,6 +37,7 @@ impl WinnerFixture {
             peer.capabilities = crate::control::PeerCapabilities {
                 hh2_pair_nomination: true,
                 hh2_plan_v2: true,
+                probe_opaque_ids_v1: false,
             };
             peer.nat_type = "p2v2:m=address_or_port_dependent;a=linear;d=4;c=90;f=address_dependent;h=unknown;g=1".into();
         }

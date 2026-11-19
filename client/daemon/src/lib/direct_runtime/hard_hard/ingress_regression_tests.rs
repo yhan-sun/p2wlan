@@ -260,7 +260,10 @@ async fn hard_hard_startup_roster_endpoint_revision_preserves_measuring_owner() 
                 .public_key,
             endpoint: "203.0.113.20:49000".into(),
             registration_seq: 202,
-            capabilities: control::PeerCapabilities::current(),
+            capabilities: control::PeerCapabilities {
+                probe_opaque_ids_v1: false,
+                ..control::PeerCapabilities::current()
+            },
             nat_type: format!(
                 "p2v2:m=address_or_port_dependent;a=linear;d=1;c=60;f=unknown;h=unknown;g={};o=1",
                 record.remote_profile_generation

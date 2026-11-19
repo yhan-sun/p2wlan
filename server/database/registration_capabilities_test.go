@@ -16,7 +16,7 @@ func TestCapabilitiesBelongToExactRegistrationLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	capable := PeerCapabilities{HH2PairNomination: true, HH2PlanV2: true}
+	capable := PeerCapabilities{HH2PairNomination: true, HH2PlanV2: true, ProbeOpaqueIDsV1: true}
 	register := func(boot int64, caps PeerCapabilities) (*Device, error) {
 		return db.RegisterDeviceWithOptions(user.ID, "default", "capability-key", "daemon", "linux", "", "", "test",
 			DeviceRegistrationAttempt{Incarnation: &boot, EnforceIncarnation: true, Capabilities: caps})
@@ -71,7 +71,7 @@ func TestLegacyRegistrationCannotAdvertiseUnfencedCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	device, err := db.RegisterDeviceWithOptions(user.ID, "default", "legacy-capability-key", "daemon", "linux", "", "", "999.0.0",
-		DeviceRegistrationAttempt{EnforceIncarnation: true, Capabilities: PeerCapabilities{HH2PairNomination: true, HH2PlanV2: true}})
+		DeviceRegistrationAttempt{EnforceIncarnation: true, Capabilities: PeerCapabilities{HH2PairNomination: true, HH2PlanV2: true, ProbeOpaqueIDsV1: true}})
 	if err != nil || device.Capabilities != (PeerCapabilities{}) {
 		t.Fatalf("legacy capabilities enabled: %+v %v", device, err)
 	}

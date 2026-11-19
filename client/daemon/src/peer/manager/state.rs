@@ -473,6 +473,9 @@ pub struct PeerManager {
     local_node_id_for_traversal: std::sync::RwLock<String>,
     /// Active peer connections, indexed by node ID.
     connections: Arc<ConnectionsTable>,
+    /// Bounded routing hints only; current connections still authenticate every probe.
+    opaque_probe_routes: Arc<std::sync::Mutex<OpaqueProbeRouteHints>>,
+    opaque_probe_registration: std::sync::OnceLock<crate::control::ControlClient>,
     /// No-await mirror of connection-map membership and peer lifecycle.
     ///
     /// The serial control-signal consumer must be able to decide whether an
@@ -769,6 +772,8 @@ pub struct PeerManager {
     outbound_loss_slot:
         Arc<std::sync::Mutex<Option<Arc<tokio::sync::Mutex<OutboundLossCounters>>>>>,
     outbound_loss_default: Arc<tokio::sync::Mutex<OutboundLossCounters>>,
+    /// Immutable result of validating the local policy at owner creation.
+    peer_trust_validated: bool,
     /// Configuration.
     config: Config,
     /// Authoritative active-path telemetry hub.

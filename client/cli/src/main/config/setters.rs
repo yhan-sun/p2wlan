@@ -52,6 +52,9 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
             }
             config.network.mtu = mtu;
         }
+        "business-padding-16" => {
+            config.network.business_padding_16 = parse_bool_config(value, "business-padding-16")?;
+        }
         "udp-bind" => {
             let endpoint = parse_socket_addr(value, "udp-bind")?;
             config.network.udp_bind = endpoint.to_string();

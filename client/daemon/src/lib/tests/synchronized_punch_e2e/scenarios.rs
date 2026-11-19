@@ -1170,7 +1170,10 @@ async fn hard_hard_measurement_lane_contention_refunds_without_sending_stun() {
         hard_hard_profile(remote_public, 3).control_label_with_generation(1),
     );
     remote.registration_seq = 1;
-    remote.capabilities = control::PeerCapabilities::current();
+    remote.capabilities = control::PeerCapabilities {
+        probe_opaque_ids_v1: false,
+        ..control::PeerCapabilities::current()
+    };
     peers.add_peer(&remote).await;
     peers
         .add_candidates_with_sources(

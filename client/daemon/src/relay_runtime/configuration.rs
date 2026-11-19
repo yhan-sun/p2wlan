@@ -18,48 +18,15 @@ pub(crate) fn infer_default_relay_servers(control_server_url: &str) -> Vec<Strin
 }
 
 pub(crate) fn effective_relay_allow_insecure_plaintext(
-    control_server_url: &str,
-    relay_catalog: &[RelayCatalogEntry],
-    relay_servers: &[String],
+    _control_server_url: &str,
+    _relay_catalog: &[RelayCatalogEntry],
+    _relay_servers: &[String],
     configured: bool,
 ) -> bool {
-    if configured {
-        return true;
-    }
-
-    if !control_server_uses_plaintext_http(control_server_url) {
-        return false;
-    }
-
-    if !relay_catalog.is_empty() {
-        return relay_catalog
-            .iter()
-            .any(|entry| relay_spec_is_plaintext(&entry.endpoint));
-    }
-
-    relay_servers
-        .iter()
-        .any(|server| relay_spec_is_plaintext(server))
-}
-
-pub(super) fn control_server_uses_plaintext_http(control_server_url: &str) -> bool {
-    control_server_url
-        .trim_start()
-        .get(..7)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-}
-
-pub(crate) fn relay_spec_is_plaintext(spec: &str) -> bool {
-    let endpoint = spec
-        .trim()
-        .split_once('@')
-        .map(|(_, endpoint)| endpoint)
-        .unwrap_or_else(|| spec.trim())
-        .trim();
-    !endpoint.is_empty()
-        && !endpoint
-            .get(..6)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tls://"))
+    // Only the local development setting can authorize plaintext transport.
+    // A Control URL or remotely supplied relay endpoint cannot grant this
+    // permission, even when Control itself is explicitly configured as HTTP.
+    configured
 }
 
 pub(crate) fn relay_candidates_from_sources(

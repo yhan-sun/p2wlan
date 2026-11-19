@@ -16,7 +16,10 @@ async fn barrier_fixture() -> (
         online: true,
         public_key: hex::encode(NodeIdentity::generate().public_key()),
         registration_seq: 202,
-        capabilities: control::PeerCapabilities::current(),
+        capabilities: control::PeerCapabilities {
+            probe_opaque_ids_v1: false,
+            ..control::PeerCapabilities::current()
+        },
         nat_type: format!(
             "p2v2:m=address_or_port_dependent;a=linear;d=1;c=60;f=unknown;h=unknown;g={};o=1",
             offer.remote_profile_generation

@@ -14,6 +14,67 @@ async fn install(
     drop(emit);
 }
 
+#[tokio::test]
+async fn business_padding_16_never_changes_control_or_keepalive_encryption() {
+    let (transport, _rx) = WireGuardTransport::new();
+    let transport = transport.with_business_padding_16(true);
+    let (local, mut remote) = establish_sessions();
+    transport.add_session("peer-a", local).await;
+    let control = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        7,
+        8,
+        &build_direct_validation_payload(DirectValidationKind::Request, 1, 2, 3, 4),
+    );
+    for packet in [vec![], control] {
+        let encrypted = transport
+            .encrypt_outbound(OutboundPacket {
+                room_authorization: None,
+                peer_id: "peer-a".into(),
+                dst_ip: "10.20.0.2".into(),
+                packet: packet.clone(),
+                trace: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(encrypted.wire_bytes.len(), packet.len() + 32);
+        assert_eq!(
+            remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+            packet
+        );
+
+        // An internal ICMP echo can also return through TUN's business FIFO.
+        // The shared control classification excludes it from padding there.
+        let prepared = PreparedEncryptionBuffer::new_for_business(&packet, true, None).unwrap();
+        let emit = transport.acquire_outbound_emit_guard("peer-a").await;
+        let encrypted = transport
+            .encrypt_request_with_prepared_buffer_diagnostics(
+                OutboundPacket {
+                    room_authorization: None,
+                    peer_id: "peer-a".into(),
+                    dst_ip: "10.20.0.2".into(),
+                    packet: packet.clone(),
+                    trace: None,
+                }
+                .into(),
+                prepared,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        drop(emit);
+        assert_eq!(encrypted.wire_bytes.len(), packet.len() + 32);
+        assert_eq!(
+            remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+            packet
+        );
+    }
+}
+
 fn drained(capture: &ResourceCapture) {
     let snapshot = capture.residency_snapshot();
     assert!(snapshot.valid && snapshot.coherent);

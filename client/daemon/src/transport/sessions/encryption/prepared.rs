@@ -28,17 +28,41 @@ impl PreparedEncryptionBuffer {
         let wire = PreparedTransportBuffer::new(plaintext_len).map_err(|error| {
             DaemonError::Peer(format!("WireGuard buffer preparation failed: {error}"))
         })?;
+        Ok(Self::observe(wire, capture))
+    }
+
+    pub(crate) fn new_for_business(
+        packet: &[u8],
+        padding_16: bool,
+        capture: Option<&Arc<ResourceCapture>>,
+    ) -> Result<Self> {
+        if !padding_16 || crate::transport::wire::is_internal_control_packet(packet) {
+            return Self::new(packet.len(), capture);
+        }
+        let wire = PreparedTransportBuffer::new_with_ip_padding(packet).map_err(|error| {
+            DaemonError::Peer(format!("WireGuard buffer preparation failed: {error}"))
+        })?;
+        Ok(Self::observe(wire, capture))
+    }
+
+    pub(crate) fn limit_ip_padding(&mut self, max_plaintext_len: usize) {
+        if let Some(wire) = self.0.wire.as_mut() {
+            wire.limit_ip_padding(max_plaintext_len);
+        }
+    }
+
+    fn observe(wire: PreparedTransportBuffer, capture: Option<&Arc<ResourceCapture>>) -> Self {
         // Storage is not ciphertext yet and grants no successful-encryption source.
         let residency = capture.and_then(|capture| {
             ResidencyLease::observe(capture, ResidencyStage::PreparationPlaintext, wire.buffer())
         });
         let buffer_lease =
             OwnedBufferLease::observe(capture, BufferStage::PreparationPlaintext, wire.buffer());
-        Ok(Self(Box::new(PreparedStorage {
+        Self(Box::new(PreparedStorage {
             wire: Some(wire),
             residency,
             _buffer_lease: buffer_lease,
-        })))
+        }))
     }
 
     pub(super) fn encrypt(

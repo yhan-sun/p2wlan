@@ -149,6 +149,8 @@ pub struct PeerConnection {
     pub app_version: String,
     /// Authenticated registration-scoped wire capabilities; absent means legacy.
     pub capabilities: crate::control::PeerCapabilities,
+    /// Sticky within one registration: metadata revocation must not reveal stable IDs.
+    pub(crate) opaque_probe_required: bool,
     pub registration_seq: u64,
     /// Peer's static WireGuard/X25519 public key as hex.
     pub public_key: String,
@@ -614,6 +616,7 @@ impl PeerConnection {
             device_name: String::new(),
             app_version: String::new(),
             capabilities: crate::control::PeerCapabilities::default(),
+            opaque_probe_required: false,
             registration_seq: 0,
             public_key: String::new(),
             probe_mac_key: None,

@@ -1532,7 +1532,7 @@ for round in $(seq 1 "$ROUNDS"); do
   NODE_A_ARGS=(--config "$NODE_A_RUNTIME/config.json"
     --control "http://127.0.0.1:$PORT" --network "$NETWORK_ID" --token-stdin
     --device-name node-a --udp-bind 127.0.0.1:0 --stun "$STUN_A"
-    --fresh-mapping-harness-loopback --no-host-candidates
+    --fresh-mapping-harness-loopback --no-host-candidates --allow-insecure-plaintext-relay
     --diagnostics-bind 127.0.0.1:$DIAG_A_PORT --heartbeat-interval 5
     $TRAVERSAL_FLAGS "${OVERLAY_FLAGS[@]}")
   if [[ -n "$STARTUP_POLICY" ]]; then
@@ -1563,7 +1563,7 @@ for round in $(seq 1 "$ROUNDS"); do
   NODE_B_ARGS=(--config "$NODE_B_RUNTIME/config.json"
     --control "http://127.0.0.1:$PORT" --network "$NETWORK_ID" --token-stdin
     --device-name node-b --udp-bind 127.0.0.1:0 --stun "$STUN_B"
-    --fresh-mapping-harness-loopback --no-host-candidates
+    --fresh-mapping-harness-loopback --no-host-candidates --allow-insecure-plaintext-relay
     --diagnostics-bind 127.0.0.1:$DIAG_B_PORT --heartbeat-interval 5
     $TRAVERSAL_FLAGS "${OVERLAY_FLAGS[@]}")
   if [[ -n "$STARTUP_POLICY" ]]; then

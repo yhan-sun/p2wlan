@@ -13,12 +13,13 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use p2pnet_nat::{
-    build_authenticated_punch_ack, build_authenticated_punch_packet_with_nomination,
-    build_punch_ack, build_punch_packet, build_punch_packet_with_nonce,
-    candidate_report_from_observations, decode_authenticated_punch_packet, decode_punch_packet,
-    gather_candidate_report, peek_authenticated_punch_identity, CandidateGatherReport,
+    build_authenticated_punch_ack_for_received, build_authenticated_punch_packet_with_nomination,
+    build_opaque_punch_packet_with_nomination, build_punch_ack, build_punch_packet,
+    build_punch_packet_with_nonce, candidate_report_from_observations,
+    decode_authenticated_punch_packet, decode_punch_packet, gather_candidate_report,
+    opaque_probe_identity, peek_authenticated_punch_identity, CandidateGatherReport,
     FilteringBehavior, IceConfig, MappingBehavior, PunchPacketKind, StunAttribute, StunClient,
-    StunMessage, StunObservation, BINDING_RESPONSE, MAGIC_COOKIE,
+    StunMessage, StunObservation, BINDING_RESPONSE, MAGIC_COOKIE, OPAQUE_PUNCH_VERSION,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};

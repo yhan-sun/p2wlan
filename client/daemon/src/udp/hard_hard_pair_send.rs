@@ -1,8 +1,7 @@
 use super::*;
 
 impl UdpTransport {
-    /// Classify at the boundary: owner/readiness failures never claim a
-    /// physical error, while every returned send syscall error retains its cost.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn send_hh2_probe_datagram(
         &self,
@@ -14,6 +13,35 @@ impl UdpTransport {
         token: &str,
         purpose: PendingProbePurpose,
         use_candidate: bool,
+    ) -> std::result::Result<usize, ProbeSendFailure> {
+        let fence = self.peers.snapshot_probe_send_fence(peer, true).await;
+        self.send_hh2_probe_datagram_fenced(
+            index,
+            socket,
+            bytes,
+            peer,
+            endpoint,
+            token,
+            purpose,
+            use_candidate,
+            fence.as_ref(),
+        )
+        .await
+    }
+    /// Classify at the boundary: owner/readiness failures never claim a
+    /// physical error, while every returned send syscall error retains its cost.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn send_hh2_probe_datagram_fenced(
+        &self,
+        index: usize,
+        socket: &Arc<UdpSocket>,
+        bytes: &[u8],
+        peer: &str,
+        endpoint: SocketAddr,
+        token: &str,
+        purpose: PendingProbePurpose,
+        use_candidate: bool,
+        fence: Option<&crate::peer::ProbeSendFence>,
     ) -> std::result::Result<usize, ProbeSendFailure> {
         let rejected = || {
             ProbeSendFailure::new(
@@ -93,16 +121,26 @@ impl UdpTransport {
                 {
                     return Err(rejected());
                 }
-                #[cfg(test)]
-                if self.should_fail_probe_send_for_test() {
-                    return Err(ProbeSendFailure::with_physical_send_error(
-                        DaemonError::Network("test-injected physical probe send failure".into()),
-                        bytes.len(),
-                    ));
-                }
                 // Epoch and exact-socket fences remain held through this
                 // nonblocking kernel handoff, but never through a wait for IO.
-                match socket.try_send_to(bytes, endpoint) {
+                let Some(fence) = fence else {
+                    return Err(rejected());
+                };
+                let handoff = self.peers.with_probe_send_fence(fence, bytes, || {
+                    #[cfg(test)]
+                    if self.should_fail_probe_send_for_test() {
+                        return Err(std::io::Error::other(
+                            "test-injected physical probe send failure",
+                        ));
+                    }
+                    socket.try_send_to(bytes, endpoint)
+                });
+                let handoff = match handoff {
+                    Ok(result) => result,
+                    Err(crate::peer::ProbeSendFenceError::Busy) => continue,
+                    Err(crate::peer::ProbeSendFenceError::Revoked) => return Err(rejected()),
+                };
+                match handoff {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                     Ok(sent) => {
                         if let Some(guard) = exploration.as_mut() {

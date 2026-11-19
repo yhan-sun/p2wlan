@@ -68,9 +68,6 @@ pub(crate) use configuration::infer_default_relay_servers;
 
 pub(crate) use configuration::effective_relay_allow_insecure_plaintext;
 
-#[cfg(test)]
-pub(crate) use configuration::relay_spec_is_plaintext;
-
 pub(crate) use configuration::relay_candidates_from_sources;
 
 pub(crate) use configuration::udp_observers_from_sources;

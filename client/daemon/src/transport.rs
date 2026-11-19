@@ -522,6 +522,7 @@ impl InboundUdpTransport {
 /// Encrypts routed TUN packets with peer WireGuard sessions.
 #[derive(Clone)]
 pub struct WireGuardTransport {
+    business_padding_16: bool,
     #[cfg(test)]
     previous_overlay_observer: Arc<std::sync::Mutex<Option<mpsc::Sender<OverlayIngressDelivery>>>>,
     resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,

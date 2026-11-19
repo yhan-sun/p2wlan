@@ -44,3 +44,6 @@ mod resource_runtime;
 
 #[path = "tests/startup_policy.rs"]
 mod startup_policy;
+
+#[path = "tests/peer_trust.rs"]
+mod peer_trust;

@@ -4,6 +4,7 @@
 //! Implements replay protection via a sliding window.
 
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 use p2pnet_crypto::aead::{decrypt_with_counter, encrypt_with_counter};
 use p2pnet_crypto::{
@@ -14,6 +15,7 @@ use crate::error::{Result, WireGuardError};
 use crate::handshake::TransportKeyPair;
 use crate::types::MessageTransport;
 
+mod padding;
 mod prepared;
 pub use prepared::PreparedTransportBuffer;
 
@@ -26,9 +28,9 @@ const REPLAY_WINDOW_SIZE: u64 = 64;
 /// transport keys derived from the Noise IK handshake.
 pub struct TransportSession {
     /// Key for sending data.
-    send_key: Hash,
+    send_key: Zeroizing<Hash>,
     /// Key for receiving data.
-    recv_key: Hash,
+    recv_key: Zeroizing<Hash>,
     /// Our session index (used in the receiver_index field of outgoing messages).
     our_index: u32,
     /// Peer's session index (used to identify incoming messages).
@@ -54,8 +56,8 @@ impl TransportSession {
     /// Create a new transport session from handshake-derived keys.
     pub fn new(keys: TransportKeyPair) -> Self {
         Self {
-            send_key: keys.send_key,
-            recv_key: keys.recv_key,
+            send_key: Zeroizing::new(keys.send_key),
+            recv_key: Zeroizing::new(keys.recv_key),
             our_index: keys.our_index,
             peer_index: keys.peer_index,
             send_counter: 0,
@@ -186,12 +188,16 @@ impl TransportSession {
         }
 
         // Decrypt
-        let plaintext =
+        let mut plaintext =
             decrypt_with_counter(&self.recv_key, msg.counter, b"", &msg.encrypted_payload)
                 .map_err(|_| WireGuardError::DecryptionFailed)?;
 
         // Mark this counter as received
         self.update_replay(msg.counter);
+
+        // Interpret lengths only after authentication. Non-IP control data,
+        // keepalives and nonzero/malformed trailers retain their exact bytes.
+        padding::strip_ip_padding(&mut plaintext);
 
         Ok(plaintext)
     }
@@ -303,3 +309,6 @@ include!("session/tests.rs");
 
 #[cfg(test)]
 mod prepared_tests;
+
+#[cfg(test)]
+mod padding_tests;

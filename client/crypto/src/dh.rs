@@ -64,14 +64,15 @@ impl DhKeyPair {
     pub fn diffie_hellman(&self, peer_public: &PublicKeyBytes) -> Result<SharedSecret> {
         let peer_pub = PublicKey::from(*peer_public);
 
-        // Check for all-zeros public key (invalid point)
-        if peer_public == &[0u8; 32] {
+        let shared = self.secret.diffie_hellman(&peer_pub);
+        // Checking the result covers all low-order inputs, including their
+        // non-canonical and high-bit aliases accepted by X25519 decoding.
+        // Require both parties to contribute to this API's shared secret.
+        if !shared.was_contributory() {
             return Err(CryptoError::InvalidInput(
-                "peer public key is all zeros".to_string(),
+                "peer public key produces a non-contributory shared secret".to_string(),
             ));
         }
-
-        let shared = self.secret.diffie_hellman(&peer_pub);
         Ok(*shared.as_bytes())
     }
 
@@ -177,6 +178,54 @@ mod tests {
         let kp = DhKeyPair::generate();
         let zero_pub = [0u8; 32];
         assert!(kp.diffie_hellman(&zero_pub).is_err());
+    }
+
+    #[test]
+    fn rejects_non_contributory_public_keys_and_aliases() {
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        let mut p_minus_one = [0xff; 32];
+        p_minus_one[0] = 0xec;
+        p_minus_one[31] = 0x7f;
+        let mut p = p_minus_one;
+        p[0] = 0xed;
+        let mut p_plus_one = p_minus_one;
+        p_plus_one[0] = 0xee;
+
+        // X25519 also accepts encodings with the high bit set and reduces
+        // non-canonical field elements. Check the shared output rather than
+        // maintaining an incomplete input blacklist.
+        for private in [[0x42; 32], [0x73; 32]] {
+            let keypair = DhKeyPair::from_private_key(private);
+            for public in [[0; 32], one, p_minus_one, p, p_plus_one] {
+                for high_bit in [0, 0x80] {
+                    let mut encoded = public;
+                    encoded[31] |= high_bit;
+                    assert!(keypair.diffie_hellman(&encoded).is_err());
+                    assert!(diffie_hellman(&private, &encoded).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contributory_public_key_aliases_remain_compatible() {
+        let keypair = DhKeyPair::from_private_key([0x42; 32]);
+        let mut basepoint = [0u8; 32];
+        basepoint[0] = 9;
+        let expected = keypair.diffie_hellman(&basepoint).unwrap();
+        assert_ne!(expected, [0; 32]);
+
+        let mut noncanonical = [0xff; 32];
+        noncanonical[0] = 0xf6; // p + 9
+        noncanonical[31] = 0x7f;
+        for public in [basepoint, noncanonical] {
+            for high_bit in [0, 0x80] {
+                let mut encoded = public;
+                encoded[31] |= high_bit;
+                assert_eq!(keypair.diffie_hellman(&encoded).unwrap(), expected);
+            }
+        }
     }
 
     #[test]

@@ -476,7 +476,7 @@ impl UdpTransport {
                         .saturating_add(1)
                 })
                 .await;
-                let Some(identity) = peek_authenticated_punch_identity(data) else {
+                let Some(mut identity) = peek_authenticated_punch_identity(data) else {
                     self.update_socket_diagnostics(socket_index, |metrics| {
                         metrics.authenticated_probe_malformed =
                             metrics.authenticated_probe_malformed.saturating_add(1)
@@ -491,6 +491,28 @@ impl UdpTransport {
                     );
                     continue;
                 };
+                let wire_identity = identity.clone();
+                if identity.version == OPAQUE_PUNCH_VERSION {
+                    let Some(peer) = self
+                        .peers
+                        .resolve_opaque_probe_peer(&identity.source_node_id)
+                    else {
+                        continue;
+                    };
+                    if self.peers.opaque_probe_mode_for_peer(&peer).await != Some(true) {
+                        continue;
+                    }
+                    identity.source_node_id = peer;
+                    identity.target_node_id = local_node_id.to_string();
+                } else if self
+                    .peers
+                    .opaque_probe_mode_for_peer(&identity.source_node_id)
+                    .await
+                    != Some(false)
+                {
+                    // A known opaque session must not accept stable-ID v2 fallback.
+                    continue;
+                }
                 if identity.target_node_id != local_node_id {
                     self.update_socket_diagnostics(socket_index, |metrics| {
                         metrics.authenticated_probe_wrong_target =
@@ -571,6 +593,16 @@ impl UdpTransport {
                 }
                 let Some((packet, key_candidate, scoped_hh2)) =
                     key_candidates.into_iter().find_map(|mut candidate| {
+                        if wire_identity.version == OPAQUE_PUNCH_VERSION
+                            && (matches!(candidate.role, ProbeKeyRole::Compatibility)
+                                || candidate.session_id.is_none()
+                                || opaque_probe_identity(&candidate.key, &identity.source_node_id)
+                                    != wire_identity.source_node_id
+                                || opaque_probe_identity(&candidate.key, local_node_id)
+                                    != wire_identity.target_node_id)
+                        {
+                            return None;
+                        }
                         if let Some(token) = hh2_token.as_deref() {
                             // HH cannot commit a pending WireGuard rekey by
                             // bypassing its existing adoption transaction.
@@ -810,14 +842,19 @@ impl UdpTransport {
                                     continue;
                                 }
                                 let generation = self.peers.current_network_generation().await;
-                                let ack = build_authenticated_punch_ack(
-                                    packet.nonce,
+                                let Some(ack) = build_authenticated_punch_ack_for_received(
+                                    &packet,
                                     local_node_id,
                                     &identity.source_node_id,
                                     generation,
                                     &key,
-                                );
-                                match socket.send_to(&ack, source).await {
+                                ) else {
+                                    continue;
+                                };
+                                let ack_fence = self
+                                    .peers
+                                    .try_snapshot_probe_send_fence(&identity.source_node_id, false);
+                                match self.send_probe_datagram(&socket, &ack, source, ack_fence.as_ref()).await {
                                     Ok(_) => {
                                         self.update_socket_diagnostics(socket_index, |metrics| {
                                             metrics.probe_acks_sent += 1
@@ -849,13 +886,15 @@ impl UdpTransport {
                         // the return window short, and the sender's nonce is
                         // only pending for this punch session.
                         let generation = self.peers.current_network_generation().await;
-                        let ack = build_authenticated_punch_ack(
-                            packet.nonce,
+                        let Some(ack) = build_authenticated_punch_ack_for_received(
+                            &packet,
                             local_node_id,
                             &identity.source_node_id,
                             generation,
                             &key,
-                        );
+                        ) else {
+                            continue;
+                        };
                         let ack_sent = match self
                             .send_punch_ack_burst(
                                 socket_index,

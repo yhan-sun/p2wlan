@@ -75,7 +75,10 @@ fn build_control_http_client(
         ));
     }
 
-    let builder = reqwest::Client::builder();
+    // Control API requests stay on the configured origin. In particular,
+    // 307/308 responses must not forward a replayable credential-bearing body
+    // or allow an HTTPS endpoint to redirect the request onto plaintext HTTP.
+    let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
 
     // `reqwest::ClientBuilder::interface` is unavailable on Windows. Keep
     // the binding code behind the same target gate so a Windows build does
@@ -578,6 +581,81 @@ mod proxy_tests {
             }
         });
         (addr, seen_rx)
+    }
+
+    #[tokio::test]
+    async fn control_redirect_does_not_forward_authenticated_post() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const BODY: &str = "private-control-request-body";
+        async fn read_post(socket: &mut tokio::net::TcpStream) -> String {
+            let mut request = Vec::new();
+            while !request.ends_with(BODY.as_bytes()) {
+                assert!(request.len() < 4096, "fixture request must stay bounded");
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "fixture request must include its complete body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            String::from_utf8(request).unwrap()
+        }
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_url = format!("http://{}/control", origin.local_addr().unwrap());
+        let location = format!("http://{}/redirected", destination.local_addr().unwrap());
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let original_request = async {
+            let (mut socket, _) = origin.accept().await.unwrap();
+            let request = read_post(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        };
+        let redirected_request = async {
+            tokio::select! {
+                biased;
+                accepted = destination.accept() => {
+                    let (mut socket, _) = accepted.unwrap();
+                    let request = read_post(&mut socket).await;
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    Some(request)
+                }
+                _ = &mut stop_rx => None,
+            }
+        };
+        let request = async {
+            let client = control_http_client(ControlProxyMode::Direct).unwrap();
+            let response = client
+                .post(&origin_url)
+                .bearer_auth("fixture-control-token")
+                .body(BODY)
+                .send()
+                .await
+                .unwrap();
+            let _ = stop_tx.send(());
+            response
+        };
+        let (original, redirected, response) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(original_request, redirected_request, request)
+            })
+            .await
+            .unwrap();
+
+        assert!(original.starts_with("POST /control HTTP/1.1\r\n"));
+        assert!(original
+            .to_ascii_lowercase()
+            .contains("authorization: bearer fixture-control-token\r\n"));
+        assert!(original.ends_with(BODY));
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.url().as_str(), origin_url);
+        assert!(
+            redirected.is_none(),
+            "Control POST body must not reach a redirect destination"
+        );
     }
 
     async fn http_get_through(client: &reqwest::Client, url: &str) -> bool {

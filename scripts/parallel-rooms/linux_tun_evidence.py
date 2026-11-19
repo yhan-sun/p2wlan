@@ -57,7 +57,7 @@ class EvidenceLab(original.Lab):
         clean.update(RUST_LOG="info", RUST_BACKTRACE="0", P2WLAN_TEST_RUN_ID=self.run_id)
         clean.update(env or {})
         if getattr(self.args, "relay_application", None) and command[:1] == [str(self.args.daemon)]:
-            command = [*command, "--relay-only"]
+            command = [*command, "--relay-only", "--allow-insecure-plaintext-relay"]
         if getattr(self.args, "server_stall", False) and command[:1] == [str(self.args.daemon)]:
             # Explicit existing public CLI fixture input; product defaults and
             # the separate normal/blackhole entries retain their original argv.

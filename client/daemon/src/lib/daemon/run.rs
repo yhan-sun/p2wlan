@@ -1,6 +1,10 @@
 impl Daemon {
     /// Run the daemon main loop.
     pub async fn run(&mut self) -> Result<()> {
+        self.config
+            .network
+            .validate_peer_trust()
+            .map_err(DaemonError::Config)?;
         #[cfg(target_env = "ohos")]
         if self.ohos_startup_ready.is_none() {
             self.route_manager.cleanup();
@@ -174,11 +178,6 @@ impl Daemon {
             &relay_servers,
             self.config.relay.allow_insecure_plaintext,
         );
-        if relay_allow_insecure_plaintext && !self.config.relay.allow_insecure_plaintext {
-            info!(
-                "Allowing plaintext relay because HTTP control plane supplied legacy relay candidates"
-            );
-        }
 
         let mut resolved_config = (*self.config).clone();
         resolved_config.network.virtual_ip = virtual_ip.clone();

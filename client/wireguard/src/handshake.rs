@@ -24,7 +24,7 @@ use subtle::ConstantTimeEq;
 
 use crate::error::{Result, WireGuardError};
 use crate::types::{MessageInitiation, MessageResponse, MAC_SIZE, TIMESTAMP_SIZE};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Compute MAC1 for a handshake message.
 ///
@@ -122,7 +122,7 @@ pub struct HandshakeInitiator {
     /// The responder's static public key.
     responder_public: PublicKeyBytes,
     /// Optional preshared key.
-    preshared_key: Option<[u8; 32]>,
+    preshared_key: Option<Zeroizing<[u8; 32]>>,
     /// The initiator's ephemeral key pair (generated for this handshake).
     ephemeral: Option<DhKeyPair>,
     /// The Noise symmetric state.
@@ -151,7 +151,7 @@ impl HandshakeInitiator {
         Self {
             identity,
             responder_public,
-            preshared_key,
+            preshared_key: preshared_key.map(Zeroizing::new),
             ephemeral: None,
             noise,
             sender_index: random_index(),
@@ -283,8 +283,8 @@ impl HandshakeInitiator {
         self.noise.mix_key(&dh4);
 
         // 4. mix_psk(psk_or_zero)
-        let psk = self.preshared_key.unwrap_or([0u8; 32]);
-        self.noise.mix_psk(&psk);
+        let psk = self.preshared_key.as_deref().unwrap_or(&[0u8; 32]);
+        self.noise.mix_psk(psk);
 
         // 5. decrypt_and_hash(enc_empty) — should be empty
         let _empty = self
@@ -314,7 +314,7 @@ pub struct HandshakeResponder {
     /// The responder's node identity (static key pair).
     identity: NodeIdentity,
     /// Optional preshared key.
-    preshared_key: Option<[u8; 32]>,
+    preshared_key: Option<Zeroizing<[u8; 32]>>,
     /// The responder's ephemeral key pair (generated for this handshake).
     ephemeral: Option<DhKeyPair>,
     /// The initiator's static public key (learned during handshake).
@@ -347,7 +347,7 @@ impl HandshakeResponder {
 
         Self {
             identity,
-            preshared_key,
+            preshared_key: preshared_key.map(Zeroizing::new),
             ephemeral: None,
             initiator_public: None,
             initiator_ephemeral: None,
@@ -479,8 +479,8 @@ impl HandshakeResponder {
         self.noise.mix_key(&dh4);
 
         // 10. mix_psk(psk_or_zero)
-        let psk = self.preshared_key.unwrap_or([0u8; 32]);
-        self.noise.mix_psk(&psk);
+        let psk = self.preshared_key.as_deref().unwrap_or(&[0u8; 32]);
+        self.noise.mix_psk(psk);
 
         // 11. encrypt_and_hash(empty) → just a 16-byte tag
         let enc_empty = self.noise.encrypt_and_hash(&[]);
@@ -530,7 +530,7 @@ impl HandshakeResponder {
 // =============================================================================
 
 /// Transport key pair derived after a successful handshake.
-#[derive(Clone, Zeroize)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct TransportKeyPair {
     /// Key for sending data.
     pub send_key: Hash,

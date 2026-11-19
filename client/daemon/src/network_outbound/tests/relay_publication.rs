@@ -196,6 +196,57 @@ async fn relay_full_before_pending_policy(path: WriterPath, cancel: bool) {
 async fn relay_full_publication_precedes_pending_policy_general() {
     relay_full_before_pending_policy(WriterPath::General, false).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn business_padding_16_actual_relay_writer_preserves_original_ip_and_baseline_cap() {
+    let budget = Budget::new();
+    let (f, transport, mut fixture, mut remote) = admitted(WriterPath::General, budget).await;
+    let transport = transport.with_business_padding_16(true);
+    let udps = RwLock::new(None);
+    let relays = RwLock::new(Some(fixture.transport().clone()));
+    for len in [29, 1167, 1168, 1169] {
+        let original = Ipv4Packet::build_icmp_echo_request(
+            "10.20.0.1".parse().unwrap(),
+            "10.20.0.2".parse().unwrap(),
+            11,
+            12,
+            &vec![0xab; len - 28],
+        );
+        let outcome = budget
+            .step(encrypt_then_send_with_deadline(
+                OutboundPacket {
+                    room_authorization: None,
+                    peer_id: PEER.into(),
+                    dst_ip: "10.20.0.2".into(),
+                    packet: original.clone(),
+                    trace: None,
+                },
+                &transport,
+                &f.peers,
+                f.record.generation,
+                false,
+                &udps,
+                &relays,
+                true,
+                Some(Instant::now() + Duration::from_secs(1)),
+                None,
+            ))
+            .await;
+        assert!(matches!(outcome, EncryptSendOutcome::Sent));
+        let frame = fixture.next_frame(budget).await;
+        let wire = frame.parse_forward_payload().unwrap().1;
+        let target = original.len().div_ceil(16) * 16;
+        let expected = if target <= 1168 {
+            target
+        } else {
+            original.len()
+        };
+        assert_eq!(wire.len(), expected + 32);
+        assert_eq!(remote.decrypt_from_bytes(wire).unwrap(), original);
+    }
+    drop(relays);
+    fixture.finish(budget).await;
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_full_publication_precedes_pending_policy_legacy() {
     relay_full_before_pending_policy(WriterPath::LegacyAddress, false).await;

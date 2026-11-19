@@ -74,6 +74,9 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
             .map(ToString::to_string)
             .collect();
     }
+    if cli.allow_insecure_plaintext_relay {
+        config.relay.allow_insecure_plaintext = true;
+    }
     if let Some(ref preferred_regions) = cli.relay_regions {
         config.relay.preferred_regions = preferred_regions
             .split(',')

@@ -29,6 +29,7 @@ fn test_cli(control: Option<&str>, network: Option<&str>) -> Cli {
         socket_pool: None,
         keepalive_interval_secs: None,
         relay: None,
+        allow_insecure_plaintext_relay: false,
         relay_regions: None,
         relay_selection_timeout_ms: None,
         relay_startup_timeout_ms: None,
@@ -56,6 +57,20 @@ fn test_cli(control: Option<&str>, network: Option<&str>) -> Cli {
         windows_service_name: None,
         log_file: None,
     }
+}
+
+#[test]
+fn plaintext_relay_requires_explicit_daemon_flag() {
+    let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
+    let mut args = vec!["p2wlan-daemon", "--relay", "tcp://127.0.0.1:18081"];
+    let cli = Cli::try_parse_from(&args).unwrap();
+    apply_cli_overrides(&mut config, &cli);
+    assert!(!config.relay.allow_insecure_plaintext);
+
+    args.push("--allow-insecure-plaintext-relay");
+    let cli = Cli::try_parse_from(&args).unwrap();
+    apply_cli_overrides(&mut config, &cli);
+    assert!(config.relay.allow_insecure_plaintext);
 }
 
 #[test]
@@ -201,6 +216,7 @@ fn network_arguments_override_generated_config() {
         socket_pool: Some("3".to_string()),
         keepalive_interval_secs: None,
         relay: Some("cn-east@127.0.0.1:8080,us-west@127.0.0.1:8081".to_string()),
+        allow_insecure_plaintext_relay: false,
         relay_regions: Some("cn-east,us-west".to_string()),
         relay_selection_timeout_ms: Some(750),
         relay_startup_timeout_ms: None,
@@ -275,6 +291,7 @@ fn test_validate_cli_invalid_cases() {
         socket_pool: None,
         keepalive_interval_secs: None,
         relay: None,
+        allow_insecure_plaintext_relay: false,
         relay_regions: None,
         relay_selection_timeout_ms: None,
         relay_startup_timeout_ms: None,
@@ -416,6 +433,7 @@ fn managed_argument_overrides_existing_manual_config() {
         socket_pool: None,
         keepalive_interval_secs: None,
         relay: None,
+        allow_insecure_plaintext_relay: false,
         relay_regions: None,
         relay_selection_timeout_ms: None,
         relay_startup_timeout_ms: None,

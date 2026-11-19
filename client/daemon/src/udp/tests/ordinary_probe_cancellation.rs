@@ -86,6 +86,96 @@ impl OrdinaryFixture {
     }
 }
 
+async fn upgrade_ordinary_fixture_to_opaque(fixture: &OrdinaryFixture) {
+    let connection = fixture.udp.peers.get_connection("peer-b").await.unwrap();
+    let mut peer = peer_with_public_key(
+        "peer-b",
+        "10.20.0.2",
+        connection.public_key,
+        Some(fixture.destination),
+    );
+    peer.registration_seq = 1;
+    peer.capabilities = crate::control::PeerCapabilities::current();
+    fixture.udp.peers.add_peer(&peer).await;
+}
+
+#[tokio::test]
+async fn queued_stable_identity_probe_is_revoked_before_original_primary_syscall() {
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let fixture = OrdinaryFixture::new().await;
+    let gate = fixture
+        .cost
+        .install_gate(OrdinaryProbeTestStage::PrimaryAwait);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let (mut task, returned) = fixture.start(deadline);
+    tokio::time::timeout_at(deadline, gate.reached.notified())
+        .await
+        .unwrap();
+    upgrade_ordinary_fixture_to_opaque(&fixture).await;
+    gate.release.notify_one();
+    let outcome = tokio::time::timeout_at(deadline, returned)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        outcome.unwrap_err().kind,
+        ProbeSendFailureKind::ProbeRegistrationFailed
+    );
+    assert!(task.finish(false).await.is_none());
+    let mut bytes = [0; 1024];
+    assert_eq!(
+        fixture
+            .receiver
+            .try_recv_from(&mut bytes)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn original_primary_success_does_not_authorize_queued_compatibility_after_upgrade() {
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let fixture = OrdinaryFixture::new().await;
+    let gate = fixture
+        .cost
+        .install_gate(OrdinaryProbeTestStage::PrimaryResult);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let (mut task, returned) = fixture.start(deadline);
+    tokio::time::timeout_at(deadline, gate.reached.notified())
+        .await
+        .unwrap();
+    let mut bytes = [0; 1024];
+    let (len, _) = tokio::time::timeout_at(deadline, fixture.receiver.recv_from(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        peek_authenticated_punch_identity(&bytes[..len])
+            .unwrap()
+            .version,
+        2
+    );
+    upgrade_ordinary_fixture_to_opaque(&fixture).await;
+    gate.release.notify_one();
+    let outcome = tokio::time::timeout_at(deadline, returned)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(task.finish(false).await.is_none());
+    assert_eq!(outcome.datagrams_sent, 1);
+    assert_eq!(outcome.physical_send_errors, 0);
+    assert_eq!(
+        fixture
+            .receiver
+            .try_recv_from(&mut bytes)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
 async fn cancelled_after_result(
     stage: OrdinaryProbeTestStage,
     expected: usize,

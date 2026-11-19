@@ -10,6 +10,10 @@ pub(super) async fn poll_peers(
     state: &Arc<RwLock<ClientState>>,
     event_tx: &mpsc::UnboundedSender<ControlEvent>,
 ) -> Result<()> {
+    config
+        .network
+        .validate_peer_trust()
+        .map_err(DaemonError::Config)?;
     let server_clock = state.read().await.server_clock.clone();
     let timing_identity = server_clock.request_identity(registration_seq, http_pool_id);
     let request_started = std::time::Instant::now();
@@ -49,6 +53,17 @@ pub(super) async fn poll_peers(
         .json()
         .await
         .map_err(|e| DaemonError::ControlPlane(format!("list nodes decode failed: {e}")))?;
+
+    // Verify independently pinned identities before publishing either the
+    // Control cache or the room authorization snapshot. Omitted/mismatched
+    // entries are departed peers below, so an old cached lifecycle is revoked.
+    let mut body = body;
+    body.nodes.retain(|node| {
+        node.id == self_node_id
+            || config
+                .network
+                .peer_identity_allowed(&node.id, &node.public_key, &node.virtual_ip)
+    });
 
     if let (Some(identity), Some(server_time_ms)) = (timing_identity, body.server_time_ms) {
         server_clock.observe_short_request(

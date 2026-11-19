@@ -5,8 +5,9 @@
 //! The main client daemon that runs the P2P virtual network.
 
 use clap::Parser;
-use p2pnet_daemon::config::ControlProxyMode;
+use p2pnet_daemon::config::{ControlProxyMode, DaemonInstanceLock};
 use p2pnet_daemon::{Config, Daemon, DaemonError, PathPolicy};
+#[cfg(all(test, unix))]
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
@@ -18,7 +19,6 @@ const DEFAULT_NETWORK_ID: &str = "default";
 
 include!("main/cli.rs");
 include!("main/validation.rs");
-include!("main/instance_lock.rs");
 include!("main/diagnostics_auth.rs");
 include!("main/lifecycle_probe.rs");
 include!("main/windows_lifecycle.rs");

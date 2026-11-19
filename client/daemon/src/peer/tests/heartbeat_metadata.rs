@@ -78,6 +78,7 @@ async fn changed_correctness_or_other_metadata_fields_keep_original_epoch_fence(
         crate::control::PeerCapabilities {
             hh2_pair_nomination: true,
             hh2_plan_v2: true,
+            probe_opaque_ids_v1: false,
         }
     );
     let epoch = manager.network_epoch_gate.lock().await;

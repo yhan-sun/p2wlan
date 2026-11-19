@@ -85,3 +85,6 @@ mod traffic_counters;
 
 #[path = "tests/relay_first_log_release.rs"]
 mod relay_first_log_release;
+
+#[path = "tests/peer_trust.rs"]
+mod peer_trust;

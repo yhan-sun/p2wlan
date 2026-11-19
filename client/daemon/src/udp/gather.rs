@@ -207,7 +207,6 @@ impl UdpTransport {
         change_port: bool,
     ) -> std::result::Result<LiveStunResponse, String> {
         let mut request = StunMessage::binding_request();
-        request.add_attribute(StunAttribute::Software("P2WLAN/0.1".to_string()));
         if change_ip || change_port {
             request.add_attribute(StunAttribute::ChangeRequest {
                 change_ip,

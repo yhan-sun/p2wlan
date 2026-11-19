@@ -16,6 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod formatting;
 use formatting::*;
+mod support_redaction;
+use support_redaction::redact_support_text;
 
 // A control server is an explicit user setting.  Keep the value empty so a
 // fresh CLI cannot silently contact a project-owned deployment.
@@ -24,7 +26,7 @@ const DEFAULT_NETWORK: &str = "default";
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
 const DEFAULT_UPDATE_REPO: &str = "yhan-sun/p2wlan";
 const DEFAULT_INSTALL_DIR: &str = "/usr/local/bin";
-const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、resource-capture、relay、relay-regions、relay-selection-timeout、relay-policy、prefer-direct、path-policy、relay-startup-timeout、proxy-mode";
+const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、business-padding-16、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、resource-capture、relay、relay-regions、relay-selection-timeout、relay-policy、prefer-direct、path-policy、relay-startup-timeout、proxy-mode";
 
 #[derive(Parser, Debug)]
 #[command(name = "p2wlan", version, about = "p2wlan Linux command-line client")]
@@ -119,9 +121,23 @@ enum ConfigCommand {
     Show,
     /// Print the configuration file path
     Path,
+    /// Protect the private keys of an existing profile while its daemon is stopped
+    ProtectIdentity {
+        /// Absolute path to an externally managed 256-bit key (Unix)
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "windows_dpapi",
+            required_unless_present = "windows_dpapi"
+        )]
+        key_file: Option<PathBuf>,
+        /// Use Windows DPAPI for the current user
+        #[arg(long)]
+        windows_dpapi: bool,
+    },
     /// Set one supported configuration value
     Set {
-        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, socket-pool, diagnostics, resource-capture, relay, relay-regions, relay-selection-timeout, relay-policy, prefer-direct, path-policy, relay-startup-timeout, or proxy-mode
+        /// control, network, device-name, interface, mtu, business-padding-16, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, socket-pool, diagnostics, resource-capture, relay, relay-regions, relay-selection-timeout, relay-policy, prefer-direct, path-policy, relay-startup-timeout, or proxy-mode
         key: String,
         value: String,
     },
