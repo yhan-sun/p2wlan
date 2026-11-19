@@ -36,6 +36,38 @@ impl RelayBackoffHeartbeatTargetSet {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectConsentPath {
+    pub(crate) path: ActivePathSnapshot,
+    pub(crate) local_endpoint: Option<SocketAddr>,
+    pub(crate) remote_candidate_epoch: u64,
+}
+
+impl PeerConnection {
+    fn direct_consent_path(&self, generation: u64) -> Option<DirectConsentPath> {
+        let epoch = self.path_state_machine.current_epoch()?;
+        if !self.online
+            || self.state != ConnectionState::Direct
+            || self.direct_generation != generation
+            || epoch.network_generation != generation
+        {
+            return None;
+        }
+        let pair = self.selected_direct_pair_for_consent(generation)?;
+        Some(DirectConsentPath {
+            local_endpoint: pair.local_endpoint,
+            path: ActivePathSnapshot {
+                path: NetworkPath::Direct,
+                generation,
+                endpoint: pair.remote_endpoint,
+                peer_session_generation: epoch.peer_session_generation,
+                direct_commit_seq: self.direct_commit_seq,
+            },
+            remote_candidate_epoch: epoch.remote_candidate_epoch,
+        })
+    }
+}
+
 impl PeerManager {
     /// Return the best current direct endpoint for encrypted UDP data.
     pub async fn direct_endpoint_for_send(&self, node_id: &str) -> Option<SocketAddr> {
@@ -49,17 +81,38 @@ impl PeerManager {
 
     /// Return direct UDP endpoints for NAT keepalive probes.
     pub async fn direct_endpoints(&self) -> Vec<(String, SocketAddr)> {
-        let generation = self.current_network_generation().await;
-        self.connections
-            .read()
+        self.direct_consent_targets()
             .await
+            .into_iter()
+            .map(|(peer, target)| (peer, target.path.endpoint))
+            .collect()
+    }
+
+    /// Capture the selected path before the first socket operation.
+    pub(crate) async fn direct_consent_targets(&self) -> Vec<(String, DirectConsentPath)> {
+        let (_epoch, connections) = self.lock_epoch_and_connections_read().await;
+        let generation = self.current_network_generation_sync();
+        connections
             .values()
-            .filter(|conn| conn.state == ConnectionState::Direct)
             .filter_map(|conn| {
-                conn.selected_direct_endpoint_for_consent(generation)
-                    .map(|endpoint| (conn.node_id.clone(), endpoint))
+                conn.direct_consent_path(generation)
+                    .map(|target| (conn.node_id.clone(), target))
             })
             .collect()
+    }
+
+    pub(crate) async fn consent_recheck_due(&self, node: &str, target: DirectConsentPath) -> bool {
+        if !self.config.network.accelerated_consent {
+            return false;
+        }
+        let conns = self.connections.read().await;
+        conns.get(node).is_some_and(|conn| {
+            conn.direct_consent_path(self.current_network_generation_sync()) == Some(target)
+                && conn.direct_health.consecutive_failures.saturating_add(1)
+                    == DIRECT_KEEPALIVE_FAILURE_THRESHOLD
+                && conn.direct_health.last_error_code.as_deref()
+                    == Some(REASON_DIRECT_KEEPALIVE_TIMEOUT)
+        })
     }
 
     /// Return candidate endpoints for a specific peer using the adaptive probe scheduler.

@@ -14,6 +14,17 @@ impl PeerManager {
         generation: u64,
         relay_available: bool,
     ) -> bool {
+        self.queued_data_path_admitted(node_id, generation, relay_available, false)
+            .await
+    }
+
+    pub(crate) async fn queued_data_path_admitted(
+        &self,
+        node_id: &str,
+        generation: u64,
+        relay_available: bool,
+        live_writer: bool,
+    ) -> bool {
         // A stable RelayOnly queue check changes no connection state. Read
         // that exact canonical connection without competing with original
         // packet observation for the epoch mutex. This result is only a
@@ -71,6 +82,7 @@ impl PeerManager {
             node_id,
             generation,
             relay_available,
+            live_writer,
         )
     }
 
@@ -80,6 +92,7 @@ impl PeerManager {
         node_id: &str,
         generation: u64,
         relay_available: bool,
+        live_writer: bool,
     ) -> bool {
         conns
             .get_mut(node_id)
@@ -100,16 +113,51 @@ impl PeerManager {
                 if conn.is_on_link_direct_for_generation(generation) {
                     return true;
                 }
+                let relay_confirmed =
+                    relay_available && conn.relay_peer_confirmed_for_generation(generation);
                 if conn.direct_first_pending() {
-                    return false;
+                    if live_writer
+                        && relay_confirmed
+                        && self.config.relay.effective_path_policy(true)
+                            == crate::config::PathPolicy::Adaptive
+                    {
+                        if let Some(epoch) = conn.path_state_machine.current_epoch() {
+                            let last_direct_progress = conn
+                                .candidate_pairs
+                                .iter()
+                                .filter(|pair| {
+                                    pair.local_generation == generation
+                                        && pair.remote_candidate_epoch
+                                            == epoch.remote_candidate_epoch
+                                })
+                                .filter_map(|pair| pair.last_success_at)
+                                .max();
+                            let now = Instant::now();
+                            let grace = path_state_machine::ADAPTIVE_DIRECT_GRACE;
+                            let ready =
+                                conn.path_state_machine.direct_first_deadline().is_some_and(
+                                    |end| {
+                                        now.saturating_duration_since(end - DIRECT_FIRST_WINDOW)
+                                            >= grace
+                                    },
+                                ) && last_direct_progress
+                                    .is_none_or(|at| now.saturating_duration_since(at) >= grace);
+                            if ready {
+                                conn.commit_path_transition(
+                                    PathEvent::QueuedRelayRequested {
+                                        epoch,
+                                        now,
+                                        last_direct_progress,
+                                    },
+                                    |_| {},
+                                );
+                            }
+                        }
+                    }
+                    if conn.direct_first_pending() {
+                        return false;
+                    }
                 }
-                let relay_confirmed = relay_available
-                    && conn.relay_confirmed_at.is_some()
-                    && conn.relay_confirmed_generation == Some(generation)
-                    && conn
-                        .relay_confirmed_endpoint
-                        .as_deref()
-                        .is_some_and(|endpoint| !endpoint.is_empty());
                 if relay_confirmed {
                     return true;
                 }

@@ -278,6 +278,7 @@ def exec_launch(artifact_set: Path, component: str, record_path: Path, role: str
         stats = environment.get("P2WLAN_NAT_SIM_EGRESS_STATS")
         environment = udp_egress.environment(snapshots["udp-shim"], int(gateway),
                                              Path(stats) if stats else None)
+        environment["P2WLAN_NAT_SIM_SENDER_PID"] = str(os.getpid())
     configuration = configuration_identity(arguments, environment, environment_keys,
         config_file=config_file, stdin_authorization=stdin_authorization)
     record = {"schema_version": 1, "source": artifacts["source"], "role": role, "component": component,

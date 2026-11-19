@@ -1505,6 +1505,12 @@ for round in $(seq 1 "$ROUNDS"); do
     # Load and arm the observer before either daemon can activate its start.
     HARD_HARD_GATE_DEADLINE=$(stage_deadline 20)
     HARD_HARD_GATE_DEADLINE_MS=$(((ROUND_CLOCK_ORIGIN_UNIX_S + HARD_HARD_GATE_DEADLINE - ROUND_CLOCK_ORIGIN_SECONDS) * 1000))
+    # Bash SECONDS and the wall-clock origin have independent second ticks.
+    # Keep the original outer cutoff and the watcher's actual 20-second cap.
+    WATCH_CAP_MS=$(python3 -c 'import time; print(time.time_ns() // 1000000 + 20000)')
+    if (( HARD_HARD_GATE_DEADLINE_MS > WATCH_CAP_MS )); then
+      HARD_HARD_GATE_DEADLINE_MS=$WATCH_CAP_MS
+    fi
     HARD_HARD_WATCHER_ARMED="$ROUND_DIR/hard-hard-direct-gate.armed"
     python3 "$ROOT_DIR/scripts/nat-sim/hard_hard_gate.py" --watch \
       --node-a-log "$ROUND_DIR/node-a.log" --node-b-log "$ROUND_DIR/node-b.log" \

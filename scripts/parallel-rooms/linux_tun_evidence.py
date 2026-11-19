@@ -26,6 +26,7 @@ from linux_tun_fault import FaultOwner
 import linux_tun_stall
 import linux_tun_stall_contract as stall_contract
 import linux_tun_relay as relay_fixture
+import linux_tun_conditions as conditions
 import linux_tun_revoke_contract as revoke_contract
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -56,9 +57,23 @@ class EvidenceLab(original.Lab):
         clean = {k: v for k, v in os.environ.items() if not k.startswith("P2WLAN_")}
         clean.update(RUST_LOG="info", RUST_BACKTRACE="0", P2WLAN_TEST_RUN_ID=self.run_id)
         clean.update(env or {})
-        if getattr(self.args, "relay_application", None) and command[:1] == [str(self.args.daemon)]:
-            command = [*command, "--relay-only"]
-        if getattr(self.args, "server_stall", False) and command[:1] == [str(self.args.daemon)]:
+        is_daemon = command[:1] == [str(self.args.daemon)]
+        alternate_build = is_daemon and label == "b" and getattr(self.args, "peer_daemon", None)
+        if alternate_build:
+            command = [str(self.args.peer_daemon), *command[1:]]
+        family = getattr(self.args, "healthy_underlay_family", None)
+        if is_daemon and family:
+            command = list(command)
+            command[command.index("--stun") + 1] = "192.0.2.2:3478" if family == "ipv6" else "[2001:db8:7::2]:3478"
+        if getattr(self.args, "relay_application", None) and is_daemon:
+            if not getattr(self.args, "startup_policy", None):
+                command = [*command, "--relay-only"]
+            if getattr(self.args, "relay_tls", False):
+                clean["SSL_CERT_FILE"] = str(self.root / "relay-test-ca.pem")
+        if is_daemon and not alternate_build and any(getattr(self.args, flag, False) for flag in
+                ("startup_policy", "early_candidates", "standby_failover")):
+            conditions.configure_daemon(self, label, command)
+        if getattr(self.args, "server_stall", False) and is_daemon:
             # Explicit existing public CLI fixture input; product defaults and
             # the separate normal/blackhole entries retain their original argv.
             command = [*command, "--keepalive-interval-secs", "1"]
@@ -67,7 +82,7 @@ class EvidenceLab(original.Lab):
                 "argv_sha256": hashlib.sha256(json.dumps(command, separators=(",", ":")).encode()).hexdigest(),
                 "default_keepalive_cycle_verified": False,
             }
-        kernel = getattr(self.groups, "kernel_captures", None) if command[:1] == [str(self.args.daemon)] else None
+        kernel = getattr(self.groups, "kernel_captures", None) if is_daemon else None
         if kernel is not None:
             clean.update(kernel.environment())
         child = self.groups.spawn(name, ["ip", "netns", "exec", self.ns(label), *command],
@@ -278,6 +293,8 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
     else:
         records = tcp.validate_probe(report)
     attach(entry, report, records, bind, destination, digest(tool))
+    if protocol == "udp" and getattr(lab.args, "standby_failover", False):
+        entry["duplicate_responses_observed"] = report["receive_counts"]["duplicate"]
     if revocation is not None:
         revocation.complete(entry, capture, kernel, report)
     if "phase" in entry:
@@ -305,7 +322,7 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
         entry["echo_termination_reason"] = echo_report_data["termination_reason"]
         if not entry["expected_blackhole_observed"]:
             raise RuntimeError("actual application failure is not the frozen expected blackhole outcome")
-    elif probe_exit != 0 or echo_exit != 0:
+    elif (probe_exit != 0 or echo_exit != 0) and not any(getattr(lab.args, key, False) for key in ("startup_measurements", "standby_failover")):
         raise RuntimeError("original application child failed; fixed denominator retained")
     if revocation is None:
         for name, peer in (("a1", "b1"), ("b1", "a1")):
@@ -318,6 +335,10 @@ def exercise(lab: EvidenceLab, groups: OwnedGroups, report: dict, out: Path,
     from linux_tun_fixture import prepare
     initial, snapshots, users, room = prepare(sys.modules[__name__], lab, report)
     relay_mode = getattr(lab.args, "relay_application", None)
+    if getattr(lab.args, "mixed_load", False):
+        conditions.start_load(lab, snapshots, report)
+    if getattr(lab.args, "standby_failover", False):
+        relay_fixture.interrupt_primary(lab, initial, report)
     if getattr(lab.args, "room_revocation", False):
         from linux_tun_room_revoke import Revocation
         measure(lab, groups, report["manifest"][0], out, snapshots)
@@ -351,6 +372,14 @@ def exercise(lab: EvidenceLab, groups: OwnedGroups, report: dict, out: Path,
             entry["recovery_report_observation_upper_bound_ns"] = (
                 entry["probe_observed_complete_monotonic_ns"] - cleared["observed_monotonic_ns"])
         report["application"] = fault_contract.summarize(report["manifest"])
+    if getattr(lab.args, "mixed_load", False):
+        conditions.finish_load(lab, report)
+    if getattr(lab.args, "standby_failover", False):
+        relay_fixture.verify_takeover(lab, initial, report)
+    if getattr(lab.args, "healthy_underlay_family", None):
+        conditions.collect_underlay_family(lab, report)
+    if "underlay_cost" in report:
+        conditions.finish_accounting(lab, report)
     report["endpoint_routes_after"] = {name: endpoint(lab, name, initial[peer]["virtual_ip"])
                                        for name, peer in (("a1", "b1"), ("b1", "a1"))}
     lab.capture_stage("fixed_application_requests_complete", successful=True)
@@ -406,6 +435,21 @@ def main() -> int:
                         help="independent fixed32 application DROP/clear/fresh scope; original baseline unchanged")
     mode.add_argument("--server-stall", action="store_true",
                       help="independent UDP fixed16 original echo STOP/CONT; explicit keepalive interval1")
+    parser.add_argument("--daemon-head", help="optional frozen binary commit when testing an earlier build with this same harness")
+    parser.add_argument("--peer-daemon", type=lambda x: Path(x).resolve(), help="run the second peer with a separately verified daemon and its own defaults")
+    parser.add_argument("--peer-daemon-head", help="exact source commit of the second peer binary")
+    parser.add_argument("--mixed-load", action="store_true", help="overlay TCP upload plus both UDP request directions on shaped TLS")
+    parser.add_argument("--outer-loss", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--standby-failover", action="store_true", help="terminate the primary of two ticket-authenticated TLS relays")
+    parser.add_argument("--cold-reconnect", action="store_true", help="run the same standby fault with warm takeover disabled")
+    parser.add_argument("--startup-policy", choices=("direct-first", "auto", "adaptive"),
+                        help="isolate peer UDP while keeping the authenticated TLS relay reachable")
+    parser.add_argument("--early-candidates", action="store_true", help="enable early candidate signaling on both daemons")
+    parser.add_argument("--healthy-underlay-family", choices=("ipv4", "ipv6"),
+                        help="dual-stack cold start with peer UDP and the STUN observer blackholed on the other family")
+    parser.add_argument("--startup-measurements", action="store_true",
+                        help="time the original join through both real UDP request directions without waiting for path readiness")
+    parser.add_argument("--relay-tls", action="store_true", help="use the production TLS relay with an isolated test CA")
     parser.add_argument("--layered-measurements", action="store_true",
                         help="export original TCP RTT, service, socket and two channel observations")
     mode.add_argument("--relay-application", choices=["udp", "tcp"],
@@ -413,6 +457,27 @@ def main() -> int:
     mode.add_argument("--room-revocation", action="store_true",
                       help="supplementary UDP16: production room leave before final original-window delivery")
     args = parser.parse_args()
+    if (args.mixed_load or args.standby_failover or args.startup_policy) and not (args.relay_tls and args.relay_application == "udp"):
+        parser.error("shaping, takeover and startup-policy experiments require the production TLS UDP application fixture")
+    if sum(map(bool, (args.mixed_load, args.standby_failover, args.startup_measurements))) > 1 or (args.outer_loss and not args.mixed_load):
+        parser.error("choose one isolated workload per run")
+    if args.startup_policy and not args.startup_measurements:
+        parser.error("--startup-policy requires the original join clock")
+    if args.healthy_underlay_family and (not args.startup_measurements or args.relay_application):
+        parser.error("isolated address-family trials require direct startup measurements")
+    if args.cold_reconnect and not args.standby_failover:
+        parser.error("--cold-reconnect requires --standby-failover")
+    if bool(args.peer_daemon) != bool(args.peer_daemon_head):
+        parser.error("--peer-daemon and --peer-daemon-head must be supplied together")
+    for commit in (args.daemon_head, args.peer_daemon_head):
+        if commit and (len(commit) != 40 or original.run(["git", "-C", str(ROOT), "rev-parse", "--verify",
+                                                       commit + "^{commit}"]).stdout.strip() != commit):
+            parser.error("daemon source must identify an exact available commit")
+    if args.startup_measurements and (not args.kernel_read_facts or args.fault_recovery or args.server_stall
+                                      or args.room_revocation or args.relay_application == "tcp"):
+        parser.error("startup measurements require original kernel reads and a normal or UDP relay run")
+    if args.relay_tls and not args.relay_application:
+        parser.error("--relay-tls requires --relay-application")
     if args.kernel_read_facts and not args.write_facts:
         parser.error("--kernel-read-facts requires the original --write-facts plans")
     if args.room_revocation and not (args.kernel_read_facts and args.write_facts):
@@ -449,7 +514,7 @@ def main() -> int:
                                  Path(__file__).with_name("linux_tun_fault.py"), Path(__file__).with_name("linux_tun_fault_contract.py"),
                                  Path(__file__).with_name("linux_tun_stall.py"), Path(__file__).with_name("linux_tun_stall_contract.py"),
                                  Path(__file__).with_name("linux_tun_relay.py"),
-                                 Path(__file__).with_name("linux_tun_fixture.py"),
+                                 Path(__file__).with_name("linux_tun_fixture.py"), Path(__file__).with_name("linux_tun_startup.py"), Path(__file__).with_name("linux_tun_conditions.py"),
                                  Path(__file__).with_name("linux_tun_revoke_contract.py"),
                                  Path(__file__).with_name("linux_tun_room_revoke.py"),
                                  Path(__file__).with_name("udp_stall_echo.py"),
@@ -458,6 +523,10 @@ def main() -> int:
                                  DUAL / "probe_completion_barrier.py",
                                  ROOT / ".github/workflows/parallel-rooms.yml")},
               "binary_sha256": {"daemon": None, "control": None}}
+    report["daemon_source_commit"] = args.daemon_head or args.head
+    report["peer_daemon_source_commit"] = args.peer_daemon_head or report["daemon_source_commit"]
+    report["experiment_inputs"] = dict(startup_policy=args.startup_policy, early_candidates=args.early_candidates,
+                                       standby_failover=args.standby_failover, cold_reconnect=args.cold_reconnect, mixed_load=args.mixed_load)
     plan = None
     fault_slot = [] if args.fault_recovery else None
     stall_slot = [] if args.server_stall else None
@@ -470,6 +539,8 @@ def main() -> int:
     captures = None
     kernel_captures = None
     measured_binaries = {"daemon": args.daemon, "control": args.control}
+    if args.peer_daemon:
+        measured_binaries["peer_daemon"] = args.peer_daemon
     if args.relay_application:
         measured_binaries.update(relay=args.relay, relay_keygen=args.relay_keygen)
         path = ROOT / "scripts/relay_keygen.go"
@@ -563,6 +634,30 @@ def main() -> int:
         if args.server_stall:
             complete = complete and report["pause_cleanup"]["complete"]
         report["cleanup_complete"] = complete
+        if args.mixed_load or args.standby_failover:
+            rows = [row for entry in report["manifest"] for row in (entry.get("records") or [])]
+            report["interactive_rtt_ms"] = udp_summary.rtt_statistics(rows)
+        if args.mixed_load:
+            try:
+                report["mixed_queue_observations"] = application_layer_export.mixed_queues(
+                    args.output_dir, report["manifest"], kernel_captures)
+            except (OSError, ValueError, KeyError, TypeError) as layer_error:
+                report["mixed_queue_observations"] = {"flows": [], "gap": str(layer_error)[:160]}
+        if args.standby_failover and "relay_fault" in report:
+            from linux_tun_startup import summarize as summarize_recovery
+            fault = report["relay_fault"]
+            comparison = summarize_recovery(dict(join_requested_ns=fault["injected_monotonic_ns"],
+                                        boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip()), report["manifest"])
+            fault["first_application_recovery_ms_by_direction"] = comparison["first_success_ms_by_direction"]
+            fault["bidirectional_application_recovery_ms"] = comparison["first_bidirectional_observed_ms"]
+        if args.startup_measurements:
+            from linux_tun_startup import summarize as summarize_startup
+            try:
+                report["startup"] = summarize_startup(report.get("startup_clock", {}), report["manifest"])
+            except (ValueError, KeyError, TypeError) as timing_error:
+                report["startup"] = dict(gap_reason=str(timing_error)[:160],
+                                         preplanned_requests=sum(e["count"] for e in report["manifest"] if e["protocol"] == "udp"),
+                                         native_direct_request_response_families={})
         if args.server_stall:
             application_ok = stall_contract.accepted(report["application"], report.get("server_stall", {}))
         elif args.fault_recovery:
@@ -570,6 +665,7 @@ def main() -> int:
         else:
             application_ok = report["application"]["all_responses_observed"]
         report["passed"] = (error is None and complete and "debug_capture_error" not in report
+                            and "gap_reason" not in report.get("startup", {})
                             and application_ok)
         if args.kernel_read_facts:
             original_kernel = report.get("original_kernel_read_observations", {})
@@ -580,6 +676,12 @@ def main() -> int:
         if args.relay_application:
             report["relay_native_path_comparisons"] = relay_fixture.path_summary(report["manifest"])
             report["passed"] = report["passed"] and report["relay_native_path_comparisons"]["complete"]
+        if args.healthy_underlay_family:
+            counts = report.get("underlay_family", {}).get("silent_observer_packets_dropped", {})
+            target = "/".join([args.healthy_underlay_family] * 2)
+            startup = report["startup"]
+            report["passed"] = (report["passed"] and set(counts) == {"a", "b"} and min(counts.values()) > 0
+                                and startup["native_direct_request_response_families"].get(target, 0) == startup["preplanned_requests"])
         if args.layered_measurements:
             try:
                 report["layered_application_observations"] = application_layer_export.export(

@@ -565,6 +565,19 @@ fn capture_direct_route_snapshot(excluded: &[String]) -> DirectRouteSnapshot {
         }
     }
     if let Some(interface) = &physical_route_interface {
+        for prefix in p2pnet_nat::ice::interface_route_prefixes(interface) {
+            signature.push(format!("address:{interface}:{prefix}"));
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(changes) = std::fs::read_to_string(
+            std::path::Path::new("/sys/class/net")
+                .join(interface)
+                .join("carrier_changes"),
+        ) {
+            if let Ok(count) = changes.trim().parse::<u64>() {
+                signature.push(format!("carrier:{interface}:{count}"));
+            }
+        }
         signature.push(format!(
             "physical:{interface}:{}",
             physical_route_path
@@ -851,4 +864,58 @@ default 192.168.0.1 UGScg en5\n";
             Some("en5")
         );
     }
+}
+
+/// Difference between kernel clocks that include and exclude system suspend.
+#[derive(Default)]
+pub(crate) struct ResumeWatch(Option<Duration>);
+
+impl ResumeWatch {
+    pub(crate) fn resumed(&mut self) -> bool {
+        self.observe(suspended_time())
+    }
+
+    fn observe(&mut self, sample: Option<Duration>) -> bool {
+        let Some(sample) = sample else {
+            return false;
+        };
+        self.0
+            .replace(sample)
+            .is_some_and(|previous| sample.saturating_sub(previous) >= Duration::from_secs(2))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn suspended_time() -> Option<Duration> {
+    #[cfg(target_os = "linux")]
+    let (continuous, active) = (libc::CLOCK_BOOTTIME, libc::CLOCK_MONOTONIC);
+    #[cfg(target_os = "macos")]
+    let (continuous, active) = (libc::CLOCK_MONOTONIC_RAW, libc::CLOCK_UPTIME_RAW);
+    fn read(id: libc::clockid_t) -> Option<Duration> {
+        let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: clock_gettime initializes the entire timespec on success.
+        if unsafe { libc::clock_gettime(id, ts.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let ts = unsafe { ts.assume_init() };
+        Some(Duration::new(
+            ts.tv_sec.try_into().ok()?,
+            ts.tv_nsec.try_into().ok()?,
+        ))
+    }
+    Some(read(continuous)?.saturating_sub(read(active)?))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn suspended_time() -> Option<Duration> {
+    None
+}
+
+#[cfg(test)]
+#[test]
+fn suspend_delta_reports_one_resume_without_wall_clock_jumps() {
+    let mut watch = ResumeWatch::default();
+    assert!(!watch.observe(Some(Duration::ZERO)));
+    assert!(watch.observe(Some(Duration::from_secs(3))));
+    assert!(!watch.observe(Some(Duration::from_secs(3))));
 }

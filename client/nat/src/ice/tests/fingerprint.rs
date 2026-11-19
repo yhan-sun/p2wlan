@@ -27,18 +27,21 @@ fn fingerprint_profile(
     {
         vec![
             StunObservation {
+                failure_kind: None,
                 server: "stun-a.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40001".to_string()),
                 rtt_ms: Some(10),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-b.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40008".to_string()),
                 rtt_ms: Some(11),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-c.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40015".to_string()),
                 rtt_ms: Some(12),

@@ -16,8 +16,8 @@ import test_udp_egress as native
 ROOT = Path(__file__).resolve().parent
 
 
-@unittest.skipUnless(sys.platform == "darwin" and Path("/usr/bin/python3").is_file(),
-                     "macOS system-interpreter environment boundary")
+@unittest.skipUnless(sys.platform in ("darwin", "linux") and Path("/usr/bin/python3").is_file(),
+                     "requires the Unix system interpreter and native test fixture")
 class FinalExecNativeUdpTests(unittest.IsolatedAsyncioTestCase):
     async def test_original_native_capture_through_system_python_final_exec(self):
         # Reuse the original real sendto/sendmsg, mapping, exact counters and
@@ -51,6 +51,7 @@ class FinalExecNativeUdpTests(unittest.IsolatedAsyncioTestCase):
                         "P2WLAN_NAT_SIM_EGRESS_STATS"):
                 command.extend(["--env-key", key])
             kwargs["env"] = native.udp_egress.recorder_environment(requested)
+            kwargs["env"]["P2WLAN_TEST_CAPTURE_CHILD_FIRST"] = "1"
             child = await original_spawn(*command, "--", *arguments[1:], **kwargs)
             children.append(child)
             return child

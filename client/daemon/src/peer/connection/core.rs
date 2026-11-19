@@ -241,6 +241,7 @@ pub struct PeerConnection {
     /// or endpoint change); outbound punch loops gate every actual UDP send
     /// on this sequence.
     pub direct_commit_seq: u64,
+    rebind_observation: Option<DirectSourceObservation>,
     /// Local network generation in which a relay transport first became ready
     /// to carry this peer's traffic (the shared relay slot published an
     /// endpoint while the peer had an encrypting WireGuard session).  This is
@@ -323,9 +324,7 @@ pub struct PeerConnection {
 
 impl PeerConnection {
     fn start_direct_first(&mut self, epoch: PathEpoch, policy: crate::config::PathPolicy) -> bool {
-        if policy == crate::config::PathPolicy::DirectFirst
-            && !self.path_state_machine.direct_first_configured()
-        {
+        if policy.starts_direct_first() && !self.path_state_machine.direct_first_configured() {
             return self
                 .commit_path_transition(
                     PathEvent::DirectFirstStarted {
@@ -650,6 +649,7 @@ impl PeerConnection {
             relay_health: PathHealth::default(),
             direct_generation: 0,
             direct_commit_seq: 0,
+            rebind_observation: None,
             relay_ready_generation: None,
             relay_ready_at: None,
             relay_ready_endpoint: None,

@@ -12,15 +12,16 @@ import (
 const authFailureSourceSnapshotLimit = 10
 
 type RelayConfig struct {
-	Bind              string
-	UDPObserverBind   string
-	SendQueueCapacity int
-	RegisterTimeout   time.Duration
-	IdleTimeout       time.Duration
-	MaxConnections    int
-	MaxFramePayload   int
-	AuthFailureLimit  int
-	AuthFailureWindow time.Duration
+	Bind                     string
+	UDPObserverAlternateBind string
+	UDPObserverBind          string
+	SendQueueCapacity        int
+	RegisterTimeout          time.Duration
+	IdleTimeout              time.Duration
+	MaxConnections           int
+	MaxFramePayload          int
+	AuthFailureLimit         int
+	AuthFailureWindow        time.Duration
 	// A2: security settings
 	RequireAuthentication      bool
 	AllowLegacyUnauthenticated bool
@@ -54,15 +55,16 @@ type RelayConfig struct {
 }
 
 type RelayServer struct {
-	config            *RelayConfig
-	listener          net.Listener
-	udpObserverConn   *net.UDPConn
-	hub               *hub
-	activeConnections int64
-	stats             relayStats
-	wg                sync.WaitGroup
-	shutdownChan      chan struct{}
-	closeOnce         sync.Once
+	config               *RelayConfig
+	listener             net.Listener
+	udpObserverAlternate *net.UDPConn
+	udpObserverConn      *net.UDPConn
+	hub                  *hub
+	activeConnections    int64
+	stats                relayStats
+	wg                   sync.WaitGroup
+	shutdownChan         chan struct{}
+	closeOnce            sync.Once
 
 	mu          sync.Mutex
 	closing     bool

@@ -237,6 +237,10 @@ impl PeerManager {
                 );
                 return false;
             }
+            if conn.path_state_machine.matches_alternate_ack(validation_identity)
+                && !validation_identity.request_endpoint().is_some_and(|endpoint| conn.may_validate_alternate(generation, endpoint)) {
+                return false;
+            }
             let was_direct = conn.state == ConnectionState::Direct;
             let previous_endpoint = conn.endpoint;
             let previous_generation = conn.direct_generation;

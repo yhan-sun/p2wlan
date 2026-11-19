@@ -1,6 +1,6 @@
 #[tokio::test]
 async fn test_gather_candidates_host_only() {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
 
     let config = IceConfig {
         gather_host: true,
@@ -41,14 +41,14 @@ async fn test_gather_candidates_with_mock_stun() {
     let report = gather_candidate_report(&socket, &config).await.unwrap();
     let candidates = report.candidates;
 
-    // Should have at least one host and one srflx candidate
+    // A loopback-only bind cannot originate traffic from other interfaces.
     let has_host = candidates
         .iter()
         .any(|c| c.candidate_type == CandidateType::Host);
     let has_srflx = candidates
         .iter()
         .any(|c| c.candidate_type == CandidateType::ServerReflexive);
-    assert!(has_host);
+    assert!(!has_host);
     assert!(has_srflx);
 
     // The srflx candidate should have the same address as our local socket
@@ -119,12 +119,14 @@ fn candidate_report_excludes_addresses_from_the_wrong_socket_family() {
         true,
         vec![
             StunObservation {
+                failure_kind: None,
                 server: "192.0.2.1:3478".to_string(),
                 mapped_address: Some("[2001:db8::10]:41000".to_string()),
                 rtt_ms: Some(10),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "192.0.2.2:3478".to_string(),
                 mapped_address: Some("198.51.100.10:41001".to_string()),
                 rtt_ms: Some(10),

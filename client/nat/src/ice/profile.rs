@@ -14,35 +14,11 @@ fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>)
         .collect::<Vec<_>>();
 
     if mapped.is_empty() {
-        let udp_blocked = observations
-            .iter()
-            .all(|observation| observation.error.is_some());
+        // Observer silence alone cannot establish a restriction on this network.
         return NatProfile {
-            local_addr: local_addr.to_string(),
             observations,
-            udp_blocked,
-            public_endpoint: None,
-            public_ip_stable: None,
-            public_port_stable: None,
-            port_preserved: None,
-            port_delta: None,
-            likely_symmetric: None,
-            mapping_behavior: if udp_blocked {
-                MappingBehavior::UdpBlocked
-            } else {
-                MappingBehavior::Unknown
-            },
-            filtering_behavior: if udp_blocked {
-                FilteringBehavior::UdpBlocked
-            } else {
-                FilteringBehavior::Unknown
-            },
-            hairpin_behavior: HairpinBehavior::Unknown,
-            mapping_lifetime: MappingLifetime::Unknown,
-            prediction_candidate: false,
-            predicted_endpoints: Vec::new(),
-            birthday_candidate: false,
-            confidence: if udp_blocked { 60 } else { 20 },
+            confidence: 20,
+            ..NatProfile::unknown(local_addr)
         };
     }
 

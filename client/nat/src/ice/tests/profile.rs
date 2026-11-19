@@ -14,26 +14,35 @@ fn test_build_nat_profile_unknown_without_observations() {
 }
 
 #[test]
-fn test_build_nat_profile_udp_blocked_when_all_stun_failed() {
-    let profile = build_nat_profile(
-        "192.168.1.2:5000".parse().unwrap(),
-        vec![StunObservation {
-            server: "stun-a.example:3478".to_string(),
-            mapped_address: None,
-            rtt_ms: None,
-            error: Some("timeout".to_string()),
-        }],
+fn test_unavailable_observers_and_invalid_replies_do_not_classify_udp_blocked() {
+    let local = "192.168.1.2:5000".parse().unwrap();
+    let a = "192.0.2.1:3478".parse().unwrap();
+    let b = "192.0.2.2:3478".parse().unwrap();
+    let timeout = StunObservation::failed(a, StunFailureKind::ResponseTimeout, "late".into());
+    let local_error = StunObservation::failed(b, StunFailureKind::LocalIo, "offline".into());
+    let empty_reply = StunObservation::reply(b, None, Duration::from_millis(8));
+    assert_eq!(empty_reply.failure_kind, Some(StunFailureKind::NoMapping));
+    assert_eq!(empty_reply.rtt_ms, Some(8));
+    let wrong_family = StunObservation::reply(
+        b,
+        Some("[2001:db8::1]:100".parse().unwrap()),
+        Duration::ZERO,
     );
-    assert_eq!(profile.mapping_behavior, MappingBehavior::UdpBlocked);
-    assert!(profile.udp_blocked);
-    assert_eq!(profile.likely_symmetric, None);
-    assert_eq!(profile.filtering_behavior, FilteringBehavior::UdpBlocked);
-    assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
-    assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
-    assert!(!profile.prediction_candidate);
-    assert!(profile.predicted_endpoints.is_empty());
-    assert!(!profile.birthday_candidate);
-    assert_eq!(profile.confidence, 60);
+    assert_eq!(
+        wrong_family.failure_kind,
+        Some(StunFailureKind::WrongAddressFamily)
+    );
+    for observations in [
+        vec![timeout.clone()],
+        vec![timeout, local_error],
+        vec![empty_reply, wrong_family],
+    ] {
+        let profile = build_nat_profile(local, observations);
+        assert_eq!(profile.mapping_behavior, MappingBehavior::Unknown);
+        assert_eq!(profile.filtering_behavior, FilteringBehavior::Unknown);
+        assert!(!profile.udp_blocked);
+        assert!(!profile.prediction_candidate);
+    }
 }
 
 #[test]
@@ -41,6 +50,7 @@ fn test_build_nat_profile_unknown_when_stun_replies_without_mapping() {
     let profile = build_nat_profile(
         "192.168.1.2:5000".parse().unwrap(),
         vec![StunObservation {
+            failure_kind: None,
             server: "stun-a.example:3478".to_string(),
             mapped_address: None,
             rtt_ms: Some(10),
@@ -64,12 +74,14 @@ fn test_build_nat_profile_endpoint_independent_mapping() {
         "192.168.1.2:5000".parse().unwrap(),
         vec![
             StunObservation {
+                failure_kind: None,
                 server: "stun-a.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:62000".to_string()),
                 rtt_ms: Some(10),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-b.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:62000".to_string()),
                 rtt_ms: Some(12),
@@ -109,18 +121,21 @@ fn test_control_label_exposes_linear_prediction_hint_without_long_payload() {
         "192.168.1.2:5000".parse().unwrap(),
         vec![
             StunObservation {
+                failure_kind: None,
                 server: "stun-a.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40001".to_string()),
                 rtt_ms: Some(10),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-b.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40033".to_string()),
                 rtt_ms: Some(11),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-c.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40065".to_string()),
                 rtt_ms: Some(12),
@@ -143,18 +158,21 @@ fn test_build_nat_profile_detects_port_dependent_mapping() {
         "192.168.1.2:5000".parse().unwrap(),
         vec![
             StunObservation {
+                failure_kind: None,
                 server: "stun-a.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40001".to_string()),
                 rtt_ms: Some(10),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-b.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40003".to_string()),
                 rtt_ms: Some(11),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-c.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40005".to_string()),
                 rtt_ms: Some(12),
@@ -190,24 +208,28 @@ fn test_build_nat_profile_detects_jittered_linear_symmetric_mapping() {
         "192.168.1.2:5000".parse().unwrap(),
         vec![
             StunObservation {
+                failure_kind: None,
                 server: "stun-a.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:32794".to_string()),
                 rtt_ms: Some(10),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-b.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:32796".to_string()),
                 rtt_ms: Some(11),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-c.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:32797".to_string()),
                 rtt_ms: Some(12),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-d.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:32798".to_string()),
                 rtt_ms: Some(13),
@@ -234,30 +256,35 @@ fn test_predicted_reflexive_window_uses_stable_suffix_after_outlier() {
         "192.168.1.2:5000".parse().unwrap(),
         vec![
             StunObservation {
+                failure_kind: None,
                 server: "stun-a.example:3478".to_string(),
                 mapped_address: Some("220.163.6.190:23801".to_string()),
                 rtt_ms: Some(180),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-b.example:3478".to_string(),
                 mapped_address: Some("220.163.6.190:23855".to_string()),
                 rtt_ms: Some(80),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-c.example:3478".to_string(),
                 mapped_address: Some("220.163.6.190:23856".to_string()),
                 rtt_ms: Some(78),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-d.example:3478".to_string(),
                 mapped_address: Some("220.163.6.190:23857".to_string()),
                 rtt_ms: Some(170),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "observer.example:18082".to_string(),
                 mapped_address: Some("220.163.6.190:23858".to_string()),
                 rtt_ms: Some(14),
@@ -282,18 +309,21 @@ fn test_predicted_reflexive_window_covers_webrtc_style_jump() {
         "192.168.1.2:5000".parse().unwrap(),
         vec![
             StunObservation {
+                failure_kind: None,
                 server: "stun-a.example:3478".to_string(),
                 mapped_address: Some("220.163.6.190:8135".to_string()),
                 rtt_ms: Some(10),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-b.example:3478".to_string(),
                 mapped_address: Some("220.163.6.190:8136".to_string()),
                 rtt_ms: Some(11),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-c.example:3478".to_string(),
                 mapped_address: Some("220.163.6.190:8137".to_string()),
                 rtt_ms: Some(12),
@@ -315,30 +345,35 @@ fn test_predicted_reflexive_window_follows_air_linear_successor_group() {
         "192.168.0.239:59458".parse().unwrap(),
         vec![
             StunObservation {
+                failure_kind: None,
                 server: "stun-a.example:3478".to_string(),
                 mapped_address: Some("220.163.6.190:8126".to_string()),
                 rtt_ms: Some(10),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-b.example:3478".to_string(),
                 mapped_address: Some("220.163.6.190:8127".to_string()),
                 rtt_ms: Some(11),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-c.example:3478".to_string(),
                 mapped_address: Some("220.163.6.190:8128".to_string()),
                 rtt_ms: Some(12),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-d.example:3478".to_string(),
                 mapped_address: Some("220.163.6.190:8130".to_string()),
                 rtt_ms: Some(13),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "observer.example:18082".to_string(),
                 mapped_address: Some("220.163.6.190:8133".to_string()),
                 rtt_ms: Some(14),
@@ -364,18 +399,21 @@ fn test_build_nat_profile_accepts_constant_wide_linear_step() {
         "192.168.1.2:5000".parse().unwrap(),
         vec![
             StunObservation {
+                failure_kind: None,
                 server: "stun-a.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40001".to_string()),
                 rtt_ms: Some(10),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-b.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40033".to_string()),
                 rtt_ms: Some(11),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-c.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:40065".to_string()),
                 rtt_ms: Some(12),
@@ -417,18 +455,21 @@ fn test_linear_successor_prediction_handles_port_wrap() {
         "192.168.1.2:5000".parse().unwrap(),
         vec![
             StunObservation {
+                failure_kind: None,
                 server: "stun-a.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:65534".to_string()),
                 rtt_ms: Some(10),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-b.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:0".to_string()),
                 rtt_ms: Some(11),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "stun-c.example:3478".to_string(),
                 mapped_address: Some("203.0.113.10:2".to_string()),
                 rtt_ms: Some(12),

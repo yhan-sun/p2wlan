@@ -18,7 +18,7 @@ use p2pnet_nat::{
     candidate_report_from_observations, decode_authenticated_punch_packet, decode_punch_packet,
     gather_candidate_report, peek_authenticated_punch_identity, CandidateGatherReport,
     FilteringBehavior, IceConfig, MappingBehavior, PunchPacketKind, StunAttribute, StunClient,
-    StunMessage, StunObservation, BINDING_RESPONSE, MAGIC_COOKIE,
+    StunFailureKind, StunMessage, StunObservation, BINDING_RESPONSE, MAGIC_COOKIE,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -96,6 +96,7 @@ include!("udp/gather.rs");
 include!("udp/fast_gather.rs");
 
 include!("udp/outbound.rs");
+include!("udp/consent.rs");
 include!("udp/inbound.rs");
 include!("udp/utils.rs");
 

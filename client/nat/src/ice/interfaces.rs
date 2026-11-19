@@ -137,6 +137,47 @@ fn select_local_addresses(interfaces: &[(String, IpAddr)], route_probes: &[IpAdd
     addresses
 }
 
+/// Addresses usable from a particular UDP bind. Explicit binds cannot originate
+/// packets from other local interfaces of the same address family.
+pub fn host_addresses_for_bind(bound: SocketAddr) -> Vec<IpAddr> {
+    if !bound.ip().is_unspecified() {
+        return is_candidate_host_ip(bound.ip())
+            .then_some(bound.ip())
+            .into_iter()
+            .collect();
+    }
+    gather_local_addresses()
+        .into_iter()
+        .filter(|ip| ip.is_ipv4() == bound.is_ipv4())
+        .collect()
+}
+
+/// Network prefixes on the active physical interface, excluding rotating IPv6
+/// host identifiers. The resulting local signature never leaves the daemon.
+pub fn interface_route_prefixes(interface: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    for (name, ip, length) in interface_networks() {
+        if name != interface || !is_candidate_host_ip(ip) {
+            continue;
+        }
+        let prefix = match ip {
+            IpAddr::V4(v4) => format!("{v4}/{length}"),
+            IpAddr::V6(v6) => {
+                let mask = u128::MAX.checked_shl(u32::from(128 - length)).unwrap_or(0);
+                format!(
+                    "{}/{}",
+                    std::net::Ipv6Addr::from(u128::from(v6) & mask),
+                    length
+                )
+            }
+        };
+        prefixes.push(prefix);
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    prefixes
+}
+
 fn interface_addresses() -> Vec<(String, IpAddr)> {
     match if_addrs::get_if_addrs() {
         Ok(interfaces) => interfaces

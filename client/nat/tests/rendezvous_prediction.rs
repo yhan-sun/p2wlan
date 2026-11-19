@@ -456,6 +456,7 @@ fn concurrent_discovery_is_a_low_confidence_hint_until_fresh_measurement() {
     };
     let observations = (0..4)
         .map(|index| StunObservation {
+            failure_kind: None,
             server: format!("192.0.2.{}:3478", index + 1),
             mapped_address: Some(format!("198.51.100.1:{}", 4000 + index)),
             rtt_ms: Some(5),

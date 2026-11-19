@@ -505,60 +505,90 @@ async fn run_udp_direct_instance(
             // report below may spend seconds probing an unreachable STUN observer;
             // that delay is useful for NAT classification but must not delay the
             // first encrypted relay session or the first LAN/public host punch.
+            let early = peers.early_candidate_signaling();
+            let mut host_candidates = Vec::new();
             if peers.gather_host_candidates().await {
-                if let Ok(local_addr) = udp.local_addr() {
-                    let mut host_candidates = p2pnet_nat::gather_local_addresses()
-                        .into_iter()
-                        .filter(|ip| ip.is_ipv4() == local_addr.ip().is_ipv4())
-                        .map(|ip| SocketAddr::new(ip, local_addr.port()).to_string())
-                        .collect::<Vec<_>>();
-                    if !local_addr.ip().is_unspecified() && !local_addr.ip().is_loopback() {
-                        host_candidates.push(local_addr.to_string());
-                    }
-                    host_candidates.sort();
-                    host_candidates.dedup();
-                    if !host_candidates.is_empty() {
-                        let mut host_sources = host_candidates
-                            .iter()
-                            .cloned()
-                            .map(|endpoint| (endpoint, "host".to_string()))
-                            .collect::<HashMap<_, _>>();
-                        let host_network_identity = prepare_signal_candidates_and_network_identity(
-                            &[],
-                            &HashMap::new(),
-                            &mut host_candidates,
-                            &mut host_sources,
-                        );
-                        // This fast path must never wait behind an older refresh: a
-                        // rebound UDP instance must still observe shutdown promptly.
-                        if let Ok(_host_commit_guard) = candidate_refresh_lock.try_lock() {
-                            publish_candidate_snapshot_to_store_with_readiness(
-                                &candidate_snapshot,
-                                host_candidates.clone(),
-                                host_sources.clone(),
-                                host_network_identity.clone(),
-                                false,
-                            )
-                            .await;
-                            *local_candidates.write().await = host_candidates.clone();
-                            *udp_local_candidate_sources.write().await = host_sources;
-                            *local_network_identity.write().await = host_network_identity;
-                            info!(
-                        "Published {} provisional host UDP candidates before STUN refresh (initial_gather_complete=false)",
-                        host_candidates.len()
+                for bound in [udp.local_addr().ok(), udp.ipv6_local_addr()]
+                    .into_iter()
+                    .flatten()
+                {
+                    host_candidates.extend(
+                        p2pnet_nat::ice::host_addresses_for_bind(bound)
+                            .into_iter()
+                            .map(|ip| SocketAddr::new(ip, bound.port()).to_string()),
                     );
-                        }
-                    }
                 }
             }
-
+            host_candidates.sort();
+            host_candidates.dedup();
+            let mut host_sources: HashMap<_, _> = host_candidates
+                .iter()
+                .map(|addr| (addr.clone(), "host".to_owned()))
+                .collect();
+            let host_identity = prepare_signal_candidates_and_network_identity(
+                &[],
+                &HashMap::new(),
+                &mut host_candidates,
+                &mut host_sources,
+            );
             let initial_refresh_guard = candidate_refresh_lock.lock().await;
+            if !host_candidates.is_empty() {
+                let global_v6 = host_candidates
+                    .iter()
+                    .filter_map(|s| s.parse::<SocketAddr>().ok())
+                    .any(|addr| matches!(addr.ip(), std::net::IpAddr::V6(ip) if ip.segments()[0] & 0xe000 == 0x2000));
+                commit_candidate_lease(
+                    &candidate_snapshot,
+                    host_candidates.clone(),
+                    host_sources.clone(),
+                    host_identity.clone(),
+                    false,
+                    early && global_v6,
+                )
+                .await;
+                *local_candidates.write().await = host_candidates.clone();
+                *udp_local_candidate_sources.write().await = host_sources.clone();
+                *local_network_identity.write().await = host_identity;
+            }
             let mut advertised_nat_type = "unknown".to_string();
 
-            let (mut candidate_endpoints, mut candidate_sources) = match udp
-                .gather_candidate_report_live_parallel(stun_servers.clone(), stun_timeout)
-                .await
-            {
+            let (progress, mut changes) = tokio::sync::watch::channel([None; 2]);
+            let gather = udp.gather_startup_candidates(
+                stun_servers.clone(),
+                stun_timeout,
+                early.then_some(progress),
+            );
+            let publish_progress = async {
+                while changes.changed().await.is_ok() {
+                    let observed = *changes.borrow_and_update();
+                    let mut endpoints = host_candidates.clone();
+                    let mut sources = host_sources.clone();
+                    for endpoint in observed.into_iter().flatten() {
+                        let text = endpoint.to_string();
+                        if !sources.contains_key(&text) {
+                            endpoints.push(text.clone());
+                        }
+                        sources.insert(text, "stun_observed".into());
+                    }
+                    let identity = prepare_signal_candidates_and_network_identity(
+                        &[],
+                        &HashMap::new(),
+                        &mut endpoints,
+                        &mut sources,
+                    );
+                    commit_candidate_lease(
+                        &candidate_snapshot,
+                        endpoints,
+                        sources,
+                        identity,
+                        false,
+                        true,
+                    )
+                    .await;
+                }
+            };
+            let (result, ()) = tokio::join!(gather, publish_progress);
+            let (mut candidate_endpoints, mut candidate_sources) = match result {
                 Ok(report) => {
                     let (endpoints, sources) = candidate_endpoints_from_report(&report);
                     info!(
@@ -583,21 +613,12 @@ async fn run_udp_direct_instance(
                             nat_publication.generation,
                             nat_publication.observation,
                         );
-                    let pool_eligible = socket_pool_enabled
-                        && report.nat_profile.mapping_behavior
-                            == MappingBehavior::AddressOrPortDependent
-                        && !report.nat_profile.udp_blocked;
-                    udp.set_socket_pool_active(pool_eligible);
+                    udp.apply_candidate_report_socket_pool_policy(&report);
                     if udp.socket_count() > 1 {
                         info!(
-                            "Experimental UDP socket pool: sockets={} active={} reason={}",
+                            "Experimental UDP socket pool: sockets={} active={}",
                             udp.socket_count(),
                             udp.socket_pool_active(),
-                            if pool_eligible {
-                                "address/port-dependent mapping"
-                            } else {
-                                "NAT profile did not qualify"
-                            }
                         );
                     }
                     *nat_profile.write().await = Some(report.nat_profile);
@@ -1011,9 +1032,15 @@ where
     let mut ticker = interval(Duration::from_secs(1));
     ticker.tick().await;
     let mut confirmation = RouteChangeConfirmation::new(baseline);
+    let mut resume = crate::netenv::ResumeWatch::default();
+    resume.resumed();
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
         let current = sample().await;
+        if resume.resumed() {
+            return current;
+        }
         if let Some(changed) = confirmation.observe(current) {
             return changed;
         }

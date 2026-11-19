@@ -92,6 +92,29 @@ impl Default for IceConfig {
     }
 }
 
+/// Reason an observer could not supply a usable mapping on this socket.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StunFailureKind {
+    LocalIo,
+    ResponseTimeout,
+    InvalidResponse,
+    NoMapping,
+    WrongAddressFamily,
+}
+
+impl From<&crate::NatError> for StunFailureKind {
+    fn from(error: &crate::NatError) -> Self {
+        match error {
+            crate::NatError::Timeout(_) => Self::ResponseTimeout,
+            crate::NatError::Stun(_)
+            | crate::NatError::InvalidStunMessage(_)
+            | crate::NatError::InvalidAttribute(_) => Self::InvalidResponse,
+            _ => Self::LocalIo,
+        }
+    }
+}
+
 /// One STUN observation collected from a single external observer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StunObservation {
@@ -101,8 +124,43 @@ pub struct StunObservation {
     pub mapped_address: Option<String>,
     /// Query round-trip time in milliseconds.
     pub rtt_ms: Option<u64>,
+    /// Older observations carry only free-text errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<StunFailureKind>,
     /// Error, if the query failed.
     pub error: Option<String>,
+}
+
+impl StunObservation {
+    pub fn reply(server: SocketAddr, mapped: Option<SocketAddr>, rtt: Duration) -> Self {
+        let failure_kind = match mapped {
+            Some(address) if address.is_ipv4() != server.is_ipv4() => {
+                Some(StunFailureKind::WrongAddressFamily)
+            }
+            None => Some(StunFailureKind::NoMapping),
+            _ => None,
+        };
+        Self {
+            server: server.to_string(),
+            mapped_address: mapped
+                .filter(|_| failure_kind.is_none())
+                .map(|address| address.to_string()),
+            rtt_ms: Some(duration_millis(rtt)),
+            failure_kind,
+            error: failure_kind
+                .map(|kind| format!("STUN reply without a usable mapping ({kind:?})")),
+        }
+    }
+
+    pub fn failed(server: SocketAddr, kind: StunFailureKind, error: String) -> Self {
+        Self {
+            server: server.to_string(),
+            mapped_address: None,
+            rtt_ms: None,
+            failure_kind: Some(kind),
+            error: Some(error),
+        }
+    }
 }
 
 /// Behavioral NAT mapping classification based on multiple STUN observers.
@@ -178,7 +236,7 @@ pub struct NatProfile {
     pub local_addr: String,
     /// STUN observations used to infer this profile.
     pub observations: Vec<StunObservation>,
-    /// True when STUN was configured but every request failed.
+    /// True when UDP blocking has corroborating evidence. Observer timeouts alone leave it unknown.
     pub udp_blocked: bool,
     /// Best public endpoint discovered from STUN, if any.
     pub public_endpoint: Option<String>,

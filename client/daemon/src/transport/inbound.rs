@@ -169,8 +169,8 @@ impl WireGuardTransport {
                     let parts = owned_inbound.into_parts();
                     let plaintext_resources = parts.0;
                     let mut inbound = parts.1;
-                    let overlay_source =
-                        overlay_origin.map(|origin| origin.authenticated(original_session_source));
+                    let overlay_source = overlay_origin
+                        .map(|origin| origin.authenticated(original_session_source.clone()));
                     #[cfg(test)]
                     let mut overlay_source = overlay_source;
                     let decrypt_completed = Instant::now();
@@ -1021,7 +1021,14 @@ impl WireGuardTransport {
                                         );
                                     } else {
                                         peers
-                                            .learn_authenticated_endpoint(&inbound.peer_id, source)
+                                            .learn_authenticated_udp_endpoint(
+                                                &inbound.peer_id,
+                                                source,
+                                                (!internal_rekey_confirmation)
+                                                    .then_some(&original_session_source),
+                                                packet_network_generation,
+                                                local_endpoint,
+                                            )
                                             .await;
                                         // A decrypted UDP payload (including an
                                         // internal rekey confirmation) is

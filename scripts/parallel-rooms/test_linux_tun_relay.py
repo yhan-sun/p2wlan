@@ -13,6 +13,17 @@ import retain_linux_tun_programs as retention
 
 
 class RelayDataControls(unittest.TestCase):
+    def test_standby_requires_one_established_socket_cookie(self):
+        endpoint = "tls://192.0.2.2:18082"
+        address = "192.0.2.2:18082"
+        output = SimpleNamespace(stdout=f"0 0 192.0.2.3:5000 {address} ino:77 sk:4abc <->\n")
+        lab = SimpleNamespace(daemons={"a1": {"namespace": "a"}}, cmd=lambda *args: output)
+        self.assertEqual(relay.standby_socket(lab, "a1", endpoint)["socket_cookie"], "4abc")
+        output.stdout += output.stdout
+        self.assertIsNone(relay.standby_socket(lab, "a1", endpoint))
+        output.stdout = f"0 0 192.0.2.3:5000 {address}\n"
+        self.assertIsNone(relay.standby_socket(lab, "a1", endpoint))
+
     def readiness_data(self):
         return dict(network_generation=0, relay_connected=True, peers=[dict(node_id="peer-1", online=True,
             active_path="direct", relay_ready_generation=0, relay_confirmed_generation=0,

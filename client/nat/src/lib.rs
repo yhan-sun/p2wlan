@@ -33,7 +33,7 @@ pub use ice::{
     candidates_to_addrs, compute_priority, gather_candidate_report, gather_candidates,
     gather_local_addresses, gather_local_networks, parse_nat_hint, CandidateGatherReport,
     FilteringBehavior, HairpinBehavior, IceConfig, LocalNetwork, MappingBehavior, MappingLifetime,
-    NatAllocation, NatFingerprintHint, NatProfile, StunObservation,
+    NatAllocation, NatFingerprintHint, NatProfile, StunFailureKind, StunObservation,
 };
 pub use mapping::allocation::{
     infer_port_domain, infer_scoped_allocation, plan_fixed_anchor, validate_allocation_attempts,

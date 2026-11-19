@@ -78,17 +78,27 @@ func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
 		log.Printf("UDP observer enabled on %s", udpObserverConn.LocalAddr())
 	}
 
+	alternate, err := openAlternateObserver(udpObserverConn, config.UDPObserverAlternateBind)
+	if err != nil {
+		if udpObserverConn != nil {
+			_ = udpObserverConn.Close()
+		}
+		_ = listener.Close()
+		return nil, err
+	}
+
 	server := &RelayServer{
-		config:            config,
-		listener:          listener,
-		udpObserverConn:   udpObserverConn,
-		hub:               newHub(),
-		shutdownChan:      make(chan struct{}),
-		connections:       make(map[net.Conn]struct{}),
-		ticketKeyring:     keyring,
-		authFailures:      authFailures,
-		revokedTicketJTIs: revokedJTIs,
-		revokedDeviceIDs:  revokedDevices,
+		config:               config,
+		listener:             listener,
+		udpObserverConn:      udpObserverConn,
+		udpObserverAlternate: alternate,
+		hub:                  newHub(),
+		shutdownChan:         make(chan struct{}),
+		connections:          make(map[net.Conn]struct{}),
+		ticketKeyring:        keyring,
+		authFailures:         authFailures,
+		revokedTicketJTIs:    revokedJTIs,
+		revokedDeviceIDs:     revokedDevices,
 	}
 	server.hub.forwardDelay = config.ForwardDelay
 	server.hub.debugFrames = config.DebugFrames
@@ -217,6 +227,10 @@ func (s *RelayServer) Close() error {
 		err = s.listener.Close()
 		if s.udpObserverConn != nil {
 			_ = s.udpObserverConn.Close()
+		}
+
+		if s.udpObserverAlternate != nil {
+			_ = s.udpObserverAlternate.Close()
 		}
 
 		for c := range s.connections {

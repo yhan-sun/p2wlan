@@ -80,6 +80,11 @@ impl PeerConnection {
         &self,
         local_generation: u64,
     ) -> Option<SocketAddr> {
+        self.selected_direct_pair_for_consent(local_generation)
+            .map(|pair| pair.remote_endpoint)
+    }
+
+    fn selected_direct_pair_for_consent(&self, local_generation: u64) -> Option<&CandidatePair> {
         self.candidate_pairs
             .iter()
             .filter(|pair| {
@@ -96,7 +101,6 @@ impl PeerConnection {
                     pair.remote_endpoint,
                 )
             })
-            .map(|pair| pair.remote_endpoint)
     }
 
     /// Whether this snapshot contains the current encrypted-confirmed Direct
@@ -390,7 +394,7 @@ impl PeerConnection {
         let direct_endpoint = self.direct_endpoint_for_send(local_generation);
         let relay_score = self.relay_path_score(relay_available);
 
-        if policy == crate::config::PathPolicy::DirectFirst
+        if policy.starts_direct_first()
             && self.direct_first_pending()
             && !self.has_current_authoritative_direct(local_generation)
         {
@@ -465,6 +469,7 @@ impl PeerConnection {
                     policy,
                     crate::config::PathPolicy::DirectSticky
                         | crate::config::PathPolicy::DirectFirst
+                        | crate::config::PathPolicy::Adaptive
                 )
             {
                 return PathSelection::relay(
@@ -484,7 +489,9 @@ impl PeerConnection {
             // dead socket to remain active.
             if matches!(
                 policy,
-                crate::config::PathPolicy::DirectSticky | crate::config::PathPolicy::DirectFirst
+                crate::config::PathPolicy::DirectSticky
+                    | crate::config::PathPolicy::DirectFirst
+                    | crate::config::PathPolicy::Adaptive
             ) {
                 return PathSelection::direct(
                     endpoint,

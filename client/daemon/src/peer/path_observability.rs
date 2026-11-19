@@ -456,6 +456,7 @@ impl PathObservabilityState {
             PathEvent::PeerOnline { .. }
             | PathEvent::DirectFirstStarted { .. }
             | PathEvent::DirectFirstDeadline { .. }
+            | PathEvent::QueuedRelayRequested { .. }
             | PathEvent::DirectFirstSatisfied { .. } => {}
             PathEvent::PeerLeft { .. } | PathEvent::IdentityReset => {
                 self.metrics.lifecycle_resets = self.metrics.lifecycle_resets.saturating_add(1);
@@ -487,7 +488,8 @@ impl PathObservabilityState {
                 self.metrics.direct_retries = self.metrics.direct_retries.saturating_add(1);
                 self.direct_attempt_started.get_or_insert(now);
             }
-            PathEvent::DirectValidationStarted { .. } => {
+            PathEvent::DirectValidationStarted { .. }
+            | PathEvent::DirectAlternateValidationStarted { .. } => {
                 self.metrics.direct_validations = self.metrics.direct_validations.saturating_add(1);
                 self.direct_attempt_started.get_or_insert(now);
             }
@@ -632,6 +634,7 @@ fn latest_candidate_punch(
 fn event_kind(event: &PathEvent) -> &'static str {
     match event {
         PathEvent::DirectFirstStarted { .. } => "direct_first_started",
+        PathEvent::QueuedRelayRequested { .. } => "queued_confirmed_relay",
         PathEvent::DirectFirstDeadline { .. } => "direct_first_deadline",
         PathEvent::DirectFirstSatisfied { .. } => "direct_first_satisfied",
         PathEvent::PeerOnline { .. } => "peer_online",
@@ -647,6 +650,7 @@ fn event_kind(event: &PathEvent) -> &'static str {
         PathEvent::RelayPathFailed { .. } => "relay_path_failed",
         PathEvent::DirectProbeStarted { .. } => "direct_probe_started",
         PathEvent::DirectValidationStarted { .. } => "direct_validation_started",
+        PathEvent::DirectAlternateValidationStarted { .. } => "direct_alternate_validation_started",
         PathEvent::DirectCommitted { .. } => "direct_committed",
         PathEvent::DirectProbeFailed { .. } => "direct_probe_failed",
         PathEvent::DirectPathFailed { .. } => "direct_path_failed",

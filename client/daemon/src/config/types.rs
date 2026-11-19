@@ -198,6 +198,12 @@ pub struct NetworkConfig {
     /// static STUN-observed candidate baseline.
     #[serde(default = "default_true")]
     pub predicted_candidates_enabled: bool,
+    /// Run one extra bounded consent check after two consecutive confirmed-path misses.
+    #[serde(default)]
+    pub accelerated_consent: bool,
+    /// Allow an initial offer as soon as a bound global IPv6 host or a public STUN mapping is available.
+    #[serde(default)]
+    pub early_candidate_signaling: bool,
     /// Whether the local socket address is gathered as a Host candidate.
     ///
     /// NAT-simulation harnesses disable host candidates so every punch must
@@ -431,6 +437,9 @@ pub struct RelayConfig {
     /// Whether to allow insecure plaintext TCP to relay (default: false, development only).
     #[serde(default)]
     pub allow_insecure_plaintext: bool,
+    /// Take over a still-authenticated standby registration after primary EOF.
+    #[serde(default)]
+    pub warm_failover: bool,
     /// Path to additional CA certificate bundle for self-hosted relays.
     #[serde(default)]
     pub ca_cert_path: Option<String>,
@@ -448,6 +457,8 @@ pub enum PathPolicy {
     /// Relay may be prepared concurrently but cannot carry first business early.
     #[default]
     DirectFirst,
+    /// Allow a queued first packet onto confirmed Relay after Direct progress stalls.
+    Adaptive,
     /// Legacy immediate Relay fallback plus the existing Direct quality policy.
     Auto,
     /// Select between encrypted-confirmed Direct and peer-confirmed Relay by
@@ -461,9 +472,14 @@ pub enum PathPolicy {
 }
 
 impl PathPolicy {
+    pub(crate) fn starts_direct_first(self) -> bool {
+        matches!(self, Self::DirectFirst | Self::Adaptive)
+    }
+
     pub fn as_label(self) -> &'static str {
         match self {
             Self::DirectFirst => "direct-first",
+            Self::Adaptive => "adaptive",
             Self::Auto => "auto",
             Self::Score => "score",
             Self::DirectSticky => "direct-sticky",
@@ -478,7 +494,7 @@ impl RelayConfig {
     pub(crate) fn startup_wait_timeout(&self, relay_expected: bool) -> Option<std::time::Duration> {
         let relay =
             std::time::Duration::from_millis(self.relay_startup_timeout_ms.clamp(1, 60_000));
-        if self.effective_path_policy(true) == PathPolicy::DirectFirst {
+        if self.effective_path_policy(true).starts_direct_first() {
             Some(
                 crate::peer::DIRECT_FIRST_WINDOW
                     + if relay_expected {

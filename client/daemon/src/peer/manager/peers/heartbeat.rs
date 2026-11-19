@@ -39,8 +39,11 @@ impl PeerManager {
             conn.remote_candidate_epoch(),
         );
         if conn.path_state_machine.current_epoch() != Some(epoch)
-            || (self.config.relay.effective_path_policy(true)
-                == crate::config::PathPolicy::DirectFirst
+            || (self
+                .config
+                .relay
+                .effective_path_policy(true)
+                .starts_direct_first()
                 && !conn.path_state_machine.direct_first_configured())
             || self.ip_to_node_snapshot.borrow().get(&info.virtual_ip) != Some(&info.node_id)
         {

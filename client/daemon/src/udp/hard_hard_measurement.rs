@@ -538,6 +538,7 @@ mod tests {
             .iter()
             .zip([None, Some(450), None, Some(30), Some(20)])
             .map(|(addr, rtt)| p2pnet_nat::StunObservation {
+                failure_kind: None,
                 server: addr.to_string(),
                 mapped_address: rtt.map(|_| "198.51.100.1:40000".into()),
                 rtt_ms: rtt,
@@ -561,6 +562,7 @@ mod tests {
             configured[..4]
         );
         let hint = p2pnet_nat::StunObservation {
+            failure_kind: None,
             server: configured[0].to_string(),
             mapped_address: None,
             rtt_ms: None,
@@ -579,6 +581,7 @@ mod tests {
         let b = "203.0.113.2:3478".parse().unwrap();
         let c = "203.0.113.3:3478".parse().unwrap();
         let hint = p2pnet_nat::StunObservation {
+            failure_kind: None,
             server: "203.0.113.99:3478".into(),
             mapped_address: Some("198.51.100.1:40000".into()),
             rtt_ms: Some(1),
@@ -604,6 +607,7 @@ mod tests {
         let hints = configured
             .iter()
             .map(|addr: &SocketAddr| p2pnet_nat::StunObservation {
+                failure_kind: None,
                 server: addr.to_string(),
                 mapped_address: Some("198.51.100.1:40000".into()),
                 rtt_ms: Some(5),

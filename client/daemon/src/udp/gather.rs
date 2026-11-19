@@ -169,28 +169,12 @@ impl UdpTransport {
         stun_timeout: Duration,
     ) -> StunObservation {
         let started = Instant::now();
-        let result = self
+        match self
             .query_stun_live_response(socket, server, stun_timeout, false, false)
             .await
-            .and_then(|response| {
-                response
-                    .mapped_address
-                    .ok_or_else(|| "STUN response has no mapped address".to_string())
-            });
-
-        match result {
-            Ok(mapped_address) => StunObservation {
-                server: server.to_string(),
-                mapped_address: Some(mapped_address.to_string()),
-                rtt_ms: Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
-                error: None,
-            },
-            Err(error) => StunObservation {
-                server: server.to_string(),
-                mapped_address: None,
-                rtt_ms: None,
-                error: Some(error),
-            },
+        {
+            Ok(reply) => StunObservation::reply(server, reply.mapped_address, started.elapsed()),
+            Err((kind, error)) => StunObservation::failed(server, kind, error),
         }
     }
 
@@ -205,7 +189,7 @@ impl UdpTransport {
         stun_timeout: Duration,
         change_ip: bool,
         change_port: bool,
-    ) -> std::result::Result<LiveStunResponse, String> {
+    ) -> std::result::Result<LiveStunResponse, (StunFailureKind, String)> {
         let mut request = StunMessage::binding_request();
         request.add_attribute(StunAttribute::Software("P2WLAN/0.1".to_string()));
         if change_ip || change_port {
@@ -221,7 +205,7 @@ impl UdpTransport {
         let _registration = self
             .stun_waiters
             .register(transaction_id, response_tx)
-            .map_err(|error| error.reason().to_string())?;
+            .map_err(|error| (StunFailureKind::LocalIo, error.reason().to_string()))?;
         let deadline = tokio::time::Instant::now() + stun_timeout;
 
         // Send readiness and response share one deadline. Dropping this future
@@ -229,29 +213,58 @@ impl UdpTransport {
         async {
             self.send_mapping_request_until(socket, &encoded, server, deadline, &|| true)
                 .await
-                .map_err(|error| format!("STUN send failed: {error:?}"))?;
+                .map_err(|error| {
+                    (
+                        StunFailureKind::LocalIo,
+                        format!("STUN send failed: {error:?}"),
+                    )
+                })?;
             let StunResponse { data, source } =
                 dynamic_punch::wait_for_mapping_io(response_rx, deadline, &|| true)
                     .await
-                    .map_err(|error| format!("STUN response wait failed: {error:?}"))?
-                    .map_err(|_| "STUN response dispatcher closed".to_string())?;
+                    .map_err(|error| {
+                        let kind = match error {
+                            dynamic_punch::MappingIoError::Deadline => {
+                                StunFailureKind::ResponseTimeout
+                            }
+                            _ => StunFailureKind::LocalIo,
+                        };
+                        (kind, format!("STUN response wait failed: {error:?}"))
+                    })?
+                    .map_err(|_| {
+                        (
+                            StunFailureKind::LocalIo,
+                            "STUN response dispatcher closed".to_owned(),
+                        )
+                    })?;
             if !change_ip && !change_port && source != server {
-                return Err(format!(
-                    "response source mismatch: expected {server}, received {source}"
+                return Err((
+                    StunFailureKind::InvalidResponse,
+                    format!("response source mismatch: expected {server}, received {source}"),
                 ));
             }
-            let response = StunMessage::decode(&data)
-                .map_err(|error| format!("invalid STUN response: {error}"))?;
+            let response = StunMessage::decode(&data).map_err(|error| {
+                (
+                    StunFailureKind::InvalidResponse,
+                    format!("invalid STUN response: {error}"),
+                )
+            })?;
             if response.transaction_id != transaction_id {
-                return Err("STUN transaction ID mismatch".to_string());
+                return Err((
+                    StunFailureKind::InvalidResponse,
+                    "STUN transaction ID mismatch".into(),
+                ));
             }
             if response.msg_type != BINDING_RESPONSE {
                 if let Some((code, reason)) = response.get_error_code() {
-                    return Err(format!("STUN error response: {code} {reason}"));
+                    return Err((
+                        StunFailureKind::InvalidResponse,
+                        format!("STUN error response: {code} {reason}"),
+                    ));
                 }
-                return Err(format!(
-                    "unexpected STUN message type: 0x{:04X}",
-                    response.msg_type
+                return Err((
+                    StunFailureKind::InvalidResponse,
+                    format!("unexpected STUN message type: 0x{:04X}", response.msg_type),
                 ));
             }
             Ok(LiveStunResponse {
@@ -327,20 +340,10 @@ impl UdpTransport {
         for server in servers {
             let started = Instant::now();
             let observation = match client.binding_request(socket, *server).await {
-                Ok(response) => StunObservation {
-                    server: server.to_string(),
-                    mapped_address: response
-                        .reflexive_address
-                        .map(|address| address.to_string()),
-                    rtt_ms: Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
-                    error: None,
-                },
-                Err(error) => StunObservation {
-                    server: server.to_string(),
-                    mapped_address: None,
-                    rtt_ms: None,
-                    error: Some(error.to_string()),
-                },
+                Ok(reply) => {
+                    StunObservation::reply(*server, reply.reflexive_address, started.elapsed())
+                }
+                Err(error) => StunObservation::failed(*server, (&error).into(), error.to_string()),
             };
             observations.push(observation);
         }

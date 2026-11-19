@@ -208,6 +208,14 @@ jobs:
               --output-dir "$RUNNER_TEMP/linux-tun-relay-$protocol" || relay_result=1
           done
           exit "$relay_result"
+      - name: Authenticated TLS standby takeover on real TUN
+        timeout-minutes: 3
+        run: |
+          sudo --preserve-env=GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT python3 scripts/parallel-rooms/linux_tun_evidence.py \
+            --write-facts --kernel-read-facts --relay-application udp --relay-tls --standby-failover \
+            --daemon target/debug/p2wlan-daemon --control target/debug/p2wlan-control \
+            --relay target/debug/p2wlan-relay --relay-keygen target/debug/p2wlan-relay-keygen \
+            --head "$(git rev-parse HEAD)" --output-dir "$RUNNER_TEMP/linux-tun-tls-takeover"
       - name: Real kernel TUN original room revocation
         if: ${{ !cancelled() }}
         timeout-minutes: 3
@@ -276,6 +284,7 @@ jobs:
             ${{ runner.temp }}/linux-tun-original-images/
             ${{ runner.temp }}/linux-tun-relay-udp/
             ${{ runner.temp }}/linux-tun-relay-tcp/
+            ${{ runner.temp }}/linux-tun-tls-takeover/
             ${{ runner.temp }}/linux-tun-relay-original-programs/
           if-no-files-found: error
           retention-days: 7

@@ -20,8 +20,23 @@ impl PeerManager {
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
         };
-        conn.commit_path_transition(PathEvent::DirectValidationStarted { validation }, |_| {})
-            .accepted()
+        let current = conn.path_state_machine.active_direct_validation();
+        let event = match current {
+            Some(current) if validation.request_endpoint().is_some_and(|endpoint|
+                conn.may_validate_alternate(validation.epoch.network_generation, endpoint)) =>
+                PathEvent::DirectAlternateValidationStarted { current, validation },
+            _ => PathEvent::DirectValidationStarted { validation },
+        };
+        let alternate = matches!(event, PathEvent::DirectAlternateValidationStarted { .. });
+        let accepted = conn.commit_path_transition(event, |_| {}).accepted();
+        if accepted && alternate {
+            if let Some(watch) = conn.rebind_observation.as_mut() {
+                if watch.challenge == validation.request_endpoint() {
+                    watch.owner = validation.owner_token;
+                }
+            }
+        }
+        accepted
     }
 
     pub(crate) async fn finish_direct_validation_attempt_in_epoch(
@@ -483,9 +498,32 @@ impl PeerManager {
         generation: u64,
         local_endpoint: Option<SocketAddr>,
     ) -> bool {
-        let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
+        let Some(target) = self
+            .connections
+            .read()
+            .await
+            .get(node_id)
+            .and_then(|conn| conn.direct_consent_path(generation))
+            .filter(|target| target.path.endpoint == endpoint)
+        else {
             return false;
         };
+        self.record_direct_consent_timeout(node_id, target, local_endpoint)
+            .await
+    }
+
+    pub(crate) async fn record_direct_consent_timeout(
+        &self,
+        node_id: &str,
+        target: DirectConsentPath,
+        local_endpoint: Option<SocketAddr>,
+    ) -> bool {
+        let ActivePathSnapshot {
+            generation,
+            peer_session_generation,
+            endpoint,
+            ..
+        } = target.path;
         let (epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         if generation != self.current_network_generation_sync()
             || !self.peer_session_is_current_sync(node_id, peer_session_generation)
@@ -497,10 +535,7 @@ impl PeerManager {
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
-            if !conn.online
-                || conn.direct_generation != generation
-                || conn.state != ConnectionState::Direct
-            {
+            if conn.direct_consent_path(generation) != Some(target) {
                 return false;
             }
 

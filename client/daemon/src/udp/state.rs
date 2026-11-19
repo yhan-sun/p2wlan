@@ -648,6 +648,7 @@ pub(crate) struct DirectValidationSession {
 /// validation worker.  Future observations merge into the watch value rather
 /// than receiving another lease.
 pub(crate) struct DirectValidationSessionLease {
+    pub(crate) initial_direct_commit: Option<u64>,
     pub(crate) peer_id: String,
     pub(crate) owner_token: u64,
     pub(crate) target_rx: watch::Receiver<DirectValidationTarget>,

@@ -68,6 +68,7 @@ def environment(library: Path, port: int, stats_path: Path | None = None) -> dic
     key = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
     env[key] = str(library.resolve())
     env["P2WLAN_NAT_SIM_GATEWAY_PORT"] = str(port)
+    env.pop("P2WLAN_NAT_SIM_SENDER_PID", None)
     env.pop("P2WLAN_NAT_SIM_EGRESS_STATS", None)
     if stats_path is not None:
         env["P2WLAN_NAT_SIM_EGRESS_STATS"] = str(stats_path.resolve())
@@ -105,6 +106,8 @@ def main() -> None:
     env = environment(args.library, args.port, args.stats)
     if args.recorder:
         env = recorder_environment(env)
+    else:
+        env["P2WLAN_NAT_SIM_SENDER_PID"] = str(os.getpid())
     os.execvpe(command[0], command, env)
 
 

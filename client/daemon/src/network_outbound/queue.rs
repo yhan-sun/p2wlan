@@ -896,10 +896,11 @@ pub(super) async fn flush_one_peer_until_stopped(
         let admitted = timeout(admission_bound(&queue), async {
             let relay_available = relay_transport.read().await.is_some();
             peers
-                .is_data_path_admitted_for_generation(
+                .queued_data_path_admitted(
                     &peer_id,
                     generation,
                     relay_available || relay_expected,
+                    relay_available,
                 )
                 .await
         })

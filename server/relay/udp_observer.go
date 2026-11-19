@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"sync/atomic"
 )
@@ -14,6 +15,61 @@ const (
 	stunMagicCookie     uint32 = 0x2112A442
 	stunHeaderLen              = 20
 )
+
+func openAlternateObserver(primary *net.UDPConn, bind string) (*net.UDPConn, error) {
+	if bind == "" {
+		return nil, nil
+	}
+	if primary == nil {
+		return nil, errors.New("alternate UDP observer requires a primary observer")
+	}
+	address, err := net.ResolveUDPAddr("udp", bind)
+	if err != nil {
+		return nil, err
+	}
+	source := primary.LocalAddr().(*net.UDPAddr)
+	if len(source.IP) == 0 || len(address.IP) == 0 || source.IP.IsUnspecified() || address.IP.IsUnspecified() || source.IP.Equal(address.IP) ||
+		(source.IP.To4() == nil) != (address.IP.To4() == nil) {
+		return nil, errors.New("alternate observer requires distinct explicit IPs of the same family")
+	}
+	alternate, err := net.ListenUDP("udp", address)
+	if err != nil {
+		return nil, fmt.Errorf("alternate UDP observer: %w", err)
+	}
+	if alternate.LocalAddr().(*net.UDPAddr).Port == source.Port {
+		_ = alternate.Close()
+		return nil, errors.New("alternate observer requires a different source port")
+	}
+	return alternate, nil
+}
+
+// A full CHANGE-REQUEST can only be answered from a registered second IP and port.
+func observerChange(request []byte) (uint32, bool) {
+	if len(request) < stunHeaderLen || int(binary.BigEndian.Uint16(request[2:4])) != len(request)-stunHeaderLen {
+		return 0, false
+	}
+	var flags uint32
+	found := false
+	for attrs := request[stunHeaderLen:]; len(attrs) > 0; {
+		if len(attrs) < 4 {
+			return 0, false
+		}
+		length := int(binary.BigEndian.Uint16(attrs[2:4]))
+		padded := (length + 3) &^ 3
+		if padded > len(attrs)-4 {
+			return 0, false
+		}
+		if binary.BigEndian.Uint16(attrs[:2]) == 3 {
+			if length != 4 || found {
+				return 0, false
+			}
+			found = true
+			flags = binary.BigEndian.Uint32(attrs[4:8])
+		}
+		attrs = attrs[4+padded:]
+	}
+	return flags, flags == 0 || flags == 6
+}
 
 func (s *RelayServer) serveUDPObserver() {
 	defer s.wg.Done()
@@ -34,6 +90,14 @@ func (s *RelayServer) serveUDPObserver() {
 			}
 		}
 
+		flags, valid := observerChange(buf[:n])
+		writer := s.udpObserverConn
+		if flags == 6 {
+			writer = s.udpObserverAlternate
+		}
+		if !valid || writer == nil {
+			continue
+		}
 		response, ok := buildUDPObserverSTUNResponse(buf[:n], addr)
 		if !ok {
 			atomic.AddUint64(&s.stats.udpObserverErrorsTotal, 1)
@@ -43,7 +107,7 @@ func (s *RelayServer) serveUDPObserver() {
 		// the caller. Otherwise a client can receive the response and read the
 		// metric before this goroutine is scheduled again.
 		atomic.AddUint64(&s.stats.udpObserverRequestsTotal, 1)
-		if _, err := s.udpObserverConn.WriteToUDP(response, addr); err != nil {
+		if _, err := writer.WriteToUDP(response, addr); err != nil {
 			atomic.AddUint64(&s.stats.udpObserverErrorsTotal, 1)
 			continue
 		}

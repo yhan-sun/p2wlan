@@ -347,6 +347,14 @@ impl PeerManager {
             .contains(node_id)
     }
 
+    pub(crate) async fn direct_committed_since(
+        &self, node: &str, epoch: PathEpoch, original: Option<u64>,
+    ) -> bool {
+        self.connections.read().await.get(node).is_some_and(|conn|
+            conn.path_state_machine.active_direct_validation().is_some_and(|active| active.epoch == epoch)
+                && original != Some(conn.direct_commit_seq))
+    }
+
     /// Whether a peer is still eligible to receive a newly allocated
     /// direct-validation worker. This deliberately distinguishes an offline
     /// peer retained for diagnostics from a live peer: lifecycle cleanup can
@@ -365,8 +373,8 @@ impl PeerManager {
 
     /// Whether an encrypted validation may establish `endpoint` as a new
     /// Direct path.  A confirmed public/UU path remains eligible for a
-    /// directly-connected LAN endpoint, but ordinary alternate public
-    /// candidates are still suppressed while Direct is healthy.
+    /// directly-connected LAN endpoint, or a recently changed,
+    /// authenticated receive port on the committed local socket.
     pub(crate) async fn is_direct_validation_eligible_for_endpoint(
         &self,
         node_id: &str,
@@ -381,7 +389,7 @@ impl PeerManager {
                 connection.online
                     && connection.state != ConnectionState::Closed
                     && (connection.state != ConnectionState::Direct
-                        || connection.should_upgrade_direct_to_on_link(generation, endpoint))
+                        || connection.may_validate_alternate(generation, endpoint))
             })
     }
 
@@ -460,7 +468,7 @@ impl PeerManager {
 
     /// Lock-free/try-lock counterpart used by the synchronous UDP ingress
     /// gate.  A Direct peer's ordinary matched ACKs must be dropped before
-    /// they wake the scheduler; only an on-link alternate may pass through to
+    /// they wake the scheduler; only an eligible alternate may pass through to
     /// the async registry check.
     pub(crate) fn is_direct_validation_eligible_for_endpoint_sync(
         &self,
@@ -478,7 +486,7 @@ impl PeerManager {
             connection.online
                 && connection.state != ConnectionState::Closed
                 && (connection.state != ConnectionState::Direct
-                    || connection.should_upgrade_direct_to_on_link(generation, endpoint))
+                    || connection.may_validate_alternate(generation, endpoint))
         })
     }
 

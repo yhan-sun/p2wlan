@@ -58,3 +58,15 @@ Relay-only 启动时不解析 Direct 专用的 STUN 或 UDP observer 地址，�
 `relay_startup_timeout_ms` 仍默认为 3000，旧字段 `fallback_timeout_ms` 仍是读取别名。在 Direct-first 下，首次业务 FIFO 的总等待预算包含 5 秒直连窗口，再加配置的 Relay 启动等待；未配置 Relay 时只等待 Direct，不会虚构中继。该预算不会因每个新业务包或候选刷新而无限续期；队列仍受原有包数、字节数和 generation 边界保护。
 
 CLI 的 `--prefer-direct` 与 `relay-policy=direct` 选择 Direct-first；显式 `--prefer-relay` 或 `relay-policy=prefer-relay` 使用兼容 Auto，不等同于 Relay-only。
+
+### 网络实验开关
+
+| 配置 | 生效条件 |
+| --- | --- |
+| `network.early_candidate_signaling` | 默认关闭。开启后，已绑定 socket 的全局 IPv6 Host 或首个有效公网 STUN 映射可进入首轮信令。后续发送完整候选集。接收端仅对同一身份、同一进程代际且保留全部原地址和来源的增量延续检查。 |
+| `relay.path_policy=adaptive` | 用 `p2wlan config set path-policy adaptive` 设置。已存在待发业务、当前 Relay 写入者在线并完成对端确认，且 Direct 至少 750 ms 没有新的成功进展时，可提前承载首包。正在加密验证的 Direct 保留原始窗口，后台仍可升级直连。 |
+| `network.accelerated_consent` | 默认关闭。选中的同一路径连续两次未回复保活时，可追加一次有独立 nonce 和超时的验证。第三次真实失约才触发降级。在同一会话和本地 socket 上，已认证业务的来源端口发生变化时，可继续使用原直连，同时对新端口发起加密验证。只有原路径、会话、本地 socket、验证所有者和请求编号仍匹配，才切换业务。同 IP 上的应答端口可以与请求端口不同，但新应答来源必须已独立验证。稳定的非对称收发端口不会重复触发。 |
+| `relay.warm_failover` | 默认关闭。配置多个认证中继时，主连接断开后可接管另一条仍持有有效票据的已注册连接。备用中继承载业务前，双方须在新连接完成加密确认。 |
+| `RELAY_UDP_OBSERVER_ALTERNATE_BIND` | Relay 管理员可搭配 `RELAY_UDP_OBSERVER_BIND` 绑定同族、异 IP 和异端口的本机地址。客户端对主地址发送 CHANGE-REQUEST，备用地址回包。目录项设置 `udp_observer_change_ip=true` 并填写 `udp_observer_endpoint` 后，客户端优先尝试该观察点。 |
+
+本地诊断中的 `failure_kind` 区分 STUN 观察点超时、本机 I/O 失败、无效回复、缺少映射和地址族错误。仅观察点失联时，NAT 画像保留 `unknown`。两条路径均已验通时，`quality_policy_preview` 提供现有 Score 策略在该次快照中的选路和原因。Linux 和 macOS 的桌面路由监测还会在系统睡眠至少两秒后重新验证连接。

@@ -558,17 +558,22 @@ impl WireGuardTransport {
                             local_endpoint,
                             latency,
                             Some(proof.remote_candidate_epoch),
-                            Some(crate::peer::DirectValidationIdentity::authenticated_ack(
-                                crate::peer::PathEpoch::new(
-                                    proof.generation,
-                                    proof.peer_session_generation,
-                                    proof.remote_candidate_epoch,
+                            Some(
+                                crate::peer::DirectValidationIdentity::authenticated_ack(
+                                    crate::peer::PathEpoch::new(
+                                        proof.generation,
+                                        proof.peer_session_generation,
+                                        proof.remote_candidate_epoch,
+                                    ),
+                                    proof.owner_token,
+                                    proof.request_id,
+                                    proof.endpoint,
+                                    source,
+                                )
+                                .with_verified_return(
+                                    endpoint_authenticated && proof.endpoint != Some(source),
                                 ),
-                                proof.owner_token,
-                                proof.request_id,
-                                proof.endpoint,
-                                source,
-                            )),
+                            ),
                             Some(&mut hooks),
                         );
                         if let Some(deadline) = deadline {

@@ -103,6 +103,14 @@ pub(crate) fn udp_observers_from_sources(
     }
 
     let mut observers = Vec::new();
+    for entry in relay_catalog
+        .iter()
+        .filter(|entry| entry.udp_observer_change_ip)
+    {
+        if let Some(observer) = entry.udp_observer_endpoint.as_deref() {
+            push_unique_udp_observer(&mut observers, observer);
+        }
+    }
     for observer in configured {
         push_unique_udp_observer(&mut observers, observer);
     }

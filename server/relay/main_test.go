@@ -152,3 +152,43 @@ func TestAuthFailureRateLimitConfigValidation(t *testing.T) {
 		t.Fatalf("expected disabled auth failure limiter, got %d", cfg.AuthFailureLimit)
 	}
 }
+
+func TestUDPObserverChangesAddressOnlyForFullChangeRequest(t *testing.T) {
+	config := testConfig()
+	config.UDPObserverBind = "127.0.0.1:0"
+	// macOS requires an explicit loopback alias. Exercise the two actual
+	// addresses when the second one is present (including Linux loopback).
+	probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.2")})
+	if err != nil {
+		t.Skip("second local loopback address unavailable")
+	}
+	_ = probe.Close()
+	config.UDPObserverAlternateBind = "127.0.0.2:0"
+	relay, _, cleanup := startTestServerWithInstance(t, config)
+	defer cleanup()
+	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	msg := make([]byte, 28)
+	binary.BigEndian.PutUint16(msg[0:2], stunBindingRequest)
+	binary.BigEndian.PutUint16(msg[2:4], 8)
+	binary.BigEndian.PutUint32(msg[4:8], stunMagicCookie)
+	copy(msg[8:20], []byte("test-udp-alt"))
+	binary.BigEndian.PutUint16(msg[20:22], 3)
+	binary.BigEndian.PutUint16(msg[22:24], 4)
+	binary.BigEndian.PutUint32(msg[24:28], 6)
+	_ = listener.SetDeadline(time.Now().Add(time.Second))
+	if _, err := listener.WriteToUDP(msg, relay.UDPObserverAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, 1500)
+	n, from, err := listener.ReadFromUDP(response)
+	if err != nil || n < 20 || from.String() != relay.udpObserverAlternate.LocalAddr().String() || !bytes.Equal(msg[8:20], response[8:20]) {
+		t.Fatalf("unexpected alternate-source reply from %v, length %d, error %v", from, n, err)
+	}
+	if _, ok := observerChange(msg[:26]); ok {
+		t.Fatal("truncated change request accepted")
+	}
+}

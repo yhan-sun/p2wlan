@@ -652,6 +652,7 @@ fn pool_stun_evidence_promotes_a_primary_blocked_profile_before_pool_gate() {
     primary.nat_profile.mapping_behavior = MappingBehavior::UdpBlocked;
     primary.nat_profile.likely_symmetric = None;
     primary.nat_profile.observations = vec![p2pnet_nat::StunObservation {
+        failure_kind: None,
         server: "198.51.100.1:3478".to_string(),
         mapped_address: None,
         rtt_ms: None,
@@ -664,6 +665,7 @@ fn pool_stun_evidence_promotes_a_primary_blocked_profile_before_pool_gate() {
         41000,
     )];
     pool.nat_profile.observations = vec![p2pnet_nat::StunObservation {
+        failure_kind: None,
         server: "198.51.100.2:3478".to_string(),
         mapped_address: Some("198.51.100.20:41000".to_string()),
         rtt_ms: Some(8),
@@ -674,13 +676,15 @@ fn pool_stun_evidence_promotes_a_primary_blocked_profile_before_pool_gate() {
     assert!(!primary.nat_profile.udp_blocked);
     assert_eq!(
         primary.nat_profile.mapping_behavior,
-        MappingBehavior::AddressOrPortDependent
+        MappingBehavior::Unknown
     );
     assert_eq!(
         primary.nat_profile.public_endpoint.as_deref(),
         Some("198.51.100.20:41000")
     );
-    assert!(primary.nat_profile.birthday_candidate);
+    assert!(!primary.nat_profile.birthday_candidate);
+    assert_eq!(primary.nat_profile.likely_symmetric, None);
+    assert_eq!(primary.nat_profile.public_port_stable, None);
     // The profile's observation sequence belongs to its primary local_addr.
     // The pool-backed public candidate is retained separately and must not
     // become a fake second port-allocation sample on that primary socket.
@@ -695,6 +699,7 @@ fn pool_socket_samples_do_not_change_primary_allocation_model() {
         .into_iter()
         .enumerate()
         .map(|(index, port)| p2pnet_nat::StunObservation {
+            failure_kind: None,
             server: format!("198.51.100.{}:3478", index + 1),
             mapped_address: Some(format!("203.0.113.10:{port}")),
             rtt_ms: Some(8),
@@ -708,6 +713,7 @@ fn pool_socket_samples_do_not_change_primary_allocation_model() {
         52017,
     )];
     pool.nat_profile.observations = vec![p2pnet_nat::StunObservation {
+        failure_kind: None,
         server: "198.51.100.9:3478".to_string(),
         mapped_address: Some("203.0.113.10:52017".to_string()),
         rtt_ms: Some(12),

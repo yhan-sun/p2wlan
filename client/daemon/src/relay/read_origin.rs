@@ -3,6 +3,12 @@
 use super::*;
 
 pub(crate) trait RelayReadItem: From<RelayMessage> + Send + 'static {
+    const ORIGINAL_READER: bool = false;
+    fn take_original_reader(
+        _input: mpsc::Receiver<Self>,
+    ) -> Option<mpsc::Receiver<OriginalRelayDelivery>> {
+        None
+    }
     fn message(&self) -> &RelayMessage;
     fn into_parts(self) -> (RelayMessage, Option<OriginalRelayFrameRead>);
     fn connect_client<'a>(
@@ -35,6 +41,13 @@ impl RelayReadItem for RelayMessage {
 }
 
 impl RelayReadItem for OriginalRelayDelivery {
+    const ORIGINAL_READER: bool = true;
+    fn take_original_reader(
+        input: mpsc::Receiver<Self>,
+    ) -> Option<mpsc::Receiver<OriginalRelayDelivery>> {
+        Some(input)
+    }
+
     fn message(&self) -> &RelayMessage {
         OriginalRelayDelivery::message(self)
     }

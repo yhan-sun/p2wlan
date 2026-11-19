@@ -4,6 +4,7 @@ impl RelaySupervisor {
     pub(crate) async fn run(self) {
         let mut retry_delay = Duration::from_millis(100);
         let max_retry_delay = Duration::from_secs(30);
+        let mut standby = None;
         let mut cooldowns: HashMap<String, Instant> = HashMap::new();
         loop {
             let now = Instant::now();
@@ -20,19 +21,23 @@ impl RelaySupervisor {
                 transport,
                 relay_rx,
                 diagnostics,
-            } = select_relay_with_cooldowns_for_read::<OriginalRelayDelivery>(
-                &self.relay_candidates,
-                &self.preferred_regions,
-                self.selection_timeout,
-                &self.node_id,
-                self.peers.clone(),
-                self.ticket_cache.clone(),
-                self.relay_ticket.clone(),
-                self.allow_insecure_plaintext,
-                self.ca_cert_path.clone(),
-                &cooldowns,
-            )
-            .await;
+            } = if let Some(prepared) = standby.take() {
+                prepared
+            } else {
+                select_relay_with_cooldowns_for_read::<OriginalRelayDelivery>(
+                    &self.relay_candidates,
+                    &self.preferred_regions,
+                    self.selection_timeout,
+                    &self.node_id,
+                    self.peers.clone(),
+                    self.ticket_cache.clone(),
+                    self.relay_ticket.clone(),
+                    self.allow_insecure_plaintext,
+                    self.ca_cert_path.clone(),
+                    &cooldowns,
+                )
+                .await
+            };
             let permanent_auth = diagnostics
                 .candidates
                 .iter()
@@ -109,7 +114,7 @@ impl RelaySupervisor {
                         },
                     )
                     .await;
-                *self.relay_transport.write().await = None;
+                let closed = self.relay_transport.write().await.take();
                 let _ = self.relay_available_tx.send(false);
                 let (peer_failure_code, peer_failure_reason) = match &ended {
                     Ok(()) => (
@@ -198,6 +203,30 @@ impl RelaySupervisor {
                 }
                 drop(diagnostics);
                 warn!("{reason}");
+                if !route_changed {
+                    if let Some(closed) = closed {
+                        if let Some((transport, rx)) = closed.take_registered_standby().await {
+                            let diagnostics = RelaySelectionDiagnostics {
+                                selected_region: Some(transport.region().to_owned()),
+                                selected_endpoint: Some(transport.endpoint().to_owned()),
+                                selected_connect_latency_ms: Some(transport.connect_latency_ms()),
+                                ..Default::default()
+                            };
+                            self.timeline.emit(
+                                "relay_standby_registered",
+                                Some("relay"),
+                                None,
+                                Some(transport.endpoint().to_owned()),
+                            );
+                            standby = Some(RelayReadSelectionOutcome {
+                                transport: Some(transport),
+                                relay_rx: Some(rx),
+                                diagnostics,
+                            });
+                            continue;
+                        }
+                    }
+                }
             } else {
                 *self.relay_transport.write().await = None;
                 let _ = self.relay_available_tx.send(false);

@@ -18,6 +18,7 @@ pub(super) struct RelayRouteMonitor {
     baseline: Vec<String>,
     pending: Option<(Vec<String>, u8)>,
     ticker: tokio::time::Interval,
+    resume: crate::netenv::ResumeWatch,
 }
 
 impl RelayRouteMonitor {
@@ -28,6 +29,7 @@ impl RelayRouteMonitor {
             baseline,
             pending: None,
             ticker,
+            resume: Default::default(),
         }
     }
 
@@ -73,6 +75,9 @@ impl RelayRouteMonitor {
                 tokio::task::spawn_blocking(|| crate::netenv::network_route_signature(&[]))
                     .await
                     .unwrap_or_default();
+            if self.resume.resumed() {
+                return observed;
+            }
             if let Some(changed) = self.observe(observed) {
                 return changed;
             }
@@ -249,7 +254,7 @@ impl RelaySupervisor {
                                     1,
                                     std::sync::atomic::Ordering::SeqCst,
                                 );
-                                current_transport.abort_writer();
+                                current_transport.retire_ended_writer();
                                 self.record_connection_close_diagnostics(&result)
                                     .await;
                                 return result;
@@ -272,7 +277,7 @@ impl RelaySupervisor {
                                     1,
                                     std::sync::atomic::Ordering::SeqCst,
                                 );
-                                current_transport.abort_writer();
+                                current_transport.retire_ended_writer();
                                 return Err(DaemonError::Relay(
                                     "relay inbound task ended without a classified close"
                                         .to_string(),
@@ -392,7 +397,7 @@ impl RelaySupervisor {
                                     1,
                                     std::sync::atomic::Ordering::SeqCst,
                                 );
-                                current_transport.abort_writer();
+                                current_transport.retire_ended_writer();
                                 self.record_connection_close_diagnostics(&ended).await;
                                 return ended;
                             }
@@ -411,7 +416,7 @@ impl RelaySupervisor {
                                     1,
                                     std::sync::atomic::Ordering::SeqCst,
                                 );
-                                current_transport.abort_writer();
+                                current_transport.retire_ended_writer();
                                 self.record_connection_close_diagnostics(&ended).await;
                                 return ended;
                             }

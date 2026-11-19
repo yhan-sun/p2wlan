@@ -12,9 +12,18 @@ struct RelayRendezvousPlan {
     connect_timeout: Duration,
 }
 
+type StandbyTransport = (RelayTransport, mpsc::Receiver<OriginalRelayDelivery>);
+type StandbyTransfer = tokio::sync::oneshot::Sender<StandbyTransport>;
+
+struct RegisteredStandby {
+    connection_id: u64,
+    transfer: tokio::sync::oneshot::Sender<StandbyTransfer>,
+}
+
 #[derive(Default)]
 struct RendezvousRoutes {
     clients: HashMap<String, Arc<RelayClient>>,
+    standbys: HashMap<String, RegisteredStandby>,
     peers: HashMap<String, String>,
 }
 
@@ -42,6 +51,7 @@ impl RelayRendezvous {
                 client.abort();
             }
             routes.clients.clear();
+            routes.standbys.clear();
             routes.peers.clear();
         }
         // Never nest the tasks gate with routes or a client close gate.
@@ -80,11 +90,63 @@ impl RelayRendezvous {
         if let Some(client) = routes.clients.remove(endpoint) {
             client.abort();
         }
+        routes.standbys.remove(endpoint);
         routes.peers.retain(|_, route| route != endpoint);
+    }
+
+    fn register_standby(
+        &self,
+        endpoint: &str,
+        writer: &Arc<RelayClient>,
+        connection_id: u64,
+        transfer: tokio::sync::oneshot::Sender<StandbyTransfer>,
+    ) {
+        let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.stopped.load(std::sync::atomic::Ordering::Acquire)
+            && routes
+                .clients
+                .get(endpoint)
+                .is_some_and(|ready| Arc::ptr_eq(ready, writer))
+        {
+            routes.standbys.insert(
+                endpoint.to_owned(),
+                RegisteredStandby {
+                    connection_id,
+                    transfer,
+                },
+            );
+        }
+    }
+
+    fn detach_standby(&self, endpoint: &str, writer: &Arc<RelayClient>) -> bool {
+        let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+        if !routes
+            .clients
+            .get(endpoint)
+            .is_some_and(|ready| Arc::ptr_eq(ready, writer))
+        {
+            return false;
+        }
+        routes.clients.remove(endpoint);
+        routes.peers.retain(|_, route| route != endpoint);
+        true
+    }
+
+    fn retire_primary(&self) {
+        if self.plan.peers.warm_relay_failover() {
+            let _routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            self.stop();
+        }
     }
 
     fn send_clients(&self, peer: &str) -> Vec<Arc<RelayClient>> {
         let routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
         if let Some(client) = routes
             .peers
             .get(peer)
@@ -105,6 +167,9 @@ impl RelayRendezvous {
         Option<Vec<send_origin::SelectedRelayWriter>>,
     ) {
         let routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return (Vec::new(), None);
+        }
         if let Some((endpoint, client)) = routes.peers.get(peer).and_then(|endpoint| {
             routes
                 .clients
@@ -169,10 +234,12 @@ impl Drop for RelayRendezvous {
 
 // A worker can be cancelled while its client is also retained in the route map.
 // Explicitly close it on every exit, rather than relying on the last Arc drop.
-struct RendezvousClientGuard(Arc<RelayClient>);
+struct RendezvousClientGuard(Option<Arc<RelayClient>>);
 impl Drop for RendezvousClientGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(client) = &self.0 {
+            client.abort();
+        }
     }
 }
 
@@ -210,7 +277,7 @@ impl RelayTransport {
                 }
                 if closed {
                     if let Some(pool) = weak.upgrade() {
-                        pool.stop();
+                        pool.retire_primary();
                     }
                     return;
                 }
@@ -226,7 +293,7 @@ impl RelayTransport {
                 )
                 .await;
             if let Some(pool) = weak.upgrade() {
-                pool.stop();
+                pool.retire_primary();
             }
         });
         pool.tasks
@@ -271,22 +338,43 @@ impl RelayTransport {
                         )
                         .await
                         .map_err(RelayAttemptError::Relay)?;
-                        Ok::<_, RelayAttemptError>((transport.client.clone(), rx, expiry))
+                        let transport = match (candidate.audience.as_deref(), expiry) {
+                            (Some(audience), Some(expiry)) => {
+                                transport.with_ticket_metadata(audience, &candidate.region, expiry)
+                            }
+                            _ => transport,
+                        };
+                        Ok::<_, RelayAttemptError>((transport, rx, expiry))
                     })
                     .await;
-                    let (client, mut input, expiry) = match connected {
+                    let (transport, mut input, expiry) = match connected {
                         Ok(Ok(connection)) => connection,
                         _ => {
                             tokio::time::sleep(Duration::from_secs(5)).await;
                             continue;
                         }
                     };
-                    let guard = RendezvousClientGuard(client.clone());
+                    let client = transport.client.clone();
+                    let mut guard = RendezvousClientGuard(Some(client.clone()));
                     if weak
                         .upgrade()
                         .is_none_or(|pool| !pool.insert(&candidate.endpoint, client))
                     {
                         return;
+                    }
+                    let (transfer_tx, mut transfer_rx) = tokio::sync::oneshot::channel();
+                    let eligible = I::ORIGINAL_READER
+                        && plan.peers.warm_relay_failover()
+                        && transport.ticket_expiry().is_some();
+                    if eligible {
+                        if let Some(pool) = weak.upgrade() {
+                            pool.register_standby(
+                                &candidate.endpoint,
+                                &transport.client,
+                                transport.connection_id(),
+                                transfer_tx,
+                            );
+                        }
                     }
                     // ticket_for() refreshes at the same margin; after this
                     // deadline the next registration cannot reuse an expiring ticket.
@@ -302,6 +390,18 @@ impl RelayTransport {
                     let mut planned_renewal = false;
                     loop {
                         tokio::select! {
+                            transfer = &mut transfer_rx, if eligible => {
+                                if let Ok(reply) = transfer {
+                                    let fresh = expiry.is_some_and(|at| at > now_unix() + RELAY_TICKET_REFRESH_MARGIN_SECS);
+                                    if fresh && weak.upgrade().is_some_and(|pool| pool.detach_standby(&candidate.endpoint, &transport.client)) {
+                                        if let Some(original) = I::take_original_reader(input) {
+                                            if reply.send((transport, original)).is_ok() { guard.0.take(); }
+                                        }
+                                        return;
+                                    }
+                                }
+                                break;
+                            }
                             _ = tokio::time::sleep_until(renewal_at.unwrap_or_else(tokio::time::Instant::now)), if renewal_at.is_some() => {
                                 planned_renewal = true;
                                 break;
@@ -320,7 +420,7 @@ impl RelayTransport {
                         }
                     }
                     if let Some(pool) = weak.upgrade() {
-                        pool.remove_if_client(&candidate.endpoint, &guard.0);
+                        pool.remove_if_client(&candidate.endpoint, &transport.client);
                     }
                     drop(guard);
                     if !planned_renewal {
@@ -337,6 +437,46 @@ impl RelayTransport {
         (self, rx)
     }
 
+    pub(crate) fn retire_ended_writer(&self) {
+        self.retire_write_boundaries();
+        self.client.abort();
+        if let Some(pool) = &self.rendezvous {
+            pool.retire_primary();
+        }
+    }
+
+    pub(crate) async fn take_registered_standby(&self) -> Option<StandbyTransport> {
+        let pool = self.rendezvous.as_ref()?;
+        if !self.peers.warm_relay_failover() {
+            return None;
+        }
+        let sender = {
+            let mut routes = pool.routes.lock().unwrap_or_else(|p| p.into_inner());
+            pool.plan
+                .candidates
+                .iter()
+                .find_map(|candidate| routes.standbys.remove(&candidate.endpoint))
+        };
+        let result = if let Some(sender) = sender {
+            let (reply, receiver) = tokio::sync::oneshot::channel();
+            if sender.transfer.send(reply).is_ok() {
+                timeout(Duration::from_millis(300), receiver)
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        pool.shutdown().await;
+        result.map(|(mut transport, input)| {
+            transport.resume_rendezvous = Some(pool.plan.clone());
+            (transport, input)
+        })
+    }
+
     pub(crate) async fn handoff_rendezvous<I: RelayReadItem>(
         &self,
         replacement: Self,
@@ -349,7 +489,10 @@ impl RelayTransport {
                 pool.shutdown().await;
                 replacement.with_rendezvous(rx, pool.plan.clone())
             }
-            None => (replacement, rx),
+            None => match &self.resume_rendezvous {
+                Some(plan) => replacement.with_rendezvous(rx, plan.clone()),
+                None => (replacement, rx),
+            },
         }
     }
 }

@@ -287,6 +287,11 @@ impl UdpTransport {
             "created one owned direct-validation worker"
         );
         DirectValidationSessionStart::Spawn(DirectValidationSessionLease {
+            initial_direct_commit: if direct_confirmed {
+                self.peers.direct_commit_seq_sync(peer_id)
+            } else {
+                None
+            },
             peer_id: peer_id.to_string(),
             owner_token,
             target_rx,

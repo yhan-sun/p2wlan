@@ -50,7 +50,7 @@ impl Daemon {
     ) -> Option<(Vec<String>, HashMap<String, String>)> {
         let snapshot = self.cached_candidate_snapshot().await?;
         snapshot
-            .initial_gather_complete
+            .ready_for_initial_offer()
             .then_some((snapshot.candidates, snapshot.candidate_sources))
     }
 

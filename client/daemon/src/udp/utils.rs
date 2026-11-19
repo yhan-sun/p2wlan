@@ -1,6 +1,14 @@
 fn socket_pool_is_eligible(report: &CandidateGatherReport) -> bool {
-    report.nat_profile.mapping_behavior == MappingBehavior::AddressOrPortDependent
-        && !report.nat_profile.udp_blocked
+    let profile = &report.nat_profile;
+    let pool_only_mapping = profile.mapping_behavior == MappingBehavior::Unknown
+        && profile.public_endpoint.is_some()
+        && profile
+            .observations
+            .iter()
+            .all(|obs| obs.mapped_address.is_none());
+    !profile.udp_blocked
+        && (profile.mapping_behavior == MappingBehavior::AddressOrPortDependent
+            || pool_only_mapping)
 }
 
 fn pool_stun_servers(

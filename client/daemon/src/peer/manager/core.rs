@@ -1,4 +1,12 @@
 impl PeerManager {
+    pub(crate) fn warm_relay_failover(&self) -> bool {
+        self.config.relay.warm_failover
+    }
+
+    pub(crate) fn early_candidate_signaling(&self) -> bool {
+        self.config.network.early_candidate_signaling
+    }
+
     /// Whether startup/live candidate gathering may advertise extrapolated
     /// server-reflexive endpoints.  Keep this accessor in the core manager
     /// implementation so fast startup gathering does not depend on any

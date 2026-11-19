@@ -22,11 +22,7 @@ pub async fn gather_candidate_report(
 
     // 1. Host candidates
     if config.gather_host {
-        let local_ips = gather_local_addresses();
-        for ip in local_ips
-            .into_iter()
-            .filter(|ip| ip.is_ipv4() == local_addr.ip().is_ipv4())
-        {
+        for ip in host_addresses_for_bind(local_addr) {
             let candidate = IceCandidate {
                 candidate_type: CandidateType::Host,
                 endpoint: crate::Endpoint::new(&ip.to_string(), local_addr.port()),
@@ -42,7 +38,11 @@ pub async fn gather_candidate_report(
     if config.gather_srflx && !config.stun_servers.is_empty() {
         let stun_client = StunClient::with_timeout(config.stun_timeout);
 
+        let mut queried = std::collections::HashSet::new();
         for &server in &config.stun_servers {
+            if !queried.insert(server) {
+                continue;
+            }
             if server.is_ipv4() != local_addr.is_ipv4() {
                 debug!(
                     "Skipping STUN server {} because it does not match local socket family {}",
@@ -57,12 +57,11 @@ pub async fn gather_candidate_report(
                     let reflexive = response
                         .reflexive_address
                         .filter(|address| address.is_ipv4() == local_addr.ip().is_ipv4());
-                    observations.push(StunObservation {
-                        server: server.to_string(),
-                        mapped_address: reflexive.map(|addr| addr.to_string()),
-                        rtt_ms: Some(rtt_ms),
-                        error: None,
-                    });
+                    observations.push(StunObservation::reply(
+                        server,
+                        response.reflexive_address,
+                        started.elapsed(),
+                    ));
 
                     if let Some(reflexive) = reflexive {
                         let candidate = IceCandidate {
@@ -86,12 +85,7 @@ pub async fn gather_candidate_report(
                     }
                 }
                 Err(e) => {
-                    observations.push(StunObservation {
-                        server: server.to_string(),
-                        mapped_address: None,
-                        rtt_ms: None,
-                        error: Some(e.to_string()),
-                    });
+                    observations.push(StunObservation::failed(server, (&e).into(), e.to_string()));
                     debug!("STUN query to {} failed: {}", server, e);
                 }
             }
@@ -150,6 +144,7 @@ pub fn candidate_report_from_observations(
                 .is_some_and(|address| address.is_ipv4() != socket_is_ipv4);
             if wrong_family {
                 observation.mapped_address = None;
+                observation.failure_kind = Some(StunFailureKind::WrongAddressFamily);
                 observation.error = Some("STUN mapping address family did not match socket".into());
             }
             observation
@@ -157,10 +152,7 @@ pub fn candidate_report_from_observations(
         .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     if gather_host {
-        for ip in gather_local_addresses()
-            .into_iter()
-            .filter(|ip| ip.is_ipv4() == socket_is_ipv4)
-        {
+        for ip in host_addresses_for_bind(local_addr) {
             candidates.push(IceCandidate {
                 candidate_type: CandidateType::Host,
                 endpoint: crate::Endpoint::new(&ip.to_string(), local_addr.port()),

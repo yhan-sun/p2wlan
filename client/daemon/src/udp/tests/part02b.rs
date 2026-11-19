@@ -187,6 +187,7 @@ async fn live_filtering_probe_keeps_port_only_response_unknown() {
         transport.local_addr().unwrap(),
         false,
         vec![StunObservation {
+            failure_kind: None,
             server: server.to_string(),
             mapped_address: Some("203.0.113.7:45678".to_string()),
             rtt_ms: Some(5),
@@ -206,12 +207,14 @@ async fn live_filtering_probe_keeps_port_only_response_unknown() {
         false,
         vec![
             StunObservation {
+                failure_kind: None,
                 server: server.to_string(),
                 mapped_address: Some("203.0.113.7:45678".to_string()),
                 rtt_ms: Some(5),
                 error: None,
             },
             StunObservation {
+                failure_kind: None,
                 server: "192.0.2.10:3478".to_string(),
                 mapped_address: Some("203.0.113.7:45678".to_string()),
                 rtt_ms: Some(5),
@@ -835,4 +838,83 @@ async fn direct_peer_matched_ack_creates_no_validation_expectation_or_probe() {
     assert!(transport.direct_validation_target("peer-b").await.is_none());
 
     worker.abort();
+}
+
+#[tokio::test]
+async fn startup_ipv6_mapping_reaches_offer_while_ipv4_observer_is_silent() {
+    let ipv6 = Arc::new(UdpSocket::bind("[::1]:0").await.unwrap());
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())
+        .await
+        .unwrap()
+        .with_ipv6_socket(ipv6);
+    let (tx, _rx) = mpsc::channel(4);
+    let inbound = tokio::spawn(udp.clone().run_inbound(tx));
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let observer = UdpSocket::bind("[::1]:0").await.unwrap();
+    let servers = vec![silent.local_addr().unwrap(), observer.local_addr().unwrap()];
+    let mapped: SocketAddr = "[2001:db8::2]:42001".parse().unwrap();
+    let response = tokio::spawn(async move {
+        let mut buf = [0; 1500];
+        let (len, from) = observer.recv_from(&mut buf).await.unwrap();
+        let request = StunMessage::decode(&buf[..len]).unwrap();
+        let mut msg = StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
+        msg.add_attribute(StunAttribute::XorMappedAddress(mapped));
+        observer.send_to(&msg.encode(), from).await.unwrap();
+    });
+    let (progress, mut change) = watch::channel([None; 2]);
+    let gather = udp.gather_startup_candidates(servers, Duration::from_secs(1), Some(progress));
+    tokio::pin!(gather);
+    tokio::select! {
+        biased;
+        _ = &mut gather => panic!("full gather finished before an available IPv6 mapping was offered"),
+        result = change.changed() => result.unwrap(),
+    };
+    assert_eq!(*change.borrow_and_update(), [None, Some(mapped)]);
+    let report = gather.await.unwrap();
+    assert!(report
+        .candidates
+        .iter()
+        .any(|c| c.endpoint.to_string() == mapped.to_string()));
+    assert_eq!(
+        report.nat_profile.observations[0].failure_kind,
+        Some(StunFailureKind::ResponseTimeout)
+    );
+    assert!(!report.nat_profile.udp_blocked);
+    response.await.unwrap();
+    inbound.abort();
+    let _ = inbound.await;
+}
+
+#[tokio::test]
+async fn live_stun_without_mapping_preserves_valid_reply_and_unknown_reachability() {
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())
+        .await
+        .unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let inbound = tokio::spawn(udp.clone().run_inbound(tx));
+    let observer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server = observer.local_addr().unwrap();
+    let reply = tokio::spawn(async move {
+        let mut bytes = [0; 1500];
+        let (size, addr) = observer.recv_from(&mut bytes).await.unwrap();
+        let id = StunMessage::decode(&bytes[..size]).unwrap().transaction_id;
+        observer
+            .send_to(
+                &StunMessage::with_transaction_id(BINDING_RESPONSE, id).encode(),
+                addr,
+            )
+            .await
+            .unwrap();
+    });
+    let report = udp
+        .gather_candidate_report_live_parallel(vec![server], Duration::from_secs(1))
+        .await
+        .unwrap();
+    let observation = &report.nat_profile.observations[0];
+    assert_eq!(observation.failure_kind, Some(StunFailureKind::NoMapping));
+    assert!(observation.rtt_ms.is_some());
+    assert!(!report.nat_profile.udp_blocked);
+    reply.await.unwrap();
+    inbound.abort();
+    let _ = inbound.await;
 }

@@ -1,16 +1,28 @@
 """Shared actual namespace/daemon/room startup; no application or native credit."""
 import json
 import secrets
+import time
+from pathlib import Path
 
 
 def prepare(harness, lab, report):
     original, relay_fixture = harness.original, harness.relay_fixture
     endpoint, digest = harness.endpoint, harness.digest
-    info = json.loads(original.run([str(lab.args.daemon), "--build-info"]).stdout)
-    if info.get("git_commit") != lab.args.head or info.get("binary_sha256") != digest(lab.args.daemon):
-        raise RuntimeError("original daemon/source/binary identity mismatch")
+    builds = [(lab.args.daemon, getattr(lab.args, "daemon_head", None) or lab.args.head)]
+    if getattr(lab.args, "peer_daemon", None):
+        builds.append((lab.args.peer_daemon, lab.args.peer_daemon_head))
+    for binary, commit in builds:
+        info = json.loads(original.run([str(binary), "--build-info"]).stdout)
+        if info.get("git_commit") != commit or info.get("binary_sha256") != digest(binary):
+            raise RuntimeError("original daemon/source/binary identity mismatch")
     lab.setup()
+    if getattr(lab.args, "healthy_underlay_family", None):
+        harness.conditions.configure_underlay_family(lab, report)
+    if any(getattr(lab.args, flag, False) for flag in ("mixed_load", "startup_measurements", "standby_failover")):
+        harness.conditions.begin_accounting(lab, report)
     relay_mode = getattr(lab.args, "relay_application", None)
+    if getattr(lab.args, "startup_policy", None):
+        harness.conditions.block_direct_udp(lab)
     if relay_mode:
         relay_fixture.start(lab, report)
     else:
@@ -22,14 +34,18 @@ def prepare(harness, lab, report):
                             body={"email": label + "@parallel.example", "password": password}) for label in ("a", "b")}
     room = lab.http("control", "/api/v1/rooms", method="POST", token=users["b"]["token"],
                     body={"name": "Linux TUN application evidence", "password": password})["room"]
+    cold = getattr(lab.args, "startup_measurements", False)
+    if cold:
+        report["startup_clock"] = dict(boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                                       join_requested_ns=time.monotonic_ns())
     lab.http("control", "/api/v1/rooms/join", method="POST", token=users["a"]["token"],
              body={"room_code": room["room_code"], "password": password})
     for name, label in (("a1", "a"), ("b1", "b")):
         lab.daemon(name, label, room, users[label]["token"], 41001)
     initial = {name: lab.wait(name + " readiness", lambda name=name: endpoint(lab, name)) for name in ("a1", "b1")}
-    if relay_mode:
+    if relay_mode and not cold:
         relay_fixture.wait(lab, initial, report)
-    else:
+    elif not cold:
         for name, peer in (("a1", "b1"), ("b1", "a1")):
             # Wait for the original committed encrypted Direct readiness; no
             # probe request is sent/retried to turn a failed run into a pass.

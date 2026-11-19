@@ -90,7 +90,9 @@ def queue_interval(row):
     return unavailable(row["reason"])
 
 
-def queue_rows(captures, probe, requests):
+def queue_rows(captures, probe, requests, *, protocol="tcp"):
+    if protocol not in ("tcp", "udp"):
+        raise ValueError("original_protocol_invalid")
     if len(captures) > 2:
         raise ValueError("daemon_capture_capacity")
     result = {i: [] for i in range(len(requests))}
@@ -123,7 +125,7 @@ def queue_rows(captures, probe, requests):
             seq = integer(row["sequence"], len(requests) - 1)
             key = (integer(row["flow"], 999), seq)
             if (row["request_nonce"] != requests[seq]["request_nonce"] or row["kind"] not in ("request", "response")
-                    or row["protocol"] != "tcp" or key in matching):
+                    or row["protocol"] != protocol or key in matching):
                 raise ValueError("daemon_request_identity_or_duplicate")
             matching[key] = row
         seen_packets = set()
@@ -163,6 +165,12 @@ def queue_rows(captures, probe, requests):
                     "capture_owner": identity[2], "flow": packet_key[0], "read_ordinal": packet_key[1],
                     "packet_sha256": digest, "kind": row["kind"], "request_nonce": row["request_nonce"],
                     "shared_packet_across_request_frames": len(selected) > 1, "intervals": copy.deepcopy(observation)})
+                if protocol == "udp":
+                    for field in ("relay_encryption_to_write_start_ns", "relay_local_write_ns"):
+                        value = packet.get(field)
+                        if value is not None and packet.get("physical_path") != "relay":
+                            raise ValueError("writer_observation_requires_original_relay")
+                        result[row["sequence"]][-1][field] = None if value is None else integer(value)
     return result
 
 

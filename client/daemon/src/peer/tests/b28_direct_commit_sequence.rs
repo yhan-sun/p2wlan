@@ -112,6 +112,79 @@ async fn current_sequence(peers: &PeerManager, node: &str, end: TokioInstant) ->
     actual
 }
 
+async fn consent_target(peers: &PeerManager, node: &str) -> DirectConsentPath {
+    peers
+        .direct_consent_targets()
+        .await
+        .into_iter()
+        .find(|(peer, _)| peer == node)
+        .expect("selected consent target")
+        .1
+}
+
+async fn assert_stale_consent(
+    peers: &PeerManager,
+    node: &str,
+    old: DirectConsentPath,
+    local: SocketAddr,
+) {
+    assert!(
+        !peers
+            .record_direct_consent_timeout(node, old, Some(local))
+            .await
+    );
+    assert_eq!(
+        peers
+            .get_connection(node)
+            .await
+            .unwrap()
+            .direct_health
+            .consecutive_failures,
+        0
+    );
+}
+
+#[tokio::test]
+async fn authenticated_port_change_is_bound_to_the_original_socket_and_peer() {
+    let end = TokioInstant::now() + Duration::from_secs(3);
+    let local = "127.0.0.1:47000".parse().unwrap();
+    let remote = "127.0.0.1:48000".parse().unwrap();
+    let first = "127.0.0.1:48001".parse().unwrap();
+    let moved = "127.0.0.1:48002".parse().unwrap();
+    let peers = PeerManager::new(test_config());
+    let node = "port-change";
+    peers.add_peer(&sequence_peer(node, remote)).await;
+    host_candidates(&peers, node, remote, 5, end).await;
+    let active = original_lan_commit(&peers, node, remote, local, end).await;
+    let mut locks = peers.connections.write().await;
+    let conn = locks.get_mut(node).unwrap();
+    let now = Instant::now();
+    let life = Some(active.peer_session_generation);
+    let start = now - Duration::from_secs(5);
+    conn.observe_direct_source(active.generation, life, local, first, start);
+    conn.observe_direct_source(
+        active.generation,
+        life,
+        local,
+        first,
+        start + Duration::from_secs(1),
+    );
+    assert!(!conn.may_validate_alternate(active.generation, first));
+    conn.observe_direct_source(active.generation + 1, life, local, moved, now);
+    conn.observe_direct_source(active.generation, None, local, moved, now);
+    conn.observe_direct_source(active.generation, life, remote, moved, now);
+    assert!(!conn.may_validate_alternate(active.generation, moved));
+    conn.observe_direct_source(active.generation, life, local, moved, now);
+    assert!(conn.may_validate_alternate(active.generation, moved));
+    assert!(!conn.may_validate_alternate(active.generation + 1, moved));
+    conn.observe_direct_source(active.generation, life, local, first, start);
+    assert!(conn.may_validate_alternate(active.generation, moved));
+    assert_eq!(
+        conn.selected_direct_endpoint_for_consent(active.generation),
+        Some(remote)
+    );
+}
+
 #[tokio::test]
 async fn b28_original_direct_sequence_survives_remove_readd_without_resurrecting_snapshot() {
     let end = TokioInstant::now() + Duration::from_secs(3);
@@ -126,6 +199,7 @@ async fn b28_original_direct_sequence_survives_remove_readd_without_resurrecting
     let original =
         original_lan_commit(&peers, &peer.node_id, remote_endpoint, local_endpoint, end).await;
 
+    let old_consent = consent_target(&peers, &peer.node_id).await;
     bounded(end, peers.remove_peer(&peer.node_id)).await;
     assert!(bounded(end, peers.get_connection(&peer.node_id))
         .await
@@ -149,6 +223,7 @@ async fn b28_original_direct_sequence_survives_remove_readd_without_resurrecting
     host_candidates(&peers, &peer.node_id, remote_endpoint, 11, end).await;
     let current =
         original_lan_commit(&peers, &peer.node_id, remote_endpoint, local_endpoint, end).await;
+    assert_stale_consent(&peers, &peer.node_id, old_consent, local_endpoint).await;
     assert!(current.direct_commit_seq > original.direct_commit_seq);
     assert_ne!(
         current.peer_session_generation,
@@ -197,6 +272,8 @@ async fn b28_original_direct_sequence_readd_then_candidate_handover_keeps_one_ow
     let before =
         original_lan_commit(&peers, &peer.node_id, old_endpoint, local_endpoint, end).await;
 
+    let old_consent = consent_target(&peers, &peer.node_id).await;
+
     // The original exact-path failure removes Direct proof. A changed signaled
     // set can now perform a real handover rather than retain the healthy path.
     assert!(
@@ -233,6 +310,7 @@ async fn b28_original_direct_sequence_readd_then_candidate_handover_keeps_one_ow
     assert!(!peers.active_direct_path_snapshot_is_current_sync(&peer.node_id, before));
 
     let after = original_lan_commit(&peers, &peer.node_id, new_endpoint, local_endpoint, end).await;
+    assert_stale_consent(&peers, &peer.node_id, old_consent, local_endpoint).await;
     assert_eq!(after.generation, before.generation);
     assert_eq!(
         after.peer_session_generation,
@@ -251,4 +329,55 @@ async fn b28_original_direct_sequence_readd_then_candidate_handover_keeps_one_ow
     );
     assert!(peers.active_direct_path_snapshot_is_current_sync(&peer.node_id, after));
     assert!(!peers.active_direct_path_snapshot_is_current_sync(&peer.node_id, removed));
+}
+
+#[tokio::test]
+async fn additive_candidate_offer_keeps_epoch_only_for_same_identity_and_sources() {
+    let mut config = test_config();
+    config.network.early_candidate_signaling = true;
+    let peers = PeerManager::new(config);
+    let a = "203.0.113.7:1001".to_owned();
+    let b = "203.0.113.7:1002".to_owned();
+    let peer = sequence_peer("additive", a.parse().unwrap());
+    peers.add_peer(&peer).await;
+    let revision = |boot: u64, seq| 0x4000_0000_0000_0000 | (boot << 21) | seq;
+    let mut sources = HashMap::from([
+        (a.clone(), "stun_observed".into()),
+        (b.clone(), "stun_observed".into()),
+    ]);
+    let apply = |rev, endpoints: Vec<String>, labels: HashMap<String, String>| {
+        let peers = &peers;
+        let peer = &peer;
+        async move {
+            assert_eq!(
+                peers
+                    .add_candidates_with_metadata_for_identity(
+                        &peer.node_id,
+                        &endpoints,
+                        &labels,
+                        rev,
+                        None,
+                        Some(&peer.public_key)
+                    )
+                    .await,
+                CandidateSetApplyResult::Applied
+            );
+            peers
+                .current_remote_candidate_epoch(&peer.node_id)
+                .await
+                .unwrap()
+        }
+    };
+    let initial = apply(revision(7, 1u64), vec![a.clone()], sources.clone()).await;
+    assert_eq!(
+        apply(revision(7, 2), vec![a.clone(), b.clone()], sources.clone()).await,
+        initial
+    );
+    let withdrawn = apply(revision(7, 3), vec![a.clone()], sources.clone()).await;
+    assert!(withdrawn > initial);
+    sources.insert(a.clone(), "predicted".into());
+    let changed_source = apply(revision(7, 4), vec![a.clone(), b.clone()], sources.clone()).await;
+    assert!(changed_source > withdrawn);
+    let fresh = apply(revision(8, 1), vec![a], sources).await;
+    assert!(fresh > changed_source);
 }

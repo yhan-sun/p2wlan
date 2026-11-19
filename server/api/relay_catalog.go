@@ -21,6 +21,7 @@ type RelayDescriptor struct {
 	Region               string   `json:"region"`
 	Audience             string   `json:"audience"`
 	Endpoint             string   `json:"endpoint"`
+	UDPObserverChangeIP  bool     `json:"udp_observer_change_ip,omitempty"`
 	UDPObserverEndpoint  string   `json:"udp_observer_endpoint,omitempty"`
 	UDPObserverEndpoints []string `json:"udp_observer_endpoints,omitempty"`
 }
@@ -57,6 +58,9 @@ func (d *RelayDescriptor) Validate() error {
 
 	if err := validateUDPObserverEndpoint("udp_observer_endpoint", d.UDPObserverEndpoint); err != nil {
 		return err
+	}
+	if d.UDPObserverChangeIP && strings.TrimSpace(d.UDPObserverEndpoint) == "" {
+		return fmt.Errorf("udp_observer_change_ip requires udp_observer_endpoint")
 	}
 	for i, observer := range d.UDPObserverEndpoints {
 		if err := validateUDPObserverEndpoint(fmt.Sprintf("udp_observer_endpoints[%d]", i), observer); err != nil {

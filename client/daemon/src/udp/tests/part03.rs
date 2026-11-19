@@ -441,7 +441,19 @@ async fn probe_ack_records_peer_round_trip_latency() {
 
 #[tokio::test]
 async fn keepalive_ack_timeout_degrades_direct_after_three_misses() {
-    let peers = peer_manager();
+    check_silent_consent_threshold(false).await;
+}
+
+#[tokio::test]
+async fn accelerated_consent_rechecks_once_after_two_misses() {
+    check_silent_consent_threshold(true).await;
+}
+
+async fn check_silent_consent_threshold(accelerated: bool) {
+    let mut config = Config::generate_default("http://ctrl.test", "default").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::Auto;
+    config.network.accelerated_consent = accelerated;
+    let peers = Arc::new(PeerManager::new(config));
     let silent_remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let remote_addr = silent_remote.local_addr().unwrap();
     peers
@@ -480,9 +492,11 @@ async fn keepalive_ack_timeout_degrades_direct_after_three_misses() {
     transport
         .run_keepalive_round(Duration::from_millis(10))
         .await;
-    transport
-        .run_keepalive_round(Duration::from_millis(10))
-        .await;
+    if !accelerated {
+        transport
+            .run_keepalive_round(Duration::from_millis(10))
+            .await;
+    }
     let after_three = peers.get_connection("peer-b").await.unwrap();
     assert_eq!(after_three.state, ConnectionState::FallbackToRelay);
     assert_eq!(after_three.direct_health.consecutive_failures, 3);

@@ -118,6 +118,7 @@ impl Fixture {
                     route_signature: Vec::new(),
                     client: Arc::new(client),
                     rendezvous: None,
+                    resume_rendezvous: None,
                     write_boundaries_live: Arc::new(std::sync::Mutex::new(true)),
                     peers,
                     ticket_audience: None,
@@ -232,6 +233,7 @@ fn pool(
             connect_timeout: Duration::from_secs(1),
         }),
         routes: std::sync::Mutex::new(super::super::RendezvousRoutes {
+            standbys: Default::default(),
             clients: clients
                 .into_iter()
                 .map(|(endpoint, client)| (endpoint.to_string(), client))

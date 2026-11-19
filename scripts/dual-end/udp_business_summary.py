@@ -157,7 +157,7 @@ def rtt_statistics(records: list[dict]) -> dict:
     return {
         "sample_count": len(samples), "conditional_on_success": True,
         "method": "nearest_rank", "unit": "ms", "p50": percentile(0.50),
-        "p95": percentile(0.95), "min": samples[0] / NS_PER_MS if samples else None,
+        "p95": percentile(0.95), "p99": percentile(0.99), "min": samples[0] / NS_PER_MS if samples else None,
         "max": samples[-1] / NS_PER_MS if samples else None,
     }
 

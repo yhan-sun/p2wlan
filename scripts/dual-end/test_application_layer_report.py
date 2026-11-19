@@ -102,6 +102,20 @@ class LayeredObservations(unittest.TestCase):
         capture['historical_full_packets'].append(copy.deepcopy(capture['historical_full_packets'][0]))
         with self.assertRaises(ValueError):layers.combine(probe, echo, [capture])
 
+    def test_udp_writer_durations_require_original_relay_packet_and_request(self):
+        probe, _ = self.pair()
+        capture = self.capture(probe)
+        for row in capture["requests"]:
+            row["protocol"] = "udp"
+        packet = capture["historical_full_packets"][0]
+        packet.update(physical_path="relay", relay_encryption_to_write_start_ns=19, relay_local_write_ns=7)
+        rows = layers.queue_rows([capture], probe, probe["requests"], protocol="udp")
+        self.assertEqual(rows[0][0]["relay_local_write_ns"], 7)
+        self.assertEqual(rows[1][0]["relay_encryption_to_write_start_ns"], 19)
+        packet["physical_path"] = "udp"
+        with self.assertRaises(ValueError):
+            layers.queue_rows([capture], probe, probe["requests"], protocol="udp")
+
     def test_wrong_nonce_or_foreign_protocol_never_joins_queue_to_request(self):
         for key, value in [('request_nonce', 'ff' * 16), ('protocol', 'udp')]:
             probe, echo = self.pair(); capture = self.capture(probe); capture['requests'][0][key] = value

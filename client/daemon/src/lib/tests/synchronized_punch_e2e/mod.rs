@@ -318,6 +318,7 @@ fn hard_hard_high_entropy_profile(
         .zip(mapped_ports.iter().copied())
         .take(observer_count)
         .map(|(observer, mapped_port)| StunObservation {
+            failure_kind: None,
             server: observer.to_string(),
             mapped_address: Some(SocketAddr::new(public_endpoint.ip(), mapped_port).to_string()),
             rtt_ms: Some(1),

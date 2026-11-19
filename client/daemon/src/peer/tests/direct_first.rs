@@ -581,3 +581,29 @@ fn direct_first_business_ready_network_change_never_restarts_cold_wait() {
         assert_eq!(machine.active_path(), Some(NetworkPath::Relay));
     }
 }
+
+#[test]
+fn queued_relay_requires_confirmation_quiet_direct_and_current_epoch() {
+    let start = Instant::now();
+    let mut machine = started(start);
+    let ask = |offset, last| PathEvent::QueuedRelayRequested {
+        epoch: epoch(),
+        now: start + Duration::from_millis(offset),
+        last_direct_progress: last,
+    };
+    commit(&mut machine, ask(800, None));
+    assert!(machine.direct_first_pending());
+    confirm_relay(&mut machine);
+    commit(&mut machine, ask(749, None));
+    commit(
+        &mut machine,
+        ask(800, Some(start + Duration::from_millis(700))),
+    );
+    assert!(machine.direct_first_pending());
+    commit(
+        &mut machine,
+        ask(1450, Some(start + Duration::from_millis(700))),
+    );
+    assert!(!machine.direct_first_pending());
+    assert_eq!(machine.active_path(), Some(NetworkPath::Relay));
+}

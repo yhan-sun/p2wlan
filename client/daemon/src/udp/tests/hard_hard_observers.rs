@@ -10,6 +10,7 @@ async fn publish_observer_health(
     profile.observations = responsive
         .iter()
         .map(|(observer, rtt)| StunObservation {
+            failure_kind: None,
             server: observer.to_string(),
             // Deliberately unrelated to the simulator's fresh mapping. Cached
             // addresses may select observers but must never become evidence.
@@ -18,6 +19,7 @@ async fn publish_observer_health(
             error: None,
         })
         .chain(unavailable.iter().map(|observer| StunObservation {
+            failure_kind: None,
             server: observer.to_string(),
             mapped_address: None,
             rtt_ms: None,

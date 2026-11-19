@@ -695,6 +695,8 @@ async fn run_direct_encrypted_validation_session_inner(
     let lease_target = *target_rx.borrow();
     let generation = lease_target.generation;
     let lease_endpoint = lease_target.endpoint;
+    let epoch = crate::peer::PathEpoch::new(generation, lease_target.peer_session_generation, lease_target.remote_candidate_epoch);
+    let completed = || peers.direct_committed_since(&peer_id, epoch, lease.initial_direct_commit);
 
     let Ok(local_ip) = local_virtual_ip.parse::<Ipv4Addr>() else {
         debug!(
@@ -760,7 +762,7 @@ async fn run_direct_encrypted_validation_session_inner(
         current_validation_target(&peers, &peer_id, &target_rx, owner_token).await
     else {
         let observed_target = *target_rx.borrow();
-        let direct = peers.is_direct_for_generation(&peer_id, generation).await;
+        let direct = completed().await;
         record_validation_event(
             &peers,
             &peer_id,
@@ -867,7 +869,7 @@ async fn run_direct_encrypted_validation_session_inner(
             current_validation_target(&peers, &peer_id, &target_rx, owner_token).await
         else {
             let observed_target = *target_rx.borrow();
-            let direct = peers.is_direct_for_generation(&peer_id, generation).await;
+            let direct = completed().await;
             record_validation_event(
                 &peers,
                 &peer_id,
@@ -1028,7 +1030,7 @@ async fn run_direct_encrypted_validation_session_inner(
             current_validation_target(&peers, &peer_id, &target_rx, owner_token).await
         else {
             let observed_target = *target_rx.borrow();
-            if peers.is_direct_for_generation(&peer_id, generation).await {
+            if completed().await {
                 terminal_stage = "direct_validation_completed";
                 terminal_reason =
                     "completed after encrypted validation ACK promoted Direct".to_string();
@@ -1324,7 +1326,7 @@ async fn run_direct_encrypted_validation_session_inner(
                     let Some(current) =
                         current_validation_target(&peers, &peer_id, &target_rx, owner_token).await
                     else {
-                        if peers.is_direct_for_generation(&peer_id, generation).await {
+                        if completed().await {
                             terminal_stage = "direct_validation_completed";
                             terminal_reason =
                                 "completed while awaiting ACK: encrypted validation ACK promoted Direct"
@@ -1339,9 +1341,9 @@ async fn run_direct_encrypted_validation_session_inner(
                         break;
                     };
                     if current.generation != generation
-                        || peers.is_direct_for_generation(&peer_id, generation).await
+                        || !peers.is_direct_validation_eligible_for_endpoint(&peer_id, current.endpoint).await
                     {
-                        if peers.is_direct_for_generation(&peer_id, generation).await {
+                        if completed().await {
                             terminal_stage = "direct_validation_completed";
                             terminal_reason =
                                 "completed while awaiting ACK: encrypted validation ACK promoted Direct"
@@ -1553,7 +1555,7 @@ async fn run_direct_encrypted_validation_session_inner(
     // The ACK handler revokes the worker as part of the same epoch transaction
     // that promotes Direct.  Observe the state once more before publishing a
     // timeout so a promotion racing the final ACK wait is reported as success.
-    if peers.is_direct_for_generation(&peer_id, generation).await {
+    if completed().await {
         terminal_stage = "direct_validation_completed";
         terminal_reason = "completed: encrypted validation ACK confirmed Direct".to_string();
     } else if emit_lock_timeouts > 0 {

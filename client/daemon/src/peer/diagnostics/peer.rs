@@ -118,6 +118,9 @@ pub struct PeerDiagnostics {
     pub direct_retry_remaining_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_path_selection: Option<PathSelectionDiagnostics>,
+    /// Read-only Score policy decision for the two currently authenticated paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_policy_preview: Option<PathSelectionDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_path_selection: Option<PathSelectionDiagnostics>,
     pub path_events: Vec<PathSelectionEventDiagnostics>,
@@ -483,6 +486,16 @@ impl PeerDiagnostics {
                 .map(|base| duration_millis(conn.direct_retry_after(base))),
             direct_retry_remaining_ms: direct_retry_after
                 .map(|base| duration_millis(conn.direct_retry_remaining(base))),
+            quality_policy_preview: (confirmed_direct_snapshot
+                && relay_available
+                && relay_peer_confirmed)
+                .then(|| {
+                    PathSelectionDiagnostics::from(&conn.select_path_for_data_with_policy(
+                        local_generation,
+                        crate::config::PathPolicy::Score,
+                        true,
+                    ))
+                }),
             current_path_selection: if confirmed_direct_active {
                 current_pair.map(|pair| {
                     PathSelectionDiagnostics::from(&PathSelection::direct(

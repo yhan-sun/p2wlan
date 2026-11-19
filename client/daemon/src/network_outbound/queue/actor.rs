@@ -431,10 +431,11 @@ async fn check_admission(peer_id: &str, generation: u64, ctx: &PeerWorkContext) 
     let relay_available = ctx.relay_transport.read().await.is_some();
     if !ctx
         .peers
-        .is_data_path_admitted_for_generation(
+        .queued_data_path_admitted(
             peer_id,
             generation,
             relay_available || ctx.startup_wait.relay_expected,
+            relay_available,
         )
         .await
     {

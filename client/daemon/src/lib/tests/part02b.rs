@@ -246,6 +246,7 @@ fn test_effective_relay_plaintext_policy_for_legacy_http_control() {
         region: "cn".to_string(),
         audience: "relay-cn-1".to_string(),
         endpoint: "tls://relay.example.com:18081".to_string(),
+        udp_observer_change_ip: false,
         udp_observer_endpoint: None,
         udp_observer_endpoints: Vec::new(),
     }];
@@ -260,6 +261,7 @@ fn test_effective_relay_plaintext_policy_for_legacy_http_control() {
         region: "cn".to_string(),
         audience: "relay-cn-1".to_string(),
         endpoint: "tcp://control.example.com:18081".to_string(),
+        udp_observer_change_ip: false,
         udp_observer_endpoint: None,
         udp_observer_endpoints: Vec::new(),
     }];
@@ -292,6 +294,7 @@ fn relay_catalog_takes_precedence_over_legacy_servers() {
         region: "sg".to_string(),
         audience: "relay-sg-1".to_string(),
         endpoint: "tls://relay.example.com:18081".to_string(),
+        udp_observer_change_ip: false,
         udp_observer_endpoint: Some("udp://relay.example.com:18082".to_string()),
         udp_observer_endpoints: Vec::new(),
     }];
@@ -311,6 +314,7 @@ fn relay_catalog_udp_observers_are_merged_with_local_config() {
         region: "sg".to_string(),
         audience: "relay-sg-1".to_string(),
         endpoint: "tls://relay.example.com:18081".to_string(),
+        udp_observer_change_ip: false,
         udp_observer_endpoint: Some("udp://relay.example.com:18082".to_string()),
         udp_observer_endpoints: vec![
             "udp://stun.l.google.com:19302".to_string(),
@@ -337,6 +341,7 @@ fn relay_catalog_udp_observers_respect_explicit_disable() {
         region: "sg".to_string(),
         audience: "relay-sg-1".to_string(),
         endpoint: "tls://relay.example.com:18081".to_string(),
+        udp_observer_change_ip: false,
         udp_observer_endpoint: Some("relay.example.com:18082".to_string()),
         udp_observer_endpoints: vec!["stun.l.google.com:19302".to_string()],
     }];

@@ -124,8 +124,13 @@ def frame_comparison(snapshot, row, window):
                     and pair[0] < max(read_ids) and pair[0] not in read_ids for pair in skipped)
             and [pair[0] for pair in skipped] == sorted(set(pair[0] for pair in skipped)),
             "native_frame_original_non_delivery_fences")
-    return dict(matched=True, physical_path=credit["physical_path"], commit_monotonic_ns=point, original_kernel_read_ordinals=read_ids,
-                original_system_write_ordinals=write_ids, original_non_delivery_attempts=skipped)
+    result = dict(matched=True, physical_path=credit["physical_path"], commit_monotonic_ns=point, original_kernel_read_ordinals=read_ids,
+                  original_system_write_ordinals=write_ids, original_non_delivery_attempts=skipped)
+    if credit["physical_path"] == "udp":
+        families = {full[i].get("udp_destination_family") for i in read_ids}
+        if len(families) == 1 and families <= {"ipv4", "ipv6"}:
+            result["udp_destination_family"] = families.pop()
+    return result
 
 
 def frame_comparison_or_gap(snapshot, row, window):

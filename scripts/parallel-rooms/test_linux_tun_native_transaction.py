@@ -33,6 +33,15 @@ def data(protocol="tcp", kind="request"):
 
 
 class ComparisonControls(unittest.TestCase):
+    def test_destination_family_requires_original_udp_full(self):
+        snapshot, row, window = data("udp", "request")
+        packet = snapshot["historical_full_packets"][0]
+        self.assertNotIn("udp_destination_family", native.frame_comparison(snapshot, row, window))
+        packet["udp_destination_family"] = "ipv6"
+        self.assertEqual(native.frame_comparison(snapshot, row, window)["udp_destination_family"], "ipv6")
+        packet["physical_path"] = row["native_credit"]["physical_path"] = "relay"
+        self.assertNotIn("udp_destination_family", native.frame_comparison(snapshot, row, window))
+
     def rejects(self, values, code):
         with self.assertRaises(native.ComparisonError) as caught:
             native.frame_comparison(*values)

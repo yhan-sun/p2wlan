@@ -23,16 +23,22 @@ impl UdpTransport {
         stun_servers: Vec<SocketAddr>,
         stun_timeout: Duration,
     ) -> Result<CandidateGatherReport> {
-        // Startup must not wait for the slowest configured observer.  The
-        // caller publishes this bounded report immediately; the regular
-        // candidate-refresh loop performs the same parallel gather with the
-        // full configured timeout right afterwards, so a slow observer can
-        // enrich later signals without delaying relay-first or Direct.
+        self.gather_startup_candidates(stun_servers, stun_timeout, None)
+            .await
+    }
+
+    pub(crate) async fn gather_startup_candidates(
+        &self,
+        stun_servers: Vec<SocketAddr>,
+        stun_timeout: Duration,
+        progress: Option<watch::Sender<[Option<SocketAddr>; 2]>>,
+    ) -> Result<CandidateGatherReport> {
         self.gather_candidate_report_live_parallel_with_timeout(
             stun_servers,
             stun_timeout.min(crate::DIRECT_STARTUP_STUN_TIMEOUT),
             false,
             true,
+            progress,
         )
         .await
     }
@@ -54,6 +60,7 @@ impl UdpTransport {
             stun_timeout,
             true,
             false,
+            None,
         )
         .await
     }
@@ -64,94 +71,62 @@ impl UdpTransport {
         stun_timeout: Duration,
         probe_filtering: bool,
         apply_socket_pool_policy: bool,
+        progress: Option<watch::Sender<[Option<SocketAddr>; 2]>>,
     ) -> Result<CandidateGatherReport> {
         let local_addr = self.local_addr()?;
-        let primary_servers = stun_servers
-            .iter()
-            .copied()
-            .filter(|server| server.is_ipv4() == local_addr.is_ipv4())
-            .collect::<Vec<_>>();
-        let observations = join_all(primary_servers.into_iter().map(|server| async move {
-            self.query_stun_live_on_socket(&self.socket, server, stun_timeout)
-                .await
-        }))
-        .await;
-
+        let hosts = self.peers.gather_host_candidates().await;
+        let pool_servers = pool_stun_servers(&stun_servers, Some(local_addr));
+        let primary = self.gather_socket_observations(
+            &self.socket,
+            &stun_servers,
+            stun_timeout,
+            progress.as_ref(),
+        );
+        let ipv6 = async {
+            let socket = self.ipv6_socket.as_ref()?;
+            let address = socket.local_addr().ok()?;
+            let observations = self
+                .gather_socket_observations(socket, &stun_servers, stun_timeout, progress.as_ref())
+                .await;
+            Some(p2pnet_nat::candidate_report_from_unordered_observations(
+                address,
+                hosts,
+                observations,
+            ))
+        };
+        let pool = join_all(self.active_sockets().iter().enumerate().skip(1).map(
+            |(index, socket)| {
+                let servers = &pool_servers;
+                async move {
+                    let address = socket.local_addr().ok()?;
+                    let observations = self
+                        .gather_socket_observations(socket, servers, stun_timeout, None)
+                        .await;
+                    Some((
+                        index,
+                        p2pnet_nat::candidate_report_from_unordered_observations(
+                            address,
+                            false,
+                            observations,
+                        ),
+                    ))
+                }
+            },
+        ));
+        let (observations, ipv6, pool) = tokio::join!(primary, ipv6, pool);
         let mut report = p2pnet_nat::candidate_report_from_unordered_observations(
             local_addr,
-            self.peers.gather_host_candidates().await,
+            hosts,
             observations,
         );
-        if self.socket_count() > 1 {
-            let pool_servers = pool_stun_servers(&stun_servers, Some(local_addr));
-            let pool_sockets = self
-                .active_sockets()
-                .iter()
-                .cloned()
-                .enumerate()
-                .skip(1)
-                .collect::<Vec<_>>();
-            let pool_reports = join_all(pool_sockets.into_iter().map(|(socket_index, socket)| {
-                let pool_servers = pool_servers.clone();
-                async move {
-                    let observations = join_all(pool_servers.into_iter().map(|server| {
-                        let socket = socket.clone();
-                        async move {
-                            self.query_stun_live_on_socket(&socket, server, stun_timeout)
-                                .await
-                        }
-                    }))
-                    .await;
-                    let local_addr = socket.local_addr().ok()?;
-                    let pool_report = p2pnet_nat::candidate_report_from_unordered_observations(
-                        local_addr,
-                        false,
-                        observations,
-                    );
-                    Some((socket_index, pool_report))
-                }
-            }))
-            .await;
-
-            for (socket_index, pool_report) in pool_reports.into_iter().flatten() {
-                // A primary socket can legitimately report no STUN response
-                // while another bound socket has a live public mapping.  The
-                // old code discarded that distinction: it classified the
-                // whole daemon as UDP-blocked and left the pool inactive,
-                // even though it had just gathered real pool targets later
-                // offered to the peer. Promote the pool-backed capability
-                // without mixing its port samples into the primary socket's
-                // allocation sequence; the socket-indexed candidates retain
-                // the pool evidence used by signaling.
-                merge_pool_nat_profile(&mut report, &pool_report);
-                self.append_pool_candidates(&mut report, pool_report.candidates, socket_index)
-                    .await;
-            }
-        }
-
-        if let Some(ipv6_socket) = self.ipv6_socket.as_ref() {
-            if let Ok(ipv6_local_addr) = ipv6_socket.local_addr() {
-                let ipv6_servers = stun_servers
-                    .iter()
-                    .copied()
-                    .filter(|server| server.is_ipv6())
-                    .collect::<Vec<_>>();
-                let v6_observations = join_all(ipv6_servers.into_iter().map(|server| {
-                    let socket = ipv6_socket.clone();
-                    async move {
-                        self.query_stun_live_on_socket(&socket, server, stun_timeout)
-                            .await
-                    }
-                }))
+        if let Some(ipv6) = ipv6 {
+            self.append_ipv6_candidates(&mut report, ipv6.candidates)
                 .await;
-                let ipv6_report = p2pnet_nat::candidate_report_from_unordered_observations(
-                    ipv6_local_addr,
-                    self.peers.gather_host_candidates().await,
-                    v6_observations,
-                );
-                self.append_ipv6_candidates(&mut report, ipv6_report.candidates)
-                    .await;
-            }
+        }
+        for (index, pool_report) in pool.into_iter().flatten() {
+            merge_pool_nat_profile(&mut report, &pool_report);
+            self.append_pool_candidates(&mut report, pool_report.candidates, index)
+                .await;
         }
 
         // The live gather uses the reader-owned STUN waiter registry instead
@@ -179,6 +154,49 @@ impl UdpTransport {
                 .retain(|candidate| candidate.source != p2pnet_nat::CandidateSource::Predicted);
         }
         Ok(report)
+    }
+
+    async fn gather_socket_observations(
+        &self,
+        socket: &UdpSocket,
+        servers: &[SocketAddr],
+        timeout: Duration,
+        progress: Option<&watch::Sender<[Option<SocketAddr>; 2]>>,
+    ) -> Vec<StunObservation> {
+        let Ok(bound) = socket.local_addr() else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        join_all(
+            servers
+                .iter()
+                .copied()
+                .filter(|server| server.is_ipv4() == bound.is_ipv4() && seen.insert(*server))
+                .map(|server| async move {
+                    let sample = self
+                        .query_stun_live_on_socket(socket, server, timeout)
+                        .await;
+                    if let (Some(tx), Some(mapped)) = (
+                        progress,
+                        sample
+                            .mapped_address
+                            .as_deref()
+                            .and_then(|s| s.parse::<SocketAddr>().ok())
+                            .filter(|addr| is_public_probe_endpoint(*addr)),
+                    ) {
+                        tx.send_if_modified(|both| {
+                            let first = &mut both[usize::from(bound.is_ipv6())];
+                            if first.is_some() {
+                                return false;
+                            }
+                            *first = Some(mapped);
+                            true
+                        });
+                    }
+                    sample
+                }),
+        )
+        .await
     }
 
     pub(crate) fn apply_candidate_report_socket_pool_policy(&self, report: &CandidateGatherReport) {
@@ -217,6 +235,12 @@ impl UdpTransport {
             .query_stun_live_response(&self.socket, server, timeout, true, true)
             .await
         {
+            if !response
+                .mapped_address
+                .is_some_and(|addr| addr.is_ipv4() == server.is_ipv4())
+            {
+                return;
+            }
             if let Some(filtering) = p2pnet_nat::ice::classify_filtering_probe_response(
                 server,
                 response.source,
@@ -250,48 +274,40 @@ fn classify_live_filtering_response(
 /// appending pool observations there can falsely label a predictable primary
 /// socket as random, or invent an ordering that was never measured.
 ///
-/// This is deliberately conservative: it does not invent a port delta or a
-/// predicted window from a single pool member.  It only changes the gates
-/// needed to keep the proven pool alive and to schedule bounded scatter/retry.
 fn merge_pool_nat_profile(
     report: &mut CandidateGatherReport,
     pool_report: &CandidateGatherReport,
 ) -> bool {
-    let observed_endpoints = pool_report
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.source == p2pnet_nat::CandidateSource::StunObserved)
-        .filter_map(|candidate| candidate.endpoint.to_string().parse::<SocketAddr>().ok())
-        .filter(|endpoint| is_public_probe_endpoint(*endpoint))
-        .collect::<Vec<_>>();
-    if observed_endpoints.is_empty() {
+    let endpoint = pool_report.candidates.iter().find_map(|candidate| {
+        if candidate.source != p2pnet_nat::CandidateSource::StunObserved {
+            return None;
+        }
+        let endpoint = candidate.endpoint.to_string().parse::<SocketAddr>().ok()?;
+        is_public_probe_endpoint(endpoint).then_some(endpoint)
+    });
+    let Some(endpoint) = endpoint else {
+        return false;
+    };
+    let profile = &mut report.nat_profile;
+    if !profile.udp_blocked
+        && (profile.public_endpoint.is_some()
+            || profile.mapping_behavior != MappingBehavior::Unknown)
+    {
         return false;
     }
-
-    if !report.nat_profile.udp_blocked {
-        return false;
-    }
-
-    let first = observed_endpoints[0];
-    let distinct_ips = observed_endpoints
-        .iter()
-        .map(|endpoint| endpoint.ip())
-        .collect::<HashSet<_>>();
-    let distinct_ports = observed_endpoints
-        .iter()
-        .map(|endpoint| endpoint.port())
-        .collect::<HashSet<_>>();
-
-    report.nat_profile.udp_blocked = false;
-    report.nat_profile.public_endpoint = Some(first.to_string());
-    report.nat_profile.public_ip_stable = Some(distinct_ips.len() == 1);
-    report.nat_profile.public_port_stable = Some(distinct_ports.len() == 1);
-    report.nat_profile.mapping_behavior = p2pnet_nat::MappingBehavior::AddressOrPortDependent;
-    report.nat_profile.filtering_behavior = p2pnet_nat::FilteringBehavior::Unknown;
-    report.nat_profile.likely_symmetric = Some(true);
-    report.nat_profile.prediction_candidate = false;
-    report.nat_profile.predicted_endpoints.clear();
-    report.nat_profile.birthday_candidate = true;
-    report.nat_profile.confidence = report.nat_profile.confidence.max(50);
+    // A pool member answered. Its actual address is usable, but neither its
+    // mapping behavior nor any allocation sequence belongs to the primary.
+    profile.public_endpoint = Some(endpoint.to_string());
+    profile.udp_blocked = false;
+    profile.public_ip_stable = None;
+    profile.public_port_stable = None;
+    profile.port_preserved = None;
+    profile.port_delta = None;
+    profile.mapping_behavior = MappingBehavior::Unknown;
+    profile.filtering_behavior = FilteringBehavior::Unknown;
+    profile.likely_symmetric = None;
+    profile.prediction_candidate = false;
+    profile.predicted_endpoints.clear();
+    profile.birthday_candidate = false;
     true
 }

@@ -35,10 +35,15 @@ pub(crate) struct CandidateSnapshotLease {
     /// ordinary refreshes and candidate trickle may continue to use the
     /// provisional snapshot.
     pub(crate) initial_gather_complete: bool,
+    early_offer_ready: bool,
     gathered_at: Instant,
 }
 
 impl CandidateSnapshotLease {
+    fn ready_for_initial_offer(&self) -> bool {
+        self.initial_gather_complete || self.early_offer_ready
+    }
+
     /// Whether the lease is still fresh: inside the TTL no signaling path may
     /// re-run a live STUN gather (single-flight).
     fn is_fresh(&self) -> bool {
@@ -83,6 +88,7 @@ impl Daemon {
                 .map_or(1, |current| current.version.saturating_add(1)),
             hash: 0,
             initial_gather_complete: true,
+            early_offer_ready: false,
             gathered_at: Instant::now(),
         };
         lease.hash = candidate_set_hash(&lease.candidates, &lease.candidate_sources);
@@ -178,6 +184,25 @@ async fn publish_candidate_snapshot_to_store_with_readiness(
     network_identity: Vec<String>,
     initial_gather_complete: bool,
 ) {
+    commit_candidate_lease(
+        store,
+        candidates,
+        candidate_sources,
+        network_identity,
+        initial_gather_complete,
+        false,
+    )
+    .await;
+}
+
+async fn commit_candidate_lease(
+    store: &Arc<RwLock<Option<CandidateSnapshotLease>>>,
+    candidates: Vec<String>,
+    candidate_sources: HashMap<String, String>,
+    network_identity: Vec<String>,
+    initial_gather_complete: bool,
+    early_offer_ready: bool,
+) {
     let mut current = store.write().await;
     let version = current
         .as_ref()
@@ -190,6 +215,7 @@ async fn publish_candidate_snapshot_to_store_with_readiness(
         version,
         hash,
         initial_gather_complete,
+        early_offer_ready,
         gathered_at: Instant::now(),
     });
 }
@@ -207,7 +233,7 @@ async fn wait_for_initial_candidate_set_from_store(
 
     loop {
         if let Some(snapshot) = store.read().await.clone() {
-            if snapshot.initial_gather_complete {
+            if snapshot.ready_for_initial_offer() {
                 return (snapshot.candidates, snapshot.candidate_sources);
             }
         }

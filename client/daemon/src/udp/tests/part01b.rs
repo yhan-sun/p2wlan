@@ -1,7 +1,7 @@
 #[tokio::test]
 async fn gathers_host_candidates_for_bound_udp_port() {
     let peers = peer_manager();
-    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+    let transport = UdpTransport::bind("0.0.0.0:0".parse().unwrap(), peers)
         .await
         .unwrap();
     let local_port = transport.local_addr().unwrap().port();

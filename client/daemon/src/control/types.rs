@@ -494,6 +494,8 @@ pub struct RelayCatalogEntry {
     #[serde(default)]
     pub udp_observer_endpoint: Option<String>,
     #[serde(default)]
+    pub udp_observer_change_ip: bool,
+    #[serde(default)]
     pub udp_observer_endpoints: Vec<String>,
 }
 

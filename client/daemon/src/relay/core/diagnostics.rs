@@ -24,6 +24,8 @@ pub struct RelaySelectionDiagnostics {
     /// Live physical registrations behind the selected logical relay transport.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rendezvous_endpoints: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub registered_standby_connection_ids: HashMap<String, u64>,
     /// Observed per-peer physical routes; encrypted validation remains mandatory.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub rendezvous_peer_routes: HashMap<String, String>,

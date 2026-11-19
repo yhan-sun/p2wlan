@@ -360,3 +360,21 @@ python3 scripts/dual-end/application_layer_report.py \
 队列字段只导出同一包已有的 dataplane channel 和 network-outbound channel 两段首次入队到出队区间，包含入队背压；缺边界或时序错误保留 unavailable。pending、锁、加密和内核队列未观测。这些字段不产生 KernelRead、Full、SystemTun、当前 owner 或 once 信用。
 
 Linux 真实 TUN 采证的 `--layered-measurements` 可组合原 TCP 报告和已经保留的 daemon 快照，写出各方向的 `tcp-*-layers.json`。它不追加快照请求，不重跑测量，也不重分类业务成功、超时、取消或失败。观察导出错误单列，原业务结果仍保留；CI 使用 `scripts/parallel-rooms/verify_application_layers.py` 单独核验基础双向 16 个 TCP 请求的区间字段。工具和 CI 的同机验证不代表真实设备、公网或性能收益已验收。
+
+### 冷启动与 TLS 中继
+
+`scripts/parallel-rooms/linux_tun_evidence.py` 的 `--startup-measurements` 从调用入网起计时，在真实虚拟路由可用后依次发起两个方向的预排 UDP 请求。每个方向都收到原期限内的回包后才产生双向首业务时间。还需请求与回包各自的原生发送记录才能归属 Direct 或 Relay。任一方向缺证时，对应的双向时间保留为空。
+
+在具备 Linux 网络命名空间和 TUN 的机器上，使用仓库的 `parallel-rooms.yml` 构建 daemon、Control、Relay 和票据工具。给相同的 UDP 实验命令传入 `--relay-application udp --relay-tls`，可分别选择以下负载。各次执行使用独立输出目录。
+
+| 参数 | 测量内容 |
+|---|---|
+| `--startup-measurements --startup-policy adaptive` | 丢弃两端间的底层 UDP，保留 TLS 中继；可用同一入口分别设置 `direct-first` 和 `auto` 作对照。 |
+| `--standby-failover`，可加 `--cold-reconnect` | 两端先确认同一主中继，再开放第二个中继。终止主中继后核对已注册备用连接的 ID、内核 TCP socket 身份及双向业务。`--cold-reconnect` 关闭热接管，在相同条件下核对重连后新的 socket。 |
+| `--mixed-load`，可加 `--outer-loss 1` | 每条外层发送链路设置 8 Mbit/s、12 ms，内层同时传 TCP 大流和双向 UDP 小包。可选丢包规则按每 100 个外层中继 TCP 包丢一个，报告各命名空间的实际丢包计数。 |
+
+混跑报告按原始请求和回包列出首次经过两个 daemon 队列的耗时、加密完成到中继写入开始的区间，以及本机中继写调用耗时。最后两项使用同一进程的单调时钟。远端转发、TCP 内核排队和 pending 队列仍各有独立的观测边界。报告保留原定请求数、缺少的包记录和业务结果。
+
+混合版本可通过 `--peer-daemon` 和 `--peer-daemon-head` 指定第二端的二进制和精确提交。两端各自的构建身份和哈希均在启动前校验，第二端使用自身的策略默认值。
+
+在直连冷启动命令上使用 `--healthy-underlay-family ipv6` 或 `ipv4`，可在双栈链路同时封锁另一族的观察点和对端 UDP。报告核对两端实际丢弃的观察包，以及每个成功请求和回包真实 UDP 发送目的地的地址族。

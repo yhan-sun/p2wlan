@@ -16,6 +16,7 @@ fn context_nat_profile(predictable: bool) -> NatProfile {
         .iter()
         .enumerate()
         .map(|(index, port)| p2pnet_nat::StunObservation {
+            failure_kind: None,
             server: format!("198.51.100.{}:3478", index + 1),
             mapped_address: Some(format!("203.0.113.10:{port}")),
             rtt_ms: Some(1),

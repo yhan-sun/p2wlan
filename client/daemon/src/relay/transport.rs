@@ -14,6 +14,8 @@ pub struct RelayTransport {
     route_signature: Vec<String>,
     client: Arc<RelayClient>,
     rendezvous: Option<Arc<RelayRendezvous>>,
+    // A promoted standby uses one writer until the next authenticated renewal.
+    resume_rendezvous: Option<Arc<RelayRendezvousPlan>>,
     /// Synchronous lifetime gate for callbacks queued in the relay client's
     /// writer.  A same-endpoint make-before-break replacement does not change
     /// the peer/network generation, so those callbacks must also be retired
@@ -171,6 +173,7 @@ impl RelayTransport {
                 route_signature,
                 client: Arc::new(client),
                 rendezvous: None,
+                resume_rendezvous: None,
                 write_boundaries_live: Arc::new(std::sync::Mutex::new(true)),
                 peers,
                 ticket_audience: None,
@@ -254,6 +257,7 @@ impl RelayTransport {
             route_signature: Vec::new(),
             client: Arc::new(p2pnet_relay::client::RelayClient::new_for_test()),
             rendezvous: None,
+            resume_rendezvous: None,
             write_boundaries_live: Arc::new(std::sync::Mutex::new(true)),
             peers,
             ticket_audience: None,
@@ -651,6 +655,13 @@ impl RelayTransport {
                                 let routes = pool.routes.lock().unwrap_or_else(|p| p.into_inner());
                                 d.rendezvous_endpoints = routes.clients.keys().cloned().collect();
                                 d.rendezvous_endpoints.sort();
+                                d.registered_standby_connection_ids = routes
+                                    .standbys
+                                    .iter()
+                                    .map(|(endpoint, standby)| {
+                                        (endpoint.clone(), standby.connection_id)
+                                    })
+                                    .collect();
                                 d.rendezvous_peer_routes = routes.peers.clone();
                             }
                         }

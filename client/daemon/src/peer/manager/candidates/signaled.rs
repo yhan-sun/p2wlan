@@ -269,6 +269,9 @@ impl PeerManager {
             );
             return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::IgnoredStale);
         }
+        let same_incarnation = candidate_incarnation.is_some()
+            && candidate_incarnation
+                == crate::control::candidate_generation_incarnation(conn.last_candidate_generation);
         if candidate_generation != 0 {
             conn.last_candidate_generation = candidate_generation;
             self.record_remote_candidate_generation_replay_floor(
@@ -314,8 +317,25 @@ impl PeerManager {
                     .flatten()
             })
             .flatten();
+        // An authenticated, same-incarnation additive snapshot can continue an
+        // in-flight ordinary check if it preserves every original address and source.
+        // Explicit restarts, withdrawals, old wire revisions and HH commits retain the handover fence.
+        let additive = self.config.network.early_candidate_signaling
+            && sender_public_key
+                .is_some_and(|key| !key.trim().is_empty() && key.trim() == conn.public_key)
+            && same_incarnation
+            && fresh_commit_id.is_none()
+            && !conn.signaled_candidates.is_empty()
+            && incoming_signaled.len() > conn.signaled_candidates.len()
+            && conn.signaled_candidates.iter().all(|address| {
+                incoming_signaled.contains(address)
+                    && candidate_sources
+                        .get(address)
+                        .and_then(|source| candidate_pair_source_from_label(source))
+                        .is_some_and(|source| conn.candidate_sources.get(address) == Some(&source))
+            });
         let remote_transport_handover =
-            remote_candidate_set_changed && retained_direct_endpoint.is_none();
+            remote_candidate_set_changed && retained_direct_endpoint.is_none() && !additive;
         if remote_transport_handover {
             conn.mark_remote_transport_handover(
                 generation,

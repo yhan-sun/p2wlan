@@ -173,7 +173,13 @@ pub(super) struct FullPacketSnapshot {
     encryption_session_instance: u64,
     encryption_peer_lifecycle: Option<u64>,
     physical_path: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    udp_destination_family: Option<&'static str>,
     initial_queue_intervals: Option<super::queue_observation::QueueIntervals>,
+    // Both durations use the original writer and its process-local clock.
+    // The first includes all scheduling/admission after encryption.
+    relay_encryption_to_write_start_ns: Option<u64>,
+    relay_local_write_ns: Option<u64>,
 }
 
 // The bounded original-read index is installed by the actual read producer.
@@ -204,7 +210,22 @@ pub(super) fn snapshot(
     output.extend(reads.iter().filter_map(|read| {
         let observed_monotonic_ns = read.full_observed_ns()?;
         let record = read.physical_publication.record()?;
+        let write = record.relay().and_then(|relay| relay.original());
+        let elapsed_ns = |end: Instant, start: Instant| {
+            u64::try_from(end.checked_duration_since(start)?.as_nanos()).ok()
+        };
         Some(FullPacketSnapshot {
+            udp_destination_family: record.udp().map(|udp| {
+                if udp.endpoint().is_ipv4() {
+                    "ipv4"
+                } else {
+                    "ipv6"
+                }
+            }),
+            relay_encryption_to_write_start_ns: write
+                .and_then(|w| elapsed_ns(w.write_started_at(), record.encryption().encrypted_at())),
+            relay_local_write_ns: write
+                .and_then(|w| elapsed_ns(w.completed_at(), w.write_started_at())),
             flow: read.flow,
             read_ordinal: read.read.ordinal(),
             read_monotonic_ns: read.read.monotonic_ns(),

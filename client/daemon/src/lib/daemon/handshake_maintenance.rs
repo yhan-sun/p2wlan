@@ -305,10 +305,9 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                     }
                 }
             } else {
-                let _lease_guard = candidate_refresh_lock.lock().await;
                 let snapshot_state = candidate_snapshot.read().await.clone();
                 let leased = snapshot_state.as_ref().and_then(|snapshot| {
-                    (snapshot.initial_gather_complete && !snapshot.candidates.is_empty()).then(
+                    (snapshot.ready_for_initial_offer() && !snapshot.candidates.is_empty()).then(
                         || {
                             (
                                 snapshot.candidates.clone(),
@@ -320,7 +319,6 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 let startup_snapshot_is_provisional = snapshot_state
                     .as_ref()
                     .is_some_and(|snapshot| !snapshot.initial_gather_complete);
-                drop(_lease_guard);
                 if let Some(leased) = leased {
                     Some(leased)
                 } else if startup_snapshot_is_provisional {

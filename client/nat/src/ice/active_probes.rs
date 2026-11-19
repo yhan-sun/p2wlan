@@ -70,6 +70,12 @@ async fn probe_filtering_behavior(
         .await
     {
         Ok(response) => {
+            if !response
+                .reflexive_address
+                .is_some_and(|addr| addr.is_ipv4() == server.is_ipv4())
+            {
+                return None;
+            }
             if let Some(behavior) =
                 classify_filtering_probe_response(server, response.from_addr, contacted_servers)
             {

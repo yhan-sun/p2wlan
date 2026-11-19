@@ -5,6 +5,8 @@
 //! path and for Direct/Relay progress.  It deliberately models those domains
 //! with enums instead of another collection of independently mutable flags.
 
+mod direct;
+
 use super::{ConnectionState, NetworkPath, PeerSessionGeneration};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -17,6 +19,9 @@ struct DirectFirstWindow {
     deadline: Instant,
     released: bool,
 }
+
+/// Minimum quiet time before opt-in adaptive startup releases a queued packet.
+pub(crate) const ADAPTIVE_DIRECT_GRACE: Duration = Duration::from_millis(750);
 
 const MAX_ACCEPTED_HEALTH_OBSERVATIONS: usize = 64;
 
@@ -61,6 +66,7 @@ enum DirectEndpointEvidence {
     RequestPending,
     AuthenticatedAck {
         observed_endpoint: SocketAddr,
+        independently_verified: bool,
     },
     Compatibility {
         selected_endpoint: Option<SocketAddr>,
@@ -107,8 +113,37 @@ impl DirectValidationIdentity {
             owner_token: Some(owner_token),
             request_id: Some(request_id),
             request_endpoint,
-            endpoint_evidence: DirectEndpointEvidence::AuthenticatedAck { observed_endpoint },
+            endpoint_evidence: DirectEndpointEvidence::AuthenticatedAck {
+                observed_endpoint,
+                independently_verified: false,
+            },
         }
+    }
+
+    pub(crate) fn with_verified_return(mut self, independently_verified: bool) -> Self {
+        if let DirectEndpointEvidence::AuthenticatedAck {
+            independently_verified: confirmed,
+            ..
+        } = &mut self.endpoint_evidence
+        {
+            *confirmed = independently_verified && self.request_endpoint.is_some();
+        }
+        self
+    }
+
+    fn alternate_return_matches(self) -> bool {
+        let (
+            Some(target),
+            DirectEndpointEvidence::AuthenticatedAck {
+                observed_endpoint,
+                independently_verified,
+            },
+        ) = (self.request_endpoint(), self.endpoint_evidence)
+        else {
+            return false;
+        };
+        target == observed_endpoint
+            || (independently_verified && target.ip() == observed_endpoint.ip())
     }
 
     pub(crate) const fn compatibility(epoch: PathEpoch, endpoint: Option<SocketAddr>) -> Self {
@@ -130,9 +165,9 @@ impl DirectValidationIdentity {
     pub(crate) const fn commit_endpoint(self) -> Option<SocketAddr> {
         match self.endpoint_evidence {
             DirectEndpointEvidence::RequestPending => None,
-            DirectEndpointEvidence::AuthenticatedAck { observed_endpoint } => {
-                Some(observed_endpoint)
-            }
+            DirectEndpointEvidence::AuthenticatedAck {
+                observed_endpoint, ..
+            } => Some(observed_endpoint),
             DirectEndpointEvidence::Compatibility { selected_endpoint } => selected_endpoint,
         }
     }
@@ -371,6 +406,12 @@ pub(crate) enum PathEvent {
         epoch: PathEpoch,
         now: Instant,
     },
+    /// Only submitted by the real plaintext queue with a live relay writer.
+    QueuedRelayRequested {
+        epoch: PathEpoch,
+        now: Instant,
+        last_direct_progress: Option<Instant>,
+    },
     /// An encrypted-confirmed Direct path is ready for a business send,
     /// including the negotiated MTU budget. This is not a delivery receipt.
     DirectFirstSatisfied {
@@ -418,6 +459,10 @@ pub(crate) enum PathEvent {
     DirectValidationStarted {
         validation: DirectValidationIdentity,
     },
+    DirectAlternateValidationStarted {
+        current: DirectValidationIdentity,
+        validation: DirectValidationIdentity,
+    },
     DirectCommitted {
         validation: DirectValidationIdentity,
     },
@@ -451,6 +496,7 @@ impl PathEvent {
         match self {
             Self::DirectFirstStarted { epoch, .. }
             | Self::DirectFirstDeadline { epoch, .. }
+            | Self::QueuedRelayRequested { epoch, .. }
             | Self::PeerOnline { epoch }
             | Self::PeerLeft { epoch }
             | Self::NetworkGenerationAdvanced { epoch, .. }
@@ -468,6 +514,7 @@ impl PathEvent {
             | Self::RelayTransportLost { relay }
             | Self::RelayPathFailed { relay } => Some(relay.epoch),
             Self::DirectFirstSatisfied { validation }
+            | Self::DirectAlternateValidationStarted { validation, .. }
             | Self::DirectValidationStarted { validation }
             | Self::DirectCommitted { validation } => Some(validation.epoch),
             Self::IdentityReset => None,
@@ -618,6 +665,7 @@ pub(crate) enum PeerPathLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PathState {
     direct_first: Option<DirectFirstWindow>,
+    alternate: Option<(DirectValidationIdentity, DirectValidationIdentity)>,
     pub(crate) lifecycle: PeerPathLifecycle,
     pub(crate) epoch: Option<PathEpoch>,
     pub(crate) active: ActiveBusinessPath,
@@ -723,6 +771,7 @@ impl PathStateMachine {
         Self {
             state: PathState {
                 direct_first: None,
+                alternate: None,
                 lifecycle: PeerPathLifecycle::Unbound,
                 epoch: None,
                 active: ActiveBusinessPath::Unavailable,
@@ -752,6 +801,18 @@ impl PathStateMachine {
 
     pub(crate) fn active_path(&self) -> Option<NetworkPath> {
         self.state.active.network_path()
+    }
+
+    pub(crate) fn alternate_validation_owner(&self) -> Option<u64> {
+        self.state
+            .alternate
+            .and_then(|(_, pending)| pending.owner_token)
+    }
+
+    pub(crate) fn matches_alternate_ack(&self, validation: DirectValidationIdentity) -> bool {
+        self.state
+            .alternate
+            .is_some_and(|(_, pending)| pending.same_validation_request(validation))
     }
 
     /// Borrow the original active validation without cloning diagnostic state.
@@ -821,6 +882,31 @@ impl PathStateMachine {
                             next.active = ActiveBusinessPath::Relay(relay);
                             next.compatibility_state = ConnectionState::Relay;
                         }
+                    }
+                }
+                Ok(())
+            }
+            PathEvent::QueuedRelayRequested {
+                epoch,
+                now,
+                last_direct_progress,
+            } => {
+                self.validate_exact_epoch(epoch)?;
+                if let (Some(window), Some(relay)) =
+                    (next.direct_first.as_mut(), next.relay.confirmed_identity())
+                {
+                    let started = window.deadline - DIRECT_FIRST_WINDOW;
+                    let last = last_direct_progress.unwrap_or(started).max(started);
+                    if !window.released
+                        && now.saturating_duration_since(last) >= ADAPTIVE_DIRECT_GRACE
+                        && !matches!(
+                            next.direct,
+                            DirectPathState::Validating(_) | DirectPathState::Committed(_)
+                        )
+                    {
+                        window.released = true;
+                        next.active = ActiveBusinessPath::Relay(relay.clone());
+                        next.compatibility_state = ConnectionState::Relay;
                     }
                 }
                 Ok(())
@@ -904,6 +990,13 @@ impl PathStateMachine {
                 self.reduce_direct_probe_started(&mut next, epoch, attempt);
                 Ok(())
             }
+            PathEvent::DirectAlternateValidationStarted {
+                current,
+                validation,
+            } => {
+                self.validate_exact_epoch(validation.epoch)?;
+                self.start_alternate_validation(&mut next, current, validation)
+            }
             PathEvent::DirectValidationStarted { validation } => {
                 self.validate_exact_epoch(validation.epoch)?;
                 self.reduce_direct_validation_started(&mut next, validation)
@@ -952,6 +1045,13 @@ impl PathStateMachine {
                 observation: None,
                 clear_relay_receipts: false,
             };
+        }
+        if next.alternate.is_some_and(|(original, _)| {
+            next.active != ActiveBusinessPath::Direct(original)
+                || next.direct != DirectPathState::Committed(original)
+                || next.epoch != Some(original.epoch)
+        }) {
+            next.alternate = None;
         }
         if !Self::state_is_valid(&next) {
             return PathTransition {
@@ -1046,6 +1146,7 @@ impl PathStateMachine {
     fn unbound_state() -> PathState {
         PathState {
             direct_first: None,
+            alternate: None,
             lifecycle: PeerPathLifecycle::Unbound,
             epoch: None,
             active: ActiveBusinessPath::Unavailable,
@@ -1080,6 +1181,7 @@ impl PathStateMachine {
         }
         *next = PathState {
             direct_first: None,
+            alternate: None,
             lifecycle: PeerPathLifecycle::Online,
             epoch: Some(epoch),
             active: ActiveBusinessPath::Unavailable,
@@ -1361,192 +1463,6 @@ impl PathStateMachine {
                 fallback: None,
             };
             next.compatibility_state = ConnectionState::FallbackToRelay;
-        }
-        Ok(())
-    }
-
-    fn reduce_direct_probe_started(
-        &self,
-        next: &mut PathState,
-        epoch: PathEpoch,
-        attempt: DirectAttemptNumber,
-    ) {
-        if matches!(
-            self.state.direct,
-            DirectPathState::Validating(_) | DirectPathState::Committed(_)
-        ) {
-            return;
-        }
-        next.direct = DirectPathState::Probing { epoch, attempt };
-        next.recovery = PathRecoveryState::Recovering {
-            epoch,
-            target: NetworkPath::Direct,
-            attempt,
-        };
-        if matches!(next.active, ActiveBusinessPath::Unavailable) {
-            next.compatibility_state = ConnectionState::HolePunching;
-        }
-    }
-
-    fn reduce_direct_validation_started(
-        &self,
-        next: &mut PathState,
-        validation: DirectValidationIdentity,
-    ) -> Result<(), PathTransitionDecision> {
-        if !validation.can_start_validation() {
-            return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
-        }
-        if let DirectPathState::Committed(current) = self.state.direct {
-            return if current.same_validation_request(validation) {
-                Ok(())
-            } else {
-                Err(PathTransitionDecision::RejectedDirectValidationIdentity)
-            };
-        }
-        if let DirectPathState::Validating(current) = self.state.direct {
-            if !current.same_owner(validation) {
-                return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
-            }
-        }
-        next.direct = DirectPathState::Validating(validation);
-        next.recovery = PathRecoveryState::Recovering {
-            epoch: validation.epoch,
-            target: NetworkPath::Direct,
-            attempt: DirectAttemptNumber(validation.owner_token.unwrap_or_default()),
-        };
-        if matches!(next.active, ActiveBusinessPath::Unavailable) {
-            next.compatibility_state = ConnectionState::HolePunching;
-        }
-        Ok(())
-    }
-
-    fn reduce_direct_committed(
-        &self,
-        next: &mut PathState,
-        validation: DirectValidationIdentity,
-    ) -> Result<(), PathTransitionDecision> {
-        if !validation.can_commit() {
-            return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
-        }
-        match self.state.direct {
-            DirectPathState::Validating(current) => {
-                if !current.same_validation_request(validation) {
-                    return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
-                }
-            }
-            DirectPathState::Committed(current) => {
-                let compatibility_replacement =
-                    current.owner_token.is_none() && validation.owner_token.is_none();
-                if current != validation
-                    && !current.same_validation_request(validation)
-                    && !compatibility_replacement
-                {
-                    return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
-                }
-                // A second ACK from the same validation owner is duplicate
-                // evidence. Preserve the first atomic commit and its endpoint.
-                if current == validation || current.same_validation_request(validation) {
-                    return Ok(());
-                }
-            }
-            DirectPathState::Idle | DirectPathState::Probing { .. }
-                if validation.owner_token.is_some() =>
-            {
-                return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
-            }
-            DirectPathState::Idle | DirectPathState::Probing { .. } => {}
-        }
-        next.direct = DirectPathState::Committed(validation);
-        next.active = ActiveBusinessPath::Direct(validation);
-        next.recovery = PathRecoveryState::Stable;
-        next.compatibility_state = ConnectionState::Direct;
-        Ok(())
-    }
-
-    fn reduce_direct_probe_failed(&self, next: &mut PathState, epoch: PathEpoch) {
-        if matches!(self.state.direct, DirectPathState::Committed(_)) {
-            return;
-        }
-        next.direct = DirectPathState::Idle;
-        if matches!(next.active, ActiveBusinessPath::Relay(_)) {
-            // Relay stays active while the failed background upgrade is
-            // retried.  In particular, this never marks the peer Offline.
-            next.recovery = PathRecoveryState::Recovering {
-                epoch,
-                target: NetworkPath::Direct,
-                attempt: DirectAttemptNumber(0),
-            };
-            next.compatibility_state = ConnectionState::Relay;
-        } else {
-            next.recovery = PathRecoveryState::Degraded {
-                epoch,
-                from: NetworkPath::Direct,
-                fallback: None,
-            };
-            next.compatibility_state = ConnectionState::FallbackToRelay;
-        }
-    }
-
-    fn reduce_direct_path_failed(&self, next: &mut PathState, epoch: PathEpoch) {
-        let direct_was_active = matches!(self.state.active, ActiveBusinessPath::Direct(_));
-        next.direct = DirectPathState::Idle;
-        if direct_was_active {
-            // A business-ready Direct path has already satisfied startup and
-            // falls back immediately. An ACK-only path whose MTU budget
-            // never became usable must not turn a probe failure into an
-            // early release of the connection's first Direct window.
-            let relay = if self.direct_first_pending() {
-                None
-            } else {
-                next.relay.confirmed_identity().cloned()
-            };
-            next.active = relay
-                .clone()
-                .map_or(ActiveBusinessPath::Unavailable, ActiveBusinessPath::Relay);
-            next.recovery = PathRecoveryState::Degraded {
-                epoch,
-                from: NetworkPath::Direct,
-                fallback: relay.as_ref().map(|_| NetworkPath::Relay),
-            };
-            next.compatibility_state = if relay.is_some() {
-                ConnectionState::Relay
-            } else {
-                ConnectionState::FallbackToRelay
-            };
-        } else if matches!(next.active, ActiveBusinessPath::Relay(_)) {
-            next.recovery = PathRecoveryState::Recovering {
-                epoch,
-                target: NetworkPath::Direct,
-                attempt: DirectAttemptNumber(0),
-            };
-            next.compatibility_state = ConnectionState::Relay;
-        } else {
-            next.recovery = PathRecoveryState::Degraded {
-                epoch,
-                from: NetworkPath::Direct,
-                fallback: None,
-            };
-            next.compatibility_state = ConnectionState::FallbackToRelay;
-        }
-    }
-
-    fn reduce_direct_cancelled(
-        &self,
-        next: &mut PathState,
-        _epoch: PathEpoch,
-        owner_token: Option<u64>,
-    ) -> Result<(), PathTransitionDecision> {
-        match self.state.direct {
-            DirectPathState::Validating(current) if current.owner_token != owner_token => {
-                return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
-            }
-            DirectPathState::Committed(_) | DirectPathState::Idle => return Ok(()),
-            DirectPathState::Probing { .. } | DirectPathState::Validating(_) => {}
-        }
-        next.direct = DirectPathState::Idle;
-        next.recovery = PathRecoveryState::Stable;
-        if matches!(next.active, ActiveBusinessPath::Unavailable) {
-            next.compatibility_state = ConnectionState::Idle;
         }
         Ok(())
     }
@@ -1861,6 +1777,133 @@ mod tests {
                 validation: matching_ack(validation),
             },
         )
+    }
+
+    #[test]
+    fn alternate_direct_ack_requires_original_commit_owner_request_and_endpoint() {
+        let epoch = epoch(7, 11, 13);
+        let mut machine = online_machine(epoch);
+        let original = validation(epoch, 10, 17);
+        assert!(commit_direct(&mut machine, original).accepted());
+        let active = matching_ack(original);
+        let moved = "198.51.100.7:4001".parse().unwrap();
+        let pending = DirectValidationIdentity::owned(epoch, 12, Some(21), Some(moved));
+        let start = PathEvent::DirectAlternateValidationStarted {
+            current: active,
+            validation: pending,
+        };
+        let ack = PathEvent::DirectCommitted {
+            validation: matching_ack(pending),
+        };
+        assert!(!commit(&mut machine, ack.clone()).accepted());
+        assert!(commit(&mut machine, start.clone()).accepted());
+        assert_eq!(machine.active_direct_validation(), Some(active));
+        let other = validation(epoch, 14, 21);
+        for wrong in [
+            matching_ack(other),
+            authenticated_ack(pending, active.commit_endpoint().unwrap()),
+        ] {
+            assert!(!commit(
+                &mut machine,
+                PathEvent::DirectCommitted { validation: wrong }
+            )
+            .accepted());
+            assert_eq!(machine.active_direct_validation(), Some(active));
+        }
+        assert!(commit(
+            &mut machine,
+            PathEvent::DirectAttemptCancelled {
+                epoch,
+                owner_token: pending.owner_token
+            }
+        )
+        .accepted());
+        assert!(!commit(&mut machine, ack.clone()).accepted());
+        assert_eq!(machine.active_direct_validation(), Some(active));
+        assert!(commit(&mut machine, start).accepted());
+        assert!(commit(&mut machine, ack).accepted());
+        assert_eq!(
+            machine.active_direct_validation(),
+            Some(matching_ack(pending))
+        );
+        assert!(!commit(
+            &mut machine,
+            PathEvent::DirectCommitted { validation: active }
+        )
+        .accepted());
+    }
+
+    #[test]
+    fn alternate_direct_drift_requires_an_independently_verified_port_on_the_same_ip() {
+        let epoch = epoch(3, 4, 5);
+        let original = validation(epoch, 2, 3);
+        let target = "198.51.100.7:5001".parse().unwrap();
+        let next = DirectValidationIdentity::owned(epoch, 4, Some(8), Some(target));
+        for (source, verified, expected) in [
+            ("198.51.100.7:5002", false, false),
+            ("198.51.100.8:5002", true, false),
+            ("198.51.100.7:5002", true, true),
+        ] {
+            let mut machine = online_machine(epoch);
+            assert!(commit_direct(&mut machine, original).accepted());
+            assert!(commit(
+                &mut machine,
+                PathEvent::DirectAlternateValidationStarted {
+                    current: matching_ack(original),
+                    validation: next
+                }
+            )
+            .accepted());
+            let ack =
+                authenticated_ack(next, source.parse().unwrap()).with_verified_return(verified);
+            assert_eq!(
+                commit(&mut machine, PathEvent::DirectCommitted { validation: ack }).accepted(),
+                expected
+            );
+            assert_eq!(
+                machine.active_direct_validation(),
+                Some(if expected {
+                    ack
+                } else {
+                    matching_ack(original)
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn old_alternate_ack_cannot_restore_direct_after_failure_or_peer_departure() {
+        let epoch = epoch(1, 5, 8);
+        let original = validation(epoch, 9, 2);
+        let pending = DirectValidationIdentity::owned(
+            epoch,
+            10,
+            Some(3),
+            Some("198.51.100.7:4001".parse().unwrap()),
+        );
+        for event in [
+            PathEvent::DirectPathFailed { epoch },
+            PathEvent::PeerLeft { epoch },
+        ] {
+            let mut machine = online_machine(epoch);
+            assert!(commit_direct(&mut machine, original).accepted());
+            assert!(commit(
+                &mut machine,
+                PathEvent::DirectAlternateValidationStarted {
+                    current: matching_ack(original),
+                    validation: pending,
+                }
+            )
+            .accepted());
+            assert!(commit(&mut machine, event).accepted());
+            assert!(!commit(
+                &mut machine,
+                PathEvent::DirectCommitted {
+                    validation: matching_ack(pending)
+                }
+            )
+            .accepted());
+        }
     }
 
     #[test]

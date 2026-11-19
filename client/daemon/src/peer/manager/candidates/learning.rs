@@ -5,6 +5,18 @@ impl PeerManager {
     /// address that was not present in the control-plane candidate set because
     /// the probe MAC proves the sender controls the peer identity.
     pub async fn learn_authenticated_endpoint(&self, node_id: &str, endpoint: SocketAddr) -> bool {
+        self.learn_authenticated_udp_endpoint(node_id, endpoint, None, None, None)
+            .await
+    }
+
+    pub(crate) async fn learn_authenticated_udp_endpoint(
+        &self,
+        node_id: &str,
+        endpoint: SocketAddr,
+        original: Option<&crate::transport::OriginalSessionSource>,
+        generation: Option<u64>,
+        local: Option<SocketAddr>,
+    ) -> bool {
         // Release epoch while waiting for the actual connection writer. The
         // shared helper returns both real guards in their original lock order.
         let (epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
@@ -14,6 +26,21 @@ impl PeerManager {
             node_id,
             endpoint,
         );
+        if learned && self.config.network.accelerated_consent {
+            if let (Some(original), Some(generation), Some(local), Some(conn)) =
+                (original, generation, local, conns.get_mut(node_id))
+            {
+                if !original.is_previous_session() && original.peer_id() == node_id {
+                    conn.observe_direct_source(
+                        generation,
+                        original.authorized_peer_lifecycle(),
+                        local,
+                        endpoint,
+                        original.authenticated_at(),
+                    );
+                }
+            }
+        }
         drop(conns);
         if !learned {
             return false;

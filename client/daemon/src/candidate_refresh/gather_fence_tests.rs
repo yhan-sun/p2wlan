@@ -32,6 +32,7 @@ async fn completed_old_discovery_cannot_replace_a_newer_same_generation_snapshot
         udp.local_addr().unwrap(),
         false,
         vec![p2pnet_nat::StunObservation {
+            failure_kind: None,
             server: "192.0.2.1:3478".into(),
             mapped_address: Some("198.51.100.1:40000".into()),
             rtt_ms: Some(10),

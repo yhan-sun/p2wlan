@@ -183,11 +183,12 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
                 match normalized.as_str() {
                     "direct-first" | "direct_first" => PathPolicy::DirectFirst,
                     "auto" => PathPolicy::Auto,
+                    "adaptive" => PathPolicy::Adaptive,
                     "score" => PathPolicy::Score,
                     "direct-sticky" | "direct_sticky" | "direct" => PathPolicy::DirectSticky,
                     "relay-only" | "relay_only" | "relay" => PathPolicy::RelayOnly,
                     _ => return Err(
-                        "path-policy 只支持 direct-first、auto、score、direct-sticky 或 relay-only"
+                        "path-policy 只支持 direct-first、adaptive、auto、score、direct-sticky 或 relay-only"
                             .to_string(),
                     ),
                 };

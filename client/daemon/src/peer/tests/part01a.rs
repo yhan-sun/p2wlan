@@ -732,6 +732,7 @@ async fn nat_profile_update_ignores_observation_jitter_and_advances_on_capabilit
 
     let mut profile = birthday_nat_profile();
     profile.observations = vec![p2pnet_nat::StunObservation {
+        failure_kind: None,
         server: "stun1.example.com".to_string(),
         mapped_address: Some("203.0.113.10:40007".to_string()),
         rtt_ms: Some(25),
@@ -769,6 +770,7 @@ async fn nat_profile_publication_tracks_real_observations_separately_from_capabi
     let manager = PeerManager::new(test_config());
     let mut profile = birthday_nat_profile();
     profile.observations = vec![p2pnet_nat::StunObservation {
+        failure_kind: None,
         server: "stun1.example.com".to_string(),
         mapped_address: Some("203.0.113.10:40007".to_string()),
         rtt_ms: Some(25),

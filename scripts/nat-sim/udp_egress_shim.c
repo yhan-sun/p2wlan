@@ -25,6 +25,7 @@
 static pthread_once_t initialize_once = PTHREAD_ONCE_INIT;
 static struct sockaddr_in gateway;
 static int enabled;
+static long sender_pid;
 struct egress_stats {
     char magic[8];
     _Atomic uint64_t packets;
@@ -46,6 +47,11 @@ static void initialize(void) {
     const char *port_text = getenv("P2WLAN_NAT_SIM_GATEWAY_PORT");
     if (!port_text || !*port_text) return;
     char *end;
+    const char *owner = getenv("P2WLAN_NAT_SIM_SENDER_PID");
+    if (owner) {
+        sender_pid = strtol(owner, &end, 10);
+        if (*end || sender_pid <= 0 || sender_pid != (long)getpid()) return;
+    }
     long port = strtol(port_text, &end, 10);
     if (*end || port < 1 || port > 65535) return;
     gateway.sin_family = AF_INET;
@@ -79,7 +85,8 @@ static void initialize(void) {
 
 static int eligible(int fd, const struct sockaddr *destination, socklen_t length) {
     pthread_once(&initialize_once, initialize);
-    if (!enabled || !destination || length < sizeof(struct sockaddr_in) ||
+    if (!enabled || (sender_pid && sender_pid != (long)getpid()) ||
+        !destination || length < sizeof(struct sockaddr_in) ||
         destination->sa_family != AF_INET) return 0;
     const struct sockaddr_in *address = (const struct sockaddr_in *)destination;
     if ((ntohl(address->sin_addr.s_addr) >> 24) != 127) return 0;

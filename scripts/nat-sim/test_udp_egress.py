@@ -25,9 +25,21 @@ NATIVE_SENDER = r'''
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
+    if (getenv("P2WLAN_TEST_CAPTURE_CHILD_FIRST")) {
+        pid_t child = fork();
+        if (child < 0) return 10;
+        if (!child) {
+            int local[2];
+            if (socketpair(AF_UNIX, SOCK_DGRAM, 0, local)) _exit(1);
+            _exit(sendto(local[0], "x", 1, 0, NULL, 0) == 1 ? 0 : 2);
+        }
+        int status;
+        if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) return 11;
+    }
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in address = {0};
     address.sin_family = AF_INET;
