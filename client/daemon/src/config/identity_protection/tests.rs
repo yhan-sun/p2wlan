@@ -1,4 +1,6 @@
-use super::{Config, DaemonInstanceLock, IdentityProtection};
+#[cfg(unix)]
+use super::DaemonInstanceLock;
+use super::{Config, IdentityProtection};
 use std::fs;
 use std::path::PathBuf;
 

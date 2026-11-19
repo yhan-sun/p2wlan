@@ -222,7 +222,9 @@ impl Daemon {
             Some(health.clone()),
             Some(peers.telemetry_hub()),
         );
-        peers.bind_opaque_probe_registration(control.clone());
+        if control_enabled {
+            peers.bind_opaque_probe_registration(control.clone());
+        }
         let resource_capture =
             crate::dataplane_resources::RuntimeResourceCapture::from_config(&config.diagnostics);
         let (transport, outbound_rx) = WireGuardTransport::new_for_daemon(
