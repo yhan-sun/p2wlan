@@ -114,6 +114,39 @@ mod vpn_network_tests {
 }
 
 impl ControlClient {
+    pub(crate) fn probe_registration_snapshot(&self) -> Option<(Option<u64>, bool)> {
+        self.with_probe_registration(None, |snapshot| snapshot)
+    }
+
+    /// Keep the original auth publication and shutdown flag borrowed through
+    /// one synchronous syscall. No callback may wait or acquire async locks.
+    pub(crate) fn with_probe_registration<T>(
+        &self,
+        expected: Option<(Option<u64>, bool)>,
+        write: impl FnOnce((Option<u64>, bool)) -> T,
+    ) -> Option<T> {
+        let shutdown = self
+            .shutdown_lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.requested.borrow());
+        if shutdown.as_ref().is_some_and(|requested| **requested)
+            || self.registration_rx.has_changed().is_err()
+        {
+            return None;
+        }
+        let auth = self.registration_rx.borrow();
+        let snapshot = auth.as_ref().map_or((None, false), |auth| {
+            (
+                auth.registration_seq.filter(|seq| *seq > 0),
+                auth.accepted_peer_capabilities.probe_opaque_ids_v1,
+            )
+        });
+        if expected.is_some_and(|expected| expected != snapshot) {
+            return None;
+        }
+        Some(write(snapshot))
+    }
+
     /// Timing from a fresh short control request; never from a long poll.
     pub(crate) fn hard_hard_timing_hint(&self) -> Option<ControlTimingHint> {
         self.server_clock
@@ -171,6 +204,24 @@ impl ControlClient {
         let auth = auth.as_ref()?;
         auth.accepted_peer_capabilities
             .supports_hh2()
+            .then_some(auth.registration_seq.filter(|seq| *seq > 0))
+            .flatten()
+    }
+
+    /// Read the accepted opaque-probe capability from the existing auth owner.
+    pub(crate) fn local_opaque_probe_registration_seq(&self) -> Option<u64> {
+        if self.registration_rx.has_changed().is_err()
+            || self
+                .shutdown_lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| *lifecycle.requested.borrow())
+        {
+            return None;
+        }
+        let auth = self.registration_rx.borrow();
+        let auth = auth.as_ref()?;
+        auth.accepted_peer_capabilities
+            .probe_opaque_ids_v1
             .then_some(auth.registration_seq.filter(|seq| *seq > 0))
             .flatten()
     }

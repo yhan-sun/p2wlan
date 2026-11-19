@@ -86,6 +86,7 @@ pub fn build_authenticated_punch_ack(
 pub fn peek_authenticated_punch_identity(data: &[u8]) -> Option<AuthenticatedPunchIdentity> {
     let parsed = parse_authenticated_punch(data)?;
     Some(AuthenticatedPunchIdentity {
+        version: parsed.version,
         kind: parsed.kind,
         source_node_id: parsed.source_node_id,
         target_node_id: parsed.target_node_id,
@@ -101,7 +102,7 @@ pub fn decode_authenticated_punch_packet(
 ) -> Option<DecodedPunchPacket> {
     let parsed = parse_authenticated_punch(data)?;
     let mac_start = data.len().checked_sub(AUTH_PUNCH_MAC_SIZE)?;
-    let expected = punch_v2_mac(&data[..mac_start], key);
+    let expected = punch_wire_mac(&data[..mac_start], key, parsed.version);
     if !constant_time_eq(&expected, &data[mac_start..]) {
         return None;
     }
@@ -109,7 +110,7 @@ pub fn decode_authenticated_punch_packet(
     Some(DecodedPunchPacket {
         kind: parsed.kind,
         nonce: parsed.nonce,
-        version: AUTH_PUNCH_VERSION,
+        version: parsed.version,
         source_node_id: Some(parsed.source_node_id),
         target_node_id: Some(parsed.target_node_id),
         generation: Some(parsed.generation),
@@ -127,6 +128,27 @@ fn encode_authenticated_punch(
     use_candidate: bool,
     key: &ProbeMacKey,
 ) -> Vec<u8> {
+    encode_punch_with_version(
+        kind,
+        nonce,
+        (source_node_id, target_node_id),
+        generation,
+        use_candidate,
+        key,
+        AUTH_PUNCH_VERSION,
+    )
+}
+
+pub(super) fn encode_punch_with_version(
+    kind: PunchPacketKind,
+    nonce: [u8; 8],
+    identities: (&str, &str),
+    generation: u64,
+    use_candidate: bool,
+    key: &ProbeMacKey,
+    version: u8,
+) -> Vec<u8> {
+    let (source_node_id, target_node_id) = identities;
     let source = source_node_id.as_bytes();
     let target = target_node_id.as_bytes();
     assert!(
@@ -138,7 +160,7 @@ fn encode_authenticated_punch(
         4 + 1 + 1 + 8 + 8 + 1 + 1 + 1 + source.len() + target.len() + AUTH_PUNCH_MAC_SIZE,
     );
     frame.extend_from_slice(&PUNCH_MAGIC);
-    frame.push(AUTH_PUNCH_VERSION);
+    frame.push(version);
     frame.push(match kind {
         PunchPacketKind::Punch => TYPE_PUNCH,
         PunchPacketKind::Ack => TYPE_ACK,
@@ -154,13 +176,14 @@ fn encode_authenticated_punch(
     frame.push(target.len() as u8);
     frame.extend_from_slice(source);
     frame.extend_from_slice(target);
-    let mac = punch_v2_mac(&frame, key);
+    let mac = punch_wire_mac(&frame, key, version);
     frame.extend_from_slice(&mac);
     frame
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedAuthenticatedPunch {
+    version: u8,
     kind: PunchPacketKind,
     nonce: [u8; 8],
     generation: u64,
@@ -170,6 +193,10 @@ struct ParsedAuthenticatedPunch {
 }
 
 fn parse_authenticated_punch(data: &[u8]) -> Option<ParsedAuthenticatedPunch> {
+    if data.get(4) == Some(&OPAQUE_PUNCH_VERSION) {
+        // A recognized opaque frame must never be reinterpreted as legacy v2.
+        return parse_authenticated_punch_with_flags(data);
+    }
     parse_authenticated_punch_with_flags(data).or_else(|| parse_authenticated_punch_legacy(data))
 }
 
@@ -189,7 +216,7 @@ fn parse_authenticated_punch_inner(
     if data.len() < minimum {
         return None;
     }
-    if data[..4] != PUNCH_MAGIC || data[4] != AUTH_PUNCH_VERSION {
+    if data[..4] != PUNCH_MAGIC || !matches!(data[4], AUTH_PUNCH_VERSION | OPAQUE_PUNCH_VERSION) {
         return None;
     }
     let kind = match data[5] {
@@ -234,7 +261,14 @@ fn parse_authenticated_punch_inner(
         return None;
     }
 
+    if data[4] == OPAQUE_PUNCH_VERSION
+        && (!opaque::valid_opaque_identity(&source_node_id)
+            || !opaque::valid_opaque_identity(&target_node_id))
+    {
+        return None;
+    }
     Some(ParsedAuthenticatedPunch {
+        version: data[4],
         kind,
         nonce,
         generation,
@@ -244,12 +278,26 @@ fn parse_authenticated_punch_inner(
     })
 }
 
+#[cfg(test)]
 pub(super) fn punch_v2_mac(
     frame_without_mac: &[u8],
     key: &ProbeMacKey,
 ) -> [u8; AUTH_PUNCH_MAC_SIZE] {
-    let mut input = Vec::with_capacity(AUTH_PUNCH_MAC_DOMAIN.len() + frame_without_mac.len());
-    input.extend_from_slice(AUTH_PUNCH_MAC_DOMAIN);
+    punch_wire_mac(frame_without_mac, key, AUTH_PUNCH_VERSION)
+}
+
+fn punch_wire_mac(
+    frame_without_mac: &[u8],
+    key: &ProbeMacKey,
+    version: u8,
+) -> [u8; AUTH_PUNCH_MAC_SIZE] {
+    let domain = if version == OPAQUE_PUNCH_VERSION {
+        b"p2wlan-udp-probe-v3".as_slice()
+    } else {
+        AUTH_PUNCH_MAC_DOMAIN
+    };
+    let mut input = Vec::with_capacity(domain.len() + frame_without_mac.len());
+    input.extend_from_slice(domain);
     input.extend_from_slice(frame_without_mac);
     let full = hmac(key, &input);
     let mut truncated = [0u8; AUTH_PUNCH_MAC_SIZE];

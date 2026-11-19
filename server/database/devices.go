@@ -163,10 +163,10 @@ func (db *DB) GetDevice(deviceID string) (*Device, error) {
 	var d Device
 	var online int
 	var relayRTTMS sql.NullInt64
-	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, ''), COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2
+	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, ''), COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2, probe_opaque_ids_v1
 		FROM devices WHERE id = ?`, deviceID).
 		Scan(&d.ID, &d.UserID, &d.NetworkID, &d.PublicKey, &d.DeviceName, &d.Platform,
-			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey, &d.RegistrationSeq, &d.RegistrationIncarnation, &d.Capabilities.HH2PairNomination, &d.Capabilities.HH2PlanV2)
+			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey, &d.RegistrationSeq, &d.RegistrationIncarnation, &d.Capabilities.HH2PairNomination, &d.Capabilities.HH2PlanV2, &d.Capabilities.ProbeOpaqueIDsV1)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +183,7 @@ func (db *DB) GetDevice(deviceID string) (*Device, error) {
 type PeerCapabilities struct {
 	HH2PairNomination bool `json:"hh2_pair_nomination"`
 	HH2PlanV2         bool `json:"hh2_plan_v2"`
+	ProbeOpaqueIDsV1  bool `json:"probe_opaque_ids_v1"`
 }
 
 // Device represents a registered device/node.
@@ -336,10 +337,10 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 	var existing Device
 	var online int
 	var existingRelayRTTMS sql.NullInt64
-	err = tx.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2
+	err = tx.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2, probe_opaque_ids_v1
 		FROM devices WHERE public_key = ? LIMIT 1`, publicKey).
 		Scan(&existing.ID, &existing.UserID, &existing.NetworkID, &existing.PublicKey, &existing.DeviceName, &existing.Platform,
-			&existing.VirtualIP, &existing.NATType, &existing.Endpoint, &existingRelayRTTMS, &existing.LastSeen, &existing.AppVersion, &online, &existing.CreatedAt, &existing.RegistrationSeq, &existing.RegistrationIncarnation, &existing.Capabilities.HH2PairNomination, &existing.Capabilities.HH2PlanV2)
+			&existing.VirtualIP, &existing.NATType, &existing.Endpoint, &existingRelayRTTMS, &existing.LastSeen, &existing.AppVersion, &online, &existing.CreatedAt, &existing.RegistrationSeq, &existing.RegistrationIncarnation, &existing.Capabilities.HH2PairNomination, &existing.Capabilities.HH2PlanV2, &existing.Capabilities.ProbeOpaqueIDsV1)
 	if err == nil {
 		if existing.UserID != userID {
 			return nil, fmt.Errorf("public key is already registered by another user")
@@ -411,8 +412,8 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 		if attempt.EnforceIncarnation && attempt.Incarnation != nil && *attempt.Incarnation > 0 {
 			registrationIncarnation = *attempt.Incarnation
 		}
-		_, err = tx.Exec(`UPDATE devices SET device_name = ?, platform = ?, virtual_ip = ?, app_version = CASE WHEN ? != '' THEN ? ELSE app_version END, endpoint = '', nat_type = 'unknown', relay_rtt_ms = NULL, last_seen = ?, online = 1, ed25519_public_key = CASE WHEN ? != '' THEN ? ELSE ed25519_public_key END, registration_seq = COALESCE(registration_seq, 1) + 1, registration_incarnation = ?, hh2_pair_nomination = ?, hh2_plan_v2 = ? WHERE id = ?`,
-			deviceName, platform, virtualIP, appVersion, appVersion, now, ed25519PublicKey, ed25519PublicKey, registrationIncarnation, capabilities.HH2PairNomination, capabilities.HH2PlanV2, existing.ID)
+		_, err = tx.Exec(`UPDATE devices SET device_name = ?, platform = ?, virtual_ip = ?, app_version = CASE WHEN ? != '' THEN ? ELSE app_version END, endpoint = '', nat_type = 'unknown', relay_rtt_ms = NULL, last_seen = ?, online = 1, ed25519_public_key = CASE WHEN ? != '' THEN ? ELSE ed25519_public_key END, registration_seq = COALESCE(registration_seq, 1) + 1, registration_incarnation = ?, hh2_pair_nomination = ?, hh2_plan_v2 = ?, probe_opaque_ids_v1 = ? WHERE id = ?`,
+			deviceName, platform, virtualIP, appVersion, appVersion, now, ed25519PublicKey, ed25519PublicKey, registrationIncarnation, capabilities.HH2PairNomination, capabilities.HH2PlanV2, capabilities.ProbeOpaqueIDsV1, existing.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -467,9 +468,9 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 	if attempt.EnforceIncarnation && attempt.Incarnation != nil && *attempt.Incarnation > 0 {
 		registrationIncarnation = *attempt.Incarnation
 	}
-	_, err = tx.Exec(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, app_version, last_seen, online, created_at, ed25519_public_key, registration_seq, registration_incarnation, hh2_pair_nomination, hh2_plan_v2)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1, ?, ?, ?)`,
-		id, userID, networkID, publicKey, deviceName, platform, virtualIP, appVersion, now, now, ed25519PublicKey, registrationIncarnation, capabilities.HH2PairNomination, capabilities.HH2PlanV2)
+	_, err = tx.Exec(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, app_version, last_seen, online, created_at, ed25519_public_key, registration_seq, registration_incarnation, hh2_pair_nomination, hh2_plan_v2, probe_opaque_ids_v1)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1, ?, ?, ?, ?)`,
+		id, userID, networkID, publicKey, deviceName, platform, virtualIP, appVersion, now, now, ed25519PublicKey, registrationIncarnation, capabilities.HH2PairNomination, capabilities.HH2PlanV2, capabilities.ProbeOpaqueIDsV1)
 	if err != nil {
 		return nil, err
 	}
@@ -491,10 +492,10 @@ func (db *DB) GetDeviceByPublicKey(networkID, publicKey string) (*Device, error)
 	var d Device
 	var online int
 	var relayRTTMS sql.NullInt64
-	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, ''), COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2
+	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, ''), COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2, probe_opaque_ids_v1
 		FROM devices WHERE network_id = ? AND public_key = ? LIMIT 1`, networkID, publicKey).
 		Scan(&d.ID, &d.UserID, &d.NetworkID, &d.PublicKey, &d.DeviceName, &d.Platform,
-			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey, &d.RegistrationSeq, &d.RegistrationIncarnation, &d.Capabilities.HH2PairNomination, &d.Capabilities.HH2PlanV2)
+			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey, &d.RegistrationSeq, &d.RegistrationIncarnation, &d.Capabilities.HH2PairNomination, &d.Capabilities.HH2PlanV2, &d.Capabilities.ProbeOpaqueIDsV1)
 	if err != nil {
 		return nil, err
 	}
@@ -632,7 +633,7 @@ func (db *DB) ListDevicesByUserAndNetwork(userID, networkID string) ([]Device, e
 func (db *DB) listDevices(fromClause string, args ...interface{}) ([]Device, error) {
 	now := time.Now().Unix()
 
-	rows, err := db.Query(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2 `+fromClause, args...)
+	rows, err := db.Query(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2, probe_opaque_ids_v1 `+fromClause, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -644,7 +645,7 @@ func (db *DB) listDevices(fromClause string, args ...interface{}) ([]Device, err
 		var online int
 		var relayRTTMS sql.NullInt64
 		if err := rows.Scan(&d.ID, &d.UserID, &d.NetworkID, &d.PublicKey, &d.DeviceName, &d.Platform,
-			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.RegistrationSeq, &d.RegistrationIncarnation, &d.Capabilities.HH2PairNomination, &d.Capabilities.HH2PlanV2); err != nil {
+			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.RegistrationSeq, &d.RegistrationIncarnation, &d.Capabilities.HH2PairNomination, &d.Capabilities.HH2PlanV2, &d.Capabilities.ProbeOpaqueIDsV1); err != nil {
 			return nil, err
 		}
 		d.RelayRTTMS = nullInt64Ptr(relayRTTMS)

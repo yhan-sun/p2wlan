@@ -12,6 +12,7 @@ async fn capability_declarations_are_fenced_by_registration_and_membership() {
     peer.capabilities = crate::control::PeerCapabilities {
         hh2_pair_nomination: true,
         hh2_plan_v2: true,
+        probe_opaque_ids_v1: false,
     };
     let update = manager.add_peer(&peer).await;
     assert!(update.registration_changed);
@@ -34,6 +35,7 @@ async fn capability_declarations_are_fenced_by_registration_and_membership() {
     peer.capabilities = crate::control::PeerCapabilities {
         hh2_pair_nomination: true,
         hh2_plan_v2: true,
+        probe_opaque_ids_v1: false,
     };
     manager.add_peer(&peer).await;
     assert!(manager.peer_supports_hh2(&peer.node_id).await);
@@ -51,6 +53,7 @@ async fn same_registration_cannot_restore_a_revoked_capability() {
     peer.capabilities = crate::control::PeerCapabilities {
         hh2_pair_nomination: true,
         hh2_plan_v2: true,
+        probe_opaque_ids_v1: false,
     };
     manager.add_peer(&peer).await;
     let enabled = peer.clone();

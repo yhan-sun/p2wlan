@@ -2,6 +2,97 @@ use super::super::test_support::*;
 use super::*;
 use crate::config::Config;
 
+#[tokio::test]
+async fn business_padding_16_cannot_cross_into_unknown_direct_budget_and_plaintext_recovers() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = receiver.local_addr().unwrap();
+    peers.add_peer(&test_peer("peer-a", endpoint)).await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    peers
+        .record_direct_probe_success_with_latency("peer-a", endpoint, None)
+        .await;
+    peers.record_direct_success("peer-a", Some(endpoint)).await;
+    let generation = peers.current_network_generation_sync();
+    let original = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        1,
+        2,
+        b"x",
+    );
+    let (transport, _outbound) = WireGuardTransport::new();
+    let transport = transport.with_business_padding_16(true);
+    let (local, mut remote) = establish_sessions();
+    transport.add_session("peer-a", local).await;
+    let packet = OutboundPacket {
+        room_authorization: None,
+        peer_id: "peer-a".into(),
+        dst_ip: "10.20.0.2".into(),
+        packet: original.clone(),
+        trace: None,
+    };
+    let prepared =
+        crate::transport::PreparedEncryptionBuffer::new_for_business(&original, true, None)
+            .unwrap();
+    let emit = transport.acquire_outbound_emit_guard("peer-a").await;
+    let padded = transport
+        .encrypt_request_with_prepared_buffer_diagnostics(
+            packet.clone().into(),
+            prepared,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let udps = RwLock::new(Some(udp));
+    let relays = RwLock::new(None);
+    let outcome = send_encrypted_packet_bounded(
+        &padded,
+        &peers,
+        true,
+        &udps,
+        &relays,
+        false,
+        None,
+        None,
+        original.len(),
+        false,
+        SendAdmissionWindow {
+            deadline: Some(Instant::now() + Duration::from_secs(2)),
+            stopping: None,
+            expected_generation: generation,
+        },
+    )
+    .await;
+    assert!(matches!(outcome, SendOutcome::DirectBudgetStale { .. }));
+    let mut bytes = [0; 2048];
+    assert_eq!(
+        receiver.try_recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(emit);
+
+    // The existing retry owns plaintext. A fresh attempt on this unmanaged
+    // Direct path omits optional padding and can deliver the original packet.
+    let outcome = encrypt_then_send(
+        packet, &transport, &peers, generation, true, &udps, &relays, false,
+    )
+    .await;
+    assert!(matches!(outcome, EncryptSendOutcome::Sent));
+    let (len, _) = timeout(Duration::from_secs(2), receiver.recv_from(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(len, original.len() + 32);
+    assert_eq!(remote.decrypt_from_bytes(&bytes[..len]).unwrap(), original);
+}
+
 #[test]
 fn relay_queue_full_and_writer_closed_are_safe_plaintext_retries() {
     for error in [

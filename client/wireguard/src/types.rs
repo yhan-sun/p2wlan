@@ -7,6 +7,7 @@
 //! - Type 4: Transport Data (variable, min 32 bytes)
 
 use crate::error::{Result, WireGuardError};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Message type for handshake initiation.
 pub const TYPE_INITIALIZATION: u8 = 1;
@@ -328,7 +329,7 @@ impl PeerConfig {
 }
 
 /// Session keys established after a successful handshake.
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SessionKeys {
     /// Key for sending (our direction).
     pub send_key: [u8; 32],

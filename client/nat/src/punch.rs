@@ -50,6 +50,9 @@ const PUNCH_VERSION: u8 = 1;
 /// Authenticated protocol version.
 const AUTH_PUNCH_VERSION: u8 = 2;
 
+/// Session-opaque authenticated probes. This version never carries node IDs.
+pub const OPAQUE_PUNCH_VERSION: u8 = 3;
+
 /// Punch packet type.
 const TYPE_PUNCH: u8 = 1;
 /// ACK packet type.
@@ -137,6 +140,8 @@ pub struct DecodedPunchPacket {
 /// Identity fields that can be read before validating a v2 probe MAC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedPunchIdentity {
+    /// Wire version; version 3 identity fields are opaque session labels.
+    pub version: u8,
     /// Packet kind.
     pub kind: PunchPacketKind,
     /// Source node ID claimed by the sender.
@@ -150,6 +155,7 @@ pub struct AuthenticatedPunchIdentity {
 }
 
 mod authenticated;
+mod opaque;
 mod packet;
 mod runtime;
 
@@ -157,6 +163,10 @@ pub use authenticated::{
     build_authenticated_punch_ack, build_authenticated_punch_packet,
     build_authenticated_punch_packet_with_nomination, build_authenticated_punch_packet_with_nonce,
     decode_authenticated_punch_packet, peek_authenticated_punch_identity,
+};
+pub use opaque::{
+    build_authenticated_punch_ack_for_received, build_opaque_punch_packet_with_nomination,
+    opaque_probe_identity,
 };
 pub use packet::{
     build_punch_ack, build_punch_packet, build_punch_packet_with_nonce, decode_punch_packet,

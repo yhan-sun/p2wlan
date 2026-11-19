@@ -188,6 +188,27 @@ impl PeerManager {
         info: &PeerInfo,
         signal_context: Option<(&str, Option<u64>, &str)>,
     ) -> PeerUpdate {
+        // This owner also receives roster repairs and direct event callers.
+        // Enforce the immutable local policy here, not only in HTTP polling.
+        // Retire any existing membership so its cached/session evidence cannot
+        // continue authorizing traffic after an untrusted replacement.
+        if !self.peer_trust_validated
+            || !self.config.network.peer_identity_allowed(
+                &info.node_id,
+                &info.public_key,
+                &info.virtual_ip,
+            )
+        {
+            self.remove_peer(&info.node_id).await;
+            warn!(
+                reason_code = "peer_identity_untrusted",
+                "Peer identity rejected by local policy"
+            );
+            return PeerUpdate {
+                last_seen_only: true,
+                ..PeerUpdate::default()
+            };
+        }
         #[cfg(test)]
         self.notify_peer_add_wait_started_for_test();
         if let Some(update) = self.try_refresh_peer_last_seen(info) {
@@ -285,10 +306,17 @@ impl PeerManager {
                     hh2_pair_nomination: old_capabilities.hh2_pair_nomination
                         && info.capabilities.hh2_pair_nomination,
                     hh2_plan_v2: old_capabilities.hh2_plan_v2 && info.capabilities.hh2_plan_v2,
+                    probe_opaque_ids_v1: old_capabilities.probe_opaque_ids_v1
+                        && info.capabilities.probe_opaque_ids_v1,
                 }
             } else {
                 info.capabilities
             };
+        if is_new || public_key_changed || registration_changed {
+            conn.opaque_probe_required = info.capabilities.probe_opaque_ids_v1;
+        } else {
+            conn.opaque_probe_required |= old_capabilities.probe_opaque_ids_v1;
+        }
         conn.registration_seq = info.registration_seq;
         if old_capabilities.supports_hh2() && !conn.capabilities.supports_hh2() {
             clear_hard_hard_after_lock = true;

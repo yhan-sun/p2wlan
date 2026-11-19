@@ -19,7 +19,8 @@ fn capabilities_require_both_explicit_bits_and_never_infer_app_version() {
     }
     assert!(PeerCapabilities {
         hh2_pair_nomination: true,
-        hh2_plan_v2: true
+        hh2_plan_v2: true,
+        probe_opaque_ids_v1: false,
     }
     .supports_hh2());
     let mut upgraded = legacy.clone();
@@ -45,6 +46,7 @@ async fn local_hh2_eligibility_requires_current_server_accepted_registration() {
         PeerCapabilities {
             hh2_pair_nomination: true,
             hh2_plan_v2: true,
+            probe_opaque_ids_v1: false,
         },
     );
     assert_eq!(client.local_hh2_registration_seq(), Some(8));
@@ -57,6 +59,7 @@ async fn local_hh2_eligibility_requires_current_server_accepted_registration() {
         PeerCapabilities {
             hh2_pair_nomination: true,
             hh2_plan_v2: true,
+            probe_opaque_ids_v1: false,
         },
     );
     assert!(client.local_hh2_registration_seq().is_none());

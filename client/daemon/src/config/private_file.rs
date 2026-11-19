@@ -2,6 +2,7 @@
 //! preparation command owns path authorization; this writer never follows a
 //! config/temp link or derives ownership from an environment variable.
 
+use fs2::FileExt;
 use std::ffi::{CString, OsStr};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Write};
@@ -51,7 +52,7 @@ fn inspect_target(
     directory: &File,
     name: &CString,
     owner: ConfigOwner,
-) -> io::Result<Option<FileIdentity>> {
+) -> io::Result<Option<(FileIdentity, File)>> {
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -82,10 +83,13 @@ fn inspect_target(
             "config target belongs to a different user",
         ));
     }
-    Ok(Some(FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }))
+    Ok(Some((
+        FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+        file,
+    )))
 }
 
 struct PendingConfig<'a> {
@@ -145,7 +149,11 @@ impl Drop for PendingConfig<'_> {
     }
 }
 
-pub(super) fn save(path: &Path, content: &[u8]) -> io::Result<()> {
+pub(super) fn save(
+    path: &Path,
+    content: &[u8],
+    expected_protection: Option<&super::IdentityProtection>,
+) -> io::Result<()> {
     let name = file_name(path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "config path has no file name")
     })?)?;
@@ -159,7 +167,16 @@ pub(super) fn save(path: &Path, content: &[u8]) -> io::Result<()> {
         .open(parent)?;
     let directory_metadata = directory.metadata()?;
     let owner = ConfigOwner::from_directory(&directory_metadata);
-    let expected = inspect_target(&directory, &name, owner)?;
+    // Scope the short publication lock to this pinned directory descriptor.
+    // Inspect and compare the current envelope before creating a temp file.
+    directory.try_lock_exclusive()?;
+    let expected = match inspect_target(&directory, &name, owner)? {
+        Some((identity, file)) => {
+            super::check_identity_protection_before_save(file, expected_protection)?;
+            Some(identity)
+        }
+        None => None,
+    };
     let mut pending = PendingConfig::create(&directory)?;
     if owner.elevated
         && unsafe { libc::fchown(pending.file.as_raw_fd(), owner.uid, owner.gid) } != 0
@@ -175,7 +192,7 @@ pub(super) fn save(path: &Path, content: &[u8]) -> io::Result<()> {
     let current_directory = directory.metadata()?;
     if (current_directory.uid(), current_directory.gid())
         != (directory_metadata.uid(), directory_metadata.gid())
-        || inspect_target(&directory, &name, owner)? != expected
+        || inspect_target(&directory, &name, owner)?.map(|(identity, _)| identity) != expected
     {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,

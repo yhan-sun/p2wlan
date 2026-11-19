@@ -26,6 +26,11 @@ var (
 	ErrUnauthorized       = errors.New("unauthorized")
 )
 
+// Match the registration bcrypt cost even when an account does not exist.
+// This public dummy hash never grants authentication; it only avoids a fast
+// account-lookup rejection that reveals registered login identifiers.
+const dummyLoginPasswordHash = "$2a$10$/YDLDyWS0ZWJje.p/ZtmEejfmDJ72Ujh/HtFH8O6Cz3Nt/kSHF8OK"
+
 // Service provides authentication operations.
 type Service struct {
 	jwtSecret []byte
@@ -52,6 +57,7 @@ func (s *Service) Login(identifier, password string) (string, *database.User, er
 	user, err := s.db.GetUserByLoginIdentifier(identifier)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			_ = bcrypt.CompareHashAndPassword([]byte(dummyLoginPasswordHash), []byte(password))
 			return "", nil, ErrInvalidCredentials
 		}
 		return "", nil, fmt.Errorf("read login account: %w", err)

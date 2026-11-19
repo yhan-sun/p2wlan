@@ -173,7 +173,8 @@ pub struct Daemon {
 impl Daemon {
     /// Create a new daemon from config.
     pub fn new(config: Config) -> Self {
-        let control_enabled = !config.network.manual;
+        let control_enabled =
+            !config.network.manual && config.network.validate_peer_trust().is_ok();
         let config_path = config.config_path.clone();
         let relay_selection = Arc::new(RwLock::new(RelaySelectionDiagnostics::default()));
         // The fresh-mapping prediction incarnation epoch: a persistent
@@ -221,12 +222,14 @@ impl Daemon {
             Some(health.clone()),
             Some(peers.telemetry_hub()),
         );
+        peers.bind_opaque_probe_registration(control.clone());
         let resource_capture =
             crate::dataplane_resources::RuntimeResourceCapture::from_config(&config.diagnostics);
         let (transport, outbound_rx) = WireGuardTransport::new_for_daemon(
             config.network.validate_overlay || crate::os_request_capture::requested_from_env(),
             resource_capture.as_ref().map(|run| run.capture().clone()),
         );
+        let transport = transport.with_business_padding_16(config.network.business_padding_16);
         let acl_engine = AclEngine::from_config(&config.acl);
         let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
 

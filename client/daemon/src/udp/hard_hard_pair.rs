@@ -267,8 +267,11 @@ impl UdpTransport {
                 let Some(local_id) = self.local_node_id.as_deref() else {
                     return;
                 };
-                let ack =
-                    build_authenticated_punch_ack(packet.nonce, local_id, peer, generation, key);
+                let Some(ack) = build_authenticated_punch_ack_for_received(
+                    packet, local_id, peer, generation, key,
+                ) else {
+                    return;
+                };
                 if self
                     .send_hh2_probe_ack(
                         &_epoch,
@@ -384,6 +387,7 @@ impl UdpTransport {
         bytes: &[u8],
         nomination_request: bool,
     ) -> std::io::Result<usize> {
+        let send_fence = self.peers.try_snapshot_probe_send_fence(peer, false);
         let rejected = || {
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -423,7 +427,17 @@ impl UdpTransport {
                 }
                 // Cancellation, action deadline and exact socket identity are
                 // rechecked after every await, immediately before kernel IO.
-                match socket.try_send_to(bytes, pair.remote_endpoint) {
+                let Some(send_fence) = send_fence.as_ref() else {
+                    return Err(rejected());
+                };
+                let handoff = match self.peers.with_probe_send_fence(send_fence, bytes, || {
+                    socket.try_send_to(bytes, pair.remote_endpoint)
+                }) {
+                    Ok(result) => result,
+                    Err(crate::peer::ProbeSendFenceError::Busy) => continue,
+                    Err(crate::peer::ProbeSendFenceError::Revoked) => return Err(rejected()),
+                };
+                match handoff {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                     Ok(sent) => {
                         permit.record_handoff(

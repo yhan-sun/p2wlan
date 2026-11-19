@@ -159,6 +159,8 @@ pub struct PeerCapabilities {
     pub hh2_pair_nomination: bool,
     #[serde(default)]
     pub hh2_plan_v2: bool,
+    #[serde(default)]
+    pub probe_opaque_ids_v1: bool,
 }
 
 impl PeerCapabilities {
@@ -166,6 +168,7 @@ impl PeerCapabilities {
         Self {
             hh2_pair_nomination: true,
             hh2_plan_v2: true,
+            probe_opaque_ids_v1: true,
         }
     }
 

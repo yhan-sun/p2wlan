@@ -5,6 +5,35 @@ mod tests {
     use crate::types::AEAD_TAG_SIZE;
     use p2pnet_crypto::NodeIdentity;
 
+    #[test]
+    fn session_owns_zeroizing_keys_after_handshake_keys_are_cleared() {
+        use zeroize::{Zeroize, ZeroizeOnDrop};
+        fn requires_zeroizing_drop<T: ZeroizeOnDrop>(_: &T) {}
+
+        let mut keys = TransportKeyPair {
+            send_key: [0x42; 32],
+            recv_key: [0x73; 32],
+            our_index: 1,
+            peer_index: 2,
+        };
+        let mut receiver = TransportSession::new(TransportKeyPair {
+            send_key: keys.recv_key,
+            recv_key: keys.send_key,
+            our_index: keys.peer_index,
+            peer_index: keys.our_index,
+        });
+        let mut sender = TransportSession::new(keys.clone());
+        requires_zeroizing_drop(&sender.send_key);
+        requires_zeroizing_drop(&sender.recv_key);
+        keys.zeroize();
+
+        let encrypted = sender.encrypt(b"session key ownership").unwrap();
+        assert_eq!(
+            receiver.decrypt(&encrypted).unwrap(),
+            b"session key ownership"
+        );
+    }
+
     fn establish_session() -> (TransportSession, TransportSession) {
         let init_id = NodeIdentity::generate();
         let resp_id = NodeIdentity::generate();

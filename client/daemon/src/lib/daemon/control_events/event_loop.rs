@@ -217,6 +217,18 @@ impl Daemon {
                             ),
                             event => (event, None, None),
                         };
+                        // Preserve canonical PeerLeft cleanup for a direct
+                        // event injection or non-HTTP roster producer too.
+                        let event = match event {
+                            ControlEvent::PeerJoined(info) | ControlEvent::PeerUpdated(info)
+                                if !self.config.network.peer_identity_allowed(
+                                    &info.node_id, &info.public_key, &info.virtual_ip,
+                                ) => {
+                                    warn!(reason_code = "peer_identity_untrusted", "Peer roster event rejected by local policy");
+                                    ControlEvent::PeerLeft(info.node_id)
+                                }
+                            event => event,
+                        };
                         let event_kind = control_event_kind(&event);
                         log_control_event_phase(event_kind, "dequeued");
                         if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
@@ -280,13 +292,6 @@ impl Daemon {
                                 &relay_servers,
                                 self.config.relay.allow_insecure_plaintext,
                             );
-                            if allow_insecure_plaintext
-                                && !self.config.relay.allow_insecure_plaintext
-                            {
-                                info!(
-                                    "Allowing plaintext relay because HTTP control plane supplied legacy relay candidates"
-                                );
-                            }
             spawn_relay_inbound(RelayInboundSpawnContext {
                 task_manager: self.task_manager.clone(),
                 relay_candidates,

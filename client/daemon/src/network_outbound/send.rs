@@ -215,8 +215,9 @@ async fn encrypt_then_send_bounded(
         // Materialize real wire storage after the original emit turn and endpoint
         // query. Emit wait retains only its original plaintext buffer budget;
         // the same outer timeout/cancellation owner covers this allocation.
-        let prepared_wire = match crate::transport::PreparedEncryptionBuffer::new(
-            packet.packet.len(),
+        let mut prepared_wire = match crate::transport::PreparedEncryptionBuffer::new_for_business(
+            &packet.packet,
+            transport.business_padding_16_enabled(),
             transport.resource_capture(),
         ) {
             Ok(prepared) => prepared,
@@ -388,6 +389,22 @@ async fn encrypt_then_send_bounded(
             } else {
                 None
             };
+            // Only an exact confirmed Direct budget authorizes extra bytes.
+            // Relay is a TLS byte stream; use the conservative baseline there.
+            // Unknown/legacy Direct paths retain their original packet sizes.
+            let padding_limit = direct_business_plan.as_ref().map_or_else(
+                || {
+                    if force_relay || selection.path == Some(NetworkPath::Relay) {
+                        (crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE
+                            - crate::dplpmtud::WIREGUARD_UDP_DATAGRAM_OVERHEAD)
+                            as usize
+                    } else {
+                        packet.packet.len()
+                    }
+                },
+                |plan| plan.prepared.token.max_overlay_payload_size.0 as usize,
+            );
+            prepared_wire.limit_ip_padding(padding_limit);
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::OriginalEcho);
             if let Some(echo) = packet.original_echo() {
                 if packet.binding().is_none_or(|binding| {
@@ -1089,6 +1106,19 @@ async fn send_encrypted_packet_once_with_origin(
             relay_endpoint = relay.as_ref().map(RelayTransport::endpoint),
             "encrypted packet is entering the selected transport handoff"
         );
+        if direct_business_plan.is_none()
+            && selection.path == Some(NetworkPath::Direct)
+            && packet.wire_bytes.len()
+                > inner_ip_packet_len
+                    .saturating_add(crate::dplpmtud::WIREGUARD_UDP_DATAGRAM_OVERHEAD as usize)
+        {
+            // A Relay-prepared padded packet may race a Direct promotion.
+            // It cannot borrow an unknown UDP budget. No I/O has begun: the
+            // existing stale-budget outcome retries only the original IP packet.
+            return SendOutcome::DirectBudgetStale {
+                reason: "padded ciphertext requires its original confirmed Direct budget".into(),
+            };
+        }
         if let Some(plan) = direct_business_plan {
             let token = &plan.prepared.token;
             let current_udp_matches = udp.as_ref().is_some_and(|current| {

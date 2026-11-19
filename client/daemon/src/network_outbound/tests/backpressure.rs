@@ -1,3 +1,4 @@
+use super::super::send::encrypt_then_send;
 use super::super::test_support::*;
 use super::*;
 use crate::config::Config;
@@ -93,6 +94,116 @@ async fn confirmed_direct(
         .expect("the loopback UDP socket must become writable")
         .unwrap();
     lease
+}
+
+#[tokio::test]
+async fn business_padding_16_managed_udp_respects_budget_and_leaves_size_probes_exact() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = receiver.local_addr().unwrap();
+    peers.add_peer(&test_peer("peer-a", endpoint)).await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    udp.set_inbound_publication_owner(608);
+    let lease = confirmed_direct(&peers, &udp, endpoint).await;
+    let DirectBusinessBudgetGate::Ready(prepared) =
+        udp.prepare_direct_business_send("peer-a", endpoint).await
+    else {
+        panic!("confirmed fixture needs a budget");
+    };
+    let budget = prepared.token.max_overlay_payload_size.0 as usize;
+    let udp_limit = prepared.token.max_udp_datagram_size.0 as usize;
+    let udps = RwLock::new(Some(udp.clone()));
+    let relays = RwLock::new(None);
+    let plan = udp
+        .dplpmtud_runtime()
+        .schedule_probe(
+            "peer-a",
+            &lease.identity,
+            lease.worker_owner_token,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .expect("confirmed fixture must schedule the next exact-size probe");
+    let probe = crate::dplpmtud::build_encrypted_probe_plaintext(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        &lease.identity,
+        &plan,
+    )
+    .unwrap();
+    for enabled in [false, true] {
+        let (transport, _outbound) = WireGuardTransport::new();
+        let transport = transport.with_business_padding_16(enabled);
+        let (local, mut remote) = establish_sessions();
+        transport.add_session("peer-a", local).await;
+        for len in [29, budget - 1, budget] {
+            let packet = Ipv4Packet::build_icmp_echo_request(
+                "10.20.0.1".parse().unwrap(),
+                "10.20.0.2".parse().unwrap(),
+                7,
+                8,
+                &vec![0xab; len - 28],
+            );
+            let outcome = encrypt_then_send(
+                OutboundPacket {
+                    room_authorization: None,
+                    peer_id: "peer-a".into(),
+                    dst_ip: "10.20.0.2".into(),
+                    packet: packet.clone(),
+                    trace: None,
+                },
+                &transport,
+                &peers,
+                peers.current_network_generation_sync(),
+                true,
+                &udps,
+                &relays,
+                false,
+            )
+            .await;
+            assert!(matches!(outcome, EncryptSendOutcome::Sent));
+            let mut wire = vec![0; 2048];
+            let (len, _) = timeout(Duration::from_secs(2), receiver.recv_from(&mut wire))
+                .await
+                .unwrap()
+                .unwrap();
+            wire.truncate(len);
+            let target = packet.len().div_ceil(16) * 16;
+            let expected = if enabled && target <= budget {
+                target
+            } else {
+                packet.len()
+            };
+            assert_eq!(wire.len(), expected + 32);
+            assert!(wire.len() <= udp_limit);
+            assert_eq!(remote.decrypt_from_bytes(&wire).unwrap(), packet);
+        }
+
+        // The real DPLPMTUD builder deliberately requests a precise wire size.
+        // It uses the control encryption entry, independent of the opt-in bit.
+        let encrypted = transport
+            .encrypt_outbound(OutboundPacket {
+                room_authorization: None,
+                peer_id: "peer-a".into(),
+                dst_ip: "10.20.0.2".into(),
+                packet: probe.clone(),
+                trace: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            encrypted.wire_bytes.len(),
+            plan.wire_token.candidate_udp_datagram_size.0 as usize
+        );
+        assert_eq!(
+            remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+            probe
+        );
+    }
 }
 
 fn packet_queue(generation: u64, deadline: Instant) -> (PeerPendingQueue, Vec<Vec<u8>>) {

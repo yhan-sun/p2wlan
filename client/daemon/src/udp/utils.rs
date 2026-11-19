@@ -32,7 +32,9 @@ fn is_ignorable_udp_receive_error(error: &std::io::Error) -> bool {
 }
 
 fn is_authenticated_punch_candidate(data: &[u8]) -> bool {
-    data.len() >= 5 && data.starts_with(&[0x50, 0x4e, 0x43, 0x48]) && data[4] == 2
+    data.len() >= 5
+        && data.starts_with(&[0x50, 0x4e, 0x43, 0x48])
+        && matches!(data[4], 2 | OPAQUE_PUNCH_VERSION)
 }
 
 fn stun_transaction_id(data: &[u8]) -> Option<StunTransactionId> {

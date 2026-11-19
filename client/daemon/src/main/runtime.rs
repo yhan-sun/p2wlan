@@ -168,6 +168,7 @@ async fn run_daemon_inner(
 
     // Check for --init flag (generate new config)
     if cli.init {
+        let _instance_lock = DaemonInstanceLock::acquire(&cli.config)?;
         let mut config = Config::generate_default(cli.control_url(), cli.network_id())?;
         validate_room_profile_overrides(&config, &cli)?;
         apply_cli_overrides(&mut config, &cli);
@@ -191,6 +192,11 @@ async fn run_daemon_inner(
 
     // Load config
     let config_path = &cli.config;
+    // Hold the instance lock before reading config so an administrative key
+    // migration cannot race a startup that still has old plaintext settings.
+    let instance_lock = (!cli.status)
+        .then(|| DaemonInstanceLock::acquire(config_path))
+        .transpose()?;
 
     let config = if config_path.exists() {
         match Config::load_from_file(config_path) {
@@ -201,7 +207,6 @@ async fn run_daemon_inner(
             }
             Err(e) => {
                 error!("Failed to load config: {}", e);
-                info!("Use --init to generate a new config");
                 return Err(e);
             }
         }
@@ -244,7 +249,8 @@ async fn run_daemon_inner(
     // Keep one owner for the TUN, control session, and UDP socket set associated
     // with this device identity. A duplicate daemon can consume the other
     // process's offer/answer signals and invalidate authenticated probe MACs.
-    let instance_lock = DaemonInstanceLock::acquire(config_path)?;
+    let instance_lock = instance_lock
+        .ok_or_else(|| DaemonError::Config("daemon instance lock was not acquired".into()))?;
     info!(
         "Acquired daemon instance lock at {}",
         instance_lock.path.display()

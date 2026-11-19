@@ -234,11 +234,16 @@ pub(crate) fn is_overlay_payload_candidate(packet: &[u8]) -> bool {
 /// IPv4 protocols (ICMP, TCP, UDP, etc.) so it is not tied to the harness-only
 /// overlay echo format.
 pub(crate) fn is_real_overlay_business_packet(packet: &[u8]) -> bool {
-    Ipv4Packet::new(packet).is_ok()
-        && !is_relay_validation_packet(packet)
-        && !is_rekey_confirmation_packet(packet)
-        && parse_direct_validation_token(packet).is_none()
-        && crate::dplpmtud::parse_control_packet(packet).is_none()
-        && crate::relay_probe::parse_relay_probe_token(packet).is_none()
-        && crate::path_commit::parse_path_commit_token(packet).is_none()
+    Ipv4Packet::new(packet).is_ok() && !is_internal_control_packet(packet)
+}
+
+/// Reuse the exact ingress classification when business preparation encounters
+/// an internal echo returned through the system TUN rather than its control lane.
+pub(super) fn is_internal_control_packet(packet: &[u8]) -> bool {
+    is_relay_validation_packet(packet)
+        || is_rekey_confirmation_packet(packet)
+        || parse_direct_validation_token(packet).is_some()
+        || crate::dplpmtud::parse_control_packet(packet).is_some()
+        || crate::relay_probe::parse_relay_probe_token(packet).is_some()
+        || crate::path_commit::parse_path_commit_token(packet).is_some()
 }

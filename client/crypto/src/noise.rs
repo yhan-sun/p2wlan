@@ -11,6 +11,7 @@
 use crate::aead;
 use crate::hash::{self, Hash};
 use crate::hkdf;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// The Noise protocol construction name for WireGuard.
 ///
@@ -37,7 +38,7 @@ pub const REJECT_AFTER_TIME: u64 = 180;
 ///
 /// This struct implements the core Noise operations used during
 /// the handshake phase.
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SymmetricState {
     /// The chaining key (32 bytes). Updated by MixKey operations.
     pub ck: Hash,
@@ -198,6 +199,23 @@ mod tests {
         assert!(debug.contains("[redacted]"));
         assert!(!debug.contains(&hex::encode(state.ck)));
         assert!(!debug.contains(&hex::encode(state.temp_k)));
+    }
+
+    #[test]
+    fn secret_state_clones_have_independent_zeroizing_lifetimes() {
+        fn requires_zeroizing_drop<T: ZeroizeOnDrop>(_: &T) {}
+
+        let mut state = SymmetricState::new();
+        state.mix_key(&[0x42; 32]);
+        let clone = state.clone();
+        requires_zeroizing_drop(&state);
+        requires_zeroizing_drop(&clone);
+        let expected = clone.derive_transport_keys();
+
+        state.zeroize();
+        assert_eq!(state.ck, [0; 32]);
+        assert_eq!(state.temp_k, [0; 32]);
+        assert_eq!(clone.derive_transport_keys(), expected);
     }
 
     #[test]

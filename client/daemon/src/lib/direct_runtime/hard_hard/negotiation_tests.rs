@@ -67,7 +67,10 @@ async fn cold_start_answer_accepts_and_fences_generation_zero() {
         peers
             .add_peer(&crate::control::PeerInfo {
                 node_id: "peer-negotiation".into(),
-                capabilities: crate::control::PeerCapabilities::current(),
+                capabilities: crate::control::PeerCapabilities {
+                    probe_opaque_ids_v1: false,
+                    ..crate::control::PeerCapabilities::current()
+                },
                 registration_seq: 202,
                 public_key: "pk".into(),
                 endpoint: answered[0].to_string(),
@@ -115,7 +118,10 @@ async fn new_registration_can_retry_hard_hard_without_heartbeat_budget_refills()
     );
     let mut info = crate::control::PeerInfo {
         node_id: "peer-restarted".into(),
-        capabilities: crate::control::PeerCapabilities::current(),
+        capabilities: crate::control::PeerCapabilities {
+            probe_opaque_ids_v1: false,
+            ..crate::control::PeerCapabilities::current()
+        },
         registration_seq: 202,
         public_key: "pk".into(),
         endpoint: "203.0.113.20:40001".into(),
@@ -445,7 +451,10 @@ async fn first_answer_returns_the_committed_claim_snapshot_without_relaxing_iden
     control.set_local_registration_for_test(Some(101), crate::control::PeerCapabilities::current());
     peers
         .add_peer(&crate::control::PeerInfo {
-            capabilities: crate::control::PeerCapabilities::current(),
+            capabilities: crate::control::PeerCapabilities {
+                probe_opaque_ids_v1: false,
+                ..crate::control::PeerCapabilities::current()
+            },
             registration_seq: 202,
             node_id: "peer-negotiation".into(),
             device_name: String::new(),
@@ -781,7 +790,10 @@ async fn production_hard_hard_retry_requires_current_recovery_feedback() {
     );
     let mut info = crate::control::PeerInfo {
         node_id: "peer-first-opportunity".into(),
-        capabilities: crate::control::PeerCapabilities::current(),
+        capabilities: crate::control::PeerCapabilities {
+            probe_opaque_ids_v1: false,
+            ..crate::control::PeerCapabilities::current()
+        },
         registration_seq: 202,
         public_key: "pk".into(),
         endpoint: "203.0.113.20:40001".into(),

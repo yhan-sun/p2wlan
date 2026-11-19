@@ -10,6 +10,9 @@ pub struct Config {
     pub config_path: Option<std::path::PathBuf>,
     /// Node identity.
     pub node: NodeConfig,
+    /// Optional wrapping of the persisted device private keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) identity_protection: Option<IdentityProtection>,
     /// Network settings.
     pub network: NetworkConfig,
     /// Control plane connection.
@@ -37,7 +40,7 @@ pub struct NodeConfig {
     pub node_id: String,
     /// X25519 public key (hex).
     pub public_key: String,
-    /// X25519 private key (hex, stored encrypted in production).
+    /// In-memory X25519 private key (hex). Config persistence may wrap it.
     pub private_key: String,
     /// Human-readable device name.
     #[serde(default = "default_device_name")]
@@ -103,6 +106,9 @@ fn default_platform() -> String {
 pub struct NetworkConfig {
     /// Network ID to join.
     pub network_id: String,
+    /// Optional locally verified peer identities. Never learned from Control.
+    #[serde(default)]
+    pub peer_trust: PeerTrustConfig,
     /// Whether to run in manual/offline mode.
     #[serde(default)]
     pub manual: bool,
@@ -116,6 +122,10 @@ pub struct NetworkConfig {
     /// MTU for the TUN interface.
     #[serde(default = "default_mtu")]
     pub mtu: u32,
+    /// Opt in to bounded sixteen-byte IP length buckets on budgeted business
+    /// sends. Unknown Direct budgets, control packets and probes stay unchanged.
+    #[serde(default)]
+    pub business_padding_16: bool,
     /// Subnet mask.
     #[serde(default = "default_netmask")]
     pub netmask: String,

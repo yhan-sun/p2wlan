@@ -117,6 +117,22 @@ struct ProbeSendFailure {
     physical_send_error_bytes: u64,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ProbeWritePreHandoffError {
+    #[error("probe send intent revoked")]
+    Revoked,
+    #[error("identified probe requires its original send fence")]
+    MissingFence,
+    #[error("probe readiness or authority stayed contended")]
+    Deadline,
+}
+
+fn stopped_before_probe_write(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<ProbeWritePreHandoffError>())
+}
+
 impl ProbeSendFailure {
     fn retryable_not_sent(&self) -> bool {
         matches!(
@@ -1094,12 +1110,38 @@ impl UdpTransport {
                 .unwrap_or(0);
             (generation, socket_epoch, cleanup_epoch)
         };
-        let requires_legacy_probe = !hh2
+        let probe_send_fence = match peer_id {
+            Some(peer) => Some(
+                self.peers
+                    .snapshot_probe_send_fence(peer, true)
+                    .await
+                    .ok_or_else(|| {
+                        ProbeSendFailure::new(
+                            ProbeSendFailureKind::ProbeRegistrationFailed,
+                            DaemonError::Network(
+                                "probe registration or binding unavailable".into(),
+                            ),
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let opaque_mode = Some(probe_send_fence.as_ref().is_some_and(|fence| fence.opaque));
+        let Some(opaque_mode) = opaque_mode else {
+            return Err(ProbeSendFailure::new(
+                ProbeSendFailureKind::ProbeRegistrationFailed,
+                DaemonError::Network(
+                    "opaque probe session or accepted capability unavailable".into(),
+                ),
+            ));
+        };
+        let requires_legacy_probe = !opaque_mode
+            && !hh2
             && match peer_id {
                 Some(peer_id) => self.peers.peer_requires_legacy_probe(peer_id).await,
                 None => true,
             };
-        let should_retransmit =
+        let mut should_retransmit =
             !hh2 && (use_candidate || purpose == PendingProbePurpose::ConsentCheck);
         let heartbeat_probe = purpose == PendingProbePurpose::RelayBackoffHeartbeat;
         let authenticated_probe = match (peer_id, self.local_node_id.as_deref()) {
@@ -1110,6 +1152,7 @@ impl UdpTransport {
                     .probe_key_and_session_for_peer(peer_id)
                     .await
                     .map(|(key, probe_session_id)| {
+                        let identity_key = key;
                         let key = if hh2 {
                             crate::peer::hard_hard_scoped_probe_key(
                                 &key,
@@ -1118,19 +1161,38 @@ impl UdpTransport {
                         } else {
                             key
                         };
-                        let (bytes, nonce) = build_authenticated_punch_packet_with_nomination(
-                            local_node_id,
-                            peer_id,
-                            generation,
-                            use_candidate,
-                            &key,
-                        );
+                        let (bytes, nonce) = if opaque_mode {
+                            build_opaque_punch_packet_with_nomination(
+                                local_node_id,
+                                peer_id,
+                                generation,
+                                use_candidate,
+                                &identity_key,
+                                &key,
+                            )
+                        } else {
+                            build_authenticated_punch_packet_with_nomination(
+                                local_node_id,
+                                peer_id,
+                                generation,
+                                use_candidate,
+                                &key,
+                            )
+                        };
                         (bytes, nonce, probe_session_id)
                     })
             }
             _ => None,
         };
 
+        if opaque_mode && authenticated_probe.is_none() {
+            return Err(ProbeSendFailure::new(
+                ProbeSendFailureKind::ProbeRegistrationFailed,
+                DaemonError::Network(
+                    "opaque probe key unavailable; legacy fallback disabled".into(),
+                ),
+            ));
+        }
         let (
             bytes,
             nonce,
@@ -1372,7 +1434,7 @@ impl UdpTransport {
                 .await;
         }
         let send_result = if hh2 {
-            self.send_hh2_probe_datagram(
+            self.send_hh2_probe_datagram_fenced(
                 socket_index,
                 &socket,
                 &bytes,
@@ -1381,18 +1443,28 @@ impl UdpTransport {
                 hard_hard_session_token.unwrap_or_default(),
                 purpose,
                 use_candidate,
+                probe_send_fence.as_ref(),
             )
             .await
         } else {
-            self.send_probe_datagram(&socket, &bytes, peer_addr)
+            self.send_probe_datagram(&socket, &bytes, peer_addr, probe_send_fence.as_ref())
                 .await
                 .map_err(|error| {
-                    ProbeSendFailure::with_physical_send_error(
-                        DaemonError::Network(format!(
-                            "UDP probe send to {peer_addr} failed: {error}"
-                        )),
-                        bytes.len(),
-                    )
+                    if stopped_before_probe_write(&error) {
+                        ProbeSendFailure::new(
+                            ProbeSendFailureKind::ProbeRegistrationFailed,
+                            DaemonError::Network(
+                                "probe send intent revoked or contended before handoff".into(),
+                            ),
+                        )
+                    } else {
+                        ProbeSendFailure::with_physical_send_error(
+                            DaemonError::Network(format!(
+                                "UDP probe send to {peer_addr} failed: {error}"
+                            )),
+                            bytes.len(),
+                        )
+                    }
                 })
         };
         let (first_send_at_ms, primary_bytes_sent) = match send_result {
@@ -1490,7 +1562,12 @@ impl UdpTransport {
                 )
             });
             match self
-                .send_probe_datagram(&socket, &legacy_probe, compatibility_addr)
+                .send_probe_datagram(
+                    &socket,
+                    &legacy_probe,
+                    compatibility_addr,
+                    probe_send_fence.as_ref(),
+                )
                 .await
             {
                 Ok(accepted) => {
@@ -1537,19 +1614,27 @@ impl UdpTransport {
                             legacy_probe,
                             peer_addr,
                             peer_id.map(str::to_string),
+                            probe_send_fence.clone(),
                         );
                     }
                 }
                 Err(err) => {
-                    if let Some(operation) = ordinary_compatibility.as_mut() {
-                        operation.complete(None, monotonic_millis());
+                    let not_handed = stopped_before_probe_write(&err);
+                    if !not_handed {
+                        if let Some(operation) = ordinary_compatibility.as_mut() {
+                            operation.complete(None, monotonic_millis());
+                        }
                     }
                     drop(ordinary_compatibility);
-                    physical_send_errors = physical_send_errors.saturating_add(1);
-                    physical_send_error_bytes =
-                        physical_send_error_bytes.saturating_add(legacy_probe.len() as u64);
-                    if let Some(recorder) = live_recorder.as_ref() {
-                        recorder.record_compatibility_error(legacy_probe.len());
+                    if not_handed {
+                        should_retransmit = false;
+                    } else {
+                        physical_send_errors = physical_send_errors.saturating_add(1);
+                        physical_send_error_bytes =
+                            physical_send_error_bytes.saturating_add(legacy_probe.len() as u64);
+                        if let Some(recorder) = live_recorder.as_ref() {
+                            recorder.record_compatibility_error(legacy_probe.len());
+                        }
                     }
                     #[cfg(test)]
                     if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
@@ -1574,6 +1659,7 @@ impl UdpTransport {
                 bytes,
                 peer_addr,
                 peer_id.map(str::to_string),
+                probe_send_fence,
             );
         }
         Ok(ProbeSendResult {
@@ -1592,14 +1678,56 @@ impl UdpTransport {
         socket: &UdpSocket,
         bytes: &[u8],
         peer_addr: SocketAddr,
+        fence: Option<&crate::peer::ProbeSendFence>,
     ) -> std::io::Result<usize> {
-        #[cfg(test)]
-        if self.should_fail_probe_send_for_test() {
-            return Err(std::io::Error::other(
-                "test-injected physical probe send failure",
-            ));
-        }
-        socket.send_to(bytes, peer_addr).await
+        let send = async {
+            loop {
+                socket.writable().await?;
+                let write = || {
+                    #[cfg(test)]
+                    if self.should_fail_probe_send_for_test() {
+                        return Err(std::io::Error::other(
+                            "test-injected physical probe send failure",
+                        ));
+                    }
+                    socket.try_send_to(bytes, peer_addr)
+                };
+                let result = match fence {
+                    Some(fence) => match self.peers.with_probe_send_fence(fence, bytes, write) {
+                        Ok(result) => result,
+                        Err(crate::peer::ProbeSendFenceError::Busy) => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Err(crate::peer::ProbeSendFenceError::Revoked) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                ProbeWritePreHandoffError::Revoked,
+                            ))
+                        }
+                    },
+                    None if bytes.len() == 14 && bytes.get(..5) == Some(b"PNCH\x01") => write(),
+                    None => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            ProbeWritePreHandoffError::MissingFence,
+                        ))
+                    }
+                };
+                match result {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    other => return other,
+                }
+            }
+        };
+        timeout(Duration::from_millis(100), send)
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    ProbeWritePreHandoffError::Deadline,
+                )
+            })?
     }
 
     #[cfg(test)]
@@ -1642,9 +1770,11 @@ impl UdpTransport {
         probe: Vec<u8>,
         peer_addr: SocketAddr,
         peer_id: Option<String>,
+        fence: Option<crate::peer::ProbeSendFence>,
     ) {
         let peer_label = peer_id.unwrap_or_else(|| peer_addr.to_string());
         let diagnostics = self.socket_pool_diagnostics.clone();
+        let transport = self.clone();
         #[cfg(test)]
         let capture_slot = self
             .probe_burst_capture_for_test
@@ -1653,7 +1783,10 @@ impl UdpTransport {
         let handle = tokio::spawn(async move {
             for delay_ms in PUNCH_PROBE_RETRANSMIT_DELAYS_MS {
                 sleep(Duration::from_millis(delay_ms)).await;
-                match socket.send_to(&probe, peer_addr).await {
+                match transport
+                    .send_probe_datagram(&socket, &probe, peer_addr, fence.as_ref())
+                    .await
+                {
                     Ok(_) => {
                         if let Some(metrics) = diagnostics.lock().await.get_mut(socket_index) {
                             metrics.probe_retransmissions_sent += 1;
@@ -1694,16 +1827,22 @@ impl UdpTransport {
         source: SocketAddr,
         peer_label: impl Into<String>,
     ) -> std::io::Result<()> {
-        socket.send_to(&ack, source).await?;
+        let peer_label = peer_label.into();
+        let fence = self.peers.try_snapshot_probe_send_fence(&peer_label, false);
+        self.send_probe_datagram(&socket, &ack, source, fence.as_ref())
+            .await?;
         self.update_socket_diagnostics(socket_index, |metrics| metrics.probe_acks_sent += 1)
             .await;
 
-        let peer_label = peer_label.into();
         let diagnostics = self.socket_pool_diagnostics.clone();
+        let transport = self.clone();
         tokio::spawn(async move {
             for delay_ms in PUNCH_ACK_RETRANSMIT_DELAYS_MS {
                 sleep(Duration::from_millis(delay_ms)).await;
-                match socket.send_to(&ack, source).await {
+                match transport
+                    .send_probe_datagram(&socket, &ack, source, fence.as_ref())
+                    .await
+                {
                     Ok(_) => {
                         if let Some(metrics) = diagnostics.lock().await.get_mut(socket_index) {
                             metrics.probe_ack_retransmissions_sent += 1;

@@ -85,7 +85,6 @@ impl StunClient {
     ) -> Result<BindingResponse> {
         // Build the Binding Request
         let mut msg = StunMessage::binding_request();
-        msg.add_attribute(StunAttribute::Software("P2PNet/0.1".to_string()));
         if change_ip || change_port {
             msg.add_attribute(StunAttribute::ChangeRequest {
                 change_ip,
@@ -248,6 +247,44 @@ pub mod test_helpers {
 mod tests {
     use super::*;
     use crate::client::test_helpers::spawn_mock_stun_server;
+
+    #[tokio::test]
+    async fn ordinary_stun_request_omits_product_software_and_preserves_change_request() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let responder = async {
+            let mut buffer = [0u8; 1024];
+            let (length, source) = server.recv_from(&mut buffer).await.unwrap();
+            let request = StunMessage::decode(&buffer[..length]).unwrap();
+            assert!(!request
+                .attributes
+                .iter()
+                .any(|attribute| matches!(attribute, StunAttribute::Software(_))));
+            assert!(request.attributes.iter().any(|attribute| matches!(
+                attribute,
+                StunAttribute::ChangeRequest {
+                    change_ip: true,
+                    change_port: true
+                }
+            )));
+            let mut response =
+                StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
+            response.add_attribute(StunAttribute::XorMappedAddress(source));
+            server.send_to(&response.encode(), source).await.unwrap();
+        };
+        let requester = async {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            StunClient::with_timeout(Duration::from_secs(1))
+                .binding_request_with_change(&socket, server_addr, true, true)
+                .await
+                .unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(responder, requester);
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn test_binding_request_reflexive_address() {

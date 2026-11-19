@@ -4,6 +4,22 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
             println!("{}", path.display());
             Ok(())
         }
+        ConfigCommand::ProtectIdentity {
+            key_file,
+            windows_dpapi,
+        } => {
+            use p2pnet_daemon::config::IdentityProtection;
+            reject_sudo_config_write()?;
+            let protection = match (key_file, windows_dpapi) {
+                (Some(path), false) => IdentityProtection::KeyFile { path },
+                (None, true) => IdentityProtection::WindowsDpapi,
+                _ => return Err("请选择一种设备私钥保护方式".to_string()),
+            };
+            Config::protect_identity_file(path, protection)
+                .map_err(|error| format!("无法保护设备私钥：{error}"))?;
+            println!("设备私钥已加密保存。现有设备公钥和身份保持有效。");
+            Ok(())
+        }
         ConfigCommand::Show => {
             let config = load_config(path)?;
             println!("配置文件：{}", path.display());
@@ -18,9 +34,15 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
             );
             println!("network = {}", config.network.network_id);
             println!("device-name = {}", config.node.device_name);
+            println!("device-public-key = {}", config.node.public_key);
+            println!("identity-protected = {}", config.identity_is_protected());
             println!("proxy-mode = {}", config.control.proxy_mode.as_label());
             println!("interface = {}", config.network.interface);
             println!("mtu = {}", config.network.mtu);
+            println!(
+                "business-padding-16 = {}",
+                config.network.business_padding_16
+            );
             println!("udp-bind = {}", config.network.udp_bind);
             println!(
                 "udp-advertise = {}",

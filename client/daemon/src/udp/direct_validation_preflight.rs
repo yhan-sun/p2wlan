@@ -142,18 +142,34 @@ impl UdpTransport {
         {
             return Err("preflight_owner_revoked");
         }
+        let send_fence = self
+            .peers
+            .try_snapshot_probe_send_fence(peer_id, true)
+            .ok_or("preflight_opaque_session_unavailable")?;
         let (key, probe_session_id) = self
             .peers
             .probe_key_and_session_for_peer(peer_id)
             .await
             .ok_or("preflight_v2_unavailable")?;
-        let (bytes, nonce) = build_authenticated_punch_packet_with_nomination(
-            local_node_id,
-            peer_id,
-            generation,
-            false,
-            &key,
-        );
+        let opaque_mode = send_fence.opaque;
+        let (bytes, nonce) = if opaque_mode {
+            build_opaque_punch_packet_with_nomination(
+                local_node_id,
+                peer_id,
+                generation,
+                false,
+                &key,
+                &key,
+            )
+        } else {
+            build_authenticated_punch_packet_with_nomination(
+                local_node_id,
+                peer_id,
+                generation,
+                false,
+                &key,
+            )
+        };
         let sessions = self.direct_validation.sessions.lock().await;
         let target = sessions
             .get(peer_id)
@@ -224,8 +240,10 @@ impl UdpTransport {
             pending.remove(&nonce);
             return Err("preflight_handoff_deadline_expired");
         }
-        match prepared.socket.try_send_to(&bytes, endpoint) {
-            Ok(sent) if sent == bytes.len() => {
+        match self.peers.with_probe_send_fence(&send_fence, &bytes, || {
+            prepared.socket.try_send_to(&bytes, endpoint)
+        }) {
+            Ok(Ok(sent)) if sent == bytes.len() => {
                 self.update_socket_diagnostics_try(prepared.socket_index, |metrics| {
                     metrics.probes_sent = metrics.probes_sent.saturating_add(1);
                 });

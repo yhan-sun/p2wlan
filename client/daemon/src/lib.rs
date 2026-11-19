@@ -169,7 +169,7 @@ use relay_runtime::{
     udp_observers_from_sources, RelaySupervisor,
 };
 #[cfg(test)]
-use relay_runtime::{relay_spec_is_plaintext, send_relay_validation_packet, RelayValidationPacket};
+use relay_runtime::{send_relay_validation_packet, RelayValidationPacket};
 #[cfg(test)]
 use transport::parse_direct_validation_token;
 use transport::{

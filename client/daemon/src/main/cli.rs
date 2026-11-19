@@ -108,6 +108,10 @@ struct Cli {
     #[arg(long)]
     relay: Option<String>,
 
+    /// Allow plaintext Relay TCP in an isolated development environment
+    #[arg(long)]
+    allow_insecure_plaintext_relay: bool,
+
     /// Override preferred relay regions (comma-separated)
     #[arg(long, name = "relay-regions")]
     relay_regions: Option<String>,

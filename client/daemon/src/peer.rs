@@ -10,6 +10,8 @@ mod connections;
 #[cfg(any(target_os = "linux", all(unix, test)))]
 pub(crate) use connections::{ConnectionsRefusalSnapshot, ConnectionsTraceLease};
 use connections::{ConnectionsTable, ConnectionsWriteGuard};
+mod opaque_probe;
+pub(crate) use opaque_probe::{OpaqueProbeRouteHints, ProbeSendFence, ProbeSendFenceError};
 mod last_seen;
 pub use last_seen::LastSeen;
 mod traffic_bytes;

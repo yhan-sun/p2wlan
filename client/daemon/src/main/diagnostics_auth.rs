@@ -510,6 +510,8 @@ fn publish_auth_file(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing auth file name")
     })?)?;
     let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+
         #[cfg(unix)]
         let mut file = open_auth_file_at(
             &discovery_lock.directory,

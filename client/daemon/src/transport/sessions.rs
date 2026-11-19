@@ -332,6 +332,7 @@ impl WireGuardTransport {
 
     fn with_raw_outbound_sink(outbound_tx: crate::request_carriage::RawOutboundSink) -> Self {
         Self {
+            business_padding_16: false,
             resource_capture: None,
             #[cfg(test)]
             resource_queue_gate: None,
@@ -353,6 +354,15 @@ impl WireGuardTransport {
             outbound_loss_sink: Arc::new(std::sync::Mutex::new(None)),
             outbound_loss_context: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn with_business_padding_16(mut self, enabled: bool) -> Self {
+        self.business_padding_16 = enabled;
+        self
+    }
+
+    pub(crate) fn business_padding_16_enabled(&self) -> bool {
+        self.business_padding_16
     }
 
     /// Install one aggregate observer before spawning the transport workers.

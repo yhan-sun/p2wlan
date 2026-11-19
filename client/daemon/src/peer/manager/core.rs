@@ -27,6 +27,7 @@ impl PeerManager {
         traversal_history_path: Option<PathBuf>,
         traversal_history: TraversalHistory,
     ) -> Self {
+        let peer_trust_validated = config.network.validate_peer_trust().is_ok();
         let (committed_business_path_change_tx, _) = tokio::sync::watch::channel(0);
         let (direct_first_deadline_change_tx, _) = tokio::sync::watch::channel(0);
         let (direct_business_budget_change_tx, _) = tokio::sync::watch::channel(0);
@@ -36,6 +37,8 @@ impl PeerManager {
         Self {
             local_node_id_for_traversal: std::sync::RwLock::new(config.node.node_id.clone()),
             connections: Arc::new(ConnectionsTable::new(HashMap::new())),
+            opaque_probe_routes: Arc::new(std::sync::Mutex::new(OpaqueProbeRouteHints::default())),
+            opaque_probe_registration: std::sync::OnceLock::new(),
             peer_membership: Arc::new(std::sync::RwLock::new(PeerMembershipState::default())),
             kernel_read_views: kernel_read_view::ReadViewRegistry::default(),
             #[cfg(test)]
@@ -119,6 +122,7 @@ impl PeerManager {
                 config.node.node_id.clone(),
                 config.network.network_id.clone(),
             )),
+            peer_trust_validated,
             config,
         }
     }

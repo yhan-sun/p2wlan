@@ -64,6 +64,16 @@ impl PeerManager {
         node_id: &str,
         sender_public_key: Option<&str>,
     ) -> bool {
+        if !self.peer_trust_validated {
+            return false;
+        }
+        if self.config.network.peer_trust.mode == crate::config::PeerTrustMode::Strict
+            && self.peer_identity_public_key_sync(node_id).is_none()
+        {
+            // Legacy signals can omit sender_public_key, but strict mode
+            // still requires a current peer admitted under the local pin.
+            return false;
+        }
         let Some(sender_public_key) = sender_public_key.map(str::trim) else {
             return true;
         };

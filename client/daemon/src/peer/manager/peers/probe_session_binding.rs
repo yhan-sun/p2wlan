@@ -376,6 +376,7 @@ impl PeerManager {
             },
             false,
         );
+        self.refresh_opaque_probe_routes(conn);
         true
     }
 
@@ -401,6 +402,7 @@ impl PeerManager {
             },
             false,
         );
+        self.refresh_opaque_probe_routes(conn);
         true
     }
 
@@ -425,13 +427,15 @@ impl PeerManager {
         let Some(conn) = conns.get_mut(node_id) else {
             return ProbeBindingStage::PeerMissing;
         };
-        stage_probe_session_binding_on_connection(
+        let outcome = stage_probe_session_binding_on_connection(
             conn,
             token,
             session_id,
             ephemeral_shared,
             promote_on_match,
-        )
+        );
+        self.refresh_opaque_probe_routes(conn);
+        outcome
     }
 
     /// Try to stage a Probe-v2 replacement without waiting for the global
@@ -455,13 +459,15 @@ impl PeerManager {
         let Some(conn) = conns.get_mut(node_id) else {
             return Some(ProbeBindingStage::PeerMissing);
         };
-        Some(stage_probe_session_binding_on_connection(
+        let outcome = stage_probe_session_binding_on_connection(
             conn,
             token,
             session_id,
             ephemeral_shared,
             promote_on_match,
-        ))
+        );
+        self.refresh_opaque_probe_routes(conn);
+        Some(outcome)
     }
 
     /// Extend a staged responder binding after the control-plane answer
@@ -515,6 +521,7 @@ impl PeerManager {
             },
             true,
         );
+        self.refresh_opaque_probe_routes(conn);
         true
     }
 
@@ -591,6 +598,7 @@ impl PeerManager {
             .remove(token)
             .expect("pending Probe binding checked above");
         install_active_probe_binding(conn, pending.binding, true);
+        self.refresh_opaque_probe_routes(conn);
         PendingProbeBindingCommitOutcome::Committed
     }
 
@@ -673,6 +681,7 @@ impl PeerManager {
             return false;
         }
         install_active_probe_binding(conn, pending.binding, true);
+        self.refresh_opaque_probe_routes(conn);
         true
     }
 
@@ -699,6 +708,7 @@ impl PeerManager {
             .await
             .get(node_id)
             .and_then(|connection| {
+                self.refresh_active_opaque_probe_route(connection);
                 effective_probe_mac_key(connection)
                     .map(|key| (key, connection.probe_session_id.clone()))
             })

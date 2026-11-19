@@ -12,6 +12,9 @@ include!("tests/part09.rs");
 include!("tests/socket_handoff.rs");
 include!("tests/keepalive_shadow.rs");
 
+#[path = "tests/opaque_probe.rs"]
+mod opaque_probe;
+
 #[path = "tests/committed_socket_resolution.rs"]
 mod committed_socket_resolution;
 

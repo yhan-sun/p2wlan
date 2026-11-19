@@ -122,8 +122,6 @@ impl UdpTransport {
     }
 }
 
-pub(super) const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
-
 pub(crate) fn monotonic_millis() -> u64 {
     static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     // Zero is reserved for a missing response in MappingObservation. Never
@@ -370,9 +368,6 @@ impl UdpTransport {
             let request_deadline = deadline.min(tokio::time::Instant::now() + per_sample_timeout);
 
             let mut request = StunMessage::binding_request();
-            request.add_attribute(StunAttribute::Software(
-                MEASUREMENT_SOFTWARE_TAG.to_string(),
-            ));
             let transaction_id = request.transaction_id;
             let encoded = request.encode();
             let (response_tx, response_rx) = oneshot::channel();

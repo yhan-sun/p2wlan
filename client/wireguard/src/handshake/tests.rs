@@ -188,6 +188,35 @@ mod tests {
     }
 
     #[test]
+    fn transport_key_clones_have_independent_zeroizing_lifetimes() {
+        fn requires_zeroizing_drop<T: ZeroizeOnDrop>(_: &T) {}
+
+        let mut keys = TransportKeyPair {
+            send_key: [0x42; 32],
+            recv_key: [0x73; 32],
+            our_index: 1,
+            peer_index: 2,
+        };
+        let clone = keys.clone();
+        requires_zeroizing_drop(&keys);
+        requires_zeroizing_drop(&clone);
+        keys.zeroize();
+        assert_eq!(keys.send_key, [0; 32]);
+        assert_eq!(keys.recv_key, [0; 32]);
+        assert_eq!(clone.send_key, [0x42; 32]);
+        assert_eq!(clone.recv_key, [0x73; 32]);
+    }
+
+    #[test]
+    fn initiator_rejects_non_contributory_responder_public_key() {
+        let mut low_order = [0u8; 32];
+        low_order[0] = 1;
+        let mut initiator = HandshakeInitiator::new(NodeIdentity::generate(), low_order, None);
+        assert!(initiator.create_initiation().is_err());
+        assert!(initiator.ephemeral.is_none());
+    }
+
+    #[test]
     fn test_handshake_with_psk() {
         let initiator_identity = NodeIdentity::generate();
         let responder_identity = NodeIdentity::generate();

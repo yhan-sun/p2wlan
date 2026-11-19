@@ -210,6 +210,23 @@ impl Daemon {
         peer_info: &control::PeerInfo,
         reservation: &mut HandshakeStartReservation,
     ) -> Result<Option<u64>> {
+        // Prepared/retry work carries a PeerInfo snapshot across awaits.
+        // Local pins are immutable for this process and cannot be replaced
+        // by a current Control lifecycle with a different identity tuple.
+        if !self.config.network.peer_identity_allowed(
+            &peer_info.node_id,
+            &peer_info.public_key,
+            &peer_info.virtual_ip,
+        ) {
+            self.pending_handshakes
+                .lock()
+                .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
+            warn!(
+                reason_code = "peer_identity_untrusted",
+                "Initiator snapshot rejected by local policy"
+            );
+            return Ok(None);
+        }
         if let Some(stale_session_id) = reservation.stale_session_id.take() {
             self.peers
                 .discard_pending_probe_session_binding(&peer_info.node_id, &stale_session_id)
