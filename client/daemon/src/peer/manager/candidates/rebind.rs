@@ -9,6 +9,7 @@ struct DirectSourceObservation {
     source: SocketAddr,
     received: Instant,
     changed_at: Option<Instant>,
+    deferred: bool,
     challenge: Option<SocketAddr>,
     owner: Option<u64>,
 }
@@ -38,6 +39,7 @@ impl PeerConnection {
                 source,
                 received,
                 changed_at: None,
+                deferred: false,
                 challenge: None,
                 owner: None,
             });
@@ -51,15 +53,20 @@ impl PeerConnection {
         let allowed = last
             .changed_at
             .is_none_or(|at| received.duration_since(at) >= REBIND_CHECK_INTERVAL);
-        let changed = fresh && last.source != source && allowed;
         // A commit resets the source baseline, but keeps the rate limit. A
         // stable asymmetric peer naturally receives on a different port.
-        if changed {
-            last.changed_at = Some(received);
-            last.challenge = Some(source);
-            last.owner = None;
-        } else if !fresh || last.challenge != Some(source) {
+        if !fresh {
+            last.deferred = false;
             last.challenge = None;
+        } else if last.source != source || last.deferred {
+            // Multiple moves within the window only update the observed
+            // source. A fresh authenticated packet must still arrive when due.
+            last.deferred = !allowed;
+            last.challenge = allowed.then_some(source);
+            if allowed {
+                last.changed_at = Some(received);
+                last.owner = None;
+            }
         }
         last.received = received;
         last.target = target;

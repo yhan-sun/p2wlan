@@ -145,6 +145,46 @@ async fn assert_stale_consent(
 }
 
 #[tokio::test]
+async fn repeated_port_changes_challenge_only_the_latest_source_after_cooldown() {
+    let end = TokioInstant::now() + Duration::from_secs(3);
+    let local = "127.0.0.1:47000".parse().unwrap();
+    let remote: SocketAddr = "127.0.0.1:48000".parse().unwrap();
+    let peers = PeerManager::new(test_config());
+    let node = "repeated-port-change";
+    peers.add_peer(&sequence_peer(node, remote)).await;
+    host_candidates(&peers, node, remote, 5, end).await;
+    let active = original_lan_commit(&peers, node, remote, local, end).await;
+    let mut locks = peers.connections.write().await;
+    let conn = locks.get_mut(node).unwrap();
+    let now = Instant::now();
+    let endpoint = |port| SocketAddr::new(remote.ip(), port);
+    let mut observe = |port, seconds_ago| {
+        let source = endpoint(port);
+        conn.observe_direct_source(
+            active.generation,
+            Some(active.peer_session_generation),
+            local,
+            source,
+            now - Duration::from_secs(seconds_ago),
+        );
+        conn.may_validate_alternate(active.generation, source)
+    };
+
+    observe(48001, 12); // Stable asymmetric baseline.
+    observe(48002, 10); // Starts the eight-second budget window.
+    assert!(!observe(48003, 7));
+    assert!(!observe(48004, 5));
+    assert!(!observe(48004, 3));
+    assert!(observe(48004, 2)); // Same source, now at the budget boundary.
+    assert!(!conn.may_validate_alternate(active.generation, endpoint(48002)));
+    assert!(!conn.may_validate_alternate(active.generation, endpoint(48003)));
+    assert_eq!(
+        conn.direct_consent_path(active.generation).unwrap().path,
+        active
+    );
+}
+
+#[tokio::test]
 async fn authenticated_port_change_is_bound_to_the_original_socket_and_peer() {
     let end = TokioInstant::now() + Duration::from_secs(3);
     let local = "127.0.0.1:47000".parse().unwrap();
