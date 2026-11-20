@@ -142,6 +142,9 @@ func main() {
 	}
 
 	// Start server
+	wakeMaintenanceContext, stopWakeMaintenance := context.WithCancel(context.Background())
+	defer stopWakeMaintenance()
+	go maintainWakeJobs(wakeMaintenanceContext, db)
 	go func() {
 		log.Printf("Listening on %s", addr)
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
@@ -153,6 +156,7 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
+	stopWakeMaintenance()
 
 	log.Println("Shutting down...")
 
@@ -165,6 +169,21 @@ func main() {
 	hub.Close()
 
 	log.Println("Server stopped")
+}
+
+func maintainWakeJobs(ctx context.Context, db *database.DB) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		if err := db.MaintainWakeJobs(ctx, time.Now()); err != nil && ctx.Err() == nil {
+			log.Println("Wake job maintenance failed")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // registerDeviceControlRoutes installs every daemon/device-token control
@@ -211,6 +230,7 @@ func registerDeviceControlRoutes(mux *http.ServeMux, authService *auth.Service, 
 
 	// Authoritative daemon path telemetry route.
 	mux.HandleFunc("POST /api/v1/telemetry/paths", anySessionAuth(apiServer.SubmitPathTelemetry))
+	apiServer.RegisterWakeRoutes(mux)
 
 	// Device-authenticated WebSocket wake-up channel. Signal payloads remain
 	// durable in the database and are consumed through GET /api/v1/signals.

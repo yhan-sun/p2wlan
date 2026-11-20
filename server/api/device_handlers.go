@@ -181,9 +181,10 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		req.VirtualIP,
 		req.AppVersion,
 		database.DeviceRegistrationAttempt{
-			Incarnation:        req.RegistrationIncarnation,
-			EnforceIncarnation: true,
-			Capabilities:       req.Capabilities,
+			Incarnation:         req.RegistrationIncarnation,
+			EnforceIncarnation:  true,
+			Capabilities:        req.Capabilities,
+			WakeProxyCredential: deviceCredentialAuth,
 		},
 	)
 	if err != nil {
@@ -221,7 +222,7 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		"registration_seq":           device.RegistrationSeq,
 		"registration_incarnation":   device.RegistrationIncarnation,
 		"relay_servers":              s.relayServers,
-		"capabilities":               []string{"path_telemetry_v1"},
+		"capabilities":               []string{"path_telemetry_v1", "wake_jobs_v1"},
 		"accepted_peer_capabilities": device.Capabilities,
 	}
 

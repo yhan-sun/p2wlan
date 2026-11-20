@@ -102,6 +102,11 @@ func New(path string) (*DB, error) {
 		return nil, fmt.Errorf("migrate connection metrics: %w", err)
 	}
 
+	if err := migrateWake(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate remote wake: %w", err)
+	}
+
 	return &DB{db}, nil
 }
 
