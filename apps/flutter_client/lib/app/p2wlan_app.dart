@@ -222,12 +222,26 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     } else if (widget.initialRefresh && canPollLocalDaemon) {
       unawaited(_statusStore.refreshUntilPeerCatalogSettled(silent: true));
     }
+    final loginSettings = _settingsStore.settings;
     if (shouldConnectAfterLoginStartup(
       wasLaunchedAtLogin: widget.connectAfterLoginStartup,
-      hasValidSession: _settingsStore.settings.hasAuthenticatedConnection,
+      hasValidSession: loginSettings.hasAuthenticatedConnection,
       onboardingComplete: !_needsOnboarding,
       canActAsLocalVpnNode: canPollLocalDaemon,
     )) {
+      final serviceInstalled =
+          Platform.isWindows &&
+          !isRoomNetwork(loginSettings.networkId) &&
+          await personalWindowsServiceInstalled(
+            executablePath: Platform.resolvedExecutable,
+          );
+      if (!mounted ||
+          serviceInstalled ||
+          accountSessionKey(_settingsStore.settings) !=
+              accountSessionKey(loginSettings) ||
+          _settingsStore.settings.networkId != loginSettings.networkId) {
+        return;
+      }
       unawaited(_statusStore.startDaemon());
     }
   }

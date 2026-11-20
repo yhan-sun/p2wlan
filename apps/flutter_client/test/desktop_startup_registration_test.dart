@@ -16,6 +16,32 @@ void main() {
     }
   });
 
+  test('only a personal machine service owns login startup', () async {
+    for (final (code, json, expected) in [
+      (
+        0,
+        '{"installed":true,"profile":"personal","state":"start_pending"}',
+        true,
+      ),
+      (0, '{"installed":true,"profile":"room","state":"running"}', false),
+      (0, '{"installed":false,"profile":"personal"}', false),
+      (1, '{"installed":true,"profile":"personal"}', false),
+      (0, 'invalid status response', false),
+    ]) {
+      expect(
+        await personalWindowsServiceInstalled(
+          executablePath: '${tempHome.path}/p2wlan_flutter_client.exe',
+          processRunner: (path, arguments) async {
+            expect(path, '${tempHome.path}${Platform.pathSeparator}p2wlan.exe');
+            expect(arguments, ['service', 'status', '--json']);
+            return ProcessResult(0, code, json, '');
+          },
+        ),
+        expected,
+      );
+    }
+  });
+
   test('macOS writes and confirms a per-user LaunchAgent', () async {
     const executable = '/Applications/P2WLAN.app/Contents/MacOS/P2WLAN';
     final registration = DesktopStartupRegistration(

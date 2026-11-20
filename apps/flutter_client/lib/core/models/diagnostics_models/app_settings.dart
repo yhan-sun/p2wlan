@@ -110,6 +110,9 @@ class AppSettings {
     this.languageCode = defaultLanguageCode,
     this.themeMode = 'system',
     this.onboardingCompleted = false,
+    this.wakeAllowRemote,
+    this.wakeAllowRemoteScope,
+    this.wakeAgents = const {},
   });
 
   final String diagnosticsUrl;
@@ -151,6 +154,11 @@ class AppSettings {
   /// Persisted so a restart resumes at the shell rather than re-running
   /// first-run. Managed-mode users who have never signed in see it as false.
   final bool onboardingCompleted;
+
+  /// Null leaves the per-profile daemon configuration authoritative.
+  final bool? wakeAllowRemote;
+  final String? wakeAllowRemoteScope;
+  final Map<String, String> wakeAgents;
 
   /// The same guard applies before desktop process launch and Android VPN
   /// permission work. Legacy offline flags are ignored by JSON decoding.
@@ -199,6 +207,9 @@ class AppSettings {
     String? languageCode,
     String? themeMode,
     bool? onboardingCompleted,
+    bool? wakeAllowRemote,
+    String? wakeAllowRemoteScope,
+    Map<String, String>? wakeAgents,
   }) {
     return AppSettings(
       diagnosticsUrl: diagnosticsUrl ?? this.diagnosticsUrl,
@@ -232,6 +243,9 @@ class AppSettings {
           ? this.themeMode
           : AppThemeMode.fromCode(themeMode).code,
       onboardingCompleted: onboardingCompleted ?? this.onboardingCompleted,
+      wakeAllowRemote: wakeAllowRemote ?? this.wakeAllowRemote,
+      wakeAllowRemoteScope: wakeAllowRemoteScope ?? this.wakeAllowRemoteScope,
+      wakeAgents: wakeAgents ?? this.wakeAgents,
     );
   }
 
@@ -273,6 +287,15 @@ class AppSettings {
       ).code,
       themeMode: AppThemeMode.fromCode(_string(json['themeMode'])).code,
       onboardingCompleted: _bool(json['onboardingCompleted']),
+      wakeAllowRemote: json['wakeAllowRemote'] is bool
+          ? json['wakeAllowRemote'] as bool
+          : null,
+      wakeAllowRemoteScope:
+          json['wakeAllowRemoteScope'] is String &&
+              (json['wakeAllowRemoteScope'] as String).length == 64
+          ? json['wakeAllowRemoteScope'] as String
+          : null,
+      wakeAgents: _wakeAgents(json['wakeAgents']),
     );
   }
 
@@ -300,8 +323,23 @@ class AppSettings {
     'languageCode': languageCode,
     'themeMode': themeMode,
     'onboardingCompleted': onboardingCompleted,
+    if (wakeAllowRemote != null) 'wakeAllowRemote': wakeAllowRemote,
+    if (wakeAllowRemoteScope != null)
+      'wakeAllowRemoteScope': wakeAllowRemoteScope,
+    if (wakeAgents.isNotEmpty) 'wakeAgents': wakeAgents,
   };
 }
+
+const maxRememberedWakeAgents = 64;
+
+Map<String, String> _wakeAgents(Object? json) => Map.unmodifiable({
+  if (json is Map<String, dynamic>)
+    for (final entry in json.entries.take(maxRememberedWakeAgents))
+      if (entry.key.length <= 256 &&
+          entry.value is String &&
+          (entry.value as String).length <= 128)
+        entry.key: entry.value as String,
+});
 
 String _normalizeCloseBehavior(String value) {
   final normalized = value.trim();

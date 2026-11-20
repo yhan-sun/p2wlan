@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
+import 'package:p2wlan_flutter_client/core/rooms/room_profiles.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
 void main() {
@@ -63,6 +64,36 @@ void main() {
       },
     );
   }
+
+  test('wake agent preference is durable and scoped to the account', () async {
+    String token(String user, String signature) {
+      final claims = base64Url
+          .encode(utf8.encode(jsonEncode({'user_id': user})))
+          .replaceAll('=', '');
+      return 'test.$claims.$signature';
+    }
+
+    await store.updateSettings(
+      store.settings.copyWith(authToken: token('owner-a', 'first')),
+    );
+    await store.updateWakeAllowRemote(true);
+    await store.rememberWakeAgent('target', 'agent-a');
+    final restored = SettingsStore(settingsFile: file, tokenRepository: tokens);
+    addTearDown(restored.dispose);
+    await restored.load();
+    expect(wakeAllowRemoteSetting(restored.settings), isTrue);
+    expect(restored.wakeAgent('target'), 'agent-a');
+    await restored.updateSettings(
+      restored.settings.copyWith(authToken: token('owner-b', 'first')),
+    );
+    expect(restored.wakeAgent('target'), isNull);
+    expect(wakeAllowRemoteSetting(restored.settings), isNull);
+    await restored.updateSettings(
+      restored.settings.copyWith(authToken: token('owner-a', 'second')),
+    );
+    expect(restored.wakeAgent('target'), 'agent-a');
+    expect(wakeAllowRemoteSetting(restored.settings), isTrue);
+  });
 
   test(
     'queued local preferences merge the latest committed connection',

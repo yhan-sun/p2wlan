@@ -21,6 +21,11 @@ class _ApplicationSection extends StatelessWidget {
           if (!_usesDesktopSettings(context))
             const SizedBox(height: AppTokens.space16),
         ],
+        if (state._capabilities.canConfigureWakeTarget)
+          _WakeTargetPreference(
+            store: state.widget.settingsStore,
+            strings: strings,
+          ),
         _PreferenceRow(
           showDivider: false,
           label: strings.closeBehavior,
@@ -172,3 +177,58 @@ String _startupReadError(AppStrings strings) => strings.isZh
 String _startupUpdateError(AppStrings strings) => strings.isZh
     ? '无法更新系统登录自启设置。请检查当前用户权限后重试。'
     : 'Unable to update the desktop login-startup setting. Check the current user permissions and try again.';
+
+class _WakeTargetPreference extends StatefulWidget {
+  const _WakeTargetPreference({required this.store, required this.strings});
+
+  final SettingsStore store;
+  final AppStrings strings;
+
+  @override
+  State<_WakeTargetPreference> createState() => _WakeTargetPreferenceState();
+}
+
+class _WakeTargetPreferenceState extends State<_WakeTargetPreference> {
+  bool _saving = false;
+
+  Future<void> _save(bool value) async {
+    setState(() => _saving = true);
+    final strings = widget.strings;
+    try {
+      await widget.store.updateWakeAllowRemote(value);
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        content: Text(strings.settingsSavedRestartRequired),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        content: Text(
+          strings.isZh ? '无法保存远程开机设置。' : 'Could not save remote wake settings.',
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = widget.strings;
+    return ListenableBuilder(
+      listenable: widget.store,
+      builder: (context, _) => _PreferenceRow(
+        label: strings.isZh ? '允许本机远程开机' : 'Allow this PC to be woken remotely',
+        subtitle: strings.isZh ? '登记本机的有线网卡，使同一局域网代理可以发送唤醒包。重启 P2WLAN 后生效。' : 'Register this PC’s wired adapter so an agent on its LAN can send a wake packet. Applies after P2WLAN restarts.',
+        inlineControl: true,
+        trailing: Switch(
+          key: const ValueKey('settings-allow-remote-wake'),
+          value: wakeAllowRemoteSetting(widget.store.settings) ?? false,
+          onChanged: _saving ? null : _save,
+        ),
+      ),
+    );
+  }
+}

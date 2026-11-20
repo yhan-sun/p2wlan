@@ -242,6 +242,45 @@ class SettingsStore extends ChangeNotifier {
     }, accountScoped: true);
   }
 
+  String? wakeAgent(String targetId) {
+    final key = _wakePreferenceKey(_settings, targetId);
+    return key == null ? null : _settings.wakeAgents[key];
+  }
+
+  Future<void> rememberWakeAgent(String targetId, String agentId) {
+    if (wakeAgent(targetId) == agentId) return Future.value();
+    return _mutateSettings((settings) {
+      final key = _wakePreferenceKey(settings, targetId);
+      if (key == null || agentId.isEmpty || agentId.length > 128) {
+        return settings;
+      }
+      final preferences = Map<String, String>.of(settings.wakeAgents)
+        ..remove(key)
+        ..[key] = agentId;
+      while (preferences.length > maxRememberedWakeAgents) {
+        preferences.remove(preferences.keys.first);
+      }
+      return settings.copyWith(wakeAgents: Map.unmodifiable(preferences));
+    }, accountScoped: true);
+  }
+
+  Future<void> updateWakeAllowRemote(bool allow) => _mutateSettings((settings) {
+    final profile = wakeAccountProfileId(settings);
+    if (profile == null) {
+      throw const FormatException('Wake account unavailable');
+    }
+    return settings.copyWith(
+      wakeAllowRemote: allow,
+      wakeAllowRemoteScope: profile,
+    );
+  }, accountScoped: true);
+
+  String? _wakePreferenceKey(AppSettings settings, String targetId) {
+    if (targetId.isEmpty || targetId.length > 128) return null;
+    final account = wakeAccountProfileId(settings);
+    return account == null ? null : '$account/$targetId';
+  }
+
   Future<void> updateSettings(AppSettings settings) {
     final expectedSession = accountSessionKey(_settings);
     Future<void> apply() {

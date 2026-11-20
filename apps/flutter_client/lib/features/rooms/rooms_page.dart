@@ -7,6 +7,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../core/capabilities/platform_capabilities.dart';
+import '../../core/api/wake_api.dart';
+import '../wake/wake_catalog.dart';
+import '../wake/wake_dialog.dart';
+import '../wake/wake_strings.dart';
 import '../../core/rooms/room_api.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/presentation/network_overview.dart';
@@ -2062,6 +2066,25 @@ class RoomsPageState extends State<RoomsPage> {
         room.isOwner &&
         device['id'] is String &&
         (device['id'] as String).isNotEmpty;
+    final wakeStrings = WakeStrings(
+      AppStrings.fromCode(widget.settingsStore.settings.languageCode).isZh,
+    );
+    final deviceId = device['id'];
+    final openWake =
+        state == 'allowed' &&
+            deviceId is String &&
+            deviceId.isNotEmpty &&
+            widget.settingsStore.settings.hasAuthenticatedConnection
+        ? () => showWakeDialog(
+            context,
+            settingsStore: widget.settingsStore,
+            strings: wakeStrings,
+            target: WakeTarget.device(
+              deviceId,
+              device['device_name'] as String? ?? '',
+            ),
+          )
+        : null;
     final management =
         ((room.isOwner ||
                 userId == _api.userId &&
@@ -2072,12 +2095,16 @@ class RoomsPageState extends State<RoomsPage> {
         ? PopupMenuButton<String>(
             tooltip: _s("管理设备"),
             enabled: !_serverActionsBusy,
-            onSelected: (action) => action == 'ip'
+            onSelected: (action) => action == 'wake'
+                ? openWake?.call()
+                : action == 'ip'
                 ? _changeIp(room, device)
                 : action == 'delete'
                 ? _deleteDevice(room, device)
                 : _controlDevice(room, device, access!, action),
             itemBuilder: (_) => [
+              if (openWake != null)
+                PopupMenuItem(value: 'wake', child: Text(wakeStrings.title)),
               if (canAssignIp)
                 PopupMenuItem(value: 'ip', child: Text(_s("分配 IP"))),
               if (access != null) ...[
@@ -2114,7 +2141,14 @@ class RoomsPageState extends State<RoomsPage> {
               ],
             ],
           )
-        : null;
+        : openWake == null
+        ? null
+        : IconButton(
+            key: ValueKey('room-wake-$deviceId'),
+            tooltip: wakeStrings.title,
+            icon: const Icon(Icons.power_settings_new_rounded, size: 18),
+            onPressed: openWake,
+          );
     final approval = access != null && state == 'pending' && room.isOwner
         ? TextButton.icon(
             key: ValueKey(
@@ -2628,6 +2662,26 @@ class RoomsPageState extends State<RoomsPage> {
     ],
   );
 
+  Widget _manualWakeTargetsButton(FriendRoom room) {
+    final strings = WakeStrings(
+      AppStrings.fromCode(widget.settingsStore.settings.languageCode).isZh,
+    );
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        key: const ValueKey('room-manual-wake-targets'),
+        onPressed: () => showWakeCatalog(
+          context,
+          settingsStore: widget.settingsStore,
+          strings: strings,
+          networkId: room.id,
+        ),
+        icon: const Icon(Icons.power_settings_new_rounded, size: 18),
+        label: Text(strings.manualTargets),
+      ),
+    );
+  }
+
   Widget _roomWorkspace(RoomRoster roster) => LayoutBuilder(
     builder: (context, constraints) {
       final sidebar = Column(
@@ -2637,6 +2691,9 @@ class RoomsPageState extends State<RoomsPage> {
           _roomTrafficCard(roster.room),
           const SizedBox(height: 12),
           _roomConnectionOptions(roster.room),
+          if (roster.room.isOwner &&
+              widget.settingsStore.settings.hasAuthenticatedConnection)
+            _manualWakeTargetsButton(roster.room),
         ],
       );
       final devices = KeyedSubtree(

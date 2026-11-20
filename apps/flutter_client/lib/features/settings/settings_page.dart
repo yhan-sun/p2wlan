@@ -19,6 +19,7 @@ import '../../core/diagnostics/support_status_capture.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/platform/native_platform.dart';
 import '../../core/platform/windows_startup_registration.dart';
+import '../../core/rooms/room_profiles.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../core/update/update_models.dart';

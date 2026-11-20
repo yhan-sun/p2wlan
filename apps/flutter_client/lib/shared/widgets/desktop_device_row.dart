@@ -5,6 +5,7 @@ import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
 import '../../core/presentation/network_overview.dart';
+import '../../features/wake/wake_strings.dart';
 import '../formatters.dart';
 import 'app_motion.dart';
 import 'app_notice.dart';
@@ -116,6 +117,7 @@ class DesktopDeviceRow extends StatefulWidget {
     this.onDiagnostics,
     this.onSpeedTest,
     this.onRename,
+    this.onWake,
     this.scopeLabel,
     this.selected = false,
     this.rowKey,
@@ -128,6 +130,7 @@ class DesktopDeviceRow extends StatefulWidget {
   final VoidCallback? onDiagnostics;
   final VoidCallback? onSpeedTest;
   final VoidCallback? onRename;
+  final VoidCallback? onWake;
   final String? scopeLabel;
   final bool selected;
   final Key? rowKey;
@@ -185,7 +188,8 @@ class _DesktopDeviceRowState extends State<DesktopDeviceRow> {
         widget.onOpen != null ||
         widget.onDiagnostics != null ||
         widget.onSpeedTest != null ||
-        widget.onRename != null;
+        widget.onRename != null ||
+        widget.onWake != null;
     final menuLabel = strings.isZh ? '设备操作' : 'Device actions';
     final selected = widget.selected || _menuOpen;
     return MenuAnchor(
@@ -208,6 +212,12 @@ class _DesktopDeviceRowState extends State<DesktopDeviceRow> {
             leadingIcon: const Icon(Icons.arrow_forward_rounded, size: 16),
             onPressed: widget.onOpen,
             child: Text(strings.deviceDetails),
+          ),
+        if (widget.onWake != null)
+          MenuItemButton(
+            leadingIcon: const Icon(Icons.power_settings_new_rounded, size: 16),
+            onPressed: widget.onWake,
+            child: Text(WakeStrings(strings.isZh).title),
           ),
         if (hasAddress)
           MenuItemButton(

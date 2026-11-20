@@ -13,6 +13,10 @@ import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
 import '../../app/session_ui_state.dart';
 import '../../core/api/control_api.dart';
+import '../../core/api/wake_api.dart';
+import '../wake/wake_catalog.dart';
+import '../wake/wake_dialog.dart';
+import '../wake/wake_strings.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/presentation/network_overview.dart';
@@ -302,6 +306,8 @@ class _NodesPageState extends State<NodesPage> {
                   ? _scopePicker(overview, selectedId)
                   : null,
               children: [
+                if (remoteOnly && settings.hasAuthenticatedConnection)
+                  _wakeCatalogButton(),
                 if (remoteOnly)
                   _RemoteOnlyNodesState(onOpenRooms: widget.onOpenRooms),
                 if (!remoteOnly)
@@ -403,6 +409,9 @@ class _NodesPageState extends State<NodesPage> {
                                       16,
                               showScope: overview.hasRooms,
                               onTap: _openNetworkPeer,
+                              onWake: settings.hasAuthenticatedConnection
+                                  ? _openPeerWake
+                                  : null,
                             );
                           },
                         ),
@@ -450,6 +459,9 @@ class _NodesPageState extends State<NodesPage> {
     }),
     onQueryChanged: () => setState(() {}),
     onClearSearch: _clearPeerSearch,
+    onOpenWakeCatalog: widget.settingsStore.settings.hasAuthenticatedConnection
+        ? _openWakeCatalog
+        : null,
   );
 
   _NodeFilter _visibleFilter(bool desktop) =>
@@ -463,6 +475,40 @@ class _NodesPageState extends State<NodesPage> {
     _filter = _NodeFilter.all;
     _saveUiState();
   });
+
+  Widget _wakeCatalogButton() => Align(
+    alignment: Alignment.centerLeft,
+    child: TextButton.icon(
+      key: const ValueKey('devices-remote-wake'),
+      onPressed: _openWakeCatalog,
+      icon: const Icon(Icons.power_settings_new_rounded, size: 18),
+      label: Text(WakeStrings(stringsOf(context).isZh).title),
+    ),
+  );
+
+  void _openWakeCatalog() {
+    final settings = widget.settingsStore.settings;
+    unawaited(
+      showWakeCatalog(
+        context,
+        settingsStore: widget.settingsStore,
+        strings: WakeStrings(stringsOf(context).isZh),
+        networkId: personalNetworkSettings(settings).networkId,
+        includeDevices: true,
+      ),
+    );
+  }
+
+  void _openPeerWake(NetworkPeerSnapshot item) {
+    unawaited(
+      showWakeDialog(
+        context,
+        settingsStore: widget.settingsStore,
+        strings: WakeStrings(stringsOf(context).isZh),
+        target: WakeTarget.device(item.peer.nodeId, item.peer.displayName),
+      ),
+    );
+  }
 
   void _openNetworkPeer(NetworkPeerSnapshot item) {
     if (!item.isPrimary) {

@@ -9,12 +9,14 @@ class _PeerList extends StatelessWidget {
     required this.showScope,
     required this.compact,
     required this.onTap,
+    this.onWake,
   });
 
   final List<NetworkPeerSnapshot> peers;
   final bool showScope;
   final bool compact;
   final ValueChanged<NetworkPeerSnapshot> onTap;
+  final ValueChanged<NetworkPeerSnapshot>? onWake;
 
   @override
   Widget build(BuildContext context) {
@@ -39,6 +41,7 @@ class _PeerList extends StatelessWidget {
               strings: strings,
               compact: compact,
               onTap: (_) => onTap(peers[index]),
+              onWake: onWake == null ? null : () => onWake!(peers[index]),
             ),
           ],
         ],
@@ -57,6 +60,7 @@ class _PeerListRow extends StatelessWidget {
     this.scopeIdentity,
     this.scopeLabel,
     this.current = true,
+    this.onWake,
   });
 
   final String? scopeIdentity;
@@ -67,6 +71,7 @@ class _PeerListRow extends StatelessWidget {
   final AppStrings strings;
   final bool compact;
   final ValueChanged<PeerSnapshot> onTap;
+  final VoidCallback? onWake;
 
   @override
   Widget build(BuildContext context) {
@@ -80,13 +85,25 @@ class _PeerListRow extends StatelessWidget {
             horizontal: 14,
             vertical: compact ? 10 : 8,
           ),
-          child: _RowContent(
-            peer: peer,
-            speedBytesPerSecond: speedBytesPerSecond,
-            strings: strings,
-            compact: compact,
-            scopeLabel: scopeLabel,
-            current: current,
+          child: Row(
+            children: [
+              Expanded(
+                child: _RowContent(
+                  peer: peer,
+                  speedBytesPerSecond: speedBytesPerSecond,
+                  strings: strings,
+                  compact: compact,
+                  scopeLabel: scopeLabel,
+                  current: current,
+                ),
+              ),
+              if (onWake != null)
+                IconButton(
+                  tooltip: WakeStrings(strings.isZh).title,
+                  icon: const Icon(Icons.power_settings_new_rounded, size: 18),
+                  onPressed: onWake,
+                ),
+            ],
           ),
         ),
       ),

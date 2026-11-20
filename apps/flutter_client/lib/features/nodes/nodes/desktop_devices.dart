@@ -194,6 +194,9 @@ class _DesktopDevices extends StatelessWidget {
                                         state._selectedDesktopPeerId ==
                                             peer.nodeId,
                                     onOpen: () => state._openNetworkPeer(item),
+                                    onWake: settings.hasAuthenticatedConnection
+                                        ? () => state._openPeerWake(item)
+                                        : null,
                                     onDiagnostics: item.isPrimary
                                         ? () => state._openPeer(
                                             peer,

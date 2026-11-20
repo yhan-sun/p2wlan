@@ -26,6 +26,7 @@ class PlatformCapabilities {
     this.canReceiveRoomLinks = false,
     this.canOpenExternalUrls = false,
     this.canReadNativeBuildInfo = false,
+    this.canConfigureWakeTarget = false,
   });
 
   /// Desktop/local can start, stop, restart the local daemon.
@@ -64,6 +65,9 @@ class PlatformCapabilities {
   /// The OHOS host registers the read-only native engine build-info method.
   final bool canReadNativeBuildInfo;
 
+  /// Can register this computer as a Wake-on-LAN target.
+  final bool canConfigureWakeTarget;
+
   /// Baseline capabilities for a normalized OS name.
   ///
   /// Platform names include windows, macos, linux, android, ios, fuchsia,
@@ -74,7 +78,7 @@ class PlatformCapabilities {
       case 'windows':
       case 'macos':
       case 'linux':
-        return const PlatformCapabilities(
+        return PlatformCapabilities(
           canControlLocalDaemon: true,
           canRequestElevation: true,
           canVerifyRoutes: true,
@@ -86,6 +90,7 @@ class PlatformCapabilities {
           canManageRemoteDevices: true,
           canReceiveRoomLinks: true,
           canOpenExternalUrls: true,
+          canConfigureWakeTarget: os == 'windows',
         );
       case 'android':
         return const PlatformCapabilities(
@@ -203,6 +208,7 @@ class PlatformCapabilities {
       canReceiveRoomLinks: canReceiveRoomLinks,
       canOpenExternalUrls: canOpenExternalUrls,
       canReadNativeBuildInfo: canReadNativeBuildInfo,
+      canConfigureWakeTarget: canConfigureWakeTarget,
     );
   }
 }
