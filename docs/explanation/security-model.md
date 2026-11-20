@@ -32,6 +32,14 @@ Relay ticket 在 `exp` 到达时即失效，clock skew 不延长到期时间；�
 - Control 校验上报端设备的会话凭据（WebSocket 认证或设备 token）、设备所属权与网络归属，并通过五级代际围栏（`registration_seq` > `network_generation` > `peer_session_generation` > `remote_candidate_epoch` > `observation_revision`）防御陈旧、越权或重放的路径上报。
 - 只有持有 `CONTROL_ADMIN_TOKEN` 的管理员可通过只读 Admin Connections API 检索路径观测记录、受限历史迁移和小时级趋势聚合，普通节点不能任意拉取其他节点的路径观测。趋势表只保存 network ID、小时 bucket、计数与 RTT histogram，不长期保存 peer/device ID、IP、endpoint、密钥或业务载荷。
 
+## 远程开机
+
+Control 按个人网络归属或房间成员及设备准入规则检查远程开机权限。手填目标的操作限于有权管理该目标的账号。只有使用有效设备凭据注册的 daemon 可以声明代理能力。为已绑定 Ed25519 公钥的设备签发凭据时，Control 要求对该公钥的持有证明。代理任务绑定设备、网络、注册代际和领取租约，回报必须持有对应领取凭证。
+
+MAC 保存在 Control 的专用目标和任务数据中。经授权的代理领取任务时取得目标地址，设备名册、路径遥测和本地诊断只传递各自需要的状态。任务结束后清除其中的 MAC，结果保留七天。代理只在本机局域网发送 Wake-on-LAN 魔术包。目标当前在线状态由 Control 的设备租约判断。
+
+Windows 系统服务以 LocalSystem 运行。程序目录的写入受管理员权限限制，机器配置只向 SYSTEM 和 Administrators 授权。安装时确认迁移设备密钥及短期设备凭据，设备凭据过期后由交互客户端重新登记，由管理员更新机器配置。
+
 ## 运维边界
 
 Control 明文监听、Relay metrics、数据库、配置和密钥文件默认只在受保护的本机或容器网络中可见。公网只发布可信 HTTPS Control 和 Relay TLS。管理控制台如果启用，也只通过可信 HTTPS Control origin 访问；其令牌不写入公开日志、URL 或文档。日志、支持包和备份按敏感数据处理，不能把私钥、token、ticket 或业务明文写入公开产物。
