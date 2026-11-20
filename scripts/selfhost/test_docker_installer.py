@@ -96,6 +96,9 @@ elif args[:1] == ['run']:
         'compose.env': f'P2WLAN_UID={uid}\nP2WLAN_GID={gid}\nCONTROL_PORT={control_port}\nRELAY_PORT={relay_port}\nMETRICS_PORT={metrics_port}\nRELAY_PUBLISH_HOST=127.0.0.1\n',
         'tls.crt': 'fixture-certificate', 'tls.key': 'fixture-private-key',
     }
+    if (output.parent / 'input.crt').is_file():
+        values['tls.crt'] = (output.parent / 'input.crt').read_text()
+        values['tls.key'] = (output.parent / 'input.key').read_text()
     for name, value in values.items():
         path = output / name
         path.write_text(value)
@@ -346,7 +349,7 @@ urllib.request.urlopen = fixture_urlopen
         key.write_text('fixture-private-key')
         code, output = self.run_interactive([
             ('部署模式', '1'), ('Relay主机', 'relay.example.test'), ('Relay端口', '28081'),
-            ('证书来源', '2'), ('证书链路径', str(certificate)), ('私钥路径', str(key)),
+            ('证书来源', '3'), ('证书链路径', str(certificate)), ('私钥路径', str(key)),
             ('Control端口', '28080'), ('metrics端口', '28082'),
             ('Relay绑定IP', '0.0.0.0'), ('启动方式', '1'), ('确认部署', '1'),
         ], before_reply=lambda *_: self.assert_not_deployed())
@@ -418,6 +421,32 @@ urllib.request.urlopen = fixture_urlopen
             self.assertTrue(links[0].resolve().is_file(), kind)
         self.assertIn('https://relay.example.test/', result.stdout)
 
+    def test_self_signed_tls_covers_an_ip_relay_without_a_domain_or_email(self):
+        result = self.run_installer('--relay-endpoint', 'tls://203.0.113.10:18081',
+                                    '--tls-mode', 'selfsigned', '--publish-host', '0.0.0.0')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        certificate = (self.target / 'config/tls.crt').read_text()
+        self.assertIn('BEGIN CERTIFICATE', certificate)
+        san = subprocess.run(['openssl', 'x509', '-noout', '-ext', 'subjectAltName',
+                              '-in', str(self.target / 'config/tls.crt')],
+                             capture_output=True, text=True, timeout=20)
+        self.assertIn('IP Address:203.0.113.10', san.stdout)
+        ca = subprocess.run(['openssl', 'verify', '-CAfile', str(self.target / 'config/relay-ca.crt'),
+                             str(self.target / 'config/tls.crt')], capture_output=True, text=True, timeout=20)
+        self.assertEqual(ca.returncode, 0, ca.stderr)
+        edge = (self.target / 'config/edge/nginx.conf').read_text()
+        self.assertIn('server_name 203.0.113.10;', edge)
+        settings = (self.target / '.env').read_text()
+        self.assertIn('P2WLAN_TLS_MODE=selfsigned', settings)
+
+    def test_automatic_tls_rejects_an_ip_relay_host(self):
+        result = self.run_installer('--relay-endpoint', 'tls://203.0.113.10:18081',
+                                    '--tls-mode', 'auto', '--tls-domain', 'relay.example.test',
+                                    '--publish-host', '0.0.0.0')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Relay 是 IP', result.stdout + result.stderr)
+        self.assertFalse(self.target.exists())
+
     def test_automatic_tls_rejects_a_domain_that_does_not_match_the_relay_host(self):
         result = self.run_installer('--relay-endpoint', 'tls://relay.example.test:18081',
                                     '--tls-mode', 'auto', '--tls-domain', 'other.example.test',
@@ -426,13 +455,19 @@ urllib.request.urlopen = fixture_urlopen
         self.assertIn('--tls-domain must equal the Relay host', result.stdout + result.stderr)
         self.assertFalse(self.target.exists())
 
-    def test_automatic_tls_requires_an_email_for_the_acme_account(self):
+    def test_automatic_tls_without_an_email_registers_without_a_contact(self):
+        certbot_log = self.path / 'certbot.log'
+        self.env['CERTBOT_LOG'] = str(certbot_log)
+        self.env['P2WLAN_ACME_LIVE_DIR'] = str(self.path / 'acme-live')
+        self.env['P2WLAN_RENEWAL_HOOKS_DIR'] = str(self.path / 'acme-hooks')
+        self.certbot_stub('relay.example.test')
         result = self.run_installer('--relay-endpoint', 'tls://relay.example.test:18081',
                                     '--tls-mode', 'auto', '--tls-domain', 'relay.example.test',
                                     '--publish-host', '0.0.0.0')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('--tls-mode auto requires --tls-domain and --tls-email', result.stdout + result.stderr)
-        self.assertFalse(self.target.exists())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        arguments = certbot_log.read_text()
+        self.assertIn('--register-unsafely-without-email', arguments)
+        self.assertNotIn('--no-eff-email', arguments)
 
     @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
     def test_q_at_the_first_prompt_cancels_without_writing_a_deployment(self):
@@ -455,7 +490,7 @@ urllib.request.urlopen = fixture_urlopen
     def test_q_at_the_certificate_prompt_cancels_before_configuration(self):
         code, output = self.run_interactive([
             ('部署模式', '1'), ('Relay主机', 'relay.example.test'), ('Relay端口', ''),
-            ('证书来源', '2'), ('证书链路径', 'q'),
+            ('证书来源', '3'), ('证书链路径', 'q'),
         ], before_reply=lambda *_: self.assert_not_deployed())
         self.assertNotEqual(code, 0, output)
         self.assertIn('installation cancelled', output)

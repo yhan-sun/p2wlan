@@ -84,7 +84,7 @@ Docker 默认使用 `p2wlan-server-source.tar.gz` 和同名 `.sha256`。包内�
 3. **选择发布版本。** 按发布时间从新到旧列出最多 15 个符合该方式资产要求的正式服务端 Release，默认 `1` 为最新一项；按编号选择、输入 `m` 手填固定 tag，或输入 `0`／`q` 取消。客户端 `vX.Y.Z` 不会混入列表，无效输入会要求重选。显式 `--version` 不重复选版。随后下载并校验同 tag 的对应包。
 4. **确认持久路径。** 原生分支分别确认程序、配置与数据目录；Docker 分支确认一个持久部署目录，默认值见上表。已有部署进入保留配置和凭据的升级流程。
 5. **选择部署模式。** 新部署选择公网服务或本机测试。公网服务使用真实证书；本机测试生成短期 loopback 测试证书，不面向公网客户端。
-6. **填写 Relay 和 TLS。** 公网模式先选证书来源：`1` 自动申请 Let's Encrypt 证书（HTTP-01，需域名与 80 端口，签发后自动续期）、`2` 使用已有证书文件。自动申请时填写与 Relay 主机名一致的证书域名和 ACME 邮箱；使用已有证书时依次填写完整证书链和匹配私钥的 PEM 路径。Docker 公网部署会同时启动内置 HTTPS 入口，面板与 Relay 共用同一份证书。
+6. **填写 Relay 和 TLS。** 公网模式先选证书来源：`1` 自动申请 Let's Encrypt 证书（HTTP-01，需要域名和 80 端口，签发后自动续期，ACME 邮箱可留空跳过）、`2` 自签名证书（Relay 是 IP 或主机名时可用，无需域名和邮箱，生成 `config/relay-ca.crt` 供客户端信任）、`3` 使用已有证书文件。自动申请要求证书域名与 Relay 主机名一致；使用已有证书时依次填写完整证书链和匹配私钥的 PEM 路径。Docker 公网部署会同时启动内置 HTTPS 入口，面板与 Relay 共用同一份证书。
 7. **确认内部端口。** Control 内部 HTTP 默认 `18080`、Relay 健康检查默认 `18082`，Relay 端口默认 `18081`。Docker 还确认 Relay 发布绑定 IP，公网默认 `0.0.0.0`。Docker 公网部署由内置 edge 容器发布 80/443 并反向代理到 loopback Control；原生部署的 Control 仍只监听 loopback。
 8. **选择执行方式并确认摘要。** 启动方式选 `1` 安装并启动、`2` 只准备，默认 `1`。摘要列出固定版本、目录、Relay、端口、TLS 文件和执行方式，Docker 还列出源码身份或显式选择的镜像身份，不显示秘密；最后选 `1` 确认、`2` 重填、`0`／`q` 取消。已有部署保留配置，重填只调整允许的执行选项。
 9. **自动执行并交付入口。** 原生分支安装已校验的二进制和 systemd unit；默认 Docker 分支运行独立 Compose builder，先构建管理台再构建 Go 服务，核验本地镜像 ID、标签和二进制版本；显式镜像模式才拉取固定摘要。新部署生成匹配的 Control/Relay 配置。立即启动会等待健康检查，失败时报告排查入口；只准备不会声称服务已经健康。完成后显示本机 Control、Relay、管理台、凭据文件位置和对应方式的管理命令。
@@ -147,7 +147,7 @@ Relay绑定IP [0.0.0.0]: 0.0.0.0
 
 在部署目录执行 `sudo docker compose ps`、`sudo docker compose logs -f` 或 `sudo docker compose down` 管理服务；默认安装会启动服务，再次运行会读取已有配置并等待服务健康。不要删除 `config/data/` 来更新服务，也不要在日志或工单中公开 `.env` 和服务配置内容。
 
-首次安装会将证书与私钥复制为 `config/tls.crt` 和 `config/tls.key`。自动申请模式下，`certbot.timer` 在到期前续期，`/etc/letsencrypt/renewal-hooks/` 中的钩子会停用 edge、更新这两个文件、重启 Relay 并恢复 edge，无需手工操作；可用 `sudo certbot renew --dry-run` 验证续期链路。自带证书模式不会自动续期：替换部署目录中的这两个文件并保持原 UID/GID 和 `0600` 权限，执行 `sudo docker compose restart relay`，需要面板同步时再 `sudo docker compose restart edge`。
+首次安装会将证书与私钥复制为 `config/tls.crt` 和 `config/tls.key`。自签名模式另外生成 `config/relay-ca.crt`：客户端需要把它加入信任，或在客户端 JSON 配置里将 `relay.ca_cert_path` 指向该文件；未信任时 Relay TLS 校验失败，浏览器访问面板也会提示证书不受信任。自动申请模式下，`certbot.timer` 在到期前续期，`/etc/letsencrypt/renewal-hooks/` 中的钩子会停用 edge、更新这两个文件、重启 Relay 并恢复 edge，无需手工操作；可用 `sudo certbot renew --dry-run` 验证续期链路。自带证书模式不会自动续期：替换部署目录中的这两个文件并保持原 UID/GID 和 `0600` 权限，执行 `sudo docker compose restart relay`，需要面板同步时再 `sudo docker compose restart edge`。
 
 ### 原生 systemd 交互安装
 

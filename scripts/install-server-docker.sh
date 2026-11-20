@@ -41,8 +41,8 @@ parser.add_argument('--dir', help='private persistent deployment directory (defa
 parser.add_argument('--relay-endpoint')
 parser.add_argument('--tls-cert')
 parser.add_argument('--tls-key')
-parser.add_argument('--tls-mode', choices=('auto', 'files'),
-                    help='auto: request a Let\'s Encrypt certificate; files: use --tls-cert/--tls-key')
+parser.add_argument('--tls-mode', choices=('auto', 'selfsigned', 'files'),
+                    help='auto: Let\'s Encrypt for a domain; selfsigned: local CA for an IP/host; files: use --tls-cert/--tls-key')
 parser.add_argument('--tls-domain', help='certificate domain for --tls-mode auto; must equal the Relay host')
 parser.add_argument('--tls-email', help='ACME account email for --tls-mode auto')
 parser.add_argument('--control-port', type=int, help='internal Control port (default: 18080)')
@@ -267,6 +267,9 @@ def certificate_domain(value):
         fail('证书域名必须是公网域名，不能是 IP 地址')
     return value.lower()
 
+def optional_email(value):
+    return certificate_email(value) if value else ''
+
 def certificate_email(value):
     if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[A-Za-z]{2,}', value):
         fail('请输入有效的 ACME 账户邮箱')
@@ -295,11 +298,13 @@ def ensure_certbot():
 def request_certificate(domain, contact):
     ensure_certbot()
     if not port_available(80):
-        fail('HTTP-01 standalone needs TCP 80 free on this host; stop that service or use --tls-mode files')
+        fail('HTTP-01 standalone needs TCP 80 free on this host; stop that service or use --tls-mode selfsigned')
     print('[TLS] Requesting a certificate for ' + domain)
+    contact_arguments = (['-m', contact, '--no-eff-email'] if contact
+                         else ['--register-unsafely-without-email'])
     try:
         run(['certbot', 'certonly', '--standalone', '--non-interactive', '--agree-tos',
-             '--keep-until-expiring', '-m', contact, '-d', domain], timeout=900, capture=False)
+             '--keep-until-expiring'] + contact_arguments + ['-d', domain], timeout=900, capture=False)
     except InstallError:
         fail('certificate request failed; verify DNS, inbound TCP 80 and ACME rate limits')
     live = ACME_LIVE_DIR / domain
@@ -307,6 +312,43 @@ def request_certificate(domain, contact):
     if not chain.is_file() or not key.is_file():
         fail('certbot did not create the expected certificate files')
     return str(chain), str(key)
+
+def self_signed_certificate(work, host):
+    work = work / 'selfsigned'
+    work.mkdir(mode=0o700, exist_ok=True)
+    openssl = shutil.which('openssl')
+    if not openssl:
+        fail('openssl is required for a self-signed certificate')
+    try:
+        address = ipaddress.ip_address(host.strip('[]'))
+    except ValueError:
+        san = 'DNS:' + host
+    else:
+        san = 'IP:' + str(address)
+    ca_config = work / 'ca.cnf'
+    ca_config.write_text('[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=v3\n'
+                         '[dn]\nCN=P2WLAN Relay CA\n'
+                         '[v3]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n')
+    san_config = work / 'san.cnf'
+    san_config.write_text('[ext]\nsubjectAltName=' + san +
+                          '\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature,keyEncipherment\n')
+    ca_key, ca_crt = work / 'relay-ca.key', work / 'relay-ca.crt'
+    cert, key, csr = work / 'input.crt', work / 'input.key', work / 'server.csr'
+    try:
+        run([openssl, 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '3650',
+             '-config', str(ca_config), '-keyout', str(ca_key), '-out', str(ca_crt)])
+        run([openssl, 'req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=' + host,
+             '-keyout', str(key), '-out', str(csr)])
+        run([openssl, 'x509', '-req', '-in', str(csr), '-CA', str(ca_crt), '-CAkey', str(ca_key),
+             '-CAcreateserial', '-days', '825', '-extfile', str(san_config), '-extensions', 'ext',
+             '-out', str(cert)])
+    except InstallError:
+        fail('self-signed certificate generation failed; install openssl and retry')
+    for path in (ca_key, key):
+        path.chmod(0o600)
+    for path in (ca_config, san_config, csr):
+        path.unlink()
+    return str(cert), str(key), str(ca_crt)
 
 def write_edge_config(config, domain, control_port):
     edge = config / 'edge'
@@ -403,17 +445,29 @@ def configure_new(terminal, plan, edit=False):
     else:
         relay_name = endpoint_parts(plan['endpoint'], False)[0]
         if edit or not plan['tls_mode']:
-            terminal.write("  1) 自动申请 Let's Encrypt 证书（HTTP-01，自动续期；面板与 Relay 共用）\n"
-                           '  2) 使用已有证书文件\n')
-            plan['tls_mode'] = {'1': 'auto', '2': 'files'}[
-                choice(terminal, '证书来源', '2' if plan['tls_mode'] == 'files' else '1', ('1', '2'))]
+            terminal.write("  1) 自动申请 Let's Encrypt 证书（需要域名，自动续期；邮箱可留空）\n"
+                           '  2) 自签名证书（IP 或主机名，无需域名和邮箱；客户端需信任生成的 CA）\n'
+                           '  3) 使用已有证书文件\n')
+            default = {'auto': '1', 'selfsigned': '2', 'files': '3'}[plan['tls_mode'] or 'auto']
+            plan['tls_mode'] = {'1': 'auto', '2': 'selfsigned', '3': 'files'}[
+                choice(terminal, '证书来源', default, ('1', '2', '3'))]
         if plan['tls_mode'] == 'auto':
+            try:
+                ipaddress.ip_address(relay_name.strip('[]'))
+            except ValueError:
+                pass
+            else:
+                fail('Relay 是 IP，自动申请需要域名；请选 2 自签名或 3 已有证书')
             plan['tls_domain'] = ask(terminal, '证书域名', plan['tls_domain'] or relay_name, certificate_domain)
             if plan['tls_domain'] != relay_name.lower():
                 fail('证书域名必须与 Relay 主机名一致：' + relay_name)
-            plan['tls_email'] = ask(terminal, 'ACME 邮箱', plan['tls_email'] or '', certificate_email)
+            plan['tls_email'] = ask(terminal, 'ACME 邮箱（留空跳过）', plan['tls_email'] or '', optional_email)
             plan['tls_cert'] = plan['tls_key'] = None
             terminal.write('将签发证书并自动续期：' + plan['tls_domain'] + '\n')
+        elif plan['tls_mode'] == 'selfsigned':
+            plan['tls_cert'] = plan['tls_key'] = None
+            terminal.write('将生成本地 CA 和覆盖 ' + relay_name +
+                           ' 的自签名证书；客户端需信任 config/relay-ca.crt。\n')
         else:
             for field, label, supplied in (('tls_cert', '证书链路径', args.tls_cert), ('tls_key', '私钥路径', args.tls_key)):
                 if edit or not supplied:
@@ -795,8 +849,9 @@ def install(resources):
                 ('部署模式', '本机测试' if plan['dev'] else '公网部署'), ('Relay地址', plan['endpoint']),
                 ('Control端口', plan['control_port']), ('Relay端口', plan['relay_port']),
                 ('metrics端口', plan['metrics_port']), ('Relay绑定IP', plan['publish_host']),
-                ('证书来源', '自动申请（自动续期）' if plan['tls_mode'] == 'auto' else
-                 ('本机测试证书' if plan['dev'] else '已有证书文件')),
+                ('证书来源', '本机测试证书' if plan['dev'] else
+                 {'auto': '自动申请（自动续期）', 'selfsigned': '自签名（本地 CA）',
+                  'files': '已有证书文件'}[plan['tls_mode']]),
                 ('证书链路径', plan['tls_cert'] or '自动生成本机测试证书'),
                 ('私钥路径', plan['tls_key'] or '自动生成本机测试私钥'),
                 ('启动方式', '只准备' if plan['no_start'] else '安装并启动'),
@@ -834,18 +889,27 @@ def install(resources):
         plan['control_port'] = port_number(plan['control_port'], (relay_port,))
         plan['metrics_port'] = port_number(plan['metrics_port'], (relay_port, plan['control_port']))
         plan['publish_host'] = bind_address(plan['publish_host'] or ('127.0.0.1' if plan['dev'] else '0.0.0.0'), plan['dev'])
-        if not plan['dev'] and plan['tls_mode'] != 'auto':
+        if not plan['dev'] and plan['tls_mode'] not in ('auto', 'selfsigned'):
             plan['tls_cert'], plan['tls_key'] = tls_path(plan['tls_cert'] or ''), tls_path(plan['tls_key'] or '')
     if not plan['dev']:
         if plan['tls_mode'] is None:
             plan['tls_mode'] = 'auto' if (args.tls_domain or args.tls_email) else 'files'
         if plan['tls_mode'] == 'auto':
-            if not plan['tls_domain'] or not plan['tls_email']:
-                fail('--tls-mode auto requires --tls-domain and --tls-email')
+            if not plan['tls_domain']:
+                fail('--tls-mode auto requires --tls-domain')
             plan['tls_domain'] = certificate_domain(plan['tls_domain'])
-            plan['tls_email'] = certificate_email(plan['tls_email'])
-            if plan['tls_domain'] != endpoint_parts(plan['endpoint'], False)[0].lower():
+            plan['tls_email'] = optional_email(plan['tls_email'] or '')
+            relay_name = endpoint_parts(plan['endpoint'], False)[0]
+            try:
+                ipaddress.ip_address(relay_name.strip('[]'))
+            except ValueError:
+                pass
+            else:
+                fail('Relay 是 IP，自动申请需要域名；请选 2 自签名或 3 已有证书')
+            if plan['tls_domain'] != relay_name.lower():
                 fail('--tls-domain must equal the Relay host')
+            plan['tls_cert'] = plan['tls_key'] = None
+        elif plan['tls_mode'] == 'selfsigned':
             plan['tls_cert'] = plan['tls_key'] = None
     args.dev_localhost, args.relay_endpoint = plan['dev'], plan['endpoint']
     args.tls_mode, args.tls_domain, args.tls_email = plan['tls_mode'], plan['tls_domain'], plan['tls_email']
@@ -946,8 +1010,12 @@ def install(resources):
                 endpoint = args.relay_endpoint or ('tls://localhost:18081' if args.dev_localhost else '')
                 if not endpoint:
                     fail('new deployment requires --relay-endpoint and TLS files, or --dev-localhost')
+                self_signed_ca = None
                 if args.tls_mode == 'auto':
                     args.tls_cert, args.tls_key = request_certificate(args.tls_domain, args.tls_email)
+                elif args.tls_mode == 'selfsigned':
+                    args.tls_cert, args.tls_key, self_signed_ca = self_signed_certificate(
+                        stage, endpoint_parts(endpoint, False)[0])
                 uid = os.geteuid() or 10001
                 gid = os.getegid() if os.geteuid() else 10001
                 if uid <= 0 or gid <= 0:
@@ -976,6 +1044,9 @@ def install(resources):
                 if not args.dev_localhost:
                     write_edge_config(stage / 'config',
                                       args.tls_domain or endpoint_parts(endpoint, False)[0], args.control_port)
+                if self_signed_ca is not None:
+                    shutil.copyfile(self_signed_ca, stage / 'config/relay-ca.crt')
+                    (stage / 'config/relay-ca.crt').chmod(0o644)
                 candidate = stage / 'config'
                 for name in ('control.env', 'relay.env', 'tls.crt', 'tls.key', 'compose.env'):
                     protected(candidate / name)
