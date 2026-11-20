@@ -9,6 +9,10 @@ fn config_dir() -> PathBuf {
     if let Some(path) = env::var_os("P2WLAN_HOME") {
         return PathBuf::from(path);
     }
+    #[cfg(windows)]
+    if let Some(path) = env::var_os("APPDATA") {
+        return PathBuf::from(path).join("p2wlan");
+    }
     if is_openwrt() {
         return PathBuf::from("/etc/p2wlan");
     }
@@ -39,6 +43,12 @@ fn state_dir() -> PathBuf {
 /// must not share the default PID, diagnostics token, or log with another
 /// profile.
 fn state_dir_for_config(config_path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Ok(paths) = p2pnet_daemon::windows_service_paths::ServicePaths::resolve() {
+        if config_path == paths.config() {
+            return paths.root;
+        }
+    }
     if is_openwrt_system_profile(config_path) {
         return PathBuf::from(OPENWRT_STATE);
     }

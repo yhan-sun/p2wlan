@@ -38,7 +38,7 @@ $armed | Write-Host
 foreach ($adapter in $adapters) {
     Write-Host "Ethernet: $($adapter.Name) ($($adapter.InterfaceDescription)), $($adapter.Status)"
     try {
-        $settings = Get-NetAdapterPowerManagement -InterfaceDescription $adapter.InterfaceDescription
+        $settings = Get-NetAdapterPowerManagement -InterfaceDescription ([WildcardPattern]::Escape($adapter.InterfaceDescription))
     } catch {
         if ($Apply) { throw }
         Write-Warning 'Adapter power settings could not be read. Retry in an elevated PowerShell session.'
@@ -57,7 +57,7 @@ foreach ($adapter in $adapters) {
         throw 'Multiple adapters share the same description. Use Device Manager to configure the intended adapter.'
     }
 
-    $changes = @{ Name = $adapter.Name; NoRestart = $true }
+    $changes = @{ Name = [WildcardPattern]::Escape($adapter.Name); NoRestart = $true }
     if ($settings.WakeOnMagicPacket -ne 'Enabled') {
         $changes.WakeOnMagicPacket = 'Enabled'
         Write-Host "Plan: enable WakeOnMagicPacket on $($adapter.Name)."

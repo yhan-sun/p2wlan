@@ -19,6 +19,18 @@ impl Config {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| DaemonError::Config(format!("failed to serialize config: {e}")))?;
 
+        #[cfg(windows)]
+        if let Ok(paths) = crate::windows_service_paths::ServicePaths::resolve() {
+            if path == paths.config() {
+                return paths
+                    .check_profile_root()
+                    .and_then(|()| paths.write_new_private_file(path, content.as_bytes()))
+                    .map_err(|e| {
+                        DaemonError::Config(format!("failed to save Windows machine profile: {e}"))
+                    });
+            }
+        }
+
         #[cfg(unix)]
         {
             private_file::save(path, content.as_bytes())

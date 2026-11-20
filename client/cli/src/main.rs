@@ -16,6 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod formatting;
 use formatting::*;
+#[path = "main/service.rs"]
+mod service;
 
 // A control server is an explicit user setting.  Keep the value empty so a
 // fresh CLI cannot silently contact a project-owned deployment.
@@ -98,6 +100,11 @@ enum Commands {
     SupportBundle(SupportBundleArgs),
     /// Diagnose local config, daemon status, direct UDP, and relay fallback
     Doctor,
+    /// Manage Windows boot-time service
+    Service {
+        #[command(subcommand)]
+        command: service::ServiceCommand,
+    },
     /// Download and install the latest Linux CLI release
     Update(UpdateArgs),
     /// Internal elevated launcher used by `p2wlan up`
@@ -227,6 +234,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Commands::Wake { command } => wake_command(&config_path, command).await,
         Commands::SupportBundle(args) => support_bundle(&config_path, args).await,
         Commands::Doctor => doctor(&config_path).await,
+        Commands::Service { command } => service::run(&config_path, command),
         Commands::Update(args) => update(&config_path, args).await,
         Commands::InternalStart(args) => start_daemon_as_root(args).await,
     }

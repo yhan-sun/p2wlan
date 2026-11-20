@@ -83,6 +83,11 @@ impl WintunApi {
                 candidates.push(PathBuf::from(path));
             }
         }
+        if std::env::var_os("P2WLAN_STRICT_WINTUN_DLL").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            return candidates;
+        }
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 candidates.push(dir.join("wintun.dll"));

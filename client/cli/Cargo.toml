@@ -22,3 +22,9 @@ libc = { workspace = true }
 flate2 = "1"
 sha2 = { workspace = true }
 hex = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Services",
+] }

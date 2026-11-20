@@ -538,8 +538,8 @@ jobs:
       - name: Restore SDK-migrated files (pre-build)
         run: bash scripts/release/hermetic_build.sh restore
 
-      - name: Build Windows daemon
-        run: cargo build -p p2wlan-daemon --release
+      - name: Build Windows daemon and CLI
+        run: cargo build -p p2wlan-daemon -p p2wlan-cli --release
 
       - name: Build Windows release bundle
         working-directory: apps/flutter_client
@@ -598,9 +598,11 @@ jobs:
           }
           $sourceDir = $releaseDir.FullName
           Copy-Item "target\release\p2wlan-daemon.exe" (Join-Path $sourceDir "p2wlan-daemon.exe") -Force
+          Copy-Item "target\release\p2wlan.exe" (Join-Path $sourceDir "p2wlan.exe") -Force
+          Copy-Item "scripts\windows\enable-wol.ps1" (Join-Path $sourceDir "enable-wol.ps1") -Force
           & "apps\flutter_client\scripts\fetch_wintun.ps1" -DestinationDirectory $sourceDir -Architecture amd64
           & "apps\flutter_client\scripts\bundle_msvc_runtime.ps1" -DestinationDirectory $sourceDir
-          foreach ($requiredFile in @("p2wlan_flutter_client.exe", "p2wlan-daemon.exe", "wintun.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")) {
+          foreach ($requiredFile in @("p2wlan_flutter_client.exe", "p2wlan-daemon.exe", "p2wlan.exe", "enable-wol.ps1", "wintun.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")) {
             if (-not (Test-Path (Join-Path $sourceDir $requiredFile))) {
               throw "Windows release bundle is missing $requiredFile"
             }
@@ -619,7 +621,7 @@ jobs:
           AppName=P2WLAN
           AppVersion={#AppVersion}
           AppPublisher=P2WLAN
-          DefaultDirName={localappdata}\Programs\P2WLAN
+          DefaultDirName={autopf}\P2WLAN
           DefaultGroupName=P2WLAN
           DisableProgramGroupPage=yes
           OutputDir={#OutputDir}
@@ -628,6 +630,10 @@ jobs:
           SolidCompression=yes
           WizardStyle=modern
           PrivilegesRequired=lowest
+          PrivilegesRequiredOverridesAllowed=dialog
+          UsePreviousPrivileges=no
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
           UninstallDisplayIcon={app}\p2wlan_flutter_client.exe
 
           [Files]
@@ -642,6 +648,44 @@ jobs:
 
           [Run]
           Filename: "{app}\p2wlan_flutter_client.exe"; Description: "Launch P2WLAN"; Flags: nowait postinstall skipifsilent
+
+          [Code]
+          function IsProductMachineInstall: Boolean;
+          begin
+            Result := IsAdminInstallMode and
+              (CompareText(ExpandConstant('{app}'), ExpandConstant('{commonpf}\P2WLAN')) = 0);
+          end;
+
+          procedure CurStepChanged(CurStep: TSetupStep);
+          var
+            Status: Integer;
+          begin
+            if (CurStep = ssPostInstall) and IsProductMachineInstall then
+            begin
+              if not Exec(ExpandConstant('{sys}\icacls.exe'),
+                          '"' + ExpandConstant('{app}') + '" /setowner *S-1-5-32-544 /T /L /Q',
+                          ExpandConstant('{sys}'), SW_HIDE, ewWaitUntilTerminated, Status) or
+                 (Status <> 0) then
+                RaiseException('Could not set Administrators ownership on the machine-wide P2WLAN package.');
+            end;
+          end;
+
+          procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+          var
+            Status: Integer;
+          begin
+            if (CurUninstallStep = usUninstall) and IsProductMachineInstall then
+            begin
+              if not Exec(ExpandConstant('{app}\p2wlan.exe'), 'service uninstall',
+                          ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Status) or
+                 (Status <> 0) then
+              begin
+                SuppressibleMsgBox('Remove the P2WLAN boot-time service from an administrator terminal, then retry uninstall.',
+                                   mbError, MB_OK, IDOK);
+                Abort;
+              end;
+            end;
+          end;
           "@ | Set-Content -Path $iss -Encoding UTF8
           & $iscc $iss
 
