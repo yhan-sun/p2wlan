@@ -92,6 +92,10 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
         config.diagnostics.enabled = true;
         config.diagnostics.bind = bind.clone();
     }
+    #[cfg(target_os = "windows")]
+    if let Some(allow_remote) = cli.wake_allow_remote {
+        config.wake.allow_remote = allow_remote;
+    }
     if cli.diagnostics_disable {
         config.diagnostics.enabled = false;
     }

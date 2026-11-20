@@ -28,6 +28,20 @@ pub struct Config {
     /// ACL rules.
     #[serde(default)]
     pub acl: AclConfig,
+    /// Optional Wake-on-LAN roles for this managed profile.
+    #[serde(default)]
+    pub wake: WakeConfig,
+}
+
+/// Neither advertising a local MAC nor relaying a wake is enabled by default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WakeConfig {
+    pub proxy: bool,
+    pub allow_remote: bool,
+    /// Pin proxy broadcasts to a configured physical LAN or bridge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_interface: Option<String>,
 }
 
 /// Node identity configuration.

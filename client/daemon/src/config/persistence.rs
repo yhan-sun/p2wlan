@@ -120,6 +120,7 @@ impl Config {
             port_mappings: Vec::new(),
             dns: DnsConfig::default(),
             acl: AclConfig::default(),
+            wake: WakeConfig::default(),
         })
     }
 }

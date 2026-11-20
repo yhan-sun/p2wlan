@@ -183,6 +183,8 @@ impl ControlClient {
     ) {
         if let Some(sender) = &self.test_registration_tx {
             sender.send_replace(sequence.map(|registration_seq| CriticalControlAuth {
+                wake_device_credential: false,
+                wake_proxy_v1: false,
                 accepted_peer_capabilities: capabilities,
                 base_url: "http://control.invalid".to_string(),
                 token: "test-registration".to_string(),
@@ -324,6 +326,10 @@ impl ControlClient {
         Err(DaemonError::ControlPlane(code.into()))
     }
 
+    pub(crate) fn wake_status(&self) -> Arc<remote_wake::WakeStatus> {
+        self.wake_status.clone()
+    }
+
     /// Create a new control client.
     ///
     /// When `enabled` is `false`, the background control loop is not spawned
@@ -402,6 +408,7 @@ impl ControlClient {
         });
         let critical_lifecycle_tx = cmd_tx.clone();
         let client = Self {
+            wake_status: Arc::new(remote_wake::WakeStatus::new(config, runtime_enabled)),
             registration_rx: critical_auth_rx.clone(),
             #[cfg(test)]
             test_registration_tx: None,
@@ -431,11 +438,31 @@ impl ControlClient {
             // primary pool. Candidate refresh has a separate pool to avoid
             // head-of-line blocking, but both pools are rebuilt atomically
             // after a stable network-route change.
-            let (http, candidate_http) = route_aware_control_http_clients(
-                config.control.proxy_mode,
-                &config.control.server_url,
-                Some(server_clock.clone()),
-            );
+            let base_url = normalize_http_base_url(&config.control.server_url);
+            let wake_enabled = remote_wake::enabled(config, &base_url);
+            let (http, candidate_http) = if wake_enabled {
+                route_aware_control_http_clients_with_wake(
+                    config.control.proxy_mode,
+                    &config.control.server_url,
+                    Some(server_clock.clone()),
+                    true,
+                )
+            } else {
+                route_aware_control_http_clients(
+                    config.control.proxy_mode,
+                    &config.control.server_url,
+                    Some(server_clock.clone()),
+                )
+            };
+            let wake_task = wake_enabled.then(|| {
+                tokio::spawn(remote_wake::run(
+                    remote_wake::Profile::new(config),
+                    client.wake_status(),
+                    http.clone(),
+                    critical_auth_rx.clone(),
+                    shutdown_rx.clone(),
+                ))
+            });
             let config = config.clone();
             let event_tx = client.event_tx.clone();
             let cfg_path = config_path.clone();
@@ -497,6 +524,7 @@ impl ControlClient {
             let tasks = ControlRuntimeTasks {
                 ordinary: tokio::spawn(ordinary),
                 critical: tokio::spawn(critical),
+                wake: wake_task,
             };
             tokio::spawn(supervisor.run(tasks));
         }
@@ -564,6 +592,7 @@ impl ControlClient {
         }));
         let (registration_tx, registration_rx) = watch::channel(None);
         Self {
+            wake_status: Arc::new(remote_wake::WakeStatus::default()),
             registration_rx,
             test_registration_tx: Some(registration_tx),
             shutdown_lifecycle: None,

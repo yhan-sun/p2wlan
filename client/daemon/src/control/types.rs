@@ -499,11 +499,19 @@ pub struct RelayCatalogEntry {
     pub udp_observer_endpoints: Vec<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct AcceptedRegistrationCapabilities {
+    #[serde(flatten)]
+    peer: PeerCapabilities,
+    #[serde(default)]
+    wake_proxy_v1: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct RegisterDeviceResponse {
     /// Echo of this daemon registration, independent of server feature flags.
     #[serde(default)]
-    accepted_peer_capabilities: PeerCapabilities,
+    accepted_peer_capabilities: AcceptedRegistrationCapabilities,
     success: bool,
     node_id: Option<String>,
     virtual_ip: Option<String>,
@@ -677,6 +685,7 @@ struct SignalResponse {
 /// signaling, peer discovery, and configuration updates.
 #[derive(Clone)]
 pub struct ControlClient {
+    wake_status: Arc<remote_wake::WakeStatus>,
     /// Existing registration owner; new-mode eligibility is never inferred locally.
     registration_rx: watch::Receiver<Option<CriticalControlAuth>>,
     #[cfg(test)]
@@ -792,6 +801,8 @@ const CRITICAL_SIGNAL_OVERALL_DEADLINE: std::time::Duration = std::time::Duratio
 /// the configured local id is deliberately not used for signal sends.
 #[derive(Clone)]
 struct CriticalControlAuth {
+    wake_device_credential: bool,
+    wake_proxy_v1: bool,
     accepted_peer_capabilities: PeerCapabilities,
     base_url: String,
     token: String,

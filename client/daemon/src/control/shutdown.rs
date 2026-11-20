@@ -61,12 +61,16 @@ struct ControlSupervisor {
 struct ControlRuntimeTasks {
     ordinary: tokio::task::JoinHandle<()>,
     critical: tokio::task::JoinHandle<()>,
+    wake: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for ControlRuntimeTasks {
     fn drop(&mut self) {
         self.ordinary.abort();
         self.critical.abort();
+        if let Some(wake) = &self.wake {
+            wake.abort();
+        }
     }
 }
 
@@ -103,7 +107,12 @@ impl ControlSupervisor {
             || timeout(Duration::from_millis(750), &mut tasks.critical)
                 .await
                 .is_ok();
-        let quiesced = ordinary_quiesced && critical_quiesced;
+        let wake_quiesced = if let Some(wake) = &mut tasks.wake {
+            timeout(Duration::from_millis(100), wake).await.is_ok()
+        } else {
+            true
+        };
+        let quiesced = ordinary_quiesced && critical_quiesced && wake_quiesced;
         drop(tasks);
 
         if quiesced {

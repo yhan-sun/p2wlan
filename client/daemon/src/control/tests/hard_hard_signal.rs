@@ -132,6 +132,8 @@ fn dispatch_auth_for_test() -> (
     watch::Receiver<Option<CriticalControlAuth>>,
 ) {
     watch::channel(Some(CriticalControlAuth {
+        wake_device_credential: false,
+        wake_proxy_v1: false,
         accepted_peer_capabilities: PeerCapabilities::current(),
         base_url: "https://ctrl.test".into(),
         token: "test-token".into(),

@@ -33,6 +33,8 @@ fn test_cli(control: Option<&str>, network: Option<&str>) -> Cli {
         relay_selection_timeout_ms: None,
         relay_startup_timeout_ms: None,
         diagnostics_bind: None,
+        #[cfg(target_os = "windows")]
+        wake_allow_remote: None,
         diagnostics_disable: false,
         prefer_relay: false,
         prefer_direct: false,
@@ -205,6 +207,8 @@ fn network_arguments_override_generated_config() {
         relay_selection_timeout_ms: Some(750),
         relay_startup_timeout_ms: None,
         diagnostics_bind: None,
+        #[cfg(target_os = "windows")]
+        wake_allow_remote: None,
         diagnostics_disable: false,
         prefer_relay: false,
         prefer_direct: false,
@@ -279,6 +283,8 @@ fn test_validate_cli_invalid_cases() {
         relay_selection_timeout_ms: None,
         relay_startup_timeout_ms: None,
         diagnostics_bind: None,
+        #[cfg(target_os = "windows")]
+        wake_allow_remote: None,
         diagnostics_disable: false,
         prefer_relay: false,
         prefer_direct: false,
@@ -420,6 +426,8 @@ fn managed_argument_overrides_existing_manual_config() {
         relay_selection_timeout_ms: None,
         relay_startup_timeout_ms: None,
         diagnostics_bind: None,
+        #[cfg(target_os = "windows")]
+        wake_allow_remote: None,
         diagnostics_disable: false,
         prefer_relay: false,
         prefer_direct: false,
@@ -723,3 +731,22 @@ fn diagnostics_scope_returns_error(
 
 include!("diagnostics_auth_tests.rs");
 include!("runtime_directory_prepare_tests.rs");
+
+#[cfg(target_os = "windows")]
+#[test]
+fn explicit_remote_wake_opt_out_updates_the_loaded_profile() {
+    let mut config = Config::generate_default("https://control.example.com", "default").unwrap();
+    assert!(!config.wake.allow_remote);
+    apply_cli_overrides(
+        &mut config,
+        &Cli::try_parse_from(["p2wlan-daemon", "--wake-allow-remote", "true"]).unwrap(),
+    );
+    assert!(config.wake.allow_remote);
+    apply_cli_overrides(&mut config, &test_cli(None, None));
+    assert!(config.wake.allow_remote);
+    apply_cli_overrides(
+        &mut config,
+        &Cli::try_parse_from(["p2wlan-daemon", "--wake-allow-remote", "false"]).unwrap(),
+    );
+    assert!(!config.wake.allow_remote);
+}

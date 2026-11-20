@@ -101,6 +101,12 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
             );
             println!("diagnostics = {}", config.diagnostics.bind);
             println!("resource-capture = {}", config.diagnostics.resource_capture);
+            println!("wake-proxy = {}", config.wake.proxy);
+            println!("wake-allow-remote = {}", config.wake.allow_remote);
+            println!(
+                "wake-proxy-interface = {}",
+                config.wake.proxy_interface.as_deref().unwrap_or("(auto)")
+            );
             Ok(())
         }
         ConfigCommand::Set { key, value } => {

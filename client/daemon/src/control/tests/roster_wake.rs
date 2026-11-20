@@ -75,6 +75,8 @@ impl CommandHarness {
         let recent = Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default()));
         let clock = self.state.read().await.server_clock.clone();
         let (critical_auth, _) = watch::channel(Some(CriticalControlAuth {
+            wake_device_credential: false,
+            wake_proxy_v1: false,
             accepted_peer_capabilities: PeerCapabilities::default(),
             base_url: self.base_url.clone(),
             token: self.token.clone(),

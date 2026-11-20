@@ -74,8 +74,12 @@ mod tests {
 
     #[test]
     fn bridge_requires_a_non_overlay_physical_lower_link() -> io::Result<()> {
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
         let directory =
-            std::env::temp_dir().join(format!("p2wlan-wake-bridge-{}", std::process::id()));
+            std::env::temp_dir().join(format!("p2wlan-wake-bridge-{}-{time}", std::process::id()));
         fs::create_dir(&directory)?;
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {

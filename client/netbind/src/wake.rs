@@ -228,6 +228,14 @@ pub async fn send_magic_packet_excluding(
     interface: Option<&str>,
     excluded: &str,
 ) -> Result<(), WakeSendError> {
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "macos",
+        windows
+    ))]
+    if interface.is_some_and(|name| excluded_interface(name.trim())) {
+        return Err(WakeSendError::NoLanInterface);
+    }
     let interfaces = list_lan_interfaces().map_err(|err| {
         if err.kind() == io::ErrorKind::Unsupported {
             WakeSendError::UnsupportedPlatform
