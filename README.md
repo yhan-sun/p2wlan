@@ -186,12 +186,12 @@ P2WLAN 提供一张跨地域的虚拟三层网络。应用通过对端的虚拟 
 | OpenWrt ARM64 / x86_64 | 24.10 `.ipk` / 25.12 `.apk`（CLI + daemon） | [安装指南](docs/guides/openwrt.md) |
 | Android 7.0+ (API 24+) arm64 | `p2wlan-android-arm64-release.apk` | 支持 |
 
-Linux 无桌面环境选择 CLI 包，也可使用固定版本安装脚本。把 `vX.Y.Z` 替换为实际客户端 Release 标签：
+Linux 无桌面环境选择 CLI 包，也可直接用安装脚本。脚本默认安装最新客户端发布：先解析客户端标签并打印，再用该标签下载包和对应的 SHA-256 校验文件；`server-vX.Y.Z` 是服务端发布，不包含 Linux CLI 包。需要复现某个版本时加 `--version vX.Y.Z`：
 
 ```bash
-P2WLAN_VERSION=vX.Y.Z
-curl -fsSL "https://raw.githubusercontent.com/yhan-sun/p2wlan/$P2WLAN_VERSION/scripts/install-linux-cli.sh" -o /tmp/p2wlan-install.sh
-sudo sh /tmp/p2wlan-install.sh --version "$P2WLAN_VERSION"
+curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+sudo sh /tmp/p2wlan-install.sh                     # 最新客户端发布
+# sudo sh /tmp/p2wlan-install.sh --version v1.0.1  # 固定版本
 ```
 
 ### 2. 配置 Control

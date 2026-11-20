@@ -28,13 +28,13 @@ daemon 构建脚本使用只读 Git 查询，避免身份检查自身刷新已�
 
 Android 生产签名只在受保护的 release-signing 环境和版本 tag 中执行。分支构建不能取得生产签名秘密。Android 原生桥使用当前 Flutter SDK 声明的固定 NDK 版本；找不到该版本时发布失败，不扫描并选择 runner 上任意最新 NDK。
 
-客户端远程安装器必须显式接收 `vX.Y.Z`，并从同一个 tag 下载包和 checksum。服务端实际部署也必须绑定一个固定 `server-vX.Y.Z`、相邻发布元数据或明确的镜像摘要；`latest` 或可变 `main` 不是可复现的服务端程序或镜像输入。
+客户端远程安装器在未指定版本时，从 GitHub Releases 解析最新的客户端标签（`vX.Y.Z` 形态；`server-v*` 和服务端发布不参与解析），打印解析出的标签，并用该标签下载包和 checksum；`--version vX.Y.Z` 可固定版本。服务端实际部署也必须绑定一个固定 `server-vX.Y.Z`、相邻发布元数据或明确的镜像摘要；`latest` 或可变 `main` 不是可复现的服务端程序或镜像输入。
 
 `bootstrap-server.sh` 的公开 `main` URL 是可更新的方式选择、环境准备与发布发现入口。交互时先选择原生 systemd 或 Docker，再只准备对应依赖并发现正式 `server-vX.Y.Z`：原生方式要求当前主机架构的服务端归档和 checksum，Docker 默认要求源码部署包和 checksum；显式 `--docker-mode image` 才要求四个可选镜像资产。Docker 的 `--docker-mode build` 是默认行为，不增加交互菜单。一经选择，本次下载与验证全部使用该准确 tag 的包、checksum 和包内身份，不从 `main` 补取 manager、Compose 或服务端源码。无人值守必须显式提供 `--version`，并应以 `--method native|docker` 明确部署方式。
 
 Docker 部署目录 `.env` 保存解析后的版本、提交、安装模式和实际运行镜像；源码模式还记录持久源码目录与构建镜像名，源码保存在 `sources/<source_sha>/`。原生安装的 `current/BUILD-METADATA.txt` 保存版本、源码提交与架构。重新执行引导入口本身不代表重新部署了同一版本，需要复现时必须使用对应的固定身份。依赖源和构建基础镜像属于构建链，源码身份一致不等于二进制逐字节可复现。
 
-Linux CLI 远程安装器对 `--version TAG`、`--version=TAG` 和 `P2WLAN_VERSION` 使用同一校验：标签以 `v` 开头，后面至少一个字符，且完整标签只能包含 ASCII 字母、数字、点、下划线和连字符。路径分隔符、查询参数、片段和空白会在选择或下载包之前被拒绝，`--dry-run` 同样执行该校验。校验只约束标签格式，不证明标签存在或对应正式版本；正式安装仍应选择明确的 `vX.Y.Z` Release。随发布包提供的本地安装器不要求远程版本参数。
+Linux CLI 远程安装器对 `--version TAG`、`--version=TAG`、`P2WLAN_VERSION` 和自动解析出的最新客户端标签使用同一校验：标签以 `v` 开头，后面至少一个字符，且完整标签只能包含 ASCII 字母、数字、点、下划线和连字符。路径分隔符、查询参数、片段和空白会在选择或下载包之前被拒绝，`--dry-run` 同样执行该校验。校验只约束标签格式，不证明标签存在或对应正式版本；解析不到最新标签时安装器报错并提示显式传入 `--version`，安装记录必须保存实际安装的标签。随发布包提供的本地安装器不要求远程版本参数。
 
 ## 发布后审计
 

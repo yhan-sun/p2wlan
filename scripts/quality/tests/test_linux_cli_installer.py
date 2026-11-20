@@ -27,11 +27,32 @@ class LinuxCLIInstallerTests(unittest.TestCase):
             encoding="utf-8",
         )
         uname.chmod(0o755)
-        for command in ("curl", "wget", "install"):
+        curl = self.bin_dir / "curl"
+        curl.write_text(
+            '#!/bin/sh\n'
+            'printf "curl %s\\n" "$*" >> "$INSTALLER_TEST_LOG"\n'
+            'case "$*" in\n'
+            '  *api.github.com*)\n'
+            '    if [ -n "${INSTALLER_TEST_API_BODY:-}" ]; then\n'
+            '      cat "$INSTALLER_TEST_API_BODY"\n'
+            '      exit 0\n'
+            '    fi\n'
+            '    echo "curl: (22) The requested URL returned error: 403" >&2\n'
+            '    exit 22\n'
+            '    ;;\n'
+            '  *)\n'
+            '    echo "unexpected release download in test" >&2\n'
+            '    exit 22\n'
+            '    ;;\n'
+            'esac\n',
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+        for command in ("wget", "install"):
             stub = self.bin_dir / command
             stub.write_text(
                 f'#!/bin/sh\nprintf "{command}\\n" >> "$INSTALLER_TEST_LOG"\n'
-                f'echo "Unexpected {command} in installer dry-run test" >&2\nexit 1\n',
+                f'echo "unexpected {command} invocation" >&2\nexit 1\n',
                 encoding="utf-8",
             )
             stub.chmod(0o755)
@@ -45,12 +66,18 @@ class LinuxCLIInstallerTests(unittest.TestCase):
             "INSTALLER_TEST_ARCH": "x86_64",
         })
 
-    def run_installer(self, tag, source="argument", arch="x86_64", locale=None):
+    def run_installer(
+        self, tag, source="argument", arch="x86_64", locale=None, dry_run=True, api_body=None
+    ):
         self.command_log.unlink(missing_ok=True)
         environment = {**self.environment, "INSTALLER_TEST_ARCH": arch}
         if locale is not None:
             environment["LC_ALL"] = locale
-        arguments = ["sh", str(self.installer), "--dry-run"]
+        if api_body is not None:
+            environment["INSTALLER_TEST_API_BODY"] = str(api_body)
+        arguments = ["sh", str(self.installer)]
+        if dry_run:
+            arguments.append("--dry-run")
         if source == "argument":
             arguments.extend(["--version", tag])
         elif source == "equals":
@@ -106,11 +133,55 @@ class LinuxCLIInstallerTests(unittest.TestCase):
                 result = self.run_installer("v1.2.3_preview-A", locale=locale)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_missing_remote_version_is_rejected(self):
+    def test_missing_remote_version_installs_latest_client_release(self):
+        api_body = self.directory / "releases.json"
+        api_body.write_text(
+            '[\n'
+            '  {\n'
+            '    "tag_name": "server-v9.9.9",\n'
+            '    "prerelease": false\n'
+            '  },\n'
+            '  {\n'
+            '    "tag_name": "v2.0.0-rc.1",\n'
+            '    "prerelease": true\n'
+            '  },\n'
+            '  {\n'
+            '    "tag_name": "v1.4.0",\n'
+            '    "prerelease": false\n'
+            '  }\n'
+            ']\n',
+            encoding="utf-8",
+        )
+        result = self.run_installer("", "environment", api_body=api_body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Using latest client release v1.4.0", result.stdout)
+        self.assertIn(
+            "https://github.com/yhan-sun/p2wlan/releases/download/v1.4.0/"
+            "p2wlan-linux-x64-cli.tar.gz",
+            result.stdout,
+        )
+
+    def test_unresolved_latest_release_requires_explicit_version(self):
         result = self.run_installer("", "environment")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("required for a reproducible remote install", result.stderr)
-        self.assertFalse(self.command_log.exists())
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(
+            "Could not read https://api.github.com/repos/yhan-sun/p2wlan/releases.",
+            result.stderr,
+        )
+        self.assertIn("--version vX.Y.Z", result.stderr)
+
+    def test_unavailable_release_package_reports_next_step(self):
+        result = self.run_installer("v1.2.3", dry_run=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(
+            "No release package at "
+            "https://github.com/yhan-sun/p2wlan/releases/download/v1.2.3/"
+            "p2wlan-linux-x64-cli.tar.gz",
+            result.stderr,
+        )
+        self.assertIn("https://github.com/yhan-sun/p2wlan/releases", result.stderr)
+        self.assertIn("server-vX.Y.Z", result.stderr)
 
     def test_local_package_does_not_require_remote_version(self):
         for name in ("p2wlan", "p2wlan-daemon", "README-LINUX-CLI.txt"):

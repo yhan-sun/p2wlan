@@ -185,12 +185,12 @@ Choose the appropriate platform artifact from a client **`vX.Y.Z`** release on [
 | Linux arm64 | `p2wlan-linux-arm64-cli.tar.gz` (CLI + daemon) | Supported |
 | Android 7.0+ (API 24+) arm64 | `p2wlan-android-arm64-release.apk` | Supported |
 
-For headless Linux, choose the CLI package or use the installer with a fixed version. Replace `vX.Y.Z` with an actual client Release tag:
+For headless Linux, choose the CLI package or use the installer directly. The installer installs the latest client release by default: it resolves the client tag, prints it, and downloads both the package and its SHA-256 checksum from that tag. `server-vX.Y.Z` is a server release and ships no Linux CLI package. Add `--version vX.Y.Z` to reproduce a specific release:
 
 ```bash
-P2WLAN_VERSION=vX.Y.Z
-curl -fsSL "https://raw.githubusercontent.com/yhan-sun/p2wlan/$P2WLAN_VERSION/scripts/install-linux-cli.sh" -o /tmp/p2wlan-install.sh
-sudo sh /tmp/p2wlan-install.sh --version "$P2WLAN_VERSION"
+curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+sudo sh /tmp/p2wlan-install.sh                     # latest client release
+# sudo sh /tmp/p2wlan-install.sh --version v1.0.1  # fixed release
 ```
 
 ### 2. Configure Control

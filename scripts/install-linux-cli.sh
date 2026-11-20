@@ -12,19 +12,20 @@ usage() {
 p2wlan Linux CLI installer
 
 Usage:
-  sudo ./install.sh
-  VERSION=vX.Y.Z
-  curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/$VERSION/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
-  sudo sh /tmp/p2wlan-install.sh --version "$VERSION"
-  sh /tmp/p2wlan-install.sh --version "$VERSION" --install-dir "$HOME/.local/bin"
+  sudo sh install.sh                    Install the latest client release
+  sudo sh install.sh --version vX.Y.Z   Install a fixed client release
+  sh install.sh --install-dir "$HOME/.local/bin"
+  curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+  sudo sh /tmp/p2wlan-install.sh
 
 Environment:
-  P2WLAN_VERSION      Release tag to install, for example v0.1.26. Required for remote install
-  P2WLAN_REPO         GitHub repo to download from. Default: yhan-sun/p2wlan
-  P2WLAN_INSTALL_DIR  Install directory. Default: /usr/local/bin
+  P2WLAN_VERSION       Release tag to install, for example vX.Y.Z. Default: latest client release
+  P2WLAN_REPO          GitHub repo to download from. Default: yhan-sun/p2wlan
+  P2WLAN_INSTALL_DIR   Install directory. Default: /usr/local/bin
+  P2WLAN_GITHUB_TOKEN  Optional token used when resolving the latest release (GitHub API rate limit)
 
 Options:
-  --version TAG       Release tag to install, for example v0.1.26
+  --version TAG       Install this exact release tag instead of the latest
   --repo OWNER/NAME   GitHub repo to download from
   --install-dir DIR   Install directory for p2wlan and p2wlan-daemon
   --dry-run           Print the selected package without installing
@@ -132,6 +133,37 @@ download_file() {
   fi
 }
 
+fetch_stdout() {
+  url=$1
+  if command -v curl >/dev/null 2>&1; then
+    if [ -n "${P2WLAN_GITHUB_TOKEN:-}" ]; then
+      curl -fsSL --retry 2 --connect-timeout 20 --max-time 60 \
+        -H "Authorization: Bearer ${P2WLAN_GITHUB_TOKEN}" "$url"
+    else
+      curl -fsSL --retry 2 --connect-timeout 20 --max-time 60 "$url"
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if [ -n "${P2WLAN_GITHUB_TOKEN:-}" ]; then
+      wget -q -O - --header="Authorization: Bearer ${P2WLAN_GITHUB_TOKEN}" "$url"
+    else
+      wget -q -O - "$url"
+    fi
+  else
+    echo "Missing required command: curl or wget" >&2
+    return 1
+  fi
+}
+
+# Newest published client release. Client tags are plain vX.Y.Z; server
+# releases use server-vX.Y.Z and pre-releases carry a suffix, so both are
+# excluded by the tag pattern.
+latest_client_version() {
+  page=$(fetch_stdout "https://api.github.com/repos/${REPO}/releases?per_page=30") || return 1
+  printf '%s\n' "$page" |
+    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' |
+    head -n 1
+}
+
 detect_arch() {
   arch=$(uname -m)
   case "$arch" in
@@ -156,8 +188,17 @@ fi
 
 if [ "$LOCAL_PACKAGE" -ne 1 ]; then
   if [ -z "$VERSION" ]; then
-    echo "--version vX.Y.Z is required for a reproducible remote install." >&2
-    exit 1
+    if ! VERSION=$(latest_client_version); then
+      echo "Could not read https://api.github.com/repos/${REPO}/releases." >&2
+      echo "Check network access, set P2WLAN_GITHUB_TOKEN, or pass --version vX.Y.Z." >&2
+      exit 1
+    fi
+    if [ -z "$VERSION" ]; then
+      echo "No client release tag found on https://github.com/${REPO}/releases." >&2
+      echo "Pass --version vX.Y.Z explicitly." >&2
+      exit 1
+    fi
+    echo "Using latest client release $VERSION"
   fi
   case "$VERSION" in
     v?*) ;;
@@ -185,8 +226,17 @@ if [ "$LOCAL_PACKAGE" -ne 1 ]; then
   ARCHIVE="$WORK_DIR/$ASSET"
   CHECKSUM="$WORK_DIR/$ASSET.sha256"
   echo "Downloading $URL"
-  download_file "$URL" "$ARCHIVE"
-  download_file "${URL}.sha256" "$CHECKSUM"
+  if ! download_file "$URL" "$ARCHIVE"; then
+    echo "No release package at $URL" >&2
+    echo "Client tags look like vX.Y.Z; server-vX.Y.Z releases carry no Linux CLI package." >&2
+    echo "Pick an existing client release from https://github.com/${REPO}/releases and pass its exact tag." >&2
+    exit 1
+  fi
+  if ! download_file "${URL}.sha256" "$CHECKSUM"; then
+    echo "No checksum at ${URL}.sha256" >&2
+    echo "Refusing to install a package without its release checksum." >&2
+    exit 1
+  fi
   (cd "$WORK_DIR" && sha256sum -c "$(basename "$CHECKSUM")")
   tar -xzf "$ARCHIVE" -C "$WORK_DIR"
   PACKAGE_DIR="$WORK_DIR/p2wlan-linux-${RELEASE_ARCH}-cli"
