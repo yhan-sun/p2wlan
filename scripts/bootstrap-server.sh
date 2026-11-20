@@ -65,6 +65,7 @@ HELP
     local variable=$1 label=$2 default=${3:-} reply
     printf '%s%s: ' "$label" "${default:+ [$default]}" >&3
     IFS= read -r reply <&3 || die 'terminal input ended; installation cancelled'
+    case "${reply%$'\r'}" in q|Q|quit|QUIT|exit|EXIT) printf '安装已取消。\n' >&3; exit 0 ;; esac
     printf -v "$variable" '%s' "${reply:-$default}"
   }
   valid_version() { [[ "$1" =~ ^server-v[A-Za-z0-9._-]+$ ]] || die 'version must be a fixed server-vX.Y.Z tag'; }
@@ -106,13 +107,13 @@ HELP
     if [ -z "$BOOT_METHOD" ]; then
       docker_description='Compose 本机源码构建'
       [ "$BOOT_DOCKER_MODE" != image ] || docker_description='预构建镜像'
-      printf '  1) 直接安装（Linux + systemd，不需要 Docker）\n  2) Docker 部署（%s）\n  0) 取消并退出\n' "$docker_description" >&3
+      printf '  1) 直接安装（Linux + systemd，不需要 Docker）\n  2) Docker 部署（%s）\n  0/q) 取消并退出\n' "$docker_description" >&3
       while [ -z "$BOOT_METHOD" ]; do
         prompt method_choice '安装方式' 2
         case "$method_choice" in
           1) BOOT_METHOD=native ;;
           2) BOOT_METHOD=docker ;;
-          0) printf '安装已取消。\n' >&3; return 0 ;;
+          0|q|Q|quit|QUIT|exit|EXIT) printf '安装已取消。\n' >&3; return 0 ;;
           *) printf '请输入 1、2 或 0。\n' >&3 ;;
         esac
       done
@@ -185,12 +186,12 @@ HELP
       done
     fi
     if [ "$BOOT_INSTALL_DEPS" -eq 0 ] && [ "$BOOT_INTERACTIVE" -eq 1 ]; then
-      printf '\n所选 %s 方式缺少运行依赖。\n  1) 安装缺失依赖\n  0) 取消并退出\n' "$BOOT_METHOD" >&3
+      printf '\n所选 %s 方式缺少运行依赖。\n  1) 安装缺失依赖\n  0/q) 取消并退出\n' "$BOOT_METHOD" >&3
       while [ "$BOOT_INSTALL_DEPS" -eq 0 ]; do
         prompt answer '请选择' 1
         case "$answer" in
           1|y|Y|yes) BOOT_INSTALL_DEPS=1 ;;
-          0|n|N|no) echo '安装已取消。' >&3; return 0 ;;
+          0|n|N|no|q|Q|quit|QUIT|exit|EXIT) echo '安装已取消。' >&3; return 0 ;;
           *) printf '请输入 1 安装，或 0 退出。\n' >&3 ;;
         esac
       done
@@ -541,11 +542,11 @@ PY
     catalog="$BOOT_TMP_DIR/catalog.json"
     python3 "$BOOT_TMP_DIR/verify.py" catalog "$bundle_method" "$BOOT_ARCH" "${pages[@]}" > "$catalog"
     python3 "$BOOT_TMP_DIR/verify.py" show "$catalog" >&3
-    printf '  m) 手动输入其他 server-v 版本\n  0) 取消并退出\n' >&3
+    printf '  m) 手动输入其他 server-v 版本\n  0/q) 取消并退出\n' >&3
     while [ -z "$BOOT_VERSION" ]; do
       prompt choice '请选择版本编号' 1
       case "$choice" in
-        0) printf '安装已取消。\n' >&3; return 0 ;;
+        0|q|Q|quit|QUIT|exit|EXIT) printf '安装已取消。\n' >&3; return 0 ;;
         m|M)
           prompt manual_version '请输入固定版本（server-vX.Y.Z）'
           if [[ "$manual_version" =~ ^server-v[A-Za-z0-9._-]+$ ]]; then

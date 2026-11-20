@@ -72,7 +72,8 @@ prompt() {
   local variable=$1 label=$2 default=${3:-} reply
   printf '%s%s: ' "$label" "${default:+ [$default]}" >&3
   IFS= read -r reply <&3 || die "terminal input ended; installation cancelled"
-  case "$reply" in cancel|取消) die 'installation cancelled' ;; esac
+  reply=${reply%$'\r'}
+  case "$reply" in q|Q|quit|QUIT|exit|EXIT|cancel|Cancel|CANCEL|取消) die 'installation cancelled' ;; esac
   printf -v "$variable" '%s' "${reply:-$default}"
 }
 valid_path() {
@@ -100,7 +101,7 @@ wizard_paths() {
     if [ "$_paths_edit" -eq 1 ] || [ "$CONFIG_SET" -eq 0 ]; then prompt CONFIG_DIR '配置目录' "$CONFIG_DIR"; fi
     if [ "$_paths_edit" -eq 1 ] || [ "$DATA_SET" -eq 0 ]; then prompt DATA_DIR '数据目录' "$DATA_DIR"; fi
     if (validate_paths) 2>/dev/null; then validate_paths; break; fi
-    printf '目录无效：请输入三个安全、绝对且互不包含的路径。请重试，或输入“取消”。\n' >&3
+    printf '目录无效：请输入三个安全、绝对且互不包含的路径。请重试，或输入 q 取消。\n' >&3
     _paths_edit=1
   done
   printf '程序：%s\n配置：%s\n数据：%s\n' "$INSTALL_ROOT" "$CONFIG_DIR" "$DATA_DIR" >&3
@@ -110,7 +111,7 @@ ask_choice() {
   while true; do
     prompt "$_choice_target" "$_choice_label" "$_choice_default"
     [[ " $_choice_allowed " == *" ${!_choice_target} "* ]] && return 0
-    printf '请选择 %s；输入“取消”可退出。\n' "$_choice_allowed" >&3
+    printf '请选择 %s；输入 q 取消。\n' "$_choice_allowed" >&3
   done
 }
 check_input() {
@@ -205,7 +206,7 @@ ask_input() {
       fi
       return 0
     fi
-    printf '输入无效：请检查地址、端口范围/重复或可读取的 PEM 路径；输入“取消”可退出。\n' >&3
+    printf '输入无效：请检查地址、端口范围/重复或可读取的 PEM 路径；输入 q 取消。\n' >&3
   done
 }
 wizard_new_configuration() {
@@ -291,7 +292,7 @@ if [ "$INTERACTIVE" -eq 1 ]; then
     while true; do
       prompt VERSION '固定服务端版本（server-vX.Y.Z）' "$VERSION"
       if (valid_version "$VERSION") 2>/dev/null; then break; fi
-      printf '请输入固定的 server-vX.Y.Z 版本，或输入“取消”。\n' >&3
+      printf '请输入固定的 server-vX.Y.Z 版本，或输入 q 取消。\n' >&3
     done
   fi
   wizard_paths 0
@@ -487,9 +488,9 @@ while true; do
   fi
   printf '安装后启动：%s\nControl 公网仍需可信 HTTPS/WSS 反向代理；本向导不签发公网证书。\n' "$START" >&3
   if [ "$configured" -eq 1 ]; then
-    printf '  1) 确认部署  2) 重新选择启动方式  0) 取消\n' >&3
+    printf '  1) 确认部署  2) 重新选择启动方式  0/q) 取消\n' >&3
   else
-    printf '  1) 确认部署  2) 重新填写配置  0) 取消\n' >&3
+    printf '  1) 确认部署  2) 重新填写配置  0/q) 取消\n' >&3
   fi
   ask_choice confirm_answer '确认部署' 1 '1 2 0'
   case "$confirm_answer" in

@@ -103,14 +103,30 @@ def protected(path, *, directory=False):
         fail('private regular configuration files and directories are required: ' + str(path))
     return info
 
+CANCEL_REPLIES = frozenset(('q', 'quit', 'exit', 'cancel', '取消'))
+
+def decode_reply(data):
+    # Terminals do not always send UTF-8: legacy zh_CN sessions use GB18030.
+    # Decode leniently so a stray byte cancels or re-prompts instead of
+    # aborting the wizard with a codec error.
+    for encoding in ('utf-8', 'gb18030'):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode('utf-8', 'replace')
+
 def prompt(terminal, label, default=''):
     terminal.write(label + (f' [{default}]' if default else '') + ': ')
     terminal.flush()
-    reply = terminal.readline()
-    if not reply:
+    try:
+        raw = terminal.buffer.readline()
+    except (OSError, ValueError):
+        fail('terminal input is unavailable; installation cancelled')
+    if not raw:
         fail('terminal input ended; installation cancelled')
-    value = reply.strip() or default
-    if value.lower() in ('cancel', '取消'):
+    value = decode_reply(raw).strip() or default
+    if value.lower() in CANCEL_REPLIES:
         fail('installation cancelled')
     return value
 
@@ -120,9 +136,9 @@ def ask(terminal, label, default, validate):
         try:
             return validate(value)
         except InstallError as error:
-            terminal.write('输入无效：' + str(error) + '。请重试，或输入“取消”。\n')
+            terminal.write('输入无效：' + str(error) + '。请重试，或输入 q 取消。\n')
         except (OSError, ValueError):
-            terminal.write('输入格式不正确或路径不可读取。请重试，或输入“取消”。\n')
+            terminal.write('输入格式不正确或路径不可读取。请重试，或输入 q 取消。\n')
 
 def choice(terminal, label, default, choices):
     def validate(value):
@@ -460,7 +476,7 @@ def install(resources):
                                         encoding='utf-8', write_through=True)
         except OSError:
             fail('interactive setup requires a terminal; use --non-interactive with --version or --image')
-        terminal.write('P2WLAN Docker 服务端安装向导；所有步骤可输入“取消”。\n\n[1/7] 部署目录\n')
+        terminal.write('P2WLAN Docker 服务端安装向导；所有步骤可输入 q 取消。\n\n[1/7] 部署目录\n')
     if terminal and args.dir is None:
         directory = ask(terminal, '部署目录', '/opt/p2wlan-docker', deployment_directory)
     else:
@@ -632,7 +648,7 @@ def install(resources):
             ):
                 terminal.write(f'  {label}：{value}\n')
             terminal.write('Control 公网访问仍需您配置可信 HTTPS/WSS 反向代理；本向导不签发公网证书。\n')
-            terminal.write('  1) 确认部署  2) 重新填写' + ('启动方式' if existing else '配置') + '  0) 取消\n')
+            terminal.write('  1) 确认部署  2) 重新填写' + ('启动方式' if existing else '配置') + '  0/q) 取消\n')
             action = choice(terminal, '确认部署', '1', ('1', '2', '0'))
             if action == '0':
                 fail('installation cancelled')

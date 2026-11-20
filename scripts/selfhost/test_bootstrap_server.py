@@ -782,6 +782,14 @@ FIXTURE
         self.assertTrue(all(f'/releases/download/{VERSION}/' in url for url in downloads))
 
     @unittest.skipUnless(os.name == 'posix', 'a real controlling terminal requires POSIX')
+    def test_q_at_the_method_menu_cancels_without_downloading_or_executing(self):
+        code, output = self.run_piped_pty(steps=[('安装方式', 'q')], method=None)
+        self.assertEqual(code, 0, output)
+        self.assertIn('安装已取消', output)
+        self.assert_installer_not_run()
+        self.assertFalse(any('/releases/download/' in url for url in self.json_lines(self.curl_log)))
+
+    @unittest.skipUnless(os.name == 'posix', 'a real controlling terminal requires POSIX')
     def test_version_menu_cancel_does_not_download_or_execute_a_release_bundle(self):
         code, output = self.run_piped_pty(steps=[('请选择版本编号', '0')])
         self.assertEqual(code, 0, output)

@@ -170,7 +170,8 @@ else:
                             break
                         if before_reply:
                             before_reply(needle, output)
-                        os.write(terminal, (reply + '\n').encode())
+                        data = reply if isinstance(reply, bytes) else reply.encode()
+                        os.write(terminal, data + b'\n')
                         cursor = found + len(needle)
                         pending.pop(0)
                 waited, child_status = os.waitpid(pid, os.WNOHANG)
@@ -372,6 +373,33 @@ urllib.request.urlopen = fixture_urlopen
         self.assertIn('CONTROL_PORT=28080', settings)
         self.assertIn('METRICS_PORT=28082', settings)
         self.assertIn('RELAY_PUBLISH_HOST=127.0.0.2', settings)
+
+    @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
+    def test_q_at_the_first_prompt_cancels_without_writing_a_deployment(self):
+        code, output = self.run_interactive([('部署目录', 'q')], include_dir=False,
+                                            before_reply=lambda *_: self.assert_not_deployed())
+        self.assertNotEqual(code, 0, output)
+        self.assertIn('installation cancelled', output)
+        self.assert_not_deployed()
+
+    @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
+    def test_cancel_reply_in_a_legacy_encoding_cancels_instead_of_raising_a_codec_error(self):
+        code, output = self.run_interactive([('部署目录', '取消'.encode('gb18030'))], include_dir=False,
+                                            before_reply=lambda *_: self.assert_not_deployed())
+        self.assertNotEqual(code, 0, output)
+        self.assertIn('installation cancelled', output)
+        self.assertNotIn('codec', output)
+        self.assert_not_deployed()
+
+    @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
+    def test_q_at_the_certificate_prompt_cancels_before_configuration(self):
+        code, output = self.run_interactive([
+            ('部署模式', '1'), ('Relay主机', 'relay.example.test'), ('Relay端口', ''),
+            ('证书链路径', 'q'),
+        ], before_reply=lambda *_: self.assert_not_deployed())
+        self.assertNotEqual(code, 0, output)
+        self.assertIn('installation cancelled', output)
+        self.assert_not_deployed()
 
     @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
     def test_final_cancellation_does_not_pull_execute_or_write_a_deployment(self):

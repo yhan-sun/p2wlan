@@ -433,6 +433,14 @@ esac
         self.assertTrue(any(call.startswith('manager check ') for call in calls))
 
     @unittest.skipUnless(os.name == 'posix', 'a real controlling terminal requires POSIX')
+    def test_native_wizard_q_at_the_first_prompt_cancels_before_any_write(self):
+        code, output = self.run_interactive([('固定服务端版本', 'q')], no_arguments=True,
+                                            before_reply=lambda *_: self.assert_no_mutation())
+        self.assertNotEqual(code, 0, output)
+        self.assertIn('installation cancelled', output)
+        self.assert_no_mutation()
+
+    @unittest.skipUnless(os.name == 'posix', 'a real controlling terminal requires POSIX')
     def test_native_wizard_cancel_leaves_all_persistent_paths_and_manager_untouched(self):
         code, output = self.run_interactive([('确认部署', '0')],
             '--dev-localhost', '--relay-endpoint', 'tls://localhost:18081',
