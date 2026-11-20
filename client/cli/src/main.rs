@@ -89,6 +89,11 @@ enum Commands {
         #[command(subcommand)]
         command: RoomCommand,
     },
+    /// Manage Wake-on-LAN
+    Wake {
+        #[command(subcommand)]
+        command: WakeCommand,
+    },
     /// Collect a redacted, server-compatible diagnostic support bundle
     SupportBundle(SupportBundleArgs),
     /// Diagnose local config, daemon status, direct UDP, and relay fallback
@@ -219,6 +224,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Commands::Config { command } => config_command(&config_path, command),
         Commands::Route { command } => route_command(&config_path, command).await,
         Commands::Room { command } => room_command(&config_path, command).await,
+        Commands::Wake { command } => wake_command(&config_path, command).await,
         Commands::SupportBundle(args) => support_bundle(&config_path, args).await,
         Commands::Doctor => doctor(&config_path).await,
         Commands::Update(args) => update(&config_path, args).await,
@@ -235,6 +241,7 @@ include!("main/paths.rs");
 include!("main/openwrt.rs");
 include!("main/routes.rs");
 include!("main/rooms.rs");
+include!("main/wake.rs");
 include!("main/support.rs");
 
 #[cfg(test)]

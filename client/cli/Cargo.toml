@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 p2pnet-daemon = { package = "p2wlan-daemon", path = "../daemon", version = "1.0.1" }
+p2pnet-netbind = { path = "../netbind", version = "1.0.1" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
