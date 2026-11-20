@@ -84,13 +84,14 @@ func (db *DB) EnqueueWakeJob(actor string, ref WakeTargetRef, explicitAgent stri
 	}
 	existing, err := readWakeJob(tx.QueryRow(`SELECT `+wakeJobColumns+` FROM wake_jobs
 		WHERE wake_target_id=? AND created_at>? ORDER BY created_at DESC,id DESC LIMIT 1`, target.ID, now-30))
-	if err == nil {
-		return visibleWakeJob(existing, now), tx.Commit()
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	duplicate := err == nil
+	if !duplicate && !errors.Is(err, sql.ErrNoRows) {
 		return WakeJob{}, err
 	}
-	if online {
+	if duplicate && explicitAgent == "" {
+		return visibleWakeJob(existing, now), tx.Commit()
+	}
+	if !duplicate && online {
 		return WakeJob{}, wakeError("already_online")
 	}
 	agents, err := wakeEligibleAgents(tx, actor, target, now)
@@ -100,6 +101,9 @@ func (db *DB) EnqueueWakeJob(actor string, ref WakeTargetRef, explicitAgent stri
 	agent, err := pickWakeAgent(agents, explicitAgent, target.PreferredAgentDeviceID)
 	if err != nil {
 		return WakeJob{}, err
+	}
+	if duplicate {
+		return visibleWakeJob(existing, now), tx.Commit()
 	}
 	if err = checkWakeJobLimits(tx, actor, target, now); err != nil {
 		return WakeJob{}, err
@@ -296,7 +300,7 @@ func rejectWakeClaim(tx *sql.Tx, job WakeJob, reason string, now int64) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return wakeError(reason)
+	return &WakeError{Code: reason, Terminal: true}
 }
 
 func (db *DB) FinishWakeJob(session WakeDeviceSession, id, token, state, reason string) (WakeJob, error) {

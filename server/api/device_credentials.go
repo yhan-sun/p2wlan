@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -88,7 +89,7 @@ func (s *Server) SubmitDeviceCredential(w http.ResponseWriter, r *http.Request) 
 	}
 
 	req.DeviceID = strings.TrimSpace(req.DeviceID)
-	req.Ed25519PublicKey = strings.TrimSpace(req.Ed25519PublicKey)
+	req.Ed25519PublicKey = strings.ToLower(strings.TrimSpace(req.Ed25519PublicKey))
 	req.ChallengeID = strings.TrimSpace(req.ChallengeID)
 	req.ChallengeSignature = strings.TrimSpace(req.ChallengeSignature)
 
@@ -113,13 +114,11 @@ func (s *Server) SubmitDeviceCredential(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
 		return
 	}
-	if err := s.db.UpdateDeviceEd25519PublicKey(req.DeviceID, req.Ed25519PublicKey); err != nil {
-		http.Error(w, `{"error":"device identity update failed"}`, http.StatusInternalServerError)
+	cred, token, err := s.db.CreateDeviceCredentialForSigningKey(req.DeviceID, claims.UserID, req.Ed25519PublicKey, 30*24*3600)
+	if errors.Is(err, database.ErrDeviceSigningKeyMismatch) {
+		http.Error(w, `{"error":"challenge verification failed"}`, http.StatusUnauthorized)
 		return
 	}
-
-	// Issue device credential with 30-day TTL
-	cred, token, err := s.db.CreateDeviceCredential(req.DeviceID, 30*24*3600)
 	if err != nil {
 		http.Error(w, `{"error":"credential creation failed"}`, http.StatusInternalServerError)
 		return

@@ -21,7 +21,7 @@ func newWakeDevice(t *testing.T, db *DB, user, network, name string, proxy bool)
 	boot := int64(1)
 	device, err = db.RegisterDeviceWithOptions(user, network, device.PublicKey, name, "linux", "", "", "",
 		DeviceRegistrationAttempt{Incarnation: &boot, EnforceIncarnation: true,
-			WakeProxyCredential: true, Capabilities: PeerCapabilities{WakeProxyV1: proxy}})
+			DeviceCredentialAuthenticated: true, Capabilities: PeerCapabilities{WakeProxyV1: proxy}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,6 +165,8 @@ func TestWakeRegistrationAndOwnershipFence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, err = db.EnqueueWakeJob(owner, ref, wrongCredential.DeviceID)
+	requireWakeError(t, err, "wake_agent_unavailable")
 	_, err = db.ClaimWakeJob(wrongCredential, job.ID)
 	requireWakeError(t, err, "wake_not_found")
 	_, err = db.ClaimWakeJob(target, job.ID)
@@ -176,7 +178,7 @@ func TestWakeRegistrationAndOwnershipFence(t *testing.T) {
 	boot := int64(2)
 	replacement, err := db.RegisterDeviceWithOptions(owner, "default", device.PublicKey, device.DeviceName, "linux", "", "", "",
 		DeviceRegistrationAttempt{Incarnation: &boot, EnforceIncarnation: true,
-			WakeProxyCredential: true, Capabilities: PeerCapabilities{WakeProxyV1: true}})
+			DeviceCredentialAuthenticated: true, Capabilities: PeerCapabilities{WakeProxyV1: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,6 +226,10 @@ func TestWakeProxySelectionRemembersSameNetworkChoice(t *testing.T) {
 	job, err := db.EnqueueWakeJob(user, ref, agent.DeviceID)
 	if err != nil || job.AgentID != agent.DeviceID {
 		t.Fatalf("explicit choice was not assigned: %v", err)
+	}
+	duplicate, err := db.EnqueueWakeJob(user, ref, other.DeviceID)
+	if err != nil || duplicate.ID != job.ID || duplicate.AgentID != agent.DeviceID {
+		t.Fatalf("duplicate discarded the original assignment: %v", err)
 	}
 	status, err := db.WakeTargetStatus(user, ref)
 	if err != nil || status.PreferredAgentDeviceID != agent.DeviceID {
@@ -279,6 +285,10 @@ func TestWakeRoomAuthorizationRecheckedAtClaim(t *testing.T) {
 	}
 	_, err = db.ClaimWakeJob(agent, job.ID)
 	requireWakeError(t, err, "target_blocked")
+	var blocked *WakeError
+	if !errors.As(err, &blocked) || !blocked.Terminal {
+		t.Fatal("claim target rejection must end the job")
+	}
 	_, err = db.EnqueueWakeJob(owner, ref, "")
 	requireWakeError(t, err, "target_blocked")
 }

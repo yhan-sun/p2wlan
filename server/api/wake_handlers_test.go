@@ -14,6 +14,19 @@ import (
 	"github.com/yhan-sun/p2wlan/server/database"
 )
 
+func TestWakeClaimTerminalBlockIsJobConflict(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	wakeError(recorder, &database.WakeError{Code: "target_blocked", Terminal: true})
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "target_blocked") {
+		t.Fatalf("terminal claim result = HTTP %d, %s", recorder.Code, recorder.Body.String())
+	}
+	recorder = httptest.NewRecorder()
+	wakeError(recorder, &database.WakeError{Code: "target_blocked"})
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("blocked authorization = HTTP %d, %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestWakeRoutesAuthorizeCredentialsAndKeepMACPrivate(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {

@@ -140,9 +140,50 @@ func (db *DB) ClaimChallenge(challengeID, expectedDeviceID string, now int64) (*
 
 // ---- Credential operations ----
 
+var ErrDeviceSigningKeyMismatch = errors.New("device signing key mismatch")
+
 // CreateDeviceCredential creates a new device credential and returns the credential
 // record along with the raw token. The token is only returned once; only its hash is stored.
 func (db *DB) CreateDeviceCredential(deviceID string, ttlSec int64) (*DeviceCredential, string, error) {
+	return createDeviceCredential(db, deviceID, ttlSec)
+}
+
+// CreateDeviceCredentialForSigningKey issues a credential after the caller verifies the
+// one-time challenge signature. The binding and issuance are one transaction so two
+// competing first enrollments cannot both create credentials with different keys.
+func (db *DB) CreateDeviceCredentialForSigningKey(deviceID, userID, signingKey string, ttlSec int64) (*DeviceCredential, string, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, "", err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`UPDATE devices
+		SET ed25519_public_key=COALESCE(NULLIF(ed25519_public_key,''),?)
+		WHERE id=? AND user_id=? AND (COALESCE(ed25519_public_key,'')='' OR lower(ed25519_public_key)=?)`,
+		signingKey, deviceID, userID, signingKey)
+	if err != nil {
+		return nil, "", err
+	}
+	matched, err := result.RowsAffected()
+	if err != nil {
+		return nil, "", err
+	}
+	if matched != 1 {
+		return nil, "", ErrDeviceSigningKeyMismatch
+	}
+	credential, token, err := createDeviceCredential(tx, deviceID, ttlSec)
+	if err != nil {
+		return nil, "", err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, "", err
+	}
+	return credential, token, nil
+}
+
+func createDeviceCredential(writer interface {
+	Exec(string, ...any) (sql.Result, error)
+}, deviceID string, ttlSec int64) (*DeviceCredential, string, error) {
 	rawBytes := make([]byte, 32)
 	if _, err := rand.Read(rawBytes); err != nil {
 		return nil, "", fmt.Errorf("generate credential token: %w", err)
@@ -156,7 +197,7 @@ func (db *DB) CreateDeviceCredential(deviceID string, ttlSec int64) (*DeviceCred
 	now := time.Now().Unix()
 	expires := now + ttlSec
 
-	_, err = db.Exec(`INSERT INTO device_credentials (id, device_id, token_hash, expires_at, revoked, created_at)
+	_, err = writer.Exec(`INSERT INTO device_credentials (id, device_id, token_hash, expires_at, revoked, created_at)
 		VALUES (?, ?, ?, ?, 0, ?)`, id, deviceID, hash, expires, now)
 	if err != nil {
 		return nil, "", err
@@ -166,12 +207,6 @@ func (db *DB) CreateDeviceCredential(deviceID string, ttlSec int64) (*DeviceCred
 		ID: id, DeviceID: deviceID, TokenHash: hash,
 		ExpiresAt: expires, Revoked: false, CreatedAt: now,
 	}, rawToken, nil
-}
-
-// UpdateDeviceEd25519PublicKey stores the verified Ed25519 identity key for a device.
-func (db *DB) UpdateDeviceEd25519PublicKey(deviceID, ed25519PublicKey string) error {
-	_, err := db.Exec(`UPDATE devices SET ed25519_public_key = ? WHERE id = ?`, ed25519PublicKey, deviceID)
-	return err
 }
 
 // HasActiveDeviceCredential reports whether a device has moved to the modern

@@ -21,8 +21,9 @@ const (
 )
 
 type WakeError struct {
-	Code   string
-	Agents []WakeAgent
+	Code     string
+	Agents   []WakeAgent
+	Terminal bool
 }
 
 func (e *WakeError) Error() string { return e.Code }

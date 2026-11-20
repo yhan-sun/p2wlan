@@ -53,8 +53,12 @@ func wakeError(w http.ResponseWriter, err error) {
 		status = http.StatusNotFound
 	case "wake_device_credential_required":
 		status = http.StatusUnauthorized
-	case "wake_forbidden", "target_blocked", "wake_proxy_required":
+	case "wake_forbidden", "wake_proxy_required":
 		status = http.StatusForbidden
+	case "target_blocked":
+		if !typed.Terminal {
+			status = http.StatusForbidden
+		}
 	case "wake_rate_limited":
 		status = http.StatusTooManyRequests
 		w.Header().Set("Retry-After", "60")
