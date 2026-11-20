@@ -119,6 +119,11 @@ else:
         for command in ('curl', 'apt-get', 'dnf', 'sudo'):
             self.executable(self.bin / command, '#!/bin/sh\necho unexpected-external-command >&2\nexit 94\n')
 
+    def assert_no_application_pull(self, calls):
+        edge = 'nginxinc/nginx-unprivileged:1.27-alpine'
+        pulled = [call['args'] for call in calls if call['args'][:1] == ['pull'] and call['args'][1:2] != [edge]]
+        self.assertEqual(pulled, [])
+
     @staticmethod
     def executable(path, content):
         if path.is_symlink():
@@ -341,7 +346,7 @@ urllib.request.urlopen = fixture_urlopen
         key.write_text('fixture-private-key')
         code, output = self.run_interactive([
             ('部署模式', '1'), ('Relay主机', 'relay.example.test'), ('Relay端口', '28081'),
-            ('证书链路径', str(certificate)), ('私钥路径', str(key)),
+            ('证书来源', '2'), ('证书链路径', str(certificate)), ('私钥路径', str(key)),
             ('Control端口', '28080'), ('metrics端口', '28082'),
             ('Relay绑定IP', '0.0.0.0'), ('启动方式', '1'), ('确认部署', '1'),
         ], before_reply=lambda *_: self.assert_not_deployed())
@@ -374,6 +379,61 @@ urllib.request.urlopen = fixture_urlopen
         self.assertIn('METRICS_PORT=28082', settings)
         self.assertIn('RELAY_PUBLISH_HOST=127.0.0.2', settings)
 
+    def certbot_stub(self, domain):
+        self.executable(self.bin / 'certbot',
+            '#!/bin/sh\n'
+            'printf "%s\\n" "$*" >> "$CERTBOT_LOG"\n'
+            'live="$P2WLAN_ACME_LIVE_DIR/' + domain + '"\n'
+            'mkdir -p "$live"\n'
+            'echo fixture-chain > "$live/fullchain.pem"\n'
+            'echo fixture-key > "$live/privkey.pem"\n')
+
+    def test_automatic_tls_issues_a_certificate_and_serves_the_panel_over_https(self):
+        certbot_log = self.path / 'certbot.log'
+        self.env['CERTBOT_LOG'] = str(certbot_log)
+        self.env['P2WLAN_ACME_LIVE_DIR'] = str(self.path / 'acme-live')
+        self.env['P2WLAN_RENEWAL_HOOKS_DIR'] = str(self.path / 'acme-hooks')
+        self.certbot_stub('relay.example.test')
+        result = self.run_installer('--relay-endpoint', 'tls://relay.example.test:18081',
+                                    '--tls-mode', 'auto', '--tls-domain', 'relay.example.test',
+                                    '--tls-email', 'ops@example.test', '--publish-host', '0.0.0.0')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        arguments = certbot_log.read_text()
+        self.assertIn('--standalone', arguments)
+        self.assertIn('-d relay.example.test', arguments)
+        self.assertIn('-m ops@example.test', arguments)
+        edge = (self.target / 'config/edge/nginx.conf').read_text()
+        self.assertIn('server_name relay.example.test;', edge)
+        self.assertIn('proxy_pass http://control:18080;', edge)
+        settings = (self.target / '.env').read_text()
+        self.assertIn('COMPOSE_PROFILES=edge', settings)
+        self.assertIn('P2WLAN_TLS_MODE=auto', settings)
+        self.assertIn('P2WLAN_TLS_DOMAIN=relay.example.test', settings)
+        self.assertTrue(any('--profile' in call['args'] and 'edge' in call['args'] for call in self.calls()))
+        hooks = self.path / 'acme-hooks'
+        for kind in ('pre', 'post', 'deploy'):
+            links = list((hooks / kind).glob('p2wlan-*.sh'))
+            self.assertEqual(len(links), 1, kind)
+            self.assertTrue(links[0].is_symlink(), kind)
+            self.assertTrue(links[0].resolve().is_file(), kind)
+        self.assertIn('https://relay.example.test/', result.stdout)
+
+    def test_automatic_tls_rejects_a_domain_that_does_not_match_the_relay_host(self):
+        result = self.run_installer('--relay-endpoint', 'tls://relay.example.test:18081',
+                                    '--tls-mode', 'auto', '--tls-domain', 'other.example.test',
+                                    '--tls-email', 'ops@example.test', '--publish-host', '0.0.0.0')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--tls-domain must equal the Relay host', result.stdout + result.stderr)
+        self.assertFalse(self.target.exists())
+
+    def test_automatic_tls_requires_an_email_for_the_acme_account(self):
+        result = self.run_installer('--relay-endpoint', 'tls://relay.example.test:18081',
+                                    '--tls-mode', 'auto', '--tls-domain', 'relay.example.test',
+                                    '--publish-host', '0.0.0.0')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--tls-mode auto requires --tls-domain and --tls-email', result.stdout + result.stderr)
+        self.assertFalse(self.target.exists())
+
     @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
     def test_q_at_the_first_prompt_cancels_without_writing_a_deployment(self):
         code, output = self.run_interactive([('部署目录', 'q')], include_dir=False,
@@ -395,7 +455,7 @@ urllib.request.urlopen = fixture_urlopen
     def test_q_at_the_certificate_prompt_cancels_before_configuration(self):
         code, output = self.run_interactive([
             ('部署模式', '1'), ('Relay主机', 'relay.example.test'), ('Relay端口', ''),
-            ('证书链路径', 'q'),
+            ('证书来源', '2'), ('证书链路径', 'q'),
         ], before_reply=lambda *_: self.assert_not_deployed())
         self.assertNotEqual(code, 0, output)
         self.assertIn('installation cancelled', output)
@@ -459,7 +519,8 @@ urllib.request.urlopen = fixture_urlopen
         calls_before = len(self.calls())
         def unchanged_before_confirmation(*_):
             self.assertEqual(before, {str(path.relative_to(config)): path.read_bytes() for path in config.rglob('*') if path.is_file()})
-            self.assertFalse(any(call['args'][:1] in (['pull'], ['run']) for call in self.calls()[calls_before:]))
+            self.assertFalse(any(call['args'][:1] == ['run'] for call in self.calls()[calls_before:]))
+        self.assert_no_application_pull(self.calls()[calls_before:])
         code, output = self.run_interactive([('确认部署', '1')], '--no-start', before_reply=unchanged_before_confirmation)
         self.assertEqual(code, 0, output)
         self.assertEqual(before, {str(path.relative_to(config)): path.read_bytes() for path in config.rglob('*') if path.is_file()})
@@ -501,7 +562,7 @@ urllib.request.urlopen = fixture_urlopen
     def test_local_image_development_path_never_pulls_from_a_registry(self):
         result = self.run_installer('--local-image', IMAGE_ID, '--dev-localhost', '--no-start', image=None)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(any(call['args'][:1] == ['pull'] for call in self.calls()))
+        self.assert_no_application_pull(self.calls())
         self.assertTrue((self.target / 'config/control.env').exists())
 
     def test_development_certificate_cannot_be_published_on_a_wildcard_address(self):
@@ -597,7 +658,7 @@ urllib.request.urlopen = fixture_urlopen
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         second = self.run_installer('--no-start', image=None)
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertFalse(any(call['args'][:1] == ['pull'] for call in self.calls()))
+        self.assert_no_application_pull(self.calls())
         self.assertEqual(sum(call['args'][:1] == ['run'] and '--output' in call['args'] for call in self.calls()), 1)
 
     def test_saved_environment_cannot_inject_docker_host_or_compose_controls(self):
@@ -680,7 +741,7 @@ tempfile.TemporaryDirectory = forbidden
         self.assertIn(f'P2WLAN_SOURCE_DIR={saved}', settings)
         self.assertIn('P2WLAN_DEV_LOCALHOST=false', settings)
         self.assertIn('P2WLAN_BUILD_IMAGE=' + build['env']['P2WLAN_BUILD_IMAGE'], settings)
-        self.assertFalse(any(call['args'][:1] == ['pull'] for call in calls))
+        self.assert_no_application_pull(calls)
         containers = [call['args'] for call in calls if call['args'][:1] == ['run']]
         self.assertTrue(any('--version' in arguments for arguments in containers))
         self.assertTrue(any('--output' in arguments for arguments in containers))
@@ -803,7 +864,7 @@ tempfile.TemporaryDirectory = forbidden
         calls = self.calls()
         self.assertEqual(sum(call['args'][:1] == ['compose'] and 'build' in call['args'] for call in calls), 2)
         self.assertEqual(sum('--output' in call['args'] for call in calls), 1)
-        self.assertFalse(any(call['args'][:1] == ['pull'] for call in calls))
+        self.assert_no_application_pull(calls)
 
     def test_source_build_failure_preserves_the_existing_runtime_configuration(self):
         source = self.source_bundle()

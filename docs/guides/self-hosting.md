@@ -43,7 +43,7 @@ Docker 默认使用 `p2wlan-server-source.tar.gz` 和同名 `.sha256`。包内�
 
 脚本只发现非 draft、非 prerelease、包含所选方式资产的正式 `server-vX.Y.Z`。直接安装要求与主机架构匹配的原生归档及同名 checksum；默认 Docker 要求源码部署包及同名 checksum 均上传完成。显式镜像模式另要求 Docker 部署包、镜像元数据及各自 checksum。确认版本后下载同一 tag 的包，校验摘要与发布身份，再运行包内向导。按提示填写路径、Relay 地址和可信 TLS 文件，完成配套配置、启动与健康检查。整个流程通过当前终端交互，支持从 `curl` 管道启动。
 
-这个入口要求 `main` 已提供 `bootstrap-server.sh`，并已有包含对应安装器与资产的正式服务端 Release。原生列表与 Docker 列表分别筛选，只有原生归档的版本不会出现在 Docker 列表中；历史归档仍须具备相应安装器接口。查找不到匹配发布或校验失败时会停止，不回退到未校验源码部署。公网 Control 的可信 HTTPS/WSS 反向代理和 Relay 证书仍由部署者准备。
+这个入口要求 `main` 已提供 `bootstrap-server.sh`，并已有包含对应安装器与资产的正式服务端 Release。原生列表与 Docker 列表分别筛选，只有原生归档的版本不会出现在 Docker 列表中；历史归档仍须具备相应安装器接口。查找不到匹配发布或校验失败时会停止，不回退到未校验源码部署。Docker 公网部署可在向导内自动申请并续期 Let's Encrypt 证书，也可以继续使用自带证书；原生 systemd 部署仍需部署者准备可信 HTTPS/WSS 反向代理和 Relay 证书。
 
 引导脚本的 `main` 地址用于获取当前安装入口；实际程序、源码和 Docker 模板来自一个已经解析并固定的 Release。重复部署时显式指定方式和 tag，例如选择默认的 Docker 源码构建：
 
@@ -83,9 +83,9 @@ Docker 默认使用 `p2wlan-server-source.tar.gz` 和同名 `.sha256`。包内�
 2. **检查对应环境。** 识别系统与架构，检查该方式所需工具。缺少依赖时选 `1` 安装或 `0` 退出，默认 `1`；已有可用环境会直接复用。原生分支使用 systemd，Docker 分支检查 Engine / Compose。
 3. **选择发布版本。** 按发布时间从新到旧列出最多 15 个符合该方式资产要求的正式服务端 Release，默认 `1` 为最新一项；按编号选择、输入 `m` 手填固定 tag，或输入 `0`／`q` 取消。客户端 `vX.Y.Z` 不会混入列表，无效输入会要求重选。显式 `--version` 不重复选版。随后下载并校验同 tag 的对应包。
 4. **确认持久路径。** 原生分支分别确认程序、配置与数据目录；Docker 分支确认一个持久部署目录，默认值见上表。已有部署进入保留配置和凭据的升级流程。
-5. **选择部署模式。** 新部署选择公网服务或本机测试。公网服务使用已有可信证书；本机测试生成短期 loopback 测试证书，不面向公网客户端。
-6. **填写 Relay 和 TLS。** 公网模式依次填写 Relay 域名或 IP、端口、完整证书链 PEM 路径、匹配私钥 PEM 路径。证书须覆盖所填主机名且在有效期内；向导不会签发公信证书。
-7. **确认内部端口。** Control 内部 HTTP 默认 `18080`、Relay 健康检查默认 `18082`，Relay 端口默认 `18081`。Docker 还确认 Relay 发布绑定 IP，公网默认 `0.0.0.0`。Control 始终只发布到 loopback，公网 HTTPS/WSS 由外部反向代理提供。
+5. **选择部署模式。** 新部署选择公网服务或本机测试。公网服务使用真实证书；本机测试生成短期 loopback 测试证书，不面向公网客户端。
+6. **填写 Relay 和 TLS。** 公网模式先选证书来源：`1` 自动申请 Let's Encrypt 证书（HTTP-01，需域名与 80 端口，签发后自动续期）、`2` 使用已有证书文件。自动申请时填写与 Relay 主机名一致的证书域名和 ACME 邮箱；使用已有证书时依次填写完整证书链和匹配私钥的 PEM 路径。Docker 公网部署会同时启动内置 HTTPS 入口，面板与 Relay 共用同一份证书。
+7. **确认内部端口。** Control 内部 HTTP 默认 `18080`、Relay 健康检查默认 `18082`，Relay 端口默认 `18081`。Docker 还确认 Relay 发布绑定 IP，公网默认 `0.0.0.0`。Docker 公网部署由内置 edge 容器发布 80/443 并反向代理到 loopback Control；原生部署的 Control 仍只监听 loopback。
 8. **选择执行方式并确认摘要。** 启动方式选 `1` 安装并启动、`2` 只准备，默认 `1`。摘要列出固定版本、目录、Relay、端口、TLS 文件和执行方式，Docker 还列出源码身份或显式选择的镜像身份，不显示秘密；最后选 `1` 确认、`2` 重填、`0`／`q` 取消。已有部署保留配置，重填只调整允许的执行选项。
 9. **自动执行并交付入口。** 原生分支安装已校验的二进制和 systemd unit；默认 Docker 分支运行独立 Compose builder，先构建管理台再构建 Go 服务，核验本地镜像 ID、标签和二进制版本；显式镜像模式才拉取固定摘要。新部署生成匹配的 Control/Relay 配置。立即启动会等待健康检查，失败时报告排查入口；只准备不会声称服务已经健康。完成后显示本机 Control、Relay、管理台、凭据文件位置和对应方式的管理命令。
 
@@ -137,17 +137,17 @@ Relay绑定IP [0.0.0.0]: 0.0.0.0
 
 向导验证源码 manifest 和每个文件摘要，确认后把源码保存在持久目录 `sources/<source_sha>/`，再通过 `compose.build.yml` 的独立 builder 构建镜像。构建会执行管理台锁文件安装、typecheck 和 production build，然后编译 Go 程序；宿主不运行 Node 或 Go。构建与运行使用不同 Compose 文件，builder 不读取运行服务的私有 env 文件。
 
-首次部署填写 Relay 的 `tls://host:port` 地址、覆盖该主机名的完整证书链和匹配私钥路径。配置生成器在核验后的镜像中运行，自动生成匹配的 Control/Relay 凭据；安装器保存持久配置和数据库，启动生产 Compose 服务并等待健康检查。Control 默认只发布到 loopback，公网 HTTPS/WSS 仍由外部可信反向代理提供。
+首次部署填写 Relay 的 `tls://host:port` 地址和证书来源。选择自动申请时，安装器用 certbot 以 HTTP-01 standalone 签发证书，写入 `config/tls.crt` 与 `config/tls.key`，并注册续期钩子；选择已有证书时改用你提供的路径。配置生成器在核验后的镜像中运行，自动生成匹配的 Control/Relay 凭据；安装器保存持久配置和数据库，启动生产 Compose 服务、内置 HTTPS edge 并等待健康检查。
 
 显式预构建镜像部署使用前面的一行入口并加 `--method docker --docker-mode image --interactive`；对应 Release 必须额外提供 Docker 部署包和 `SERVER-IMAGE.json`。直接使用该可选包时，也可向安装器提供 `--version server-vX.Y.Z` 或明确的 `--image repository@sha256:...`；镜像仓库必须允许主机读取。源码部署不需要 GHCR 应用镜像登录，但构建仍需下载基础镜像、npm 和 Go 依赖。
 
 `--dir` 选择持久部署目录；重复运行保留已有配置、凭据和数据库，升级前仍应备份。`--dev-localhost` 使用仅用于隔离测试的 loopback 证书，不适合公网客户端。`--no-start` 完成镜像和配置准备，不启动 Control/Relay；`--wait-timeout` 设置启动健康检查期限。安装器的 `--dry-run` 校验本地输入并展示计划，不调用 Docker、下载元数据或写入持久部署目录，不作为构建成功或 TLS 已验证的证据。
 
-部署目录保存 `compose.yml`、唯一的 Compose 运行参数文件 `.env`，以及 `config/` 下的服务配置、TLS 文件和持久 `data/`。源码模式还保存 `sources/<source_sha>/` 与构建所用模板；`.env` 记录安装模式、源码目录、构建镜像名及实际运行的本地镜像 ID。升级时重新运行一行命令并选择新版本，已有源码和 Docker 构建缓存可复用，配置和数据库不会重新生成。
+部署目录保存 `compose.yml`、唯一的 Compose 运行参数文件 `.env`，以及 `config/` 下的服务配置、TLS 文件、`edge/nginx.conf`（内置 HTTPS 入口）和持久 `data/`。公网 Docker 部署的 `.env` 记录 `COMPOSE_PROFILES=edge` 与证书来源。源码模式还保存 `sources/<source_sha>/` 与构建所用模板；`.env` 记录安装模式、源码目录、构建镜像名及实际运行的本地镜像 ID。升级时重新运行一行命令并选择新版本，已有源码和 Docker 构建缓存可复用，配置和数据库不会重新生成。
 
 在部署目录执行 `sudo docker compose ps`、`sudo docker compose logs -f` 或 `sudo docker compose down` 管理服务；默认安装会启动服务，再次运行会读取已有配置并等待服务健康。不要删除 `config/data/` 来更新服务，也不要在日志或工单中公开 `.env` 和服务配置内容。
 
-首次安装会将指定证书与私钥复制为 `config/tls.crt` 和 `config/tls.key`。续期只更新原输入路径不会生效；需要显式替换部署目录中的这两个文件，保持原 UID/GID 和 `0600` 权限，执行 `sudo docker compose restart relay`，再验证公网 TLS 证书链和 `/readyz`。
+首次安装会将证书与私钥复制为 `config/tls.crt` 和 `config/tls.key`。自动申请模式下，`certbot.timer` 在到期前续期，`/etc/letsencrypt/renewal-hooks/` 中的钩子会停用 edge、更新这两个文件、重启 Relay 并恢复 edge，无需手工操作；可用 `sudo certbot renew --dry-run` 验证续期链路。自带证书模式不会自动续期：替换部署目录中的这两个文件并保持原 UID/GID 和 `0600` 权限，执行 `sudo docker compose restart relay`，需要面板同步时再 `sudo docker compose restart edge`。
 
 ### 原生 systemd 交互安装
 
@@ -189,18 +189,19 @@ Control 保持 loopback HTTP 监听。公网部署还需准备可信 HTTPS/WSS �
 
 ## 网络边界
 
-Control 的 HTTP 监听默认只在 loopback，公网通过可信 HTTPS 反向代理暴露，并保留 WebSocket Upgrade。Relay 使用独立的 TLS 入口；Relay 的 loopback metrics 和 readyz 不对公网开放。
+Docker 公网部署的 Control HTTP 监听仍只在 loopback，公网经内置 edge 容器的 80/443 暴露，并保留 WebSocket Upgrade；原生部署由外部可信 HTTPS 反向代理暴露。Relay 使用独立的 TLS 入口；Relay 的 loopback metrics 和 readyz 不对公网开放。
 
 推荐的最小公网入口：
 
 | 入口 | 用途 | 公开 |
 | --- | --- | --- |
+| HTTP 80 | 跳转到 HTTPS；ACME HTTP-01 续期时短暂占用 | 是 |
 | HTTPS 443 | Control API、WebSocket、可选 `/admin/` | 是 |
 | TLS 18081 | Relay 数据连接 | 是 |
 | HTTP 18080 | Control 内部监听 | 否 |
 | HTTP 18082 | Relay metrics、readyz | 否 |
 
-Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。JWT、设备凭据、Relay ticket、票据签名密钥和 TLS 私钥不是同一种凭据。
+Docker 新部署由内置 edge 容器占用 80/443；原生部署由外部反向代理占用 443，80 是否开放取决于你的 ACME 或跳转策略。Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。JWT、设备凭据、Relay ticket、票据签名密钥和 TLS 私钥不是同一种凭据。
 
 ## 配置
 

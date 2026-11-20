@@ -7,6 +7,7 @@ exec python3 - "$SCRIPT_DIR" "$@" <<'PY'
 import argparse
 import contextlib
 import fcntl
+import errno
 import hashlib
 import ipaddress
 import io
@@ -15,6 +16,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -39,6 +41,10 @@ parser.add_argument('--dir', help='private persistent deployment directory (defa
 parser.add_argument('--relay-endpoint')
 parser.add_argument('--tls-cert')
 parser.add_argument('--tls-key')
+parser.add_argument('--tls-mode', choices=('auto', 'files'),
+                    help='auto: request a Let\'s Encrypt certificate; files: use --tls-cert/--tls-key')
+parser.add_argument('--tls-domain', help='certificate domain for --tls-mode auto; must equal the Relay host')
+parser.add_argument('--tls-email', help='ACME account email for --tls-mode auto')
 parser.add_argument('--control-port', type=int, help='internal Control port (default: 18080)')
 parser.add_argument('--metrics-port', type=int, help='internal Relay readiness port (default: 18082)')
 parser.add_argument('--publish-host', help='Relay host bind IP; public 0.0.0.0, test 127.0.0.1')
@@ -48,6 +54,10 @@ parser.add_argument('--dry-run', action='store_true', help='show a plan without 
 parser.add_argument('--wait-timeout', type=int, default=90, help='Compose health deadline, 10-600 seconds')
 args = parser.parse_args(sys.argv[2:])
 interactive = args.interactive or len(sys.argv) == 2
+
+EDGE_IMAGE_DEFAULT = 'nginxinc/nginx-unprivileged:1.27-alpine'
+ACME_LIVE_DIR = Path(os.environ.get('P2WLAN_ACME_LIVE_DIR', '/etc/letsencrypt/live'))
+RENEWAL_HOOKS_DIR = Path(os.environ.get('P2WLAN_RENEWAL_HOOKS_DIR', '/etc/letsencrypt/renewal-hooks'))
 
 class InstallError(Exception):
     pass
@@ -76,7 +86,8 @@ def read_env(path, content=None):
     allowed = {'P2WLAN_UID', 'P2WLAN_GID', 'CONTROL_PORT', 'RELAY_PORT', 'METRICS_PORT',
                'RELAY_PUBLISH_HOST', 'P2WLAN_IMAGE', 'P2WLAN_CONFIG_DIR', 'COMPOSE_PROJECT_NAME',
                'P2WLAN_VERSION', 'P2WLAN_COMMIT', 'P2WLAN_DEV_LOCALHOST',
-               'P2WLAN_INSTALL_MODE', 'P2WLAN_SOURCE_DIR', 'P2WLAN_BUILD_IMAGE'}
+               'P2WLAN_INSTALL_MODE', 'P2WLAN_SOURCE_DIR', 'P2WLAN_BUILD_IMAGE',
+               'P2WLAN_TLS_MODE', 'P2WLAN_TLS_DOMAIN', 'COMPOSE_PROFILES'}
     for line in (path.read_text() if content is None else content.decode()).splitlines():
         if not line or line.startswith('#'):
             continue
@@ -210,6 +221,129 @@ def tls_path(value):
         pass
     fail('请输入存在且可读取的 PEM 文件路径')
 
+EDGE_NGINX = '''# Managed by the P2WLAN installer: public HTTPS/WSS entry for Control.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+server {
+    listen 8080;
+    server_name __DOMAIN__;
+    location = /healthz {
+        add_header Content-Type text/plain;
+        return 200 'ok';
+    }
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+server {
+    listen 8443 ssl;
+    http2 on;
+    server_name __DOMAIN__;
+    ssl_certificate /run/secrets/p2wlan_tls_cert;
+    ssl_certificate_key /run/secrets/p2wlan_tls_key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1h;
+    client_max_body_size 8m;
+    location / {
+        proxy_pass http://control:__CONTROL_PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+'''
+
+def certificate_domain(value):
+    if not re.fullmatch(r'(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}', value):
+        fail('证书域名必须是公网域名，不能是 IP 地址')
+    return value.lower()
+
+def certificate_email(value):
+    if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[A-Za-z]{2,}', value):
+        fail('请输入有效的 ACME 账户邮箱')
+    return value
+
+def port_available(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(('0.0.0.0', port))
+        except OSError as error:
+            return error.errno != errno.EADDRINUSE
+    return True
+
+def ensure_certbot():
+    if shutil.which('certbot'):
+        return
+    print('[TLS] Installing certbot with apt-get')
+    environment = dict(os.environ, DEBIAN_FRONTEND='noninteractive')
+    try:
+        run(['apt-get', 'update', '-qq'], timeout=600, capture=False, env=environment)
+        run(['apt-get', 'install', '-y', '-qq', 'certbot'], timeout=600, capture=False, env=environment)
+    except InstallError:
+        fail('installing certbot failed; install it with apt-get, or use --tls-mode files')
+
+def request_certificate(domain, contact):
+    ensure_certbot()
+    if not port_available(80):
+        fail('HTTP-01 standalone needs TCP 80 free on this host; stop that service or use --tls-mode files')
+    print('[TLS] Requesting a certificate for ' + domain)
+    try:
+        run(['certbot', 'certonly', '--standalone', '--non-interactive', '--agree-tos',
+             '--keep-until-expiring', '-m', contact, '-d', domain], timeout=900, capture=False)
+    except InstallError:
+        fail('certificate request failed; verify DNS, inbound TCP 80 and ACME rate limits')
+    live = ACME_LIVE_DIR / domain
+    chain, key = live / 'fullchain.pem', live / 'privkey.pem'
+    if not chain.is_file() or not key.is_file():
+        fail('certbot did not create the expected certificate files')
+    return str(chain), str(key)
+
+def write_edge_config(config, domain, control_port):
+    edge = config / 'edge'
+    edge.mkdir(mode=0o700, exist_ok=True)
+    target = edge / 'nginx.conf'
+    target.write_text(EDGE_NGINX.replace('__DOMAIN__', domain).replace('__CONTROL_PORT__', str(control_port)))
+    target.chmod(0o644)
+
+def install_renewal_hooks(directory, domain, uid, gid):
+    edge = directory / 'config' / 'edge'
+    compose = ('docker compose --env-file ' + str(directory / '.env')
+               + ' -f ' + str(directory / 'compose.yml'))
+    live = ACME_LIVE_DIR / domain
+    scripts = {
+        'pre': ('#!/bin/sh\nset -eu\n' + '[ -f "' + str(directory / 'compose.yml') + '" ] || exit 0\n'
+                + compose + ' stop edge >/dev/null 2>&1 || true\n'),
+        'post': ('#!/bin/sh\nset -eu\n' + '[ -f "' + str(directory / 'compose.yml') + '" ] || exit 0\n'
+                 + compose + ' start edge >/dev/null 2>&1 || true\n'),
+        'deploy': ('#!/bin/sh\nset -eu\n' + '[ -f "' + str(directory / 'compose.yml') + '" ] || exit 0\n'
+                   + 'install -m 0600 -o ' + str(uid) + ' -g ' + str(gid) + ' "' + str(live / 'fullchain.pem')
+                   + '" "' + str(directory / 'config/tls.crt') + '"\n'
+                   + 'install -m 0600 -o ' + str(uid) + ' -g ' + str(gid) + ' "' + str(live / 'privkey.pem')
+                   + '" "' + str(directory / 'config/tls.key') + '"\n'
+                   + compose + ' restart relay >/dev/null 2>&1 || true\n'
+                   + compose + ' exec -T edge nginx -s reload >/dev/null 2>&1 || true\n'),
+    }
+    for kind, body in scripts.items():
+        path = edge / (kind + '.sh')
+        path.write_text(body)
+        path.chmod(0o700)
+        hooks = RENEWAL_HOOKS_DIR / kind
+        hooks.mkdir(parents=True, exist_ok=True)
+        link = hooks / ('p2wlan-' + hashlib.sha256(str(directory).encode()).hexdigest()[:12] + '.sh')
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(path)
+
 def bind_address(value, dev=False):
     try:
         address = ipaddress.ip_address(value)
@@ -267,14 +401,28 @@ def configure_new(terminal, plan, edit=False):
         plan['tls_cert'] = plan['tls_key'] = None
         terminal.write('使用仅本机测试证书；不会配置公网 HTTPS 或签发可信证书。\n')
     else:
-        for field, label, supplied in (('tls_cert', '证书链路径', args.tls_cert), ('tls_key', '私钥路径', args.tls_key)):
-            if edit or not supplied:
-                plan[field] = ask(terminal, label, plan[field], tls_path)
-            else:
-                try:
-                    plan[field] = tls_path(supplied)
-                except (InstallError, OSError, ValueError):
-                    plan[field] = ask(terminal, label, supplied, tls_path)
+        relay_name = endpoint_parts(plan['endpoint'], False)[0]
+        if edit or not plan['tls_mode']:
+            terminal.write("  1) 自动申请 Let's Encrypt 证书（HTTP-01，自动续期；面板与 Relay 共用）\n"
+                           '  2) 使用已有证书文件\n')
+            plan['tls_mode'] = {'1': 'auto', '2': 'files'}[
+                choice(terminal, '证书来源', '2' if plan['tls_mode'] == 'files' else '1', ('1', '2'))]
+        if plan['tls_mode'] == 'auto':
+            plan['tls_domain'] = ask(terminal, '证书域名', plan['tls_domain'] or relay_name, certificate_domain)
+            if plan['tls_domain'] != relay_name.lower():
+                fail('证书域名必须与 Relay 主机名一致：' + relay_name)
+            plan['tls_email'] = ask(terminal, 'ACME 邮箱', plan['tls_email'] or '', certificate_email)
+            plan['tls_cert'] = plan['tls_key'] = None
+            terminal.write('将签发证书并自动续期：' + plan['tls_domain'] + '\n')
+        else:
+            for field, label, supplied in (('tls_cert', '证书链路径', args.tls_cert), ('tls_key', '私钥路径', args.tls_key)):
+                if edit or not supplied:
+                    plan[field] = ask(terminal, label, plan[field], tls_path)
+                else:
+                    try:
+                        plan[field] = tls_path(supplied)
+                    except (InstallError, OSError, ValueError):
+                        plan[field] = ask(terminal, label, supplied, tls_path)
     terminal.write('\n[5/7] 监听端口与 Relay 绑定\n')
     for field, label, supplied in (
         ('control_port', 'Control端口', args.control_port),
@@ -609,12 +757,17 @@ def install(resources):
                     break
             return dict(dev=saved['P2WLAN_DEV_LOCALHOST'] == 'true', endpoint=endpoint,
                         tls_cert=str(directory / 'config/tls.crt'), tls_key=str(directory / 'config/tls.key'),
+                        tls_mode=saved.get('P2WLAN_TLS_MODE', 'files'),
+                        tls_domain=saved.get('P2WLAN_TLS_DOMAIN') or '',
+                        tls_email=None,
                         control_port=port_number(saved.get('CONTROL_PORT', '')),
                         metrics_port=port_number(saved.get('METRICS_PORT', '')),
                         relay_port=port_number(saved.get('RELAY_PORT', '')),
                         publish_host=saved.get('RELAY_PUBLISH_HOST', ''), no_start=args.no_start)
         return dict(dev=args.dev_localhost, endpoint=args.relay_endpoint or '',
                     tls_cert=args.tls_cert, tls_key=args.tls_key,
+                    tls_mode=args.tls_mode or ('files' if args.tls_cert and args.tls_key else None),
+                    tls_domain=args.tls_domain, tls_email=args.tls_email,
                     control_port=args.control_port if args.control_port is not None else 18080,
                     metrics_port=args.metrics_port if args.metrics_port is not None else 18082,
                     publish_host=args.publish_host, no_start=args.no_start)
@@ -642,12 +795,18 @@ def install(resources):
                 ('部署模式', '本机测试' if plan['dev'] else '公网部署'), ('Relay地址', plan['endpoint']),
                 ('Control端口', plan['control_port']), ('Relay端口', plan['relay_port']),
                 ('metrics端口', plan['metrics_port']), ('Relay绑定IP', plan['publish_host']),
+                ('证书来源', '自动申请（自动续期）' if plan['tls_mode'] == 'auto' else
+                 ('本机测试证书' if plan['dev'] else '已有证书文件')),
                 ('证书链路径', plan['tls_cert'] or '自动生成本机测试证书'),
                 ('私钥路径', plan['tls_key'] or '自动生成本机测试私钥'),
                 ('启动方式', '只准备' if plan['no_start'] else '安装并启动'),
             ):
                 terminal.write(f'  {label}：{value}\n')
-            terminal.write('Control 公网访问仍需您配置可信 HTTPS/WSS 反向代理；本向导不签发公网证书。\n')
+            if plan['dev']:
+                terminal.write('Control 仅监听 loopback；本机测试不配置公网 HTTPS。\n')
+            else:
+                terminal.write('将启动内置 HTTPS 入口：https://'
+                               + (plan['tls_domain'] or endpoint_parts(plan['endpoint'], False)[0]) + '\n')
             terminal.write('  1) 确认部署  2) 重新填写' + ('启动方式' if existing else '配置') + '  0/q) 取消\n')
             action = choice(terminal, '确认部署', '1', ('1', '2', '0'))
             if action == '0':
@@ -675,9 +834,22 @@ def install(resources):
         plan['control_port'] = port_number(plan['control_port'], (relay_port,))
         plan['metrics_port'] = port_number(plan['metrics_port'], (relay_port, plan['control_port']))
         plan['publish_host'] = bind_address(plan['publish_host'] or ('127.0.0.1' if plan['dev'] else '0.0.0.0'), plan['dev'])
-        if not plan['dev']:
+        if not plan['dev'] and plan['tls_mode'] != 'auto':
             plan['tls_cert'], plan['tls_key'] = tls_path(plan['tls_cert'] or ''), tls_path(plan['tls_key'] or '')
+    if not plan['dev']:
+        if plan['tls_mode'] is None:
+            plan['tls_mode'] = 'auto' if (args.tls_domain or args.tls_email) else 'files'
+        if plan['tls_mode'] == 'auto':
+            if not plan['tls_domain'] or not plan['tls_email']:
+                fail('--tls-mode auto requires --tls-domain and --tls-email')
+            plan['tls_domain'] = certificate_domain(plan['tls_domain'])
+            plan['tls_email'] = certificate_email(plan['tls_email'])
+            if plan['tls_domain'] != endpoint_parts(plan['endpoint'], False)[0].lower():
+                fail('--tls-domain must equal the Relay host')
+            plan['tls_cert'] = plan['tls_key'] = None
     args.dev_localhost, args.relay_endpoint = plan['dev'], plan['endpoint']
+    args.tls_mode, args.tls_domain, args.tls_email = plan['tls_mode'], plan['tls_domain'], plan['tls_email']
+    edge_enabled = (not args.dev_localhost) and (not existing or settings.get('COMPOSE_PROFILES') == 'edge')
     args.tls_cert, args.tls_key = plan['tls_cert'], plan['tls_key']
     args.control_port, args.metrics_port = plan['control_port'], plan['metrics_port']
     args.publish_host, args.no_start = plan['publish_host'], plan['no_start']
@@ -774,6 +946,8 @@ def install(resources):
                 endpoint = args.relay_endpoint or ('tls://localhost:18081' if args.dev_localhost else '')
                 if not endpoint:
                     fail('new deployment requires --relay-endpoint and TLS files, or --dev-localhost')
+                if args.tls_mode == 'auto':
+                    args.tls_cert, args.tls_key = request_certificate(args.tls_domain, args.tls_email)
                 uid = os.geteuid() or 10001
                 gid = os.getegid() if os.geteuid() else 10001
                 if uid <= 0 or gid <= 0:
@@ -799,6 +973,9 @@ def install(resources):
                                   '--entrypoint', '/usr/local/bin/p2wlan-config', image] + generator, timeout=60)
                 except InstallError:
                     fail('configuration generation failed; verify Relay endpoint, matching TLS chain/key and certificate hostname/validity')
+                if not args.dev_localhost:
+                    write_edge_config(stage / 'config',
+                                      args.tls_domain or endpoint_parts(endpoint, False)[0], args.control_port)
                 candidate = stage / 'config'
                 for name in ('control.env', 'relay.env', 'tls.crt', 'tls.key', 'compose.env'):
                     protected(candidate / name)
@@ -820,6 +997,9 @@ def install(resources):
                             P2WLAN_VERSION=version, P2WLAN_COMMIT=commit,
                             P2WLAN_DEV_LOCALHOST='true' if args.dev_localhost else 'false',
                             P2WLAN_INSTALL_MODE='source' if source_bundle else 'image')
+            if not args.dev_localhost and not existing:
+                settings.update(COMPOSE_PROFILES='edge', P2WLAN_TLS_MODE=args.tls_mode or 'files',
+                                P2WLAN_TLS_DOMAIN=args.tls_domain or endpoint_parts(args.relay_endpoint, False)[0])
             if source_bundle:
                 settings.update(P2WLAN_SOURCE_DIR=str(saved_source), P2WLAN_BUILD_IMAGE=build_image)
             else:
@@ -833,14 +1013,23 @@ def install(resources):
             validation_env = dict(os.environ, **settings)
             validation_env['P2WLAN_CONFIG_DIR'] = str(candidate)
             base = ['docker', 'compose', '--project-name', project]
+            if edge_enabled:
+                base += ['--profile', 'edge']
             run(base + ['--env-file', str(staged_env), '-f', str(staged_compose), 'config', '--quiet'], env=validation_env)
             if not existing:
                 (candidate / 'compose.env').unlink()
                 candidate.rename(config)
             staged_compose.replace(directory / 'compose.yml')
             staged_env.replace(settings_path)
+            if not args.dev_localhost and args.tls_mode == 'auto':
+                install_renewal_hooks(directory, args.tls_domain,
+                                      int(settings['P2WLAN_UID']), int(settings['P2WLAN_GID']))
             command = base + ['--env-file', str(settings_path), '-f', str(directory / 'compose.yml')]
             if not args.no_start:
+                if edge_enabled:
+                    print('[3/3] Pulling the HTTPS edge image')
+                    run(['docker', 'pull', os.environ.get('P2WLAN_EDGE_IMAGE', EDGE_IMAGE_DEFAULT)],
+                        timeout=600, capture=False)
                 print('[3/3] Starting Control/Relay and waiting for health')
                 try:
                     run(command + ['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', str(args.wait_timeout)],
@@ -858,9 +1047,16 @@ def install(resources):
             label = 'Configured Control (services not started)' if args.no_start else 'Local Control'
             print(f'{label}: http://127.0.0.1:{settings["CONTROL_PORT"]}')
             print(f'Admin path: http://127.0.0.1:{settings["CONTROL_PORT"]}/admin/')
+            if edge_enabled:
+                panel = args.tls_domain or endpoint_parts(args.relay_endpoint, False)[0]
+                print('Panel: https://' + panel + '/')
+                print('Admin path: https://' + panel + '/admin/')
             print('Relay endpoint: ' + plan['endpoint'])
             print('Admin credential: CONTROL_ADMIN_TOKEN in config/control.env (not printed).')
-            print('Public Control access still requires trusted HTTPS/WSS; Relay requires client-trusted TLS.')
+            if args.dev_localhost:
+                print('Control stays on loopback; Relay uses a local test certificate.')
+            else:
+                print('Panel serves trusted HTTPS/WSS; Relay uses the same certificate files.')
             if args.dev_localhost:
                 print('Local test only: the generated certificate expires in 24 hours and is not publicly trusted.')
     if terminal:

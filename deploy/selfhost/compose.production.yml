@@ -59,3 +59,42 @@ services:
       interval: 10s
       timeout: 5s
       retries: 6
+
+  # Public HTTPS/WSS entry for the Control panel and admin UI. It starts only
+  # with the "edge" profile and serves the same certificate files as the Relay.
+  # nginx-unprivileged listens on 8080/8443, so the container needs neither
+  # privileged ports nor extra capabilities.
+  edge:
+    profiles: ["edge"]
+    image: "${P2WLAN_EDGE_IMAGE:-nginxinc/nginx-unprivileged:1.27-alpine}"
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp, /var/cache/nginx, /var/run]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      control:
+        condition: service_healthy
+    ports:
+      - "80:8080"
+      - "443:8443"
+    volumes:
+      - type: bind
+        source: "${P2WLAN_CONFIG_DIR:?Set P2WLAN_CONFIG_DIR}/edge/nginx.conf"
+        target: /etc/nginx/conf.d/default.conf
+        read_only: true
+        bind:
+          create_host_path: false
+    secrets:
+      - p2wlan_tls_cert
+      - p2wlan_tls_key
+    healthcheck:
+      test: [CMD-SHELL, 'wget -q -T 4 -O /dev/null http://127.0.0.1:8080/healthz']
+      interval: 10s
+      timeout: 5s
+      retries: 6
+secrets:
+  p2wlan_tls_cert:
+    file: "${P2WLAN_CONFIG_DIR:?Set P2WLAN_CONFIG_DIR}/tls.crt"
+  p2wlan_tls_key:
+    file: "${P2WLAN_CONFIG_DIR:?Set P2WLAN_CONFIG_DIR}/tls.key"

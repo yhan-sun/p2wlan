@@ -41,6 +41,9 @@ Options:
                              native program/configuration/database directories
   --relay-endpoint URL        public tls://host:port
   --tls-cert FILE --tls-key FILE
+  --tls-mode auto|files       Docker: request a Let's Encrypt certificate or use files
+  --tls-domain DOMAIN         Docker: certificate domain (must equal the Relay host)
+  --tls-email EMAIL           Docker: ACME account email
   --publish-host IP          Docker Relay host bind address (Docker only)
   --control-port PORT        internal Control port (default: 18080)
   --metrics-port PORT        loopback Relay readiness port (default: 18082)
@@ -54,7 +57,9 @@ Fresh-host dependency installation supports Ubuntu 22.04/24.04/26.04 and
 Debian 12/13, amd64/arm64, with systemd. Native installation prepares only
 native prerequisites and never installs or invokes Docker. Existing prepared
 Linux environments can be reused. Public use requires a trusted Relay
-certificate and a Control HTTPS/WSS reverse proxy. Unattended deployments
+certificate and a Control HTTPS/WSS reverse proxy. Docker public installs can
+request and renew a trusted certificate in the wizard and serve the panel over
+HTTPS; native installs still need their own certificate and proxy. Unattended deployments
 should specify --method; its compatibility default is docker. Docker builds
 the selected source release with Compose by default, without a registry login.
 Go and Node run inside the build containers, not on the deployment host.
@@ -83,7 +88,7 @@ HELP
         value "$@"; BOOT_FORWARD+=("$1" "$2"); BOOT_DOCKER_OPTIONS=1; shift 2 ;;
       --root|--config-dir|--data-dir)
         value "$@"; BOOT_FORWARD+=("$1" "$2"); BOOT_NATIVE_OPTIONS=1; shift 2 ;;
-      --relay-endpoint|--tls-cert|--tls-key|--control-port|--metrics-port)
+      --relay-endpoint|--tls-cert|--tls-key|--tls-mode|--tls-domain|--tls-email|--control-port|--metrics-port)
         value "$@"; BOOT_FORWARD+=("$1" "$2"); shift 2 ;;
       --start) BOOT_FORWARD+=("$1"); BOOT_NATIVE_OPTIONS=1; shift ;;
       --no-start) BOOT_FORWARD+=("$1"); BOOT_NO_START=1; shift ;;
