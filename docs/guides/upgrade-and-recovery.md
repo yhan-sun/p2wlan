@@ -1,46 +1,91 @@
-# 升级与恢复
+# 升级与灾难恢复
 
-## 升级
+本指南面向自托管服务端管理员，介绍 P2WLAN 服务端（Control 与 Relay）的版本平滑升级、数据备份、恢复与故障回滚操作。
 
-每次升级只使用一个固定 server-vX.Y.Z 归档：
+---
 
-    sudo p2wlan-server backup
-    sudo p2wlan-server update --version server-vX.Y.Z
-    sudo p2wlan-server verify --service all
-    sudo p2wlan-server check --service all
-    sudo p2wlan-server doctor --service all
+## 1. 平滑升级
 
-升级保留已有配置和数据。当前 manager 在激活新发布前检查支持日志配置：`LOG_UPLOAD_DIR` 缺失或为空时，仅追加数据目录下 `log-uploads` 的绝对路径；非空自定义值保持原样。它只创建或恢复受管理的最后一级目录，不递归修改数据文件；符号链接、其他用户属主、配置锁冲突或配置在检查期间被替换时拒绝继续。准备过程只解析完整的单行环境赋值；任意变量使用多行引号或反斜线续行时，报告 `unsupported_environment_syntax` 并在更改目录和配置前停止，不把其他变量中的文本误作配置项。准备失败不会切换当前发布。更新前后记录准确版本、源码提交、归档 checksum、服务健康检查和 doctor 结果。doctor 的主机级检查仍不替代真实客户端/TUN/公网入口验收。
+原生 systemd 部署环境提供了全自动的在线更新工具。在执行升级前，推荐先进行一次数据备份：
 
-旧版 manager 自身不具备新增的准备逻辑。升级遗留安装时，先从已校验的新归档安装其中的 `p2wlan-server`，再运行该版本的 update；上传部署入口会在 update 前安装同归档的 manager。已有自定义日志目录不会被自动接管，须由部署者按原路径核对访问权限。该补齐过程不会轮换 JWT、管理台、Relay 或 TLS 凭据。
+```bash
+# 1. 备份当前数据
+sudo p2wlan-server backup
 
-## 备份
+# 2. 执行版本升级（指定目标服务端版本 tag）
+sudo p2wlan-server update --version server-vX.Y.Z
 
-backup 使用服务端内置的 SQLite 一致性快照工具，不按顺序复制在线的主文件、WAL 和 SHM。数据库路径读取 Control 的 DB_PATH；相对路径相对于服务数据目录。备份目录包含数据库摘要、完整性检查结果、schema 版本和当前发布元数据。
+# 3. 校验并检查升级后的服务健康状态
+sudo p2wlan-server verify --service all
+sudo p2wlan-server check --service all
+sudo p2wlan-server doctor --service all
+```
 
-配置含有秘密。需要把配置一起保存时，使用独立于备份包的 age 私钥：
+升级过程会保留您现有的全部配置与数据库，并平滑重启服务。
 
-    sudo p2wlan-server backup --include-config --age-recipient age1example
+> [!TIP]
+> 如果您采用的是 Docker Compose 部署，升级只需要在部署目录（如 `/opt/p2wlan-docker`）修改 `.env` 中的镜像版本标签，然后执行：
+> ```bash
+> sudo docker compose pull
+> sudo docker compose up -d
+> ```
 
-age 私钥不放在服务器备份目录、同一个归档或命令行中。没有加密接收方时，backup 只保存数据库快照和恢复所需的非秘密元数据。
+---
 
-## 恢复
+## 2. 数据备份
 
-恢复要求 systemd 可用，并在替换数据库前验证 checksum、SQLite integrity_check 和备份元数据：
+P2WLAN Control 内置了专为 SQLite 打造的一致性快照备份工具。它会在事务一致性边界内安全生成数据库快照，避免因直接拷贝在线的 `.db` 和 WAL 文件导致数据损坏。
 
-    sudo p2wlan-server restore --backup /var/lib/p2wlan/backups/p2wlan-YYYYMMDDTHHMMSSZ
+### 基础数据备份
+```bash
+sudo p2wlan-server backup
+```
+备份产物默认保存在 `/var/lib/p2wlan/backups/` 目录下，包含数据库一致性快照、完整性校验值（SHA-256）与元数据。
 
-如果备份包含加密配置，显式提供离线保存的 age identity：
+### 加密备份配置文件
+如果希望将敏感配置文件（包含 JWT 密钥、Admin Token 等）一并打包备份，可以使用 `age` 工具进行公钥加密：
 
-    sudo p2wlan-server restore \
-      --backup /var/lib/p2wlan/backups/p2wlan-YYYYMMDDTHHMMSSZ \
-      --age-identity /secure/recovery-key.txt
+```bash
+sudo p2wlan-server backup --include-config --age-recipient age1example...
+```
+配置文件在写入备份包前会使用指定的公钥加密，确保即使备份文件离线存储也能防止密钥泄露。
 
-恢复前会为当前数据库创建一致性 pre-restore 快照，并保存现有 Control/Relay 配置和两项服务的运行状态。服务原本运行时会在替换数据前严格停止对应服务；停止失败立即中止。恢复后的启动或健康检查失败时，manager 会恢复 pre-restore 数据库、原配置和原服务状态；如果这一步也无法完整完成，会保留 recovery copy 并明确报错，不会把部分恢复状态报告为成功。服务原本未运行时不会擅自启动。恢复完成后仍须执行登录、房间、票据、撤权和双端通信验证。
+---
 
-## 回滚
+## 3. 灾难恢复
 
-    sudo p2wlan-server rollback --version server-vX.Y.Z
-    sudo p2wlan-server check --service all
+当遇到硬件故障、误操作或迁移服务器时，可以使用备份文件快速还原系统：
 
-回滚只切换到已经安装的发布目录，并检查版本和健康状态，不自动把新 schema 降回旧 schema。新版本写入数据后，旧版本可能不兼容；此时应恢复兼容的数据库快照或向前修复，不应承诺无损自动降级。
+### 从基础备份恢复
+```bash
+sudo p2wlan-server restore --backup /var/lib/p2wlan/backups/p2wlan-YYYYMMDDTHHMMSSZ
+```
+
+### 恢复包含加密配置的备份
+如果备份包包含了加密配置，需提供对应的私钥文件路径解密：
+
+```bash
+sudo p2wlan-server restore \
+  --backup /var/lib/p2wlan/backups/p2wlan-YYYYMMDDTHHMMSSZ \
+  --age-identity /path/to/recovery-key.txt
+```
+
+> **自动安全保护机制**：
+> 在执行还原前，系统会自动对当前运行中的数据库做一份预还原快照（Pre-restore snapshot）。若还原或启动过程出现异常，系统会自动安全回滚至当前状态，避免产生半写入的不一致数据。
+
+---
+
+## 4. 版本回滚
+
+如果升级到新版本后发现异常，可快速回滚至上一版本：
+
+```bash
+# 回滚至指定的历史版本
+sudo p2wlan-server rollback --version server-vX.Y.Z
+
+# 检查回滚后的服务状态
+sudo p2wlan-server check --service all
+```
+
+> [!NOTE]
+> 回滚操作会切换运行程序二进制并重启服务。如果新版本包含了不可逆的数据库迁移（Schema 变更），回滚后建议配合对应版本的数据库备份进行完整还原。

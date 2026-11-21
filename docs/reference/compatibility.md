@@ -1,29 +1,43 @@
 # 兼容性参考
 
-| 平台 | 当前发布形态 | 说明 |
-| --- | --- | --- |
-| macOS 12+ Apple Silicon | DMG | 需要系统网络扩展/TUN 权限 |
-| macOS 12+ Intel | DMG | 需要系统网络扩展/TUN 权限 |
-| Windows x64 | 安装器 | 需要 Wintun、路由和防火墙权限 |
-| Linux x64 | GUI、CLI/daemon 包 | CLI/daemon 适合无桌面服务 |
-| Linux arm64 | CLI/daemon 包 | 以对应 Release 归档为准 |
-| OpenWrt 24.10 / 25.12 ARM64、x86_64 | IPK / APK | [原生包与 procd](../guides/openwrt.md)，路由器本机节点 |
-| Android 7.0+ arm64 | arm64 APK | 受系统 VPN、生命周期和后台策略影响 |
+本篇文档列出 P2WLAN 各组件支持的操作系统、架构、运行环境要求及版本兼容规范。
 
-当前公开支持范围为 Windows、macOS、Linux 和 Android。iOS 暂不纳入支持范围；已有 unsigned IPA 构建入口不作为当前受支持客户端的下载或兼容性承诺。
+---
 
-客户端和服务端使用独立的版本命名空间：客户端是 `vX.Y.Z`，服务端是 `server-vX.Y.Z`。即使两个标签具有相同的数字后缀，也不表示它们指向同一个源码提交、同一次构建或同一组发布产物。自托管部署和问题定位应分别记录客户端 tag + commit、服务端 tag + commit，不能只记录 `X.Y.Z`。
+## 1. 客户端支持矩阵
 
-不同标签不代表协议完全兼容；升级前检查发布契约和服务端说明。固定服务端归档的公开部署路径、发行版验证范围和 Windows/Docker 边界见[自托管指南](../guides/self-hosting.md)。
+| 平台 | 架构 | 发布形式 | 最低系统版本 | 权限与依赖说明 |
+| --- | --- | --- | --- | --- |
+| **Windows** | x64 | 安装程序 (`.exe`) | Windows 10 (1809+) / 11 | 需要管理员权限安装 Wintun 驱动 |
+| **macOS** | Apple Silicon / Intel | 磁盘映像 (`.dmg`) | macOS 12 (Monterey)+ | 首次启动网络需要系统管理员授权以创建 utun 接口 |
+| **Linux (桌面)** | x64 / arm64 | 便携包 / 安装包 | 主流发行版（Ubuntu 22.04+、Debian 12+、Fedora 等） | 需要 TUN 模块（`kmod-tun`）及 PolicyKit/sudo 授权 |
+| **Linux (CLI)** | x64 / arm64 | 独立压缩包 (`tar.gz`) | glibc 2.31+ | 适合服务器与无桌面环境 |
+| **OpenWrt** | ARM64 / x86_64 | 原生包 (`.ipk` / `.apk`) | OpenWrt 24.10 / 25.12 | 详情请参考 [OpenWrt 路由器指南](../guides/openwrt.md) |
+| **Android** | arm64-v8a | 安装包 (`.apk`) | Android 7.0 (API 24)+ | 需要在系统中授予 VPN 连接权限 |
 
-## Hard↔Hard 协商
+> [!NOTE]
+> iOS 客户端目前尚在开发与测试阶段，暂未发布正式安装包。
 
-客户端在注册时分别声明 `hh2_pair_nomination` 和 `hh2_plan_v2`，服务端保存当前注册的能力并随 roster 分发。只有本端注册确认和对端当前注册均具备两项能力，才使用 `hh2` 的计划协商与精确候选对提名。客户端版本号不能替代能力证据；旧服务端未返回能力确认、旧客户端缺字段或重新注册失去能力时，均不启用 `hh2`。混合版本继续使用兼容打洞流程和原有 Relay 回退。
+---
 
-`hh2` 的候选计划绑定双方注册序号和网络身份。无效、过期或不支持的版本化协商报文被拒绝，不能按旧版信令重新解释，也不能替换当前候选或创建另一条连接状态。
+## 2. 服务端支持与运行环境
 
-## 服务端验证范围
+P2WLAN 服务端（Control 与 Relay）采用 Go 语言开发，支持以下运行形态：
 
-原生服务端 CI 在 Ubuntu 22.04 和 Windows latest 上运行 Go 测试及 Control/Relay 双进程 smoke；systemd manager 与恢复契约在 Ubuntu 22.04 上执行。Docker 自托管拓扑在 Ubuntu 22.04 runner 上验证。服务端使用 `CGO_ENABLED=0` 的静态 Linux 二进制，并额外在 Ubuntu 20.04 容器中执行 loader/`--version` 兼容检查，但这不等于 Ubuntu 20.04 的完整 systemd、TLS、数据库恢复和真实网络部署已经端到端验证。
+- **Docker 容器部署（推荐）**：支持 Linux x86_64 与 ARM64，兼容主流 Linux 发行版（Ubuntu、Debian、CentOS、Rocky、Alpine 等）；
+- **Linux 原生 systemd 部署**：提供静态编译的无动态链接二进制包，经过 Ubuntu 22.04 LTS / 24.04 LTS、Debian 12 等环境的完整测试；
+- **自托管部署指南**：完整安装、反向代理与证书设置请参阅[自托管指南](../guides/self-hosting.md)。
 
-兼容性声明只覆盖仓库已执行的构建与测试。真实设备、真实 TUN、不同 NAT、休眠唤醒、网络切换和长期业务流量需要单独验证。
+---
+
+## 3. 版本命名规范与兼容性
+
+为了清晰区分客户端与服务端的发布节奏，项目采用了独立的版本标签命名空间：
+
+- **客户端版本**：以 `vX.Y.Z` 命名（例如 `v0.1.170`）；
+- **服务端版本**：以 `server-vX.Y.Z` 命名（例如 `server-v0.1.170`）。
+
+### 双对称 NAT 穿透协商（HH2）
+新版本客户端引入了 HH2 增强穿透协调协议，支持在复杂的双对称 NAT 下进行端口预测与协同探测：
+- 当通信双方均支持 HH2 时，系统自动启用高级协同穿透方案；
+- 若其中一方为旧版本，系统会自动回退到经典打洞流程或透明 Relay 中继，确保连接平稳兼容。

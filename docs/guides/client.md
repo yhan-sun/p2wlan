@@ -1,49 +1,110 @@
 # 客户端指南
 
-OpenWrt 使用原生 IPK/APK 和 procd 服务，安装、路径与升级规则见 [OpenWrt 指南](openwrt.md)。普通 Linux 的 CLI tarball 使用 glibc，不能用于 OpenWrt。
+P2WLAN 提供了全平台的跨平台客户端，包括具备现代化界面的图形应用（GUI）与适合服务器运维的命令行工具（CLI）。
 
-## 安装与配置
+> 如果你需要在路由器上运行，请参阅专门的 [OpenWrt 路由器指南](openwrt.md)。
 
-优先使用 GitHub Release 的固定版本包。安装脚本只负责安装公开的客户端文件，不包含 Control 地址、账号或凭据。
+---
 
-桌面和移动客户端必须在登录页填写服务器地址并登录后使用。服务器地址为必填项，中继配置由服务器自动下发；客户端不提供离线启动入口，缺少地址或登录凭据时会提示补齐配置并拒绝启动本机网络。旧配置中的离线标记不再生效，无登录凭据时进入登录页。
+## 1. 平台支持与安装
 
-## 检查客户端更新
+从官方 GitHub Releases 下载与你系统匹配的安装包：
 
-桌面和移动客户端启动后会异步检查一次 GitHub 上的客户端正式 Release；也可以在“设置 → 诊断与关于 → 检查更新”中手动检查。客户端只接受 `vX.Y.Z` 标签，服务端的 `server-vX.Y.Z` 标签不会被当作客户端版本。
+- **Windows**：下载安装包（`.exe`），按向导安装。首次启动连接时系统会提示安装 Wintun 驱动；
+- **macOS**：下载 `.dmg` 镜像，拖入“应用程序”文件夹。首次启动网络时会弹出系统管理员授权窗口以创建虚拟网络接口；
+- **Linux**：提供图形客户端包（桌面用户）与轻量 CLI tarball（服务器用户）；
+- **Android**：下载 `.apk` 安装包，首次连接时授予系统 VPN 连接权限即可。
 
-发现新版本时，客户端显示当前版本和最新版本，用户确认后打开对应的 GitHub Release 页面。更新检查失败不会阻止客户端启动，也不会自动下载、替换或安装任何程序；手动安装仍使用固定版本 Release 包。
+---
 
-常用 CLI：
+## 2. 图形客户端使用
 
-    p2wlan config set control https://control.example.com
-    p2wlan config show
-    p2wlan login -u your-name
-    p2wlan up
-    p2wlan down
-    p2wlan status
+### 首次配置与登录
+启动客户端后，在登录界面填写管理员提供的 Control 服务器地址（例如 `https://control.example.com`），输入用户名登录。登录成功后，客户端会自动拉取可用的中继节点与网络信息，点击主界面的“启动 P2WLAN”即可连入虚拟网络。
 
-登录和配置不要使用 sudo；创建 TUN、路由或系统服务时，CLI 会在需要的位置请求权限。
+### 检查更新
+客户端启动时会在后台检查 GitHub Releases 是否有新版本发布，你也可以在“设置 → 诊断与关于”中手动点击“检查更新”。发现新版本时，客户端会显示版本提示并指引你前往下载更新。
 
-macOS 和 Linux 桌面启动会先准备当前实例的配置、日志目录，再写入一次性启动凭据。默认用户目录中遗留的 root 属主会在停止旧实例后进行有界提权恢复，每个失败目录最多恢复一次，并由当前用户复验。恢复保留配置内容，只处理本应用当前实例的目录和固定文件；自定义路径、其他用户属主、符号链接、硬链接或仍被活动实例锁定的目录会拒绝自动接管。日志轮转和 PID 文件写入由交互用户执行，Unix 配置及诊断文件保持 `0600`，运行目录保持 `0700`。
+### 开机自启动
+在“设置 → 通用”中可以开启“登录时启动 P2WLAN”。开启后，当你开机登录桌面会话时，应用会自动在后台启动并恢复上次配置的连接：
+- **Windows**：注册在当前用户的启动项注册表中；
+- **macOS**：使用当前用户的 LaunchAgent；
+- **Linux**：符合 XDG Autostart 规范。
 
-Windows、macOS 和 Linux 桌面客户端可在“设置 → 通用 → 登录时启动 P2WLAN”中选择是否在当前用户进入桌面会话后自动启动应用，并在登录状态、首次配置和本机 VPN 能力均有效时连接已配置的 P2WLAN 网络。手动启动应用不会隐式连接网络。
+该设置仅作用于当前操作系统登录用户，关闭开关后会自动清理对应启动项。
 
-登录自启只写入当前用户范围：Windows 使用 `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`，macOS 使用 `~/Library/LaunchAgents/io.p2wlan.desktop.login-startup.plist`，Linux 使用 XDG Autostart（`$XDG_CONFIG_HOME/autostart/p2wlan.desktop`，未设置绝对的 `XDG_CONFIG_HOME` 时回退到 `~/.config/autostart/p2wlan.desktop`）。关闭开关会移除对应当前用户条目，不创建系统级服务。
+---
 
-如果应用安装位置变化，设置页会把旧条目视为未启用；重新打开开关会使用当前应用路径重建条目。没有有效登录状态、首次配置未完成或当前平台不能作为本机 VPN 节点时，即使应用由登录自启启动，也不会自动启动网络。
+## 3. 命令行（CLI）指南
 
-## 路径和路由
+在 Linux 服务器、容器或习惯终端的环境中，CLI 提供了完整的管理与诊断能力。
 
-    p2wlan doctor
-    p2wlan route verify
-    p2wlan route repair
-    p2wlan logs -f
+### 基础网络操作
+```bash
+# 配置 Control 服务器地址
+p2wlan config set control https://control.example.com
 
-CLI 展示的是 daemon 已确认的状态。Connecting 不等于业务可用，Direct/Relay 标签也不等于对端应用已经收到数据；需要用虚拟 IP 执行实际的 TCP、UDP 或 ICMP 验证。
+# 登录账号
+p2wlan login -u your-name
 
-## 支持包
+# 查看当前配置与账号状态
+p2wlan config show
+p2wlan account show
 
-支持包用于用户主动提交诊断。上传前检查压缩包和日志，删除不必要的业务信息，确认接收方和保留期限。不要上传 JWT、设备凭据、Relay ticket、私钥、完整环境文件或真实主机密钥。
+# 启动虚拟网络
+p2wlan up
 
-没有获得明确上传授权时，只保留本地文件并通过安全渠道交给管理员。支持包行为和服务端保存目录由当前实现与部署策略共同决定。
+# 停止虚拟网络
+p2wlan down
+
+# 查看节点与路径实时状态
+p2wlan status
+```
+
+### 权限说明与最佳实践
+- **日常命令无需 `sudo`**：配置修改、账号登录、状态查询等操作均以普通用户运行即可；
+- **提权请求**：只有在启动网络需要创建底层 TUN 虚拟网卡或写入路由规则时，系统才会按需请求提权；
+- **权限自愈机制**：如果此前曾误用 `sudo` 运行导致本地配置或日志目录归属于 root，桌面客户端在启动时会自动检测并尝试将目录属主恢复为当前登录用户。
+
+---
+
+## 4. 路径观测与网络排障
+
+P2WLAN 内置了完整的自检与排障命令，帮助你快速定位网络状况：
+
+```bash
+# 运行全面健康体检
+p2wlan doctor
+
+# 检查当前虚拟网卡与路由表状态
+p2wlan route verify
+
+# 尝试自动修复受损的路由规则
+p2wlan route repair
+
+# 实时追踪运行日志
+p2wlan logs -f
+```
+
+在查看 `p2wlan status` 时：
+- **Connecting**：表示客户端正在与对端进行打洞协商或中继建立；
+- **Direct**：表示已成功建立端到端 P2P 直连（延迟低，推荐）；
+- **Relay**：表示通过中继服务器进行加密转发（直连受限时的稳定保底方案）。
+
+连接建立后，建议使用实际的业务流量（如 `ping <对端IP>` 或访问对应端口）进行最终验证。
+
+---
+
+## 5. 诊断支持包（Support Bundle）
+
+当你遇到难以自行解决的网络问题需要向管理员或社区反馈时，可以生成脱敏的诊断支持包：
+
+```bash
+# 生成本地诊断压缩包（存放在当前目录，不含私钥与敏感 Token）
+p2wlan support-bundle
+
+# 在确认目标与必要性后，直接上传至管理员配置的日志收集端点
+p2wlan support-bundle --upload
+```
+
+支持包会自动收集近期的连接事件摘要、NAT 类型模型与脱敏日志，绝不会打包你的账号密码、私钥或业务明文数据。

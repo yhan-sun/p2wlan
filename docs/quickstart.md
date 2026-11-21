@@ -1,46 +1,94 @@
 # 快速开始
 
-## 前提
+通过本指南，你可以在几分钟内完成 P2WLAN 客户端的安装、配置并与朋友或自己的设备建立虚拟局域网连接。
 
-准备一台已经提供 Control 地址的服务，或先完成[自托管部署](guides/self-hosting.md)。新安装不预填项目服务器，也不会自动注册。
+## 1. 准备工作
 
-## 客户端
+P2WLAN 采用去中心化直连与集中控制协调相结合的架构。开始前，你需要一个 P2WLAN Control 服务器地址：
+- 如果朋友已经搭建了服务器，直接向其索取服务器地址（如 `https://control.example.com`）；
+- 如果打算自己搭建，请先参考[自托管指南](guides/self-hosting.md)在云服务器或局域网机器上完成部署。
 
-从 GitHub Releases 下载对应平台的包并安装。Linux CLI 的远程安装器必须显式指定 `vX.Y.Z`；也可以直接使用 Release 内的固定版本包。
+## 2. 安装与配置客户端
 
-先写入 Control 地址，再登录：
+前往 GitHub Releases 页面，下载适合你操作系统的客户端安装包：
+- **Windows / macOS / Android**：推荐下载图形客户端，安装后即可在图形界面中直观操作；
+- **Linux**：可选择图形客户端或轻量 CLI 工具。
 
-    p2wlan config set control https://control.example.com
-    p2wlan login -u your-name
-    p2wlan account show
+### 图形客户端配置
+打开客户端后，在登录界面填入服务器地址（例如 `https://control.example.com`），输入用户名进行登录或注册。登录成功后，客户端会自动拉取网络配置与中继信息。
 
-启动并确认本机网络：
+### 命令行（CLI）配置
+如果你使用的是 Linux 服务器或习惯使用终端，可以通过 CLI 进行配置：
 
-    p2wlan up
-    p2wlan status
-    p2wlan doctor
+```bash
+# 设置服务器地址
+p2wlan config set control https://control.example.com
 
-## 房间与业务
+# 登录或注册账号
+p2wlan login -u your-name
 
-加入房间后等待对端在线：
+# 查看当前账号信息
+p2wlan account show
+```
 
-    p2wlan room list
-    p2wlan room connect <房间号或房间 ID>
+启动虚拟网络并检查状态：
 
-使用对端的虚拟 IP 验证实际业务，而不是只看 Control 登录成功：
+```bash
+# 启动网络（创建虚拟网卡并建立连接）
+p2wlan up
 
-    ping <对端虚拟 IP>
-    ssh <对端虚拟 IP>
+# 查看运行状态与分配到的虚拟 IP
+p2wlan status
 
-路径优先级是 LAN Direct、IPv6 / IPv4 UDP Direct、Encrypted Relay。Direct 受 NAT、防火墙和云安全组影响；Relay 可用也依赖 Control 和 Relay 的 TLS 配置。
+# 运行健康检查诊断
+p2wlan doctor
+```
 
-## 出现问题时
+## 3. 加入房间与网络互通
 
-先保存版本和不含秘密的诊断摘要：
+P2WLAN 通过“房间”来组织互联的设备。加入同一个房间的设备就像接入了同一台虚拟交换机：
 
-    p2wlan --version
-    p2wlan status --json
-    p2wlan doctor
-    p2wlan logs -f
+```bash
+# 查看可用房间
+p2wlan room list
 
-支持包上传不是初始化步骤。只有在确认目标、内容和保存期限后，才显式执行 support-bundle 的上传选项。详见[排障指南](guides/troubleshooting.md)。
+# 加入或连接房间
+p2wlan room connect <房间号或房间 ID>
+```
+
+连接成功后，在客户端或 `p2wlan status` 中可以看到对端设备的在线状态与分配到的私有虚拟 IP。
+
+### 验证通信
+通过虚拟 IP 测试两端连通性与实际应用业务：
+
+```bash
+# 测试网络连通性
+ping <对端虚拟 IP>
+
+# 测试实际业务连接（如 SSH、游戏服务或 Web 面板）
+ssh <对端虚拟 IP>
+```
+
+> [!TIP]
+> **关于连接路径**：
+> P2WLAN 会优先尝试 **局域网直连** 与 **IPv6 / IPv4 UDP 打洞直连**（延迟最低，不消耗服务器中继流量）。当两端处于复杂的对称型 NAT 或被严格防火墙阻隔时，系统会自动平滑切换到 **端到端加密中继（Relay）** 转发，确保连接始终可用。
+
+## 4. 常见问题与排查
+
+如果遇到连接不通或设备离线，可以按以下顺序快速定位：
+
+```bash
+# 1. 检查客户端版本
+p2wlan --version
+
+# 2. 输出结构化状态（包含路径类型：Direct 或 Relay）
+p2wlan status --json
+
+# 3. 运行本地网络与路由诊断
+p2wlan doctor
+
+# 4. 查看实时运行日志
+p2wlan logs -f
+```
+
+更详细的排查技巧与解决方案，请参阅[排障指南](guides/troubleshooting.md)。

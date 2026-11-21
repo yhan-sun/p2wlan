@@ -1,146 +1,80 @@
-# P2WLAN Flutter Client
+# P2WLAN Flutter 客户端
 
-Flutter frontend for the Rust P2WLAN client, paired with the Rust networking
-core.
+本项目是 P2WLAN 跨平台客户端的 Flutter 前端实现，配合 Rust 编写的网络核心守护进程（`p2wlan-daemon`）共同构建完整的客户端应用。
 
-The supported toolchain is Flutter 3.47.2 with Dart 3.13.2. The repository-root
-`.fvmrc` is the source of truth for local FVM, CI, and release builds.
-Public client support covers Windows, macOS 12+, Linux, and Android API 24+.
-iOS is outside the current support scope; retained iOS build files do not imply
-a supported public client.
+## 技术栈与支持平台
 
-The split is:
+- **开发工具链**：Flutter 3.47.2 / Dart 3.13.2（项目根目录 `.fvmrc` 统一指定工具版本）；
+- **支持平台**：
+  - Windows（x64）
+  - macOS 12+（Apple Silicon 与 Intel 架构）
+  - Linux（x64 / arm64 桌面环境）
+  - Android（API 24+）
 
-- Flutter: desktop/mobile UI, settings, status, peer views, and lifecycle
-  controls. It exits normally when its window is closed in the default desktop
-  flow.
-- Rust `p2wlan-tray`: tiny native tray process for idle status, opening the
-  Flutter UI on demand, and quick daemon controls without keeping WebView or
-  Flutter UI memory resident.
-- Rust `p2wlan-daemon`: virtual adapter, routes, crypto, NAT traversal, relay,
-  control-plane session, diagnostics, and shutdown.
+## 架构分工
 
-## Run
+- **Flutter 应用**：跨平台 UI 呈现层，负责用户交互、设置管理、网络启停控制与连接状态展示；
+- **Rust `p2wlan-tray`**：轻量级系统托盘组件，常驻后台提供快捷控制，在窗口关闭后维持低内存占用；
+- **Rust `p2wlan-daemon`**：底层网络守护进程，负责 TUN 虚拟网卡、WireGuard 协议栈、NAT 穿透、加密中继与本地 IPC。
 
-For a configured macOS development checkout, use the one-command launcher. It
-builds and verifies the matching Rust daemon, then launches the normal Flutter
-app. Start and stop the daemon from Home or the system tray:
+---
+
+## 本地开发与运行
+
+### 一键启动（macOS）
+在 macOS 开发环境中，可以直接运行打包脚本一键编译 Rust 依赖并启动 Flutter 应用：
 
 ```bash
 ./apps/flutter_client/scripts/run_test_app_macos.sh
 ```
 
-Clicking **Start P2WLAN** can show the normal macOS administrator prompt. A
-fresh checkout still goes through login and onboarding. Use `--dry-run` to
-build and print the resolved launch command without opening the app.
+首次点击“启动 P2WLAN”时，系统会弹出管理员授权以允许创建 `utun` 虚拟网络接口。
 
-Equivalent manual commands:
+### 手动构建与运行
 
-```bash
-# Build the daemon binary used by the Flutter desktop client.
-cargo build -p p2wlan-daemon
+1. **编译 Rust 核心依赖**：
+   ```bash
+   # 编译网络守护进程
+   cargo build -p p2wlan-daemon
 
-# Run the lightweight menu bar / tray controller.
-cargo build -p p2wlan-tray
-target/debug/p2wlan-tray
+   # 编译系统托盘伴侣程序
+   cargo build -p p2wlan-tray
+   ```
 
-# Run Flutter.
-cd apps/flutter_client
-P2WLAN_DAEMON_BIN=../../target/debug/p2wlan-daemon \
-flutter run -d macos
-```
+2. **启动 Flutter 应用**：
+   ```bash
+   cd apps/flutter_client
+   P2WLAN_DAEMON_BIN=../../target/debug/p2wlan-daemon flutter run -d macos
+   ```
 
-The packaged desktop app uses the in-process Flutter tray by default, so the
-macOS menu bar, Windows notification area, and Linux panel always have a
-visible P2WLAN entry. For the low-idle-memory native-tray experiment, set
-`P2WLAN_ENABLE_FLUTTER_TRAY=0` and launch `p2wlan-tray` separately.
+> [!TIP]
+> 守护进程查找优先级：
+> 1. `P2WLAN_DAEMON_BIN` 环境变量；
+> 2. 与客户端可执行文件同级的目录；
+> 3. macOS 应用包内 `Contents/Resources/p2wlan-daemon`；
+> 4. 根工作区 `target/debug` 或 `target/release`；
+> 5. 系统 `PATH` 路径。
 
-The client looks for `p2wlan-daemon` in this order:
+---
 
-1. `P2WLAN_DAEMON_BIN`
-2. Side-by-side with the app executable
-3. macOS `.app/Contents/Resources/p2wlan-daemon`
-4. Workspace `target/debug` or `target/release`
-5. `PATH`
+## 诊断与调试接口
 
-On macOS, starting P2WLAN from the app requests administrator authorization so
-`p2wlan-daemon` can create `utun` and install routes. Stop first tries
-`POST /shutdown`, then falls back to a verified PID marker.
+桌面守护进程会在本地暴露轻量级 HTTP 诊断接口（默认地址 `http://127.0.0.1:39277`）：
+- `GET /health`：存活探活检查；
+- `GET /status`：获取当前连接、对端节点与实时路径数据快照；
+- `POST /shutdown`：优雅退出守护进程。
 
-## macOS Bundle
+---
 
-The macOS Runner has a build phase that runs:
+## 质量验证
 
-```bash
-apps/flutter_client/scripts/bundle_daemon_macos.sh
-```
-
-It rebuilds `p2wlan-daemon` for Debug/Release and verifies its version and git
-commit before copying it into the app bundle Resources directory. This avoids
-silently embedding a stale daemon from `target/`.
-
-Build the release Flutter DMG, including a freshly compiled Rust daemon, with:
-
-```bash
-apps/flutter_client/scripts/package_macos.sh
-```
-
-The artifact is written under `target/flutter/release/`.
-
-## Diagnostics
-
-The default diagnostics URL is:
-
-```text
-http://127.0.0.1:39277/status
-```
-
-The app uses:
-
-- `GET /health` for lightweight reachability checks
-- `GET /status` for runtime snapshots
-- `POST /shutdown` for graceful daemon stop
-
-## Memory Snapshot
-
-Measure the Flutter UI separately from the Rust daemon:
-
-```bash
-apps/flutter_client/scripts/memory_baseline_macos.sh
-```
-
-Use `CORE_PATTERN` only when you explicitly want a combined UI + daemon number.
-
-For the intended low-idle-memory desktop flow, run `p2wlan-tray` and close the
-Flutter window when the dashboard is not needed:
-
-```bash
-cargo build -p p2wlan-tray
-target/debug/p2wlan-tray
-```
-
-## Validate
+在提交改动前，请运行本地代码分析与测试：
 
 ```bash
 cd apps/flutter_client
 flutter analyze
 flutter test
+
+# 构建验证（以 macOS 为例）
 flutter build macos --release
-
-cd ../..
-cargo check -p p2wlan-daemon
 ```
-
-## Acceptance Checklist
-
-- [x] Flutter exposes `p2wlan-daemon` start from Dashboard.
-- [x] Flutter exposes daemon stop through `/shutdown` with PID fallback.
-- [x] Dashboard, Diagnostics, and Nodes update from `/status`.
-- [x] Flutter in-process tray is enabled by default in packaged desktop apps;
-  `P2WLAN_ENABLE_FLUTTER_TRAY=0` selects the separate native tray experiment.
-- [x] Rust `p2wlan-tray` builds as a lightweight idle tray companion.
-- [ ] macOS release app bundles `p2wlan-daemon` in Resources and passes local
-  notarization/signing smoke.
-- [ ] Windows UAC, Linux elevation, and packaged tray behavior pass live smoke.
-- [ ] Flutter UI RSS is measured separately from daemon RSS.
-- [x] Flutter is the primary desktop client path.
