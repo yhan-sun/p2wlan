@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -257,6 +258,67 @@ void main() {
     );
     expect(result.exitCode, 0, reason: result.stderr.toString());
     expect(result.stdout.toString().trim(), 'P2WLAN-中文路径-✓');
+  }, skip: !Platform.isWindows);
+
+  test('Windows helper reads protected ACL with its Desktop cmdlet', () async {
+    final api = DiagnosticsApi(authTokenReader: () async => null);
+    addTearDown(api.close);
+    final controller = DaemonController(diagnosticsApi: api);
+    final directory = await Directory.systemTemp.createTemp(
+      'p2wlan-native-acl-',
+    );
+    addTearDown(() => directory.delete(recursive: true));
+    await controller.protectRuntimeDirectory(directory);
+    final quotedPath = directory.path.replaceAll("'", "''");
+    final result = await controller.runWindowsPowerShellForTesting(
+      r"$command = Get-Command Get-Acl -ErrorAction Stop; "
+      "\$acl = Get-Acl -LiteralPath '$quotedPath' -ErrorAction Stop; "
+      r"$rules = @($acl.GetAccessRules($true, $true, "
+      r"[Security.Principal.SecurityIdentifier])); "
+      // A binary cmdlet's ModuleBase need not be its manifest directory.
+      // Record the actual identity and require the operation, not one layout.
+      r"[ordered]@{ edition = $PSVersionTable.PSEdition; "
+      r"command_type = $command.CommandType.ToString(); "
+      r"module_name = $command.ModuleName; "
+      r"implementation_type = $command.ImplementingType.FullName; "
+      r"module_base = $command.Module.ModuleBase; "
+      r"assembly_location = $command.ImplementingType.Assembly.Location; "
+      r"protected = $acl.AreAccessRulesProtected; "
+      r"current_sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; "
+      r"rules = @($rules | ForEach-Object { [ordered]@{ "
+      r"sid = $_.IdentityReference.Value; inherited = $_.IsInherited; "
+      r"allow = $_.AccessControlType.ToString(); "
+      r"rights = $_.FileSystemRights.ToString() } }) "
+      r"} | ConvertTo-Json -Depth 4 -Compress",
+    );
+    final diagnostic = 'stdout=${result.stdout} stderr=${result.stderr}';
+    expect(result.exitCode, 0, reason: diagnostic);
+    final actual = jsonDecode(result.stdout.toString()) as Map<String, dynamic>;
+    expect(actual['edition'], 'Desktop', reason: diagnostic);
+    expect(actual['command_type'], 'Cmdlet', reason: diagnostic);
+    expect(
+      actual['module_name'],
+      'Microsoft.PowerShell.Security',
+      reason: diagnostic,
+    );
+    expect(
+      actual['implementation_type'],
+      'Microsoft.PowerShell.Commands.GetAclCommand',
+      reason: diagnostic,
+    );
+    expect(actual['protected'], isTrue, reason: diagnostic);
+    final rules = actual['rules'] as List<dynamic>;
+    expect(rules, hasLength(3), reason: diagnostic);
+    expect(rules.map((rule) => rule['sid']).toSet(), {
+      actual['current_sid'],
+      'S-1-5-32-544',
+      'S-1-5-18',
+    }, reason: diagnostic);
+    for (final rule in rules) {
+      expect(rule['inherited'], isFalse, reason: diagnostic);
+      expect(rule['allow'], 'Allow', reason: diagnostic);
+      expect(rule['rights'], 'FullControl', reason: diagnostic);
+    }
   }, skip: !Platform.isWindows);
 
   test('trusted fresh child resolves identity through Win32', () async {

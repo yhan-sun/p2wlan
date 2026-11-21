@@ -476,6 +476,7 @@ pub(super) fn prepared_prediction(
         first_punch_sent_at_ms: 0,
         last_punch_sent_at_ms: 0,
         measurement,
+        ordinary_probe_summary: None,
     });
     (allocation, allocation_rejection, prediction)
 }

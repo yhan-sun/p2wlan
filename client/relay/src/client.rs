@@ -197,6 +197,7 @@ pub enum RelayCloseReason {
 
 /// Commands sent from the client handle to the background write task.
 type WriteBoundaryHook = Box<dyn FnOnce(Instant) -> bool + Send + 'static>;
+type WriteObserver = Box<dyn FnOnce(OriginalRelayWriteFact) + Send + 'static>;
 
 enum ClientCommand {
     /// Send a raw frame (currently unused by public API but available for extensions).
@@ -210,6 +211,8 @@ enum ClientCommand {
         /// dequeues and encodes this frame, immediately before `write_all`.
         /// Returning false rejects the frame without touching the socket.
         write_boundary: Option<WriteBoundaryHook>,
+        /// Opt-in observation after the original full frame write succeeds.
+        write_observer: Option<WriteObserver>,
         /// Completion is sent only after the writer has completed
         /// `write_all`. A successful `try_send` alone is only local queue
         /// acceptance and must not be reported as transport success.
@@ -231,7 +234,7 @@ pub struct RelayClient {
     /// Immediate shutdown signal for transport replacement or an outbound
     /// write timeout.  It must not wait behind a potentially blocked
     /// `SendData` command in `cmd_tx`.
-    close_tx: watch::Sender<bool>,
+    close_signal: Arc<close::RelayCloseSignal>,
 }
 
 impl RelayClient {
@@ -242,24 +245,50 @@ impl RelayClient {
     #[allow(dead_code)]
     pub fn new_for_test() -> Self {
         let (tx, _rx) = mpsc::channel(1);
-        let (close_tx, _close_rx) = watch::channel(false);
+        let (close_signal, _close_rx) = close::RelayCloseSignal::new();
         Self {
             cmd_tx: tx,
-            close_tx,
+            close_signal,
         }
     }
 
-    /// Abort the writer immediately.  This is intentionally synchronous: a
-    /// caller handling an uncertain send must be able to invalidate the old
-    /// connection without acquiring a mutex or enqueueing another command.
+    /// Synchronously close this client without waiting behind queued writes or
+    /// network IO. A short borrowed open guard may delay close publication;
+    /// callers must never abort while holding that same client's open guard.
     pub fn abort(&self) {
-        let _ = self.close_tx.send(true);
+        self.close_signal
+            .publish_closed(close::ClosePublisher::Abort);
     }
 }
+
+mod close;
+pub use close::{RelayClientOpenError, RelayClientOpenGuard};
+
+impl RelayClient {
+    /// Freeze this exact client's original close watch, without waiting for its gate.
+    /// Does not establish current route, transport, peer or session ownership.
+    pub fn try_open_guard(
+        &self,
+    ) -> std::result::Result<RelayClientOpenGuard<'_>, RelayClientOpenError> {
+        self.close_signal.try_open()
+    }
+}
+
+mod read_origin;
+#[cfg(test)]
+use read_origin::OriginalRelayReadWitness;
+pub use read_origin::{OriginalRelayDelivery, OriginalRelayFrameRead};
+use read_origin::{ReadInput, ReadOptions};
+
+mod write_origin;
+pub use write_origin::OriginalRelayWriteFact;
 
 mod commands;
 mod connect;
 mod legacy_tcp;
+
+#[cfg(test)]
+pub(crate) mod original_workers_for_test;
 
 #[cfg(test)]
 mod tests;

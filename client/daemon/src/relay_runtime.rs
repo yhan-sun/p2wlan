@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 
-use p2pnet_relay::RelayMessage;
+use p2pnet_relay::{OriginalRelayDelivery, RelayMessage};
 
 use p2pnet_tun::Ipv4Packet;
 
@@ -37,8 +37,8 @@ use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
 
 use crate::relay::{
-    select_relay_with_cooldowns, RelayCandidateConfig, RelaySelectionDiagnostics,
-    RelaySelectionOutcome, RelayTicketCache, RelayTransport,
+    select_relay_with_cooldowns_for_read, RelayCandidateConfig, RelayReadItem,
+    RelayReadSelectionOutcome, RelaySelectionDiagnostics, RelayTicketCache, RelayTransport,
 };
 
 #[cfg(test)]
@@ -111,7 +111,7 @@ const RELAY_TICKET_RENEWAL_RETRY: Duration = Duration::from_secs(5);
 #[cfg(test)]
 pub(crate) use connection::relay_renewal_deadline;
 
-use connection::spawn_relay_renewal_task_impl;
+use connection::spawn_relay_renewal_task_for_read;
 
 #[cfg(test)]
 use supervisor::relay_retry_delay_with_jitter;

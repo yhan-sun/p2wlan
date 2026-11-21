@@ -94,6 +94,28 @@ impl RelayTransport {
         allow_insecure_plaintext: bool,
         ca_cert_path: Option<String>,
     ) -> std::result::Result<(Self, mpsc::Receiver<RelayMessage>), p2pnet_relay::RelayError> {
+        Self::connect_in_region_for_read::<RelayMessage>(
+            relay_endpoint,
+            relay_region,
+            node_id,
+            peers,
+            relay_ticket,
+            allow_insecure_plaintext,
+            ca_cert_path,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_in_region_for_read<I: RelayReadItem>(
+        relay_endpoint: &str,
+        relay_region: &str,
+        node_id: &str,
+        peers: Arc<PeerManager>,
+        relay_ticket: Option<String>,
+        allow_insecure_plaintext: bool,
+        ca_cert_path: Option<String>,
+    ) -> std::result::Result<(Self, mpsc::Receiver<I>), p2pnet_relay::RelayError> {
         let started = Instant::now();
         let mut config = RelayClientConfig {
             idle_timeout: RELAY_INBOUND_IDLE_TIMEOUT,
@@ -126,8 +148,7 @@ impl RelayTransport {
         }
 
         // Use the new A2 endpoint-based connection which supports tls:// and tcp://
-        let (client, relay_rx) =
-            RelayClient::connect_with_endpoint(relay_endpoint, node_id, config).await?;
+        let (client, relay_rx) = I::connect_client(relay_endpoint, node_id, config).await?;
 
         let relay_connection_id =
             NEXT_RELAY_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -158,6 +179,32 @@ impl RelayTransport {
             },
             relay_rx,
         ))
+    }
+
+    /// Private typed renewal entry; same connection core and error attribution.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_secure_for_read<I: RelayReadItem>(
+        relay_endpoint: &str,
+        relay_region: &str,
+        node_id: &str,
+        peers: Arc<PeerManager>,
+        relay_ticket: Option<String>,
+        allow_insecure_plaintext: bool,
+        ca_cert_path: Option<String>,
+    ) -> Result<(Self, mpsc::Receiver<I>)> {
+        Self::connect_in_region_for_read::<I>(
+            relay_endpoint,
+            relay_region,
+            node_id,
+            peers,
+            relay_ticket,
+            allow_insecure_plaintext,
+            ca_cert_path,
+        )
+        .await
+        .map_err(|e| {
+            DaemonError::Relay(format!("failed to connect to relay {relay_endpoint}: {e}"))
+        })
     }
 
     /// Attach the auth ticket metadata so the supervisor can schedule the
@@ -268,7 +315,7 @@ impl RelayTransport {
 
     /// Send a single encrypted packet through the relay.
     pub async fn send_packet(&self, packet: &EncryptedPeerPacket) -> Result<()> {
-        self.send_packet_inner(packet, None).await
+        self.send_packet_inner(packet, None, None, None).await
     }
 
     /// Send a control packet whose expectation must be installed at the relay
@@ -281,14 +328,43 @@ impl RelayTransport {
     where
         F: FnOnce(Instant) -> bool + Send + 'static,
     {
-        self.send_packet_inner(packet, Some(Box::new(write_boundary)))
+        self.send_packet_inner(packet, Some(Box::new(write_boundary)), None, None)
             .await
+    }
+
+    // Staged neutral adapter. Canonical request/attempt and emit ownership are
+    // deliberately not supplied by this interface.
+    #[allow(dead_code)]
+    pub(crate) async fn send_packet_with_origin(
+        &self,
+        packet: &EncryptedPeerPacket,
+        origin: Arc<RelaySendCapture>,
+    ) -> Result<()> {
+        self.send_packet_inner(packet, None, Some(origin), None)
+            .await
+    }
+
+    /// Sealed REQUEST source is revalidated at the original writer prewrite.
+    pub(crate) async fn send_packet_with_original_echo(
+        &self,
+        packet: &EncryptedPeerPacket,
+        echo: Arc<crate::overlay_requests::OriginalEchoPrewrite>,
+    ) -> Result<()> {
+        if !echo.matches_packet(packet) {
+            return Err(crate::error::DaemonError::RelaySend {
+                endpoint: self.relay_endpoint.clone(),
+                error: p2pnet_relay::RelayError::WriteBoundaryRejected,
+            });
+        }
+        self.send_packet_inner(packet, None, None, Some(echo)).await
     }
 
     async fn send_packet_inner(
         &self,
         packet: &EncryptedPeerPacket,
         write_boundary: Option<Box<dyn FnOnce(Instant) -> bool + Send + 'static>>,
+        origin: Option<Arc<RelaySendCapture>>,
+        echo: Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>>,
     ) -> Result<()> {
         debug!(
             event = "relay_outbound_write_submitted",
@@ -302,36 +378,76 @@ impl RelayTransport {
             relay_endpoint = %self.relay_endpoint,
             "opaque encrypted frame submitted to the relay client's bounded command queue"
         );
-        let clients = self
-            .rendezvous
-            .as_ref()
-            .map(|pool| pool.send_clients(&packet.peer_id))
-            .unwrap_or_else(|| vec![self.client.clone()]);
+        let clients = if let Some(origin) = origin.as_ref() {
+            let (clients, selected) = self
+                .rendezvous
+                .as_ref()
+                .map(|pool| pool.send_clients_with_origins(&packet.peer_id))
+                .unwrap_or_else(|| {
+                    (
+                        vec![self.client.clone()],
+                        send_origin::SelectedRelayWriter::single(
+                            &self.relay_endpoint,
+                            &self.client,
+                        ),
+                    )
+                });
+            origin.configure(
+                packet,
+                selected,
+                self.relay_connection_id,
+                Arc::downgrade(&self.write_boundaries_live),
+            );
+            clients
+        } else {
+            self.rendezvous
+                .as_ref()
+                .map(|pool| pool.send_clients(&packet.peer_id))
+                .unwrap_or_else(|| vec![self.client.clone()])
+        };
         let boundary = Arc::new(std::sync::Mutex::new((write_boundary, None::<bool>)));
         let send_result = if clients.len() == 1 {
-            guarded_relay_write(
+            guarded_relay_write_with_origin(
                 &clients[0],
                 packet,
                 self.write_boundaries_live.clone(),
                 boundary,
+                origin.as_ref().and_then(|capture| capture.branch(0)),
+                echo.clone(),
+                self.relay_connection_id,
             )
             .await
         } else {
             let mut writes = JoinSet::new();
-            for client in clients {
+            for (index, client) in clients.into_iter().enumerate() {
                 let live = self.write_boundaries_live.clone();
                 let boundary = boundary.clone();
                 let packet = packet.clone();
+                let write_origin = origin.as_ref().and_then(|capture| capture.branch(index));
+                let echo = echo.clone();
+                let publication_id = self.relay_connection_id;
                 writes.spawn(async move {
+                    let timeout_origin = write_origin.clone();
                     match timeout(
                         Duration::from_secs(1),
-                        guarded_relay_write(&client, &packet, live, boundary),
+                        guarded_relay_write_with_origin(
+                            &client,
+                            &packet,
+                            live,
+                            boundary,
+                            write_origin,
+                            echo,
+                            publication_id,
+                        ),
                     )
                     .await
                     {
                         Ok(result) => result,
                         Err(_) => {
                             client.abort();
+                            if let Some(origin) = timeout_origin {
+                                origin.note_unknown();
+                            }
                             Err(p2pnet_relay::RelayError::WriterStoppedBeforeWrite)
                         }
                     }
@@ -407,11 +523,22 @@ impl RelayTransport {
     /// `crate::relay_runtime::RelaySupervisor`).
     pub async fn run_inbound(
         self,
-        mut relay_rx: mpsc::Receiver<RelayMessage>,
+        relay_rx: mpsc::Receiver<RelayMessage>,
         inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
         relay_selection: Option<Arc<tokio::sync::RwLock<RelaySelectionDiagnostics>>>,
     ) -> Result<()> {
-        while let Some(message) = relay_rx.recv().await {
+        self.run_inbound_for_read(relay_rx, inbound_tx, relay_selection)
+            .await
+    }
+
+    pub(crate) async fn run_inbound_for_read<I: RelayReadItem>(
+        self,
+        mut relay_rx: mpsc::Receiver<I>,
+        inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+        relay_selection: Option<Arc<tokio::sync::RwLock<RelaySelectionDiagnostics>>>,
+    ) -> Result<()> {
+        while let Some(delivery) = relay_rx.recv().await {
+            let (message, original_read) = delivery.into_parts();
             match message {
                 RelayMessage::Closed { reason } => {
                     let reason_label = relay_close_reason_label(reason);
@@ -527,6 +654,7 @@ impl RelayTransport {
                     );
                     inbound_tx
                         .send(ReceivedEncryptedPacket {
+                            physical_ingress: None,
                             source: None,
                             local_endpoint: None,
                             relay_endpoint: Some(self.relay_endpoint.clone()),
@@ -537,7 +665,9 @@ impl RelayTransport {
                             udp_transport_owner: None,
                             network_generation: Some(self.peers.current_network_generation_sync()),
                             profile_sampled,
-                            udp_received: None,
+                            udp_received: original_read.as_ref().map(|read| read.completed_at()),
+                            original_relay_read: original_read,
+                            original_udp_read: None,
                             transport_queue_send_started: Some(transport_queue_send_started),
                             wire_bytes: data,
                         })
@@ -568,19 +698,46 @@ type SharedRelayWriteBoundary = Arc<
 >;
 
 async fn guarded_relay_write(
-    client: &RelayClient,
+    client: &Arc<RelayClient>,
     packet: &EncryptedPeerPacket,
     live: Arc<std::sync::Mutex<bool>>,
     boundary: SharedRelayWriteBoundary,
+    echo: Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>>,
+    publication_id: u64,
 ) -> std::result::Result<(), p2pnet_relay::RelayError> {
+    let actual_client = Arc::downgrade(client);
+    let actual_live = live.clone();
     let permit = packet.room_authorization.clone();
     client
         .send_data_with_write_boundary(&packet.peer_id, &packet.wire_bytes, move |sent_at| {
-            let live = live.lock().unwrap_or_else(|p| p.into_inner());
+            let live = if echo.is_some() {
+                match live.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return false,
+                }
+            } else {
+                live.lock().unwrap_or_else(|p| p.into_inner())
+            };
             if !*live || permit.as_ref().is_some_and(|p| !p.is_valid()) {
                 return false;
             }
-            let mut boundary = boundary.lock().unwrap_or_else(|p| p.into_inner());
+            if echo.as_ref().is_some_and(|echo| {
+                actual_client.upgrade().is_none_or(|client| {
+                    !echo.relay_prewrite_is_current(&client, publication_id, &actual_live)
+                })
+            }) {
+                return false;
+            }
+            let mut boundary = if echo.is_some() {
+                match boundary.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return false,
+                }
+            } else {
+                boundary.lock().unwrap_or_else(|p| p.into_inner())
+            };
             if let Some(accepted) = boundary.1 {
                 return accepted;
             }
@@ -589,4 +746,76 @@ async fn guarded_relay_write(
             accepted
         })
         .await
+}
+
+// None delegates to the unmodified original guarded writer. Opt-in observation
+// only appends finite atomic/OnceLock bookkeeping to the existing hook/result.
+async fn guarded_relay_write_with_origin(
+    client: &Arc<RelayClient>,
+    packet: &EncryptedPeerPacket,
+    live: Arc<std::sync::Mutex<bool>>,
+    boundary: SharedRelayWriteBoundary,
+    origin: Option<send_origin::RelayWriteObserver>,
+    echo: Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>>,
+    publication_id: u64,
+) -> std::result::Result<(), p2pnet_relay::RelayError> {
+    let Some(origin) = origin else {
+        return guarded_relay_write(client, packet, live, boundary, echo, publication_id).await;
+    };
+    let actual_client = Arc::downgrade(client);
+    let actual_live = live.clone();
+    let permit = packet.room_authorization.clone();
+    let prewrite = origin.clone();
+    let observer = origin.clone();
+    let result = client
+        .send_data_with_write_boundary_and_observer(
+            &packet.peer_id,
+            &packet.wire_bytes,
+            move |sent_at| {
+                let live = if echo.is_some() {
+                    match live.try_lock() {
+                        Ok(guard) => guard,
+                        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                        Err(std::sync::TryLockError::WouldBlock) => return false,
+                    }
+                } else {
+                    live.lock().unwrap_or_else(|p| p.into_inner())
+                };
+                if !*live || permit.as_ref().is_some_and(|p| !p.is_valid()) {
+                    return false;
+                }
+                if echo.as_ref().is_some_and(|echo| {
+                    actual_client.upgrade().is_none_or(|client| {
+                        !echo.relay_prewrite_is_current(&client, publication_id, &actual_live)
+                    })
+                }) {
+                    return false;
+                }
+                let mut boundary = if echo.is_some() {
+                    match boundary.try_lock() {
+                        Ok(guard) => guard,
+                        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                        Err(std::sync::TryLockError::WouldBlock) => return false,
+                    }
+                } else {
+                    boundary.lock().unwrap_or_else(|p| p.into_inner())
+                };
+                if let Some(accepted) = boundary.1 {
+                    if accepted {
+                        prewrite.note_handed();
+                    }
+                    return accepted;
+                }
+                let accepted = boundary.0.take().is_none_or(|hook| hook(sent_at));
+                boundary.1 = Some(accepted);
+                if accepted {
+                    prewrite.note_handed();
+                }
+                accepted
+            },
+            move |fact| observer.observe(fact),
+        )
+        .await;
+    origin.note_result(&result);
+    result
 }

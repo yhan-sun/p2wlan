@@ -80,7 +80,7 @@ impl Daemon {
             let (tun, controller) =
                 p2pnet_tun::mock::MockTunDevice::new_pair(&interface_name, mtu, &local_vip);
             let (dataplane, outbound_rx, inbound_tx) =
-                DataPlane::new_bidirectional(tun, peers.clone());
+                DataPlane::new_bidirectional_with_request_carriage(tun, peers.clone());
             let mut dataplane = dataplane
                 .with_acl(self.acl.clone(), self.config.node.node_id.clone())
                 .with_overlay_cidr(&self.config.network.cidr)
@@ -90,7 +90,9 @@ impl Daemon {
             let outbound_transport = transport.clone();
             self.task_manager
                 .spawn_result("wireguard-outbound", true, async move {
-                    outbound_transport.run_outbound(outbound_rx).await
+                    outbound_transport
+                        .run_outbound_with_request_carriage(outbound_rx)
+                        .await
                 })
                 .await;
 
@@ -133,9 +135,14 @@ impl Daemon {
             let overlay_burst = self.config.network.overlay_burst;
             let overlay_timeline = self.timeline.clone();
             let shutdown_rx = self.shutdown_rx.clone();
+            let overlay_native_owners = SourcedOverlayOwners {
+                wireguard: self.transport.clone(),
+                relay: self.relay_transport.clone(),
+                room: self.control.room_authorization().await,
+            };
             self.task_manager
                 .spawn("overlay-validate", false, async move {
-                    run_overlay_validate_loop(
+                    run_sourced_overlay_validate_loop(
                         controller,
                         overlay_peers,
                         overlay_local_vip,
@@ -147,6 +154,7 @@ impl Daemon {
                         overlay_timeline,
                         overlay_ingress_rx,
                         shutdown_rx,
+                        overlay_native_owners,
                     )
                     .await
                 })

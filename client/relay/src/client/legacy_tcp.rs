@@ -44,11 +44,24 @@ impl RelayClient {
         Self::connect_to_addr_with_config(addr, node_id, config).await
     }
 
+    #[allow(dead_code)] // Preserved private legacy entry; all modes share the original TCP core.
     pub(super) async fn connect_to_addr_with_config(
         addr: SocketAddr,
         node_id: &str,
         config: RelayClientConfig,
     ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
+        let (client, rx) =
+            Self::connect_to_addr_with_read_options(addr, node_id, config, ReadOptions::legacy())
+                .await?;
+        Ok((client, rx.into_legacy()?))
+    }
+
+    pub(super) async fn connect_to_addr_with_read_options(
+        addr: SocketAddr,
+        node_id: &str,
+        config: RelayClientConfig,
+        options: ReadOptions,
+    ) -> Result<(Self, ReadInput)> {
         debug!("Connecting to relay server at {}", addr);
 
         let stream = tokio::time::timeout(
@@ -76,9 +89,12 @@ impl RelayClient {
 
         // Channels
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCommand>(config.cmd_queue_capacity);
-        let (msg_tx, msg_rx) = mpsc::channel::<RelayMessage>(config.inbound_queue_capacity);
+        let write_origin = cmd_tx.downgrade();
+        let (msg_tx, msg_rx) = options.channel(config.inbound_queue_capacity, &cmd_tx);
+        #[cfg(test)]
+        let read_witness = options.witness();
         let (reg_tx, reg_rx) = oneshot::channel::<Result<()>>();
-        let (close_tx, close_rx) = watch::channel(false);
+        let (close_signal, close_rx) = close::RelayCloseSignal::new();
         // Shared close-reason attribution shared by both background tasks.
         let close_reason = Arc::new(std::sync::Mutex::new(RelayCloseReason::Unknown));
         let ping_expectations = new_ping_expectations(effective_idle_timeout(
@@ -87,7 +103,7 @@ impl RelayClient {
         ));
 
         // Write task: processes commands and writes to the TCP stream
-        let write_close_tx = close_tx.clone();
+        let write_close_signal = close_signal.clone();
         let mut write_close_rx = close_rx.clone();
         let max_payload = config.max_frame_payload;
         let write_reason = close_reason.clone();
@@ -128,6 +144,7 @@ impl RelayClient {
                                 dst,
                                 data,
                                 write_boundary,
+                                write_observer,
                                 completion,
                             } => {
                                 let data_len = data.len();
@@ -156,12 +173,30 @@ impl RelayClient {
                                                 bytes = data_len,
                                                 "legacy relay writer passed the write-boundary guard and is entering write_all"
                                             );
-                                            write_all_or_shutdown(
+                                            match write_all_or_shutdown(
                                                 &mut writer,
                                                 &encoded,
                                                 &mut write_close_rx,
                                             )
                                             .await
+                                            {
+                                                Ok(()) => {
+                                                    if let Some(observer) = write_observer {
+                                                        let completed_at = Instant::now();
+                                                        let fact = OriginalRelayWriteFact::completed(
+                                                            &write_origin,
+                                                            dst.clone(),
+                                                            data_len,
+                                                            encoded.len(),
+                                                            write_started,
+                                                            completed_at,
+                                                        );
+                                                        observer(fact);
+                                                    }
+                                                    Ok(())
+                                                }
+                                                Err(error) => Err(error),
+                                            }
                                         }
                                     }
                                     Err(err) => Err(err),
@@ -240,14 +275,14 @@ impl RelayClient {
                     }
                 }
             }
-            let _ = write_close_tx.send(true);
+            write_close_signal.publish_closed(close::ClosePublisher::LegacyWriter);
             debug!("Relay write task ended");
         });
 
         // Read task: reads frames and dispatches messages
         let msg_tx_clone = msg_tx.clone();
         let mut reg_tx = Some(reg_tx);
-        let read_close_tx = close_tx.clone();
+        let read_close_signal = close_signal.clone();
         let mut read_close_rx = close_rx.clone();
         let idle_timeout = effective_idle_timeout(config.idle_timeout, config.keepalive_interval);
         let registration_timeout = config.register_timeout;
@@ -349,6 +384,7 @@ impl RelayClient {
                 }
 
                 // Read payload
+                let mut frame_read = None;
                 if payload_len > 0 {
                     if buf.len() < FRAME_HEADER_SIZE + payload_len {
                         buf.resize(FRAME_HEADER_SIZE + payload_len, 0);
@@ -372,7 +408,11 @@ impl RelayClient {
                         }
                     };
                     match read_payload_res {
-                        Ok(true) => {}
+                        Ok(true) => {
+                            if msg_type == MSG_RECEIVED {
+                                frame_read = msg_tx_clone.capture_data_read();
+                            }
+                        }
                         Ok(false) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                             if let Some(tx) = reg_tx.take() {
@@ -405,6 +445,12 @@ impl RelayClient {
                         let frame = Frame::new(MSG_RECEIVED, payload.to_vec());
                         match frame.parse_forward_payload() {
                             Ok((src, data)) => {
+                                #[cfg(test)]
+                                if let (Some(witness), Some(read)) =
+                                    (&read_witness, frame_read.as_ref())
+                                {
+                                    witness.observe_once(read).await;
+                                }
                                 // Preserve every encrypted data frame while
                                 // applying bounded backpressure.  A
                                 // try_send/full close here silently discards
@@ -412,10 +458,13 @@ impl RelayClient {
                                 // must wait for the dataplane consumer just
                                 // like the TLS client does.
                                 if msg_tx_clone
-                                    .send(RelayMessage::Data {
-                                        from_node: src.to_string(),
-                                        data: data.to_vec(),
-                                    })
+                                    .send_data(
+                                        RelayMessage::Data {
+                                            from_node: src.to_string(),
+                                            data: data.to_vec(),
+                                        },
+                                        frame_read,
+                                    )
                                     .await
                                     .is_err()
                                 {
@@ -486,8 +535,8 @@ impl RelayClient {
 
             // Signal end of stream with the classified close reason
             let reason = resolve_close_reason(&read_reason);
+            read_close_signal.publish_closed(close::ClosePublisher::LegacyReader);
             let _ = msg_tx_clone.try_send(RelayMessage::Closed { reason });
-            let _ = read_close_tx.send(true);
             debug!("Relay read task ended; close_reason={reason:?}");
         });
 
@@ -507,6 +556,17 @@ impl RelayClient {
             }
         }
 
-        Ok((Self { cmd_tx, close_tx }, msg_rx))
+        Ok((
+            Self {
+                cmd_tx,
+                close_signal,
+            },
+            msg_rx,
+        ))
     }
+}
+
+#[cfg(test)]
+mod original_write_helper_controls {
+    include!("tests/original_write_helpers.rs");
 }

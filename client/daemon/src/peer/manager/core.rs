@@ -29,7 +29,6 @@ impl PeerManager {
     ) -> Self {
         let (committed_business_path_change_tx, _) = tokio::sync::watch::channel(0);
         let (direct_first_deadline_change_tx, _) = tokio::sync::watch::channel(0);
-        let (dplpmtud_capability_tx, _) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
         let (direct_business_budget_change_tx, _) = tokio::sync::watch::channel(0);
         let (ip_to_node_snapshot, _) =
             tokio::sync::watch::channel(Arc::new(HashMap::<String, String>::new()));
@@ -54,7 +53,7 @@ impl PeerManager {
             committed_business_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             committed_business_path_change_tx,
             direct_first_deadline_change_tx,
-            dplpmtud_capability_tx,
+            dplpmtud_capability: DplpmtudCapabilityPublication::new(),
             direct_business_budget_change_tx,
             local_mtu_feedback_tx,
             local_mtu_feedback_limiter: Arc::new(std::sync::Mutex::new(
@@ -126,42 +125,6 @@ impl PeerManager {
     /// Return a handle to the authoritative active-path telemetry hub.
     pub fn telemetry_hub(&self) -> Arc<path_telemetry::PathTelemetryHub> {
         self.telemetry_hub.clone()
-    }
-
-    /// Remember a negotiated capability at the WireGuard peer-session scope.
-    /// The immutable watch value gives the business hot path a registry-free
-    /// read and remains valid across a UDP socket publication replacement.
-    pub(crate) fn mark_dplpmtud_capable_sync(
-        &self,
-        peer_id: &str,
-        peer_session_generation: PeerSessionGeneration,
-    ) {
-        let current = self.dplpmtud_capability_tx.borrow().clone();
-        if current.get(peer_id) == Some(&peer_session_generation) {
-            return;
-        }
-        let mut next = (*current).clone();
-        next.retain(|candidate, generation| {
-            self.peer_session_is_current_sync(candidate, *generation)
-        });
-        // This mirror is bounded by the authoritative live peer-session set,
-        // not by the smaller DPLPMTUD worker/publication cap. Evicting a live
-        // negotiated capability would incorrectly turn that modern peer into
-        // a legacy bypass while its old runtime entry still existed.
-        next.insert(peer_id.to_string(), peer_session_generation);
-        self.dplpmtud_capability_tx.send_replace(Arc::new(next));
-        self.notify_direct_business_budget_changed();
-    }
-
-    pub(crate) fn peer_supports_dplpmtud_sync(
-        &self,
-        peer_id: &str,
-        peer_session_generation: PeerSessionGeneration,
-    ) -> bool {
-        self.dplpmtud_capability_tx
-            .borrow()
-            .get(peer_id)
-            .is_some_and(|generation| *generation == peer_session_generation)
     }
 
     pub(crate) fn direct_business_budget_change_sender(&self) -> tokio::sync::watch::Sender<u64> {
@@ -855,13 +818,17 @@ impl PeerManager {
     }
 
     /// Cancel a peer's Direct-validation ownership after an accepted remote
-    /// candidate-set handover. Candidate publication releases the epoch gate
-    /// before awaiting this cancellation, keeping the publication transaction
-    /// bounded.
-    pub(crate) async fn cancel_direct_validation_for_remote_candidate_change(&self, peer_id: &str) {
+    /// candidate-set handover. The captured commit epoch limits deferred
+    /// cleanup to older candidate owners in the same peer/network lifecycle;
+    /// a worker admitted after publication must survive this cleanup.
+    pub(crate) async fn cancel_direct_validation_for_remote_candidate_change(
+        &self,
+        peer_id: &str,
+        committed_epoch: PathEpoch,
+    ) {
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
             registry
-                .cancel_peer_with_reason(peer_id, "remote_candidate_generation_changed")
+                .cancel_peer_before_remote_candidate_epoch(peer_id, committed_epoch)
                 .await;
         }
     }
@@ -994,7 +961,16 @@ impl PeerManager {
                 Ok(connections) => return (epoch_guard, connections),
                 Err(_) => {
                     drop(epoch_guard);
-                    drop(self.connections.write().await);
+                    let connections = self.connections.write().await;
+                    // The fair RwLock has granted this writer its permit.
+                    // Dropping it before try_write would let another queued
+                    // writer reserve that permit and make both owners yield
+                    // forever. Retain it only across a nonblocking epoch
+                    // attempt: no reverse-order await may hold connections.
+                    if let Ok(epoch_guard) = self.network_epoch_gate.try_lock() {
+                        return (epoch_guard, connections);
+                    }
+                    drop(connections);
                 }
             }
         }
@@ -1014,7 +990,15 @@ impl PeerManager {
                 Ok(connections) => return (epoch_guard, connections),
                 Err(_) => {
                     drop(epoch_guard);
-                    drop(self.connections.read().await);
+                    let connections = self.connections.read().await;
+                    // A queued writer can similarly block try_read after
+                    // a granted reader is discarded. Try the epoch while
+                    // retaining that grant, but release connections at once
+                    // if the epoch is busy; never await in reverse order.
+                    if let Ok(epoch_guard) = self.network_epoch_gate.try_lock() {
+                        return (epoch_guard, connections);
+                    }
+                    drop(connections);
                 }
             }
         }
@@ -1029,6 +1013,27 @@ impl PeerManager {
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, PeerConnection>> {
         self.connections.write().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_local_nat_profile_writer_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, Option<NatProfile>> {
+        self.local_nat_profile.write().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hard_hard_terminal_summaries_for_test(
+        &self,
+    ) -> Vec<crate::connection_timeline::HardHardTerminalSummary> {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        timeline
+            .map(|timeline| timeline.snapshot().hard_hard_terminal_summaries)
+            .unwrap_or_default()
     }
 
     /// Pause target snapshot preparation before its connection writer is queued.

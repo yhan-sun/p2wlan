@@ -4,8 +4,15 @@
 //! macOS utun, and the Mock device) implement this trait.
 
 use async_trait::async_trait;
+use std::any::Any;
 
 use crate::error::Result;
+
+/// Opaque local context carried with one complete packet read.
+///
+/// This is untrusted metadata. Consumers must validate its private type and its
+/// binding to the packet before using it as an identity or capability.
+pub type PacketReadContext = Box<dyn Any + Send + Sync>;
 
 /// The core trait for a virtual network interface.
 ///
@@ -22,6 +29,15 @@ pub trait VirtualInterface: Send {
     ///
     /// * `buf` - Buffer to receive the packet data. Should be at least MTU-sized.
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+
+    /// Take the context of the last complete, nonempty read at most once.
+    ///
+    /// Implementations must clear any previous context when starting a read,
+    /// including a read that fails, is cancelled, or truncates the packet.
+    /// System interfaces carry no local context by default.
+    fn take_last_read_context(&mut self) -> Option<PacketReadContext> {
+        None
+    }
 
     /// Write a single IP packet to the interface.
     ///

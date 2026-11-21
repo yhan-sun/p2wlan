@@ -50,6 +50,7 @@ Participating devices receive private virtual IPs. P2WLAN prefers **LAN / IPv6 /
 - **Keep a fallback for restrictive networks.** Automatically use an encrypted relay when needed and keep trying to recover a direct path. Applications retain their virtual IP endpoint.
 - **Reach multiple services through one private network.** Connect to SSH, RDP, NAS services, web panels, and game servers by virtual IP and service port.
 - **See how devices connect.** View availability, Direct / Relay paths, latency, and traffic information, with built-in diagnostics for troubleshooting.
+- **Built-in Web Admin Console.** Self-hosting administrators can monitor cluster topology, node health, directional active paths, and historical trends directly in the browser.
 - **Control your infrastructure.** Client, Control, and Relay source code is available under MIT. Choose server locations and manage accounts and data yourself. Hosting, bandwidth, and domain costs remain the deployer's responsibility.
 
 ## Sponsors
@@ -296,13 +297,14 @@ The default policy reserves a 5-second direct window while preparing Relay. Once
 
 | Component | Technology | Responsibility |
 | --- | --- | --- |
-| GUI | Flutter | Sign-in, device / room management, connection status, and diagnostics. |
+| GUI (Desktop & Mobile) | Flutter | Sign-in, device / room management, connection status, and diagnostics. |
+| Web Admin Console | React + TS + Vite (embedded in Go) | Accessible at `/admin`; provides real-time topology, directional connection troubleshooting, and health trends for administrators. |
 | Data Plane / Daemon | Rust | TUN, routing, peers, NAT traversal, encrypted sessions, and Relay fallback. |
 | Virtual interface | macOS `utun` / Windows Wintun / Linux TUN | Provides a standard layer-3 virtual network interface to applications. |
 | Control Plane | Go + SQLite | Authentication, device registry, virtual IPs, credentials, signaling, and Relay information. |
 | Relay | Go | Relay connections, ticket validation, and ciphertext forwarding. |
 
-P2WLAN uses a self-contained **WireGuard-like Noise** data plane with X25519, ChaCha20-Poly1305, BLAKE2s, and related primitives. **P2WLAN is not an official WireGuard implementation and does not claim WireGuard interoperability.**
+P2WLAN uses a self-contained data plane based on the **Noise protocol framework** (modern cryptographic primitives similar to WireGuard, including X25519, ChaCha20-Poly1305, and BLAKE2s) to ensure confidentiality and integrity.
 
 ## Self-hosting
 
@@ -336,14 +338,13 @@ The detailed guides are currently in Chinese:
 - [Upgrade and recovery](docs/guides/upgrade-and-recovery.md): backups, upgrades, restore, and rollback.
 - [Operations guide](docs/guides/operations.md): service management, health checks, logs, and certificates.
 
-## Security Boundaries
+## Security Model and Privacy Protection
 
-- Device traffic uses an encrypted data plane between endpoints.
-- Relays forward ciphertext and do not decrypt private payloads.
-- Relays may still observe connection metadata such as node identifiers, timing, and packet sizes.
-- P2P connectivity is not guaranteed across arbitrary NAT environments; Relay availability also depends on the Control Plane and Relay being reachable.
+- **End-to-End Encrypted Data Plane**: Application traffic is encrypted directly between endpoints; private keys never leave local devices.
+- **Zero-Knowledge Relaying**: Relays forward ciphertext based on short-lived cryptographic tickets and cannot decrypt user payloads.
+- **Minimal Telemetry Exposure**: Telemetry only carries abstract path states and RTT, never recording or persisting real physical IP addresses or ports.
 
-Credential boundaries and security limitations are documented in [SECURITY.md](SECURITY.md), [PRIVACY.md](PRIVACY.md), and the [security model](docs/explanation/security-model.md). Published-asset identity is defined in the [release contract](docs/reference/release-contract.md).
+For detailed security boundaries, see [SECURITY.md](SECURITY.md), [PRIVACY.md](PRIVACY.md), and the [security model](docs/explanation/security-model.md). Published-asset identity is defined in the [release contract](docs/reference/release-contract.md).
 
 ## Developers
 

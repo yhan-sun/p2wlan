@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -562,20 +563,37 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--source-head-sha", required=True)
     parser.add_argument("--workflow-sha", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--github-run-id", type=int)
+    parser.add_argument("--github-run-attempt", type=int)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     input_root = Path(args.input_root)
-    result = aggregate_records(
-        _read_records(input_root),
-        args.source_head_sha,
-        args.workflow_sha,
-        _read_attempt_histories(input_root),
-        input_root,
-    )
-    Path(args.output).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    import aggregate_failure_report as failure
+    try:
+        histories = _read_attempt_histories(input_root)
+        result = aggregate_records(_read_records(input_root), args.source_head_sha, args.workflow_sha,
+                                   histories, input_root)
+        if args.github_run_id is not None or args.github_run_attempt is not None:
+            for path, history in histories:
+                if failure.attempt_binding(path, input_root, history["scenario_id"],
+                                           args.github_run_id, args.github_run_attempt) is None:
+                    raise ValueError("current_run_attempt_binding_unknown")
+                if len(history["attempts"]) != 1 or history["final_adjudication"]["attempt"] != 1:
+                    raise ValueError("authoritative_scenario_attempt_budget_exceeded")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        result = failure.build_report(input_root, args.source_head_sha, args.workflow_sha, failure.issue_code(error),
+            validate_record=validate_record, validate_attempt_history=validate_attempt_history,
+            expected_topologies=EXPECTED_TOPOLOGIES, run_id=args.github_run_id, run_attempt=args.github_run_attempt)
+    result.update(github_run_id=args.github_run_id, github_run_attempt=args.github_run_attempt)
+    result.pop("aggregate_digest", None)
+    canonical = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+    result["aggregate_digest"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(json.dumps(result, sort_keys=True))
     return 0 if result["result"] == "pass" else 1
 

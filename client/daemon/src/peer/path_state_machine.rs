@@ -754,6 +754,19 @@ impl PathStateMachine {
         self.state.active.network_path()
     }
 
+    /// Borrow the original active validation without cloning diagnostic state.
+    pub(crate) fn active_direct_validation(&self) -> Option<DirectValidationIdentity> {
+        if self.state.lifecycle != PeerPathLifecycle::Online {
+            return None;
+        }
+        match self.state.active {
+            ActiveBusinessPath::Direct(identity) if self.state.epoch == Some(identity.epoch) => {
+                Some(identity)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn direct_first_configured(&self) -> bool {
         self.state.direct_first.is_some()
     }

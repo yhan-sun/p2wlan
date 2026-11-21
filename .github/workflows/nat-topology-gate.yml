@@ -10,11 +10,20 @@ on:
       - "scripts/diagnostics-auth.sh"
       - "client/nat/**"
       - "client/daemon/**"
+      - "client/tun/**"
       - "client/relay/**"
       - "server/**"
       - "contracts/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - ".github/workflows/**"
+      - "client/netbind/**"
+      - "client/wireguard/**"
+      - "scripts/dplpmtud/**"
+      - "docs/reference/networking.md"
+      - "scripts/mtu-smoke.sh"
+      - "scripts/quality/**"
   push:
     branches: [main]
     paths:
@@ -23,11 +32,20 @@ on:
       - "scripts/diagnostics-auth.sh"
       - "client/nat/**"
       - "client/daemon/**"
+      - "client/tun/**"
       - "client/relay/**"
       - "server/**"
       - "contracts/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - ".github/workflows/**"
+      - "client/netbind/**"
+      - "client/wireguard/**"
+      - "scripts/dplpmtud/**"
+      - "docs/reference/networking.md"
+      - "scripts/mtu-smoke.sh"
+      - "scripts/quality/**"
   schedule:
     - cron: "23 18 * * *"
   workflow_dispatch:
@@ -48,6 +66,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  macos-clock:
+    name: macOS cross-process deadline controls
+    runs-on: macos-14
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check native system Python clock boundaries
+        run: |
+          /usr/bin/python3 --version
+          /usr/bin/python3 -m unittest discover -s scripts/nat-sim -p 'test_monotonic_clock.py' -v
+
   unit:
     name: NAT simulator unit tests
     runs-on: ubuntu-24.04
@@ -182,7 +211,7 @@ jobs:
   required:
     name: NAT Topology Required
     if: always()
-    needs: [unit, direct, relay]
+    needs: [macos-clock, unit, direct, relay]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -245,6 +274,8 @@ jobs:
             --input-root "$RUNNER_TEMP/nat-topology-evidence" \
             --source-head-sha "${{ steps.identity.outputs.source_head_sha }}" \
             --workflow-sha "${{ steps.identity.outputs.workflow_sha }}" \
+            --github-run-id "$GITHUB_RUN_ID" \
+            --github-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --output "$RUNNER_TEMP/nat-topology-aggregate.json"
 
       - name: Upload actual-execution NAT aggregate
@@ -258,6 +289,7 @@ jobs:
 
       - name: Enforce required topology results and aggregate
         env:
+          MACOS_CLOCK_RESULT: ${{ needs.macos-clock.result }}
           UNIT_RESULT: ${{ needs.unit.result }}
           DIRECT_RESULT: ${{ needs.direct.result }}
           RELAY_RESULT: ${{ needs.relay.result }}
@@ -267,6 +299,7 @@ jobs:
           AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
         run: |
           set -euo pipefail
+          test "$MACOS_CLOCK_RESULT" = "success"
           test "$UNIT_RESULT" = "success"
           test "$DIRECT_RESULT" = "success"
           test "$RELAY_RESULT" = "success"

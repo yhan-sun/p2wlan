@@ -17,6 +17,9 @@ on:
       - "docs/reference/networking.md"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - ".github/workflows/**"
+      - "scripts/quality/**"
   pull_request:
     branches: [main]
     paths:
@@ -33,6 +36,9 @@ on:
       - "docs/reference/networking.md"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - ".github/workflows/**"
+      - "scripts/quality/**"
   workflow_dispatch:
     inputs:
       validation_sha:
@@ -248,6 +254,12 @@ jobs:
 
   existing_required_gates:
     name: DPLPMTUD external required gates
+    needs:
+      - contract
+      - dplpmtud_linux
+      - runtime_acceptance
+      - live_evidence
+      - dplpmtud_windows
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 70

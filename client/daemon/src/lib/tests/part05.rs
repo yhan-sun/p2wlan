@@ -303,12 +303,25 @@ async fn same_class_endpoint_churn_preserves_delayed_validation_ack() {
     // worker. It then forwards the responder's ACK from that exact tuple.
     let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let proxy_addr = proxy.local_addr().unwrap();
+    let proxy_started = Instant::now();
+    let proxy_events = Arc::new(std::sync::Mutex::new(Vec::with_capacity(16)));
     let proxy_worker = {
         let proxy = proxy.clone();
+        let events = proxy_events.clone();
         tokio::spawn(async move {
             let mut packet = vec![0u8; 65_535];
             loop {
                 let (len, source) = proxy.recv_from(&mut packet).await.unwrap();
+                {
+                    let mut events = events.lock().unwrap();
+                    if events.len() < 16 {
+                        events.push((
+                            proxy_started.elapsed().as_millis(),
+                            source == udp_a_addr,
+                            len,
+                        ));
+                    }
+                }
                 if source == udp_a_addr {
                     sleep(Duration::from_millis(300)).await;
                     proxy.send_to(&packet[..len], udp_b_addr).await.unwrap();
@@ -363,13 +376,24 @@ async fn same_class_endpoint_churn_preserves_delayed_validation_ack() {
         sleep(Duration::from_millis(5)).await;
     }
 
-    timeout(Duration::from_secs(2), async {
+    let promoted = timeout(Duration::from_secs(2), async {
         while !peers_a.is_direct("node-b").await {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("same-class endpoint churn must not invalidate the delayed matching ACK");
+    .await;
+    // Preserve the original deadline result before collecting diagnostics:
+    // a late promotion must never turn this timeout into a passing assertion.
+    let diagnostics = timeout(Duration::from_millis(20), async {
+        (peers_a.diagnostics().await, peers_b.diagnostics().await)
+    })
+    .await;
+    eprintln!(
+        "CHURN_ORIGINAL_RESULT promoted={} proxy_rx={:?} peers={diagnostics:?}",
+        promoted.is_ok(),
+        proxy_events.lock().unwrap()
+    );
+    promoted.expect("same-class endpoint churn must not invalidate the delayed matching ACK");
     validation_task.await.unwrap();
 
     let diagnostics = peers_a.diagnostics().await;

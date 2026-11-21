@@ -1,6 +1,12 @@
 use super::*;
 
 impl UdpTransport {
+    #[cfg(test)]
+    pub(crate) async fn hold_primary_socket_diagnostics_for_test(
+        &self,
+    ) -> tokio::sync::OwnedMutexGuard<Vec<UdpSocketPoolMemberDiagnostics>> {
+        self.socket_pool_diagnostics.clone().lock_owned().await
+    }
     /// A stable, endpoint-free view of the bounded socket pool activity.
     pub async fn socket_pool_diagnostics(&self) -> Vec<UdpSocketPoolMemberDiagnostics> {
         let mut sockets = self.socket_pool_diagnostics.lock().await.clone();

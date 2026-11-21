@@ -39,7 +39,7 @@ mod windows_command;
 pub use config::InterfaceConfig;
 pub use device::TunDevice;
 pub use error::{Error, Result};
-pub use interface::VirtualInterface;
+pub use interface::{PacketReadContext, VirtualInterface};
 pub use mock::MockTunDevice;
 pub use packet::{IpPacket, Ipv4Packet, Ipv6Packet, Protocol};
 #[cfg(target_os = "android")]

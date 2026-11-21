@@ -1,6 +1,91 @@
 use probe_budget::{RelayBackoffHeartbeatReservation, RelayBackoffHeartbeatReservationRejection};
 
 #[cfg(test)]
+struct ProbeBurstHandlesForTest {
+    handles: [Option<tokio::task::JoinHandle<()>>; 6],
+    reserved: usize,
+}
+
+#[cfg(test)]
+impl Drop for ProbeBurstHandlesForTest {
+    fn drop(&mut self) {
+        for handle in self.handles.iter().flatten() {
+            handle.abort();
+        }
+    }
+}
+
+/// A fixed test owner, attached only to the exact fixture transport. It is
+/// absent from production and neither schedules nor suppresses any burst.
+#[cfg(test)]
+struct ProbeBurstCaptureForTest {
+    tasks: StdMutex<ProbeBurstHandlesForTest>,
+}
+
+#[cfg(test)]
+impl ProbeBurstCaptureForTest {
+    fn new() -> Self {
+        Self {
+            tasks: StdMutex::new(ProbeBurstHandlesForTest {
+                handles: std::array::from_fn(|_| None),
+                reserved: 0,
+            }),
+        }
+    }
+
+    fn reserve_before_spawn(&self) -> usize {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(
+            tasks.reserved < tasks.handles.len(),
+            "test burst owner capacity exceeded before spawn"
+        );
+        let slot = tasks.reserved;
+        tasks.reserved += 1;
+        slot
+    }
+
+    fn handoff_after_spawn(&self, slot: usize, handle: tokio::task::JoinHandle<()>) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+        tasks.handles[slot] = Some(handle);
+    }
+
+    async fn abort_and_join_until(&self, end: tokio::time::Instant) -> (usize, bool) {
+        let mut owned = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+            std::mem::replace(
+                &mut *tasks,
+                ProbeBurstHandlesForTest {
+                    handles: std::array::from_fn(|_| None),
+                    reserved: 0,
+                },
+            )
+        };
+        for handle in owned.handles.iter().flatten() {
+            handle.abort();
+        }
+        let mut all_joined = true;
+        for slot in owned.handles.iter_mut().take(owned.reserved) {
+            let Some(handle) = slot.as_mut() else {
+                all_joined = false;
+                continue;
+            };
+            match tokio::time::timeout_at(end, handle).await {
+                Ok(result) => {
+                    // Take only after the original handle completed. Never
+                    // poll an already-ready JoinHandle again during cleanup.
+                    drop(slot.take());
+                    all_joined &= result.is_ok() || result.is_err_and(|error| error.is_cancelled());
+                }
+                Err(_) => all_joined = false,
+            }
+        }
+        // Unjoined handles remain abort-on-drop owned; they are a failed
+        // collection, not a claimed join or a new cleanup grace window.
+        (owned.reserved, all_joined)
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct ProbeSendFailureHook {
     fail_on_attempts: HashSet<usize>,
@@ -33,6 +118,13 @@ struct ProbeSendFailure {
 }
 
 impl ProbeSendFailure {
+    fn retryable_not_sent(&self) -> bool {
+        matches!(
+            self.kind,
+            ProbeSendFailureKind::PhysicalSend | ProbeSendFailureKind::PreHandoffTimeout
+        )
+    }
+
     fn new(kind: ProbeSendFailureKind, error: DaemonError) -> Self {
         Self {
             error,
@@ -781,6 +873,8 @@ impl UdpTransport {
     /// landed between the snapshot and the registration invalidates the WHOLE
     /// probe (the stale payload is never stamped with the new epoch and never
     /// sent).
+    // Production consumes classified send outcomes; nonce-only callers are tests.
+    #[cfg(test)]
     async fn send_probe_on_socket(
         &self,
         socket_index: usize,
@@ -862,6 +956,66 @@ impl UdpTransport {
         require_exact_dynamic_owner: bool,
         live_recorder: Option<BirthdayLiveRecorder>,
     ) -> std::result::Result<ProbeSendResult, ProbeSendFailure> {
+        self.send_probe_on_socket_classified_observed(
+            socket_index,
+            socket,
+            peer_id,
+            peer_addr,
+            use_candidate,
+            purpose,
+            hard_hard_session_token,
+            require_exact_dynamic_owner,
+            live_recorder,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_ordinary_probe_classified_observed(
+        &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        peer_id: Option<&str>,
+        peer_addr: SocketAddr,
+        use_candidate: bool,
+        purpose: PendingProbePurpose,
+        require_exact_dynamic_owner: bool,
+        owner: &OrdinaryProbeCost,
+    ) -> std::result::Result<ProbeSendResult, ProbeSendFailure> {
+        let mut call = owner.begin_call();
+        let result = self
+            .send_probe_on_socket_classified_observed(
+                socket_index,
+                socket,
+                peer_id,
+                peer_addr,
+                use_candidate,
+                purpose,
+                None,
+                require_exact_dynamic_owner,
+                None,
+                Some(&mut call),
+            )
+            .await;
+        call.returned(&result);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_probe_on_socket_classified_observed(
+        &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        peer_id: Option<&str>,
+        peer_addr: SocketAddr,
+        use_candidate: bool,
+        purpose: PendingProbePurpose,
+        hard_hard_session_token: Option<&str>,
+        require_exact_dynamic_owner: bool,
+        live_recorder: Option<BirthdayLiveRecorder>,
+        mut ordinary_call: Option<&mut OrdinaryProbeCall>,
+    ) -> std::result::Result<ProbeSendResult, ProbeSendFailure> {
         let mode = self.hard_hard_socket_mode(socket_index).await;
         let committed_ordinary = hard_hard_session_token.is_none()
             && mode
@@ -875,6 +1029,9 @@ impl UdpTransport {
                 )
                 .await;
         let hh2 = mode.is_some() && !committed_ordinary;
+        if let Some(call) = ordinary_call.as_mut() {
+            call.classify_domain(!hh2);
+        }
         if hh2
             && mode.as_ref().is_some_and(|mode| {
                 Some(mode.peer.as_str()) != peer_id
@@ -1195,6 +1352,25 @@ impl UdpTransport {
             send_lease
         };
 
+        let mut ordinary_primary = ordinary_call.as_mut().filter(|_| !hh2).map(|call| {
+            call.begin_operation(
+                OrdinaryProbeKind::Primary,
+                bytes.len(),
+                OrdinaryProbeSocket {
+                    index: socket_index,
+                    socket_ptr: Arc::as_ptr(&socket) as usize,
+                    local_endpoint: socket.local_addr().ok(),
+                    target: peer_addr,
+                    network_generation: generation,
+                },
+            )
+        });
+        #[cfg(test)]
+        if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
+            call.owner
+                .wait_at_gate(OrdinaryProbeTestStage::PrimaryAwait)
+                .await;
+        }
         let send_result = if hh2 {
             self.send_hh2_probe_datagram(
                 socket_index,
@@ -1208,11 +1384,24 @@ impl UdpTransport {
             )
             .await
         } else {
-            self.send_probe_datagram(&socket, &bytes, peer_addr).await
+            self.send_probe_datagram(&socket, &bytes, peer_addr)
+                .await
+                .map_err(|error| {
+                    ProbeSendFailure::with_physical_send_error(
+                        DaemonError::Network(format!(
+                            "UDP probe send to {peer_addr} failed: {error}"
+                        )),
+                        bytes.len(),
+                    )
+                })
         };
-        let first_send_at_ms = match send_result {
-            Ok(_) => {
+        let (first_send_at_ms, primary_bytes_sent) = match send_result {
+            Ok(accepted) => {
                 let sent_at_ms = monotonic_millis();
+                if let Some(operation) = ordinary_primary.as_mut() {
+                    operation.complete(Some(accepted), sent_at_ms);
+                }
+                drop(ordinary_primary);
                 // This is the physical send commit point.  It must precede
                 // the test gate, diagnostics update, lease cleanup, and every
                 // other follow-up await so a cancelled worker cannot lose a
@@ -1226,31 +1415,38 @@ impl UdpTransport {
                     );
                 }
                 #[cfg(test)]
-                wait_for_probe_post_send_gate_for_test().await;
-                Some(sent_at_ms)
-            }
-            Err(error) => {
-                if hh2 && error.kind() == std::io::ErrorKind::PermissionDenied {
-                    self.pending_probes.lock().await.remove(&nonce);
-                    self.clear_hard_hard_pending_probe_token(nonce).await;
-                    return Err(ProbeSendFailure::new(
-                        ProbeSendFailureKind::SocketRevoked,
-                        DaemonError::Network(error.to_string()),
-                    ));
-                }
-                // The primary send failed, but the physical error must still
-                // survive a cancellation racing the pending-probe cleanup.
-                if let Some(recorder) = live_recorder.as_ref() {
-                    recorder.record_primary_error(bytes.len());
+                if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
+                    call.owner
+                        .wait_at_gate(OrdinaryProbeTestStage::PrimaryResult)
+                        .await;
                 }
                 #[cfg(test)]
                 wait_for_probe_post_send_gate_for_test().await;
+                (Some(sent_at_ms), accepted as u64)
+            }
+            Err(failure) => {
+                // The primary send failed, but the physical error must still
+                // survive a cancellation racing the pending-probe cleanup.
+                if failure.kind == ProbeSendFailureKind::PhysicalSend {
+                    if let Some(operation) = ordinary_primary.as_mut() {
+                        operation.complete(None, monotonic_millis());
+                    }
+                    drop(ordinary_primary);
+                    if let Some(recorder) = live_recorder.as_ref() {
+                        recorder.record_primary_error(bytes.len());
+                    }
+                    #[cfg(test)]
+                    if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
+                        call.owner
+                            .wait_at_gate(OrdinaryProbeTestStage::PrimaryResult)
+                            .await;
+                    }
+                    #[cfg(test)]
+                    wait_for_probe_post_send_gate_for_test().await;
+                }
                 self.pending_probes.lock().await.remove(&nonce);
                 self.clear_hard_hard_pending_probe_token(nonce).await;
-                return Err(ProbeSendFailure::with_physical_send_error(
-                    DaemonError::Network(format!("UDP probe send to {peer_addr} failed: {error}")),
-                    bytes.len(),
-                ));
+                return Err(failure);
             }
         };
         // The send completed: release the in-flight send lease.  The pending
@@ -1270,24 +1466,52 @@ impl UdpTransport {
         }
 
         let mut datagrams_sent = 1u8;
-        let mut physical_bytes_sent = bytes.len() as u64;
+        let mut physical_bytes_sent = primary_bytes_sent;
         let mut physical_send_errors = 0u8;
         let mut physical_send_error_bytes = 0u64;
         if let Some(legacy_probe) = compat_legacy_probe.clone() {
+            #[cfg(not(test))]
+            let compatibility_addr = peer_addr;
+            #[cfg(test)]
+            let compatibility_addr = ordinary_call
+                .as_ref()
+                .map_or(peer_addr, |call| call.owner.compatibility_target(peer_addr));
+            let mut ordinary_compatibility = ordinary_call.as_mut().filter(|_| !hh2).map(|call| {
+                call.begin_operation(
+                    OrdinaryProbeKind::Compatibility,
+                    legacy_probe.len(),
+                    OrdinaryProbeSocket {
+                        index: socket_index,
+                        socket_ptr: Arc::as_ptr(&socket) as usize,
+                        local_endpoint: socket.local_addr().ok(),
+                        target: compatibility_addr,
+                        network_generation: generation,
+                    },
+                )
+            });
             match self
-                .send_probe_datagram(&socket, &legacy_probe, peer_addr)
+                .send_probe_datagram(&socket, &legacy_probe, compatibility_addr)
                 .await
             {
-                Ok(_) => {
+                Ok(accepted) => {
+                    if let Some(operation) = ordinary_compatibility.as_mut() {
+                        operation.complete(Some(accepted), monotonic_millis());
+                    }
+                    drop(ordinary_compatibility);
                     datagrams_sent = datagrams_sent.saturating_add(1);
-                    physical_bytes_sent =
-                        physical_bytes_sent.saturating_add(legacy_probe.len() as u64);
+                    physical_bytes_sent = physical_bytes_sent.saturating_add(accepted as u64);
                     if let Some(recorder) = live_recorder.as_ref() {
                         recorder.record_compatibility_success(
                             socket_index,
                             monotonic_millis(),
                             legacy_probe.len(),
                         );
+                    }
+                    #[cfg(test)]
+                    if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
+                        call.owner
+                            .wait_at_gate(OrdinaryProbeTestStage::CompatibilityResult)
+                            .await;
                     }
                     self.update_socket_diagnostics(socket_index, |metrics| {
                         metrics.probes_sent += 1
@@ -1317,11 +1541,21 @@ impl UdpTransport {
                     }
                 }
                 Err(err) => {
+                    if let Some(operation) = ordinary_compatibility.as_mut() {
+                        operation.complete(None, monotonic_millis());
+                    }
+                    drop(ordinary_compatibility);
                     physical_send_errors = physical_send_errors.saturating_add(1);
                     physical_send_error_bytes =
                         physical_send_error_bytes.saturating_add(legacy_probe.len() as u64);
                     if let Some(recorder) = live_recorder.as_ref() {
                         recorder.record_compatibility_error(legacy_probe.len());
+                    }
+                    #[cfg(test)]
+                    if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
+                        call.owner
+                            .wait_at_gate(OrdinaryProbeTestStage::CompatibilityResult)
+                            .await;
                     }
                     debug!(
                         "Failed to send compatibility legacy UDP punch probe to peer {} at {}: {}",
@@ -1411,7 +1645,12 @@ impl UdpTransport {
     ) {
         let peer_label = peer_id.unwrap_or_else(|| peer_addr.to_string());
         let diagnostics = self.socket_pool_diagnostics.clone();
-        tokio::spawn(async move {
+        #[cfg(test)]
+        let capture_slot = self
+            .probe_burst_capture_for_test
+            .as_ref()
+            .map(|capture| capture.reserve_before_spawn());
+        let handle = tokio::spawn(async move {
             for delay_ms in PUNCH_PROBE_RETRANSMIT_DELAYS_MS {
                 sleep(Duration::from_millis(delay_ms)).await;
                 match socket.send_to(&probe, peer_addr).await {
@@ -1436,6 +1675,15 @@ impl UdpTransport {
                 }
             }
         });
+        #[cfg(test)]
+        if let Some(slot) = capture_slot {
+            self.probe_burst_capture_for_test
+                .as_ref()
+                .unwrap()
+                .handoff_after_spawn(slot, handle);
+            return;
+        }
+        drop(handle);
     }
 
     async fn send_punch_ack_burst(

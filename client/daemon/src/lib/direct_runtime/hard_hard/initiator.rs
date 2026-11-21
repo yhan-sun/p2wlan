@@ -1543,7 +1543,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response_with_signal(
             None => return HardHardRemoteStart::Rejected,
         };
     let cleanup_udp = udp.clone();
-    let swept = hard_hard_wait_and_sweep(
+    let swept = Box::pin(hard_hard_wait_and_sweep(
         udp,
         peers.clone(),
         session,
@@ -1569,7 +1569,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response_with_signal(
         "initiator",
         record.attempt_count,
         record.measurement.clone(),
-    )
+    ))
     .await;
     // Nomination may commit any socket from this token, not only the primary
     // used to publish its measurement. Resolve the authority again after await.

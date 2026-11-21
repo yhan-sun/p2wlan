@@ -31,16 +31,43 @@ pub struct InboundPacket {
     /// the bounded WireGuard overlap window, but they are never path or
     /// first-usable evidence for the current session.
     pub from_previous_session: bool,
+    /// Original opt-in auth facts; default None is one pointer wide.
+    pub(crate) authenticated_ingress:
+        Option<Arc<crate::business_evidence::AuthenticatedIngressContext>>,
     /// Low-frequency userspace latency context, attached only by the live
     /// decrypt worker before the packet is written to TUN.
     pub(crate) trace: Option<DataplaneRxTrace>,
 }
 
+#[cfg(test)]
+pub(crate) struct RequestRouteTestGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl RequestRouteTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 /// Reads packets from a virtual interface and routes them by destination IP.
 pub struct DataPlane<T> {
+    resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
+    /// Default-disabled evidence scope; never packet acceptance authority.
+    #[allow(dead_code)]
+    rx_business_capture: Option<Arc<crate::business_evidence::CaptureOwner>>,
+    #[allow(dead_code)]
+    tun_evidence_identity: Option<crate::business_evidence::TunEvidenceIdentity>,
     tun: T,
+    #[cfg(test)]
+    request_route_test_gate: Option<Arc<RequestRouteTestGate>>,
     peers: Arc<PeerManager>,
-    outbound_tx: mpsc::Sender<OutboundPacket>,
+    outbound_tx: RawOutboundSink,
     inbound_rx: Option<mpsc::Receiver<InboundPacket>>,
     local_feedback_rx: Option<tokio::sync::broadcast::Receiver<Vec<u8>>>,
     acl: Option<Arc<RwLock<AclEngine>>>,
@@ -56,25 +83,51 @@ impl<T> DataPlane<T>
 where
     T: VirtualInterface + Send + 'static,
 {
+    /// Install aggregate diagnostics before starting the worker. The owner
+    /// does not authorize delivery and is absent from default instances.
+    #[allow(dead_code)]
+    pub(crate) fn with_resource_capture(
+        mut self,
+        capture: Arc<crate::dataplane_resources::ResourceCapture>,
+    ) -> std::result::Result<Self, crate::dataplane_resources::EnableError> {
+        if self.resource_capture.is_some() {
+            return Err(crate::dataplane_resources::EnableError::AlreadyEnabled);
+        }
+        if capture.is_finished() {
+            return Err(crate::dataplane_resources::EnableError::CaptureFinished);
+        }
+        self.resource_capture = Some(capture);
+        Ok(self)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resource_capture(
+        &self,
+    ) -> Option<&Arc<crate::dataplane_resources::ResourceCapture>> {
+        self.resource_capture.as_ref()
+    }
+
+    /// Opt in with an explicit backend before starting the packet worker.
+    /// Historical receipts never decide packet acceptance.
+    #[allow(dead_code)]
+    pub(crate) fn with_rx_business_capture(
+        mut self,
+        capture: Arc<crate::business_evidence::CaptureOwner>,
+        target: crate::business_evidence::TunEvidenceIdentity,
+    ) -> std::result::Result<Self, crate::business_evidence::EnableError> {
+        if self.rx_business_capture.is_some() {
+            return Err(crate::business_evidence::EnableError::AlreadyEnabled);
+        }
+        self.rx_business_capture = Some(capture);
+        self.tun_evidence_identity = Some(target);
+        Ok(self)
+    }
+
     /// Create a data plane and a receiver for routed outbound packets.
     pub fn new(tun: T, peers: Arc<PeerManager>) -> (Self, mpsc::Receiver<OutboundPacket>) {
         let (outbound_tx, outbound_rx) = mpsc::channel(1024);
-        let local_feedback_rx = peers.subscribe_local_mtu_feedback();
         (
-            Self {
-                tun,
-                peers,
-                outbound_tx,
-                inbound_rx: None,
-                local_feedback_rx: Some(local_feedback_rx),
-                acl: None,
-                local_node_id: None,
-                overlay_v4: None,
-                room_authorization: None,
-                local_source_addresses: std::collections::HashSet::new(),
-                #[cfg(target_os = "android")]
-                tun_turnaround: TunTurnaroundCorrelator::default(),
-            },
+            Self::with_outbound_sink(tun, peers, RawOutboundSink::Legacy(outbound_tx), None),
             outbound_rx,
         )
     }
@@ -93,25 +146,84 @@ where
     ) {
         let (outbound_tx, outbound_rx) = mpsc::channel(1024);
         let (inbound_tx, inbound_rx) = mpsc::channel(1024);
-        let local_feedback_rx = peers.subscribe_local_mtu_feedback();
         (
-            Self {
+            Self::with_outbound_sink(
                 tun,
                 peers,
-                outbound_tx,
-                inbound_rx: Some(inbound_rx),
-                local_feedback_rx: Some(local_feedback_rx),
-                acl: None,
-                local_node_id: None,
-                overlay_v4: None,
-                room_authorization: None,
-                local_source_addresses: std::collections::HashSet::new(),
-                #[cfg(target_os = "android")]
-                tun_turnaround: TunTurnaroundCorrelator::default(),
-            },
+                RawOutboundSink::Legacy(outbound_tx),
+                Some(inbound_rx),
+            ),
             outbound_rx,
             inbound_tx,
         )
+    }
+
+    #[allow(dead_code)] // Outbound-only tracked entry is exercised by bounded controls.
+    pub(crate) fn new_with_request_carriage(
+        tun: T,
+        peers: Arc<PeerManager>,
+    ) -> (Self, mpsc::Receiver<RawRequestDelivery>) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(1024);
+        (
+            Self::with_outbound_sink(tun, peers, RawOutboundSink::Tracked(outbound_tx), None),
+            outbound_rx,
+        )
+    }
+
+    pub(crate) fn new_bidirectional_with_request_carriage(
+        tun: T,
+        peers: Arc<PeerManager>,
+    ) -> (
+        Self,
+        mpsc::Receiver<RawRequestDelivery>,
+        mpsc::Sender<InboundPacket>,
+    ) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(1024);
+        let (inbound_tx, inbound_rx) = mpsc::channel(1024);
+        (
+            Self::with_outbound_sink(
+                tun,
+                peers,
+                RawOutboundSink::Tracked(outbound_tx),
+                Some(inbound_rx),
+            ),
+            outbound_rx,
+            inbound_tx,
+        )
+    }
+
+    fn with_outbound_sink(
+        tun: T,
+        peers: Arc<PeerManager>,
+        outbound_tx: RawOutboundSink,
+        inbound_rx: Option<mpsc::Receiver<InboundPacket>>,
+    ) -> Self {
+        let local_feedback_rx = peers.subscribe_local_mtu_feedback();
+        Self {
+            resource_capture: None,
+            rx_business_capture: None,
+            tun_evidence_identity: None,
+            tun,
+            #[cfg(test)]
+            request_route_test_gate: None,
+            peers,
+            outbound_tx,
+            inbound_rx,
+            local_feedback_rx: Some(local_feedback_rx),
+            acl: None,
+            local_node_id: None,
+            overlay_v4: None,
+            room_authorization: None,
+            local_source_addresses: std::collections::HashSet::new(),
+            #[cfg(target_os = "android")]
+            tun_turnaround: TunTurnaroundCorrelator::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_request_route_test_gate(mut self, gate: Arc<RequestRouteTestGate>) -> Self {
+        self.request_route_test_gate = Some(gate);
+        self
     }
 
     pub fn with_room_authorization(
@@ -182,20 +294,22 @@ where
             .local_feedback_rx
             .take()
             .expect("DataPlane::run may only be called once");
+        let mut local_feedback_open = true;
 
         if let Some(mut inbound_rx) = self.inbound_rx.take() {
             loop {
                 tokio::select! {
                     result = self.read_packet(&mut buf) => {
-                        let (packet, tun_read_started, tun_read_completed) = result?;
+                        let (packet, tun_read_started, tun_read_completed, binding) = result?;
                         if !packet.is_empty() {
                             // The TUN read has completed.  Route outside the
                             // select future so a competing inbound packet
                             // cannot cancel after bytes were consumed.
-                            self.route_outbound_packet(
+                            self.route_outbound_packet_with_binding(
                                 &packet,
                                 tun_read_started,
                                 tun_read_completed,
+                                binding,
                             )
                             .await?;
                         }
@@ -235,7 +349,7 @@ where
                         }
                         self.write_inbound(packet).await?;
                     }
-                    feedback = local_feedback_rx.recv() => {
+                    feedback = local_feedback_rx.recv(), if local_feedback_open => {
                         match feedback {
                             Ok(packet) => self.write_local_feedback(&packet).await?,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -245,7 +359,12 @@ where
                                     "local PMTU feedback receiver dropped a bounded backlog"
                                 );
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                // Feedback closure must neither discard the
+                                // inbound receiver nor leave a ready branch
+                                // spinning in the outbound-only fallback.
+                                local_feedback_open = false;
+                            }
                         }
                     }
                 }
@@ -254,8 +373,21 @@ where
 
         loop {
             tokio::select! {
-                result = self.read_and_route_once(&mut buf) => result?,
-                feedback = local_feedback_rx.recv() => {
+                result = self.read_packet(&mut buf) => {
+                    let (packet, tun_read_started, tun_read_completed, binding) = result?;
+                    if !packet.is_empty() {
+                        // Match the bidirectional loop: once read consumed a
+                        // packet, feedback cannot cancel its routing awaits.
+                        self.route_outbound_packet_with_binding(
+                            &packet,
+                            tun_read_started,
+                            tun_read_completed,
+                            binding,
+                        )
+                        .await?;
+                    }
+                }
+                feedback = local_feedback_rx.recv(), if local_feedback_open => {
                     match feedback {
                         Ok(packet) => self.write_local_feedback(&packet).await?,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -265,7 +397,9 @@ where
                                 "local PMTU feedback receiver dropped a bounded backlog"
                             );
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            local_feedback_open = false;
+                        }
                     }
                 }
             }
@@ -293,13 +427,19 @@ where
         Ok(())
     }
 
-    async fn read_and_route_once(&mut self, buf: &mut [u8]) -> Result<()> {
-        let (packet, tun_read_started, tun_read_completed) = self.read_packet(buf).await?;
+    #[cfg(test)]
+    pub(crate) async fn read_and_route_once(&mut self, buf: &mut [u8]) -> Result<()> {
+        let (packet, tun_read_started, tun_read_completed, binding) = self.read_packet(buf).await?;
         if packet.is_empty() {
             return Ok(());
         }
-        self.route_outbound_packet(&packet, tun_read_started, tun_read_completed)
-            .await
+        self.route_outbound_packet_with_binding(
+            &packet,
+            tun_read_started,
+            tun_read_completed,
+            binding,
+        )
+        .await
     }
 
     /// Read exactly one TUN packet without doing any further asynchronous
@@ -309,24 +449,62 @@ where
     async fn read_packet(
         &mut self,
         buf: &mut [u8],
-    ) -> Result<(Vec<u8>, std::time::Instant, std::time::Instant)> {
+    ) -> Result<(
+        Vec<u8>,
+        std::time::Instant,
+        std::time::Instant,
+        Option<RequestBinding>,
+    )> {
         let started = std::time::Instant::now();
         let n = self
             .tun
             .read(buf)
             .await
             .map_err(|e| DaemonError::Network(format!("TUN read failed: {e}")))?;
-        Ok((buf[..n].to_vec(), started, std::time::Instant::now()))
+        // Take this exact completed read before any resolve/ACL/route await.
+        let context = if n == 0 {
+            None
+        } else {
+            self.tun.take_last_read_context()
+        };
+        let packet = buf[..n].to_vec();
+        let completed = std::time::Instant::now();
+        if let Some(capture) = self.resource_capture() {
+            let _ = capture.observe_vec(
+                crate::dataplane_resources::VecSite::TxTunReadCopy,
+                crate::dataplane_resources::VecOperation::SliceCopy,
+                Some(packet.len()),
+                &packet,
+            );
+        }
+        let binding = if self.outbound_tx.is_tracked() {
+            RequestBinding::from_read_context(context, &packet, &self.peers, completed)
+        } else {
+            None
+        };
+        Ok((packet, started, completed, binding))
     }
 
     /// Route a packet that has already been removed from the TUN read queue.
     /// This method may await peer state and ACL locks, but it is never placed
     /// directly in the `select!` that owns the TUN read operation.
+    #[cfg(test)]
     async fn route_outbound_packet(
         &mut self,
         packet: &[u8],
         tun_read_started: std::time::Instant,
         tun_read_completed: std::time::Instant,
+    ) -> Result<()> {
+        self.route_outbound_packet_with_binding(packet, tun_read_started, tun_read_completed, None)
+            .await
+    }
+
+    async fn route_outbound_packet_with_binding(
+        &mut self,
+        packet: &[u8],
+        tun_read_started: std::time::Instant,
+        tun_read_completed: std::time::Instant,
+        mut binding: Option<RequestBinding>,
     ) -> Result<()> {
         let profiler = global_dataplane_profiler();
         let sampled = profiler.sample_next_packet();
@@ -357,6 +535,12 @@ where
         let dst_ip = parsed.dst_addr_string();
         let src_ip = parsed.src_addr_string();
 
+        // Test-only boundary observation; resolve itself uses a watch snapshot.
+        #[cfg(test)]
+        if let Some(gate) = self.request_route_test_gate.take() {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
         let Some(peer_id) = self.peers.resolve_virtual_ip(&dst_ip).await else {
             trace!("Dropping packet for unknown virtual IP {dst_ip} ({protocol})");
             self.record_room_drop(
@@ -370,7 +554,16 @@ where
         };
 
         let routed_packet = if src_ip == self.tun.address() {
-            packet[..total_len].to_vec()
+            let routed = packet[..total_len].to_vec();
+            if let Some(capture) = self.resource_capture() {
+                let _ = capture.observe_vec(
+                    crate::dataplane_resources::VecSite::TxRoutedPacketCopy,
+                    crate::dataplane_resources::VecOperation::SliceCopy,
+                    Some(routed.len()),
+                    &routed,
+                );
+            }
+            routed
         } else {
             match self.normalize_outbound_source(&packet[..total_len], &src_ip, &dst_ip, protocol) {
                 Some(normalized) => normalized,
@@ -460,6 +653,9 @@ where
             }),
         };
 
+        if let Some(binding) = binding.as_mut() {
+            binding.recheck_routed(&routed, &self.peers, route_ready);
+        }
         let queue_started = std::time::Instant::now();
         if let Some(trace) = routed.trace.as_mut() {
             trace.dataplane_queue_send_started = Some(queue_started);
@@ -490,7 +686,8 @@ where
             );
             return Ok(());
         }
-        slot.send(routed);
+        slot.send(RawRequestDelivery::routed(routed, binding))
+            .map_err(|_| DaemonError::Network("tracked outbound sink mismatch".to_string()))?;
         if let Some(auth) = self.room_authorization.as_ref() {
             auth.record_packet(&peer_id, false);
         }
@@ -531,6 +728,8 @@ where
     }
 
     async fn write_inbound(&mut self, packet: InboundPacket) -> Result<()> {
+        use crate::dataplane_resources::{VecOperation, VecSite};
+
         let trace = packet.trace.clone();
         let validation_started = std::time::Instant::now();
         let parsed = match IpPacket::new(&packet.packet) {
@@ -547,6 +746,14 @@ where
         let protocol = parsed.protocol();
         let total_len = parsed.total_len().min(packet.packet.len());
         let mut inbound_packet = packet.packet[..total_len].to_vec();
+        if let Some(capture) = self.resource_capture() {
+            capture.observe_vec(
+                VecSite::RxTunPacketCopy,
+                VecOperation::SliceCopy,
+                Some(inbound_packet.len()),
+                &inbound_packet,
+            );
+        }
         let src_ip = parsed.src_addr_string();
         let dst_ip = parsed.dst_addr_string();
 
@@ -577,7 +784,8 @@ where
             return Ok(());
         }
 
-        if src_ip != peer.virtual_ip {
+        let source_was_normalized = src_ip != peer.virtual_ip;
+        if source_was_normalized {
             match self.normalize_inbound_source(
                 &inbound_packet,
                 &packet.peer_id,
@@ -635,6 +843,20 @@ where
                 tun_write_started.duration_since(validation_started),
             );
         }
+        // Bind the original auth carrier and this actual TUN target before
+        // write awaits. Current session/path/runtime is never substituted.
+        let tun_evidence = self.rx_business_capture.as_ref().map(|capture| {
+            (
+                capture.clone(),
+                packet.authenticated_ingress.clone(),
+                self.tun_evidence_identity,
+                if source_was_normalized {
+                    peer.virtual_ip.parse::<Ipv4Addr>().ok()
+                } else {
+                    None
+                },
+            )
+        });
         let written = self
             .tun
             .write(&inbound_packet)
@@ -649,6 +871,24 @@ where
                 written,
                 inbound_packet.len()
             )));
+        }
+
+        if let Some((capture, authenticated, target, allowed_source)) = tun_evidence {
+            match (authenticated.as_deref(), target) {
+                (Some(authenticated), Some(target)) if written != 0 => {
+                    capture.capture_tun_full(
+                        authenticated,
+                        target,
+                        &inbound_packet,
+                        written,
+                        allowed_source,
+                        tun_write_completed,
+                    );
+                }
+                _ => {
+                    capture.note_gap(crate::business_evidence::EvidenceGap::IdentityMissing);
+                }
+            }
         }
 
         #[cfg(target_os = "android")]
@@ -788,6 +1028,14 @@ where
         }
         match normalize_overlay_source(packet, src_ip, local_ip, self.overlay_v4) {
             SourceNormalization::Normalized(normalized) => {
+                if let Some(capture) = self.resource_capture() {
+                    let _ = capture.observe_vec(
+                        crate::dataplane_resources::VecSite::TxNormalizedPacketCopy,
+                        crate::dataplane_resources::VecOperation::SliceCopy,
+                        Some(normalized.len()),
+                        &normalized,
+                    );
+                }
                 debug!(
                     "Normalized outbound {protocol} source IP {src_ip} -> {local_ip} for {dst_ip}"
                 );
@@ -826,6 +1074,14 @@ where
     ) -> Option<Vec<u8>> {
         match normalize_overlay_source(packet, src_ip, peer_virtual_ip, self.overlay_v4) {
             SourceNormalization::Normalized(normalized) => {
+                if let Some(capture) = self.resource_capture() {
+                    let _ = capture.observe_vec(
+                        crate::dataplane_resources::VecSite::RxNormalizedPacketCopy,
+                        crate::dataplane_resources::VecOperation::SliceCopy,
+                        Some(normalized.len()),
+                        &normalized,
+                    );
+                }
                 debug!(
                     "Normalized inbound {protocol} source IP {src_ip} -> {peer_virtual_ip} for peer {peer_id} ({dst_ip})"
                 );

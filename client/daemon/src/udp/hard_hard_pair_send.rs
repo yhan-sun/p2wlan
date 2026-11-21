@@ -1,6 +1,8 @@
 use super::*;
 
 impl UdpTransport {
+    /// Classify at the boundary: owner/readiness failures never claim a
+    /// physical error, while every returned send syscall error retains its cost.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn send_hh2_probe_datagram(
         &self,
@@ -12,21 +14,31 @@ impl UdpTransport {
         token: &str,
         purpose: PendingProbePurpose,
         use_candidate: bool,
-    ) -> std::io::Result<usize> {
+    ) -> std::result::Result<usize, ProbeSendFailure> {
         let rejected = || {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "hh2 pair send intent, deadline or owner revoked",
+            ProbeSendFailure::new(
+                ProbeSendFailureKind::SocketRevoked,
+                DaemonError::Network("hh2 pair send intent, deadline or owner revoked".into()),
             )
         };
         let pair = crate::peer::HardHardPairKey {
             socket_index: index,
-            local_endpoint: socket.local_addr()?,
+            local_endpoint: socket.local_addr().map_err(|error| {
+                ProbeSendFailure::new(
+                    ProbeSendFailureKind::SocketUnavailable,
+                    DaemonError::Network(error.to_string()),
+                )
+            })?,
             remote_endpoint: endpoint,
         };
         let send = async {
             loop {
-                socket.writable().await?;
+                socket.writable().await.map_err(|error| {
+                    ProbeSendFailure::new(
+                        ProbeSendFailureKind::SocketUnavailable,
+                        DaemonError::Network(error.to_string()),
+                    )
+                })?;
                 let _epoch = self.network_epoch_gate.lock().await;
                 let Some(scope) = self.peers.hard_hard_pair_scope(peer, token).await else {
                     return Err(rejected());
@@ -83,8 +95,9 @@ impl UdpTransport {
                 }
                 #[cfg(test)]
                 if self.should_fail_probe_send_for_test() {
-                    return Err(std::io::Error::other(
-                        "test-injected physical probe send failure",
+                    return Err(ProbeSendFailure::with_physical_send_error(
+                        DaemonError::Network("test-injected physical probe send failure".into()),
+                        bytes.len(),
                     ));
                 }
                 // Epoch and exact-socket fences remain held through this
@@ -120,16 +133,25 @@ impl UdpTransport {
                         }
                         return Ok(sent);
                     }
-                    result => return result,
+                    Err(error) => {
+                        return Err(ProbeSendFailure::with_physical_send_error(
+                            DaemonError::Network(format!(
+                                "UDP probe send to {endpoint} failed: {error}"
+                            )),
+                            bytes.len(),
+                        ));
+                    }
                 }
             }
         };
         timeout(Duration::from_millis(100), send)
             .await
             .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "hh2 probe readiness timed out before kernel handoff",
+                ProbeSendFailure::new(
+                    ProbeSendFailureKind::PreHandoffTimeout,
+                    DaemonError::Network(
+                        "hh2 probe readiness timed out before kernel handoff".into(),
+                    ),
                 )
             })?
     }

@@ -1,4 +1,5 @@
 use super::*;
+use futures_util::FutureExt;
 
 /// Sender-owned extension of [`ActivePathSnapshot`]. The peer manager owns
 /// path/generation state; the outbound worker owns the exact session and UDP
@@ -29,16 +30,17 @@ impl FastPathEligibilityToken {
 
 pub(super) enum FastPathAttempt {
     Sent,
-    Fallback(OutboundPacket),
+    Fallback(RawRequestDelivery),
     Terminal {
-        packet: OutboundPacket,
+        packet: RawRequestDelivery,
         generation: u64,
         reason_code: &'static str,
         reason: String,
     },
     TerminalBytes {
         peer_id: String,
-        generation: u64,
+        path: ActivePathSnapshot,
+        local_endpoint: Option<SocketAddr>,
         bytes: usize,
         reason_code: &'static str,
         reason: String,
@@ -49,8 +51,8 @@ pub(super) enum FastPathAttempt {
 /// that this peer has no older pending FIFO or in-flight flush task, so a
 /// successful fast send cannot overtake an earlier plaintext packet.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn try_lan_direct_fast_path(
-    packet: OutboundPacket,
+pub(super) fn try_lan_direct_fast_path(
+    packet: impl Into<RawRequestDelivery>,
     transport: &WireGuardTransport,
     peers: &PeerManager,
     prefer_direct: bool,
@@ -58,14 +60,21 @@ pub(super) async fn try_lan_direct_fast_path(
     fast_paths: &mut HashMap<String, DirectFastPathEntry>,
     ineligible: &mut HashMap<String, FastPathEligibilityToken>,
 ) -> FastPathAttempt {
+    let packet = packet.into();
+    // A sourced echo needs the original receive fence at the final syscall.
+    // The general sender owns that boundary; the cache carries no RX source.
+    if packet.original_echo().is_some() {
+        return FastPathAttempt::Fallback(packet);
+    }
     let peer_id = packet.peer_id.as_str();
     let profiler = global_dataplane_profiler();
     // The legacy LAN specialization predates business-budget tokens. A
     // capability-managed peer must use the tokenized slow path until the fast
     // cache itself carries the complete DPLPMTUD identity and revision.
-    if udp_transport
-        .read()
-        .await
+    let Ok(udp_guard) = udp_transport.try_read() else {
+        return FastPathAttempt::Fallback(packet);
+    };
+    if udp_guard
         .as_ref()
         .is_some_and(|udp| udp.peer_requires_direct_business_budget(peer_id))
     {
@@ -73,6 +82,7 @@ pub(super) async fn try_lan_direct_fast_path(
         ineligible.remove(peer_id);
         return FastPathAttempt::Fallback(packet);
     }
+    drop(udp_guard);
     let fast_path_lookup_started = Instant::now();
     let mut udp_socket_lookup_us = 0u64;
     let mut entry = fast_paths.get(peer_id).cloned();
@@ -98,8 +108,11 @@ pub(super) async fn try_lan_direct_fast_path(
         let generation = peers.current_network_generation_sync();
         let Some(path) = peers
             .active_direct_path_snapshot(peer_id, generation, prefer_direct)
-            .await
+            .now_or_never()
         else {
+            return FastPathAttempt::Fallback(packet);
+        };
+        let Some(path) = path else {
             if let (Some(direct_commit_seq), Some(peer_session_generation)) = (
                 peers.direct_commit_seq_sync(peer_id),
                 peers.peer_session_generation_sync(peer_id),
@@ -117,9 +130,8 @@ pub(super) async fn try_lan_direct_fast_path(
         };
         let session_status_started = Instant::now();
         let session_instance = transport
-            .session_status(peer_id)
-            .await
-            .active_session_instance;
+            .try_session_status(peer_id)
+            .and_then(|status| status.active_session_instance);
         if let Some(trace) = packet.trace.as_ref() {
             profiler.record(
                 trace.sampled,
@@ -131,7 +143,9 @@ pub(super) async fn try_lan_direct_fast_path(
             return FastPathAttempt::Fallback(packet);
         };
         let udp_read_started = Instant::now();
-        let udp_guard = udp_transport.read().await;
+        let Ok(udp_guard) = udp_transport.try_read() else {
+            return FastPathAttempt::Fallback(packet);
+        };
         let udp_read_acquired = Instant::now();
         let udp = udp_guard.clone();
         let udp_read_hold = udp_read_acquired.elapsed();
@@ -152,9 +166,7 @@ pub(super) async fn try_lan_direct_fast_path(
             return FastPathAttempt::Fallback(packet);
         };
         let socket_lookup_started = Instant::now();
-        let socket = udp
-            .socket_for_peer_endpoint(Some(peer_id), Some(path.endpoint))
-            .await;
+        let socket = udp.try_socket_for_peer_endpoint(peer_id, path.endpoint);
         let socket_lookup_completed = Instant::now();
         let cache_socket_lookup_us = socket_lookup_completed
             .duration_since(socket_lookup_started)
@@ -202,9 +214,11 @@ pub(super) async fn try_lan_direct_fast_path(
     let overlay_identity = overlay_packet_identity(&packet.packet);
     let encrypt_started = Instant::now();
     let mut epoch_gate_wait_us = 0u64;
-    let mut epoch_gate_hold_us = 0u64;
     let emit_guard_wait_started = Instant::now();
-    let emit_guard = transport.acquire_outbound_emit_guard(peer_id).await;
+    let Some(emit_guard) = transport.try_acquire_outbound_emit_guard(peer_id) else {
+        return FastPathAttempt::Fallback(packet);
+    };
+    let mut physical_attempt = PhysicalAttempt::new(emit_guard, None);
     let emit_guard_acquired = Instant::now();
     if let Some(trace) = sampled_trace.as_ref() {
         profiler.record(
@@ -215,12 +229,26 @@ pub(super) async fn try_lan_direct_fast_path(
     }
 
     // Keep the lock order identical to the existing business path:
-    // per-peer emit -> network epoch -> socket state/session. The UDP write is
-    // intentionally outside the epoch gate.
-    let (udp, socket, encrypted, session_lock_wait_us, crypto_us) = {
+    // per-peer emit -> network epoch -> socket state/session. Every admission
+    // is nonblocking. Retain epoch/slot through the single nonblocking syscall
+    // so path replacement cannot slip between encryption and physical handoff.
+    let (
+        udp,
+        socket,
+        encrypted,
+        plaintext,
+        session_lock_wait_us,
+        crypto_us,
+        epoch_gate_acquired,
+        epoch_guard,
+        udp_guard,
+        physical_preparation,
+    ) = {
         let epoch_gate = peers.network_epoch_gate();
         let epoch_gate_wait_started = Instant::now();
-        let _epoch_guard = epoch_gate.lock().await;
+        let Ok(epoch_guard) = epoch_gate.try_lock_owned() else {
+            return FastPathAttempt::Fallback(packet);
+        };
         let epoch_gate_acquired = Instant::now();
         if let Some(trace) = sampled_trace.as_ref() {
             epoch_gate_wait_us = epoch_gate_acquired
@@ -233,18 +261,19 @@ pub(super) async fn try_lan_direct_fast_path(
             );
         }
         if !peers.active_direct_path_snapshot_is_current_sync(peer_id, entry.path) {
-            drop(emit_guard);
+            physical_attempt.finish(false);
             profiler.record_fast_path_invalidation();
             fast_paths.remove(peer_id);
             return FastPathAttempt::Fallback(packet);
         }
 
         let udp_read_started = Instant::now();
-        let udp_guard = udp_transport.read().await;
+        let Ok(udp_guard) = udp_transport.try_read() else {
+            return FastPathAttempt::Fallback(packet);
+        };
         let udp_read_acquired = Instant::now();
         let udp = udp_guard.clone();
         let udp_read_hold = udp_read_acquired.elapsed();
-        drop(udp_guard);
         if let Some(trace) = sampled_trace.as_ref() {
             profiler.record(
                 trace.sampled,
@@ -258,7 +287,7 @@ pub(super) async fn try_lan_direct_fast_path(
             );
         }
         let Some(udp) = udp else {
-            drop(emit_guard);
+            physical_attempt.finish(false);
             profiler.record_fast_path_invalidation();
             fast_paths.remove(peer_id);
             return FastPathAttempt::Fallback(packet);
@@ -266,7 +295,7 @@ pub(super) async fn try_lan_direct_fast_path(
         if udp.transport_instance_id() != entry.udp_transport_instance_id
             || udp.inbound_publication_owner() != entry.publication_owner
         {
-            drop(emit_guard);
+            physical_attempt.finish(false);
             profiler.record_fast_path_invalidation();
             fast_paths.remove(peer_id);
             return FastPathAttempt::Fallback(packet);
@@ -274,7 +303,8 @@ pub(super) async fn try_lan_direct_fast_path(
         let socket_lookup_started = Instant::now();
         let socket = udp
             .socket_for_inbound_peer_index(peer_id, entry.socket_index)
-            .await;
+            .now_or_never()
+            .flatten();
         let socket_lookup_completed = Instant::now();
         let socket_lookup_us = socket_lookup_completed
             .duration_since(socket_lookup_started)
@@ -288,22 +318,25 @@ pub(super) async fn try_lan_direct_fast_path(
             );
         }
         let Some(socket) = socket else {
-            drop(emit_guard);
+            physical_attempt.finish(false);
             profiler.record_fast_path_invalidation();
             fast_paths.remove(peer_id);
             return FastPathAttempt::Fallback(packet);
         };
 
-        let (encrypted, session_lock_wait_us, crypto_us) = match transport
-            .encrypt_outbound_with_emit_guard_for_session(packet, entry.session_instance)
-            .await
+        let (encrypted, plaintext, session_lock_wait_us, crypto_us) = match transport
+            .try_encrypt_request_with_emit_guard_for_session(packet, entry.session_instance)
         {
-            SessionBoundEncryption::Encrypted {
+            RequestEncryptionAttempt::Encrypted {
                 packet: encrypted,
+                plaintext,
                 session_lock_wait_us,
                 crypto_us,
-            } => (encrypted, session_lock_wait_us, crypto_us),
-            SessionBoundEncryption::Unavailable { packet, reason } => {
+            } => (encrypted, plaintext, session_lock_wait_us, crypto_us),
+            RequestEncryptionAttempt::Contended(packet) => {
+                return FastPathAttempt::Fallback(packet);
+            }
+            RequestEncryptionAttempt::Unavailable { packet, reason } => {
                 debug!(
                     event = "wireguard_session_unavailable",
                     peer_id = %packet.peer_id,
@@ -311,13 +344,13 @@ pub(super) async fn try_lan_direct_fast_path(
                     expected_session_instance = entry.session_instance,
                     "LAN Direct FastPath cache could not bind the packet to its expected session"
                 );
-                drop(emit_guard);
+                physical_attempt.finish(false);
                 profiler.record_fast_path_invalidation();
                 fast_paths.remove(packet.peer_id.as_str());
                 return FastPathAttempt::Fallback(packet);
             }
-            SessionBoundEncryption::Failed { packet, error } => {
-                drop(emit_guard);
+            RequestEncryptionAttempt::Failed { packet, error } => {
+                physical_attempt.finish(false);
                 fast_paths.remove(packet.peer_id.as_str());
                 return FastPathAttempt::Terminal {
                     packet,
@@ -327,16 +360,25 @@ pub(super) async fn try_lan_direct_fast_path(
                 };
             }
         };
-        if let Some(trace) = sampled_trace.as_ref() {
-            epoch_gate_hold_us = epoch_gate_acquired.elapsed().as_micros() as u64;
-            profiler.record(
-                trace.sampled,
-                "tx_epoch_gate_hold_us",
-                Duration::from_micros(epoch_gate_hold_us),
-            );
-        }
-        (udp, socket, encrypted, session_lock_wait_us, crypto_us)
+        let physical_preparation = encrypted.prepare_physical_publication(
+            peers,
+            transport,
+            peers.current_network_generation_sync(),
+        );
+        (
+            udp,
+            socket,
+            encrypted,
+            plaintext,
+            session_lock_wait_us,
+            crypto_us,
+            epoch_gate_acquired,
+            epoch_guard,
+            udp_guard,
+            physical_preparation,
+        )
     };
+    physical_attempt.arm(physical_preparation);
 
     let peer_id = encrypted.peer_id.as_str();
     let encrypt_completed = Instant::now();
@@ -379,16 +421,31 @@ pub(super) async fn try_lan_direct_fast_path(
         counter = ?crate::transport::wire_counter(&encrypted.wire_bytes),
         "encrypted packet entered the LAN Direct fast path"
     );
-    let send_result = timeout(
-        OUTBOUND_SEND_TIMEOUT,
-        udp.send_encrypted_packet_on_socket(
+    #[cfg(test)]
+    transport.observe_request_handoff_for_test(
+        &encrypted,
+        crate::request_carriage::test_probe::HandoffArgumentPoint::FastUdpCall,
+    );
+    let send_result = match physical_attempt.capture() {
+        Some(origin) => udp.try_send_lan_business_packet_on_socket_with_origin(
             &socket,
             entry.socket_index,
             &encrypted,
             entry.path.endpoint,
+            entry.publication_owner,
+            Some(origin),
         ),
-    )
-    .await;
+        None => udp.try_send_lan_business_packet_on_socket(
+            &socket,
+            entry.socket_index,
+            &encrypted,
+            entry.path.endpoint,
+            entry.publication_owner,
+        ),
+    };
+    drop(udp_guard);
+    let epoch_gate_hold_us = epoch_gate_acquired.elapsed().as_micros() as u64;
+    drop(epoch_guard);
     let transport_handoff_completed = Instant::now();
     let udp_send_call_us = transport_handoff_completed
         .duration_since(transport_handoff_started)
@@ -397,6 +454,11 @@ pub(super) async fn try_lan_direct_fast_path(
         .duration_since(emit_guard_acquired)
         .as_micros() as u64;
     if let Some(trace) = sampled_trace.as_ref() {
+        profiler.record(
+            trace.sampled,
+            "tx_epoch_gate_hold_us",
+            Duration::from_micros(epoch_gate_hold_us),
+        );
         profiler.record(
             trace.sampled,
             "udp_send_call_us",
@@ -470,38 +532,59 @@ pub(super) async fn try_lan_direct_fast_path(
         }
     }
 
+    let definitely_not_handed = matches!(
+        &send_result,
+        Err(DirectBusinessUdpSendError::StaleToken
+            | DirectBusinessUdpSendError::WouldBlock
+            | DirectBusinessUdpSendError::LocalPacketTooLarge
+            | DirectBusinessUdpSendError::CiphertextTooLarge)
+    );
     let outcome = match send_result {
-        Ok(Ok(_)) => {
+        Ok(_) => {
             profiler.record_fast_path_hit();
             FastPathAttempt::Sent
         }
-        Ok(Err(error)) => {
-            let reason = format!("LAN Direct UDP send result uncertain: {error}");
-            peers
-                .record_direct_failure_with_code_and_local_endpoint(
-                    peer_id,
-                    REASON_DIRECT_SEND_FAILED,
-                    reason.clone(),
-                    local_endpoint,
+        Err(DirectBusinessUdpSendError::WouldBlock) => FastPathAttempt::Fallback(plaintext),
+        Err(DirectBusinessUdpSendError::StaleToken) => {
+            fast_paths.remove(peer_id);
+            profiler.record_fast_path_invalidation();
+            FastPathAttempt::Fallback(plaintext)
+        }
+        Err(DirectBusinessUdpSendError::LocalPacketTooLarge) => {
+            // LAN legacy peers have no confirmed token to invalidate. Match
+            // the unmanaged Direct path's conservative local PMTU feedback;
+            // this known not-sent error never changes Direct path health.
+            let inner_len =
+                complete_inner_ip_packet_len(&plaintext.packet).unwrap_or(plaintext.packet.len());
+            let inner_ip_mtu = inner_len
+                .saturating_sub(1)
+                .min(
+                    crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE as usize
+                        - crate::dplpmtud::WIREGUARD_UDP_DATAGRAM_OVERHEAD as usize,
                 )
-                .await;
+                .max(68) as u32;
+            let feedback = peers.emit_local_mtu_feedback(
+                &plaintext.peer_id,
+                &plaintext.packet,
+                crate::business_mtu::LocalMtuFeedbackKind::PacketTooBig { inner_ip_mtu },
+            );
+            FastPathAttempt::Terminal {
+                packet: plaintext,
+                generation: entry.path.generation,
+                reason_code: REASON_DIRECT_BUSINESS_EMSGSIZE,
+                reason: format!("LAN unmanaged Direct UDP returned EMSGSIZE before handoff; no budget token to invalidate; feedback={feedback:?}"),
+            }
+        }
+        Err(error) => {
+            let reason = format!("LAN Direct UDP send result uncertain: {error}");
             fast_paths.remove(peer_id);
             FastPathAttempt::TerminalBytes {
                 peer_id: encrypted.peer_id.clone(),
-                generation: entry.path.generation,
+                path: entry.path,
+                local_endpoint,
                 bytes: packet_bytes,
                 reason_code: REASON_DIRECT_DELIVERY_UNCERTAIN,
                 reason,
-            }
-        }
-        Err(_) => {
-            fast_paths.remove(peer_id);
-            FastPathAttempt::TerminalBytes {
-                peer_id: encrypted.peer_id.clone(),
-                generation: entry.path.generation,
-                bytes: packet_bytes,
-                reason_code: REASON_DIRECT_DELIVERY_UNCERTAIN,
-                reason: "LAN Direct UDP send timed out; delivery is uncertain".to_string(),
             }
         }
     };
@@ -523,10 +606,14 @@ pub(super) async fn try_lan_direct_fast_path(
             "encrypted overlay packet reached the LAN Direct fast-path outcome"
         );
     }
-    drop(emit_guard);
+    physical_attempt.finish(definitely_not_handed);
     outcome
 }
 
 #[cfg(test)]
 #[path = "tests/fast_path.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/request_carriage_fast.rs"]
+mod request_carriage_tests;

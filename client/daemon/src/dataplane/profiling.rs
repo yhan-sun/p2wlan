@@ -130,6 +130,76 @@ pub(crate) struct DataplaneTxTrace {
     pub(crate) network_queue_dequeued: Option<Instant>,
 }
 
+/// Diagnostic time accumulated only while one sampled plaintext packet is
+/// parked in network-outbound pending queues. Moving a queue between the
+/// actor and a flush task does not end an interval. An actual send attempt
+/// pauses it; a retry resumes it without counting encryption/send execution
+/// twice. This context never participates in a delivery decision.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PendingQueueResidence {
+    queued_at: Option<Instant>,
+    accumulated: Duration,
+}
+
+impl PendingQueueResidence {
+    pub(crate) fn start(sampled: bool) -> Option<Self> {
+        if !sampled {
+            return None;
+        }
+        Some(Self::start_at(Instant::now()))
+    }
+
+    pub(crate) fn start_at(now: Instant) -> Self {
+        Self {
+            queued_at: Some(now),
+            accumulated: Duration::ZERO,
+        }
+    }
+
+    pub(crate) fn pause(&mut self) {
+        if self.queued_at.is_some() {
+            self.pause_at(Instant::now());
+        }
+    }
+
+    pub(crate) fn pause_at(&mut self, now: Instant) {
+        if let Some(queued_at) = self.queued_at.take() {
+            self.accumulated = self
+                .accumulated
+                .saturating_add(now.saturating_duration_since(queued_at));
+        }
+    }
+
+    pub(crate) fn resume(&mut self) {
+        if self.queued_at.is_none() {
+            self.resume_at(Instant::now());
+        }
+    }
+
+    fn resume_at(&mut self, now: Instant) {
+        // Queue-to-queue ownership transfers and repeated admission must not
+        // discard an interval that is still running.
+        self.queued_at.get_or_insert(now);
+    }
+
+    pub(crate) fn finish(mut self) -> Duration {
+        self.pause();
+        self.accumulated
+    }
+}
+
+/// Exact values available from the network-outbound actor at one sampling
+/// point. Task-owned queues and each task's active packet are deliberately
+/// outside actor_pending; channel byte depth and a whole-pipeline logical
+/// byte total cannot be derived from these owners.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NetworkOutboundResourceSnapshot {
+    pub(crate) channel_packets: usize,
+    pub(crate) actor_pending_packets: usize,
+    pub(crate) actor_pending_bytes: usize,
+    pub(crate) active_flush_tasks: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DataplaneRxTrace {
     pub(crate) sampled: bool,
@@ -184,15 +254,58 @@ pub(crate) struct FastPathCounters {
     pub(crate) invalidated: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ProfileUnit {
+    Microseconds,
+    Count,
+    Bytes,
+}
+
+impl ProfileUnit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Microseconds => "microseconds",
+            Self::Count => "count",
+            Self::Bytes => "bytes",
+        }
+    }
+
+    fn legacy_duration_value(self, value: u64) -> Option<u64> {
+        (self == Self::Microseconds).then_some(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProfileSample {
+    value: u64,
+    observed_at_us: u64,
+}
+
 #[derive(Default)]
 struct StageSamples {
-    values: VecDeque<u64>,
+    values: VecDeque<ProfileSample>,
     total: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StageSummary {
+    unit: ProfileUnit,
+    /// Cumulative observations for this stage/unit, including evicted samples.
+    sample_count: u64,
+    /// Only these retained samples contribute to the percentiles below.
+    window_sample_count: u64,
+    window_start_elapsed_us: u64,
+    window_end_elapsed_us: u64,
+    window_span_us: u64,
+    p50: u64,
+    p95: u64,
+    p99: u64,
+    max: u64,
 }
 
 #[derive(Default)]
 struct DataplaneProfilerState {
-    stages: HashMap<&'static str, StageSamples>,
+    stages: HashMap<(&'static str, ProfileUnit), StageSamples>,
 }
 
 /// Process-local, low-frequency dataplane profiler. It is intentionally a
@@ -206,6 +319,8 @@ pub(crate) struct DataplaneProfiler {
     fast_path_misses: AtomicU64,
     fast_path_invalidated: AtomicU64,
     tail_events: AtomicU64,
+    tail_events_emitted: AtomicU64,
+    tail_events_suppressed: AtomicU64,
     last_tail_event_us: AtomicU64,
     last_summary_us: AtomicU64,
     state: Mutex<DataplaneProfilerState>,
@@ -223,6 +338,8 @@ impl DataplaneProfiler {
             fast_path_misses: AtomicU64::new(0),
             fast_path_invalidated: AtomicU64::new(0),
             tail_events: AtomicU64::new(0),
+            tail_events_emitted: AtomicU64::new(0),
+            tail_events_suppressed: AtomicU64::new(0),
             last_tail_event_us: AtomicU64::new(0),
             last_summary_us: AtomicU64::new(0),
             state: Mutex::new(DataplaneProfilerState::default()),
@@ -271,44 +388,119 @@ impl DataplaneProfiler {
         if !sampled {
             return;
         }
-        self.record_value(
-            sampled,
+        self.record_with_unit(
+            true,
             stage,
-            duration.as_micros().min(u128::from(u64::MAX)) as u64,
+            duration_us(duration),
+            ProfileUnit::Microseconds,
         );
     }
 
+    /// Record a count (for example, queue depth), rather than a duration.
     pub(crate) fn record_value(&self, sampled: bool, stage: &'static str, value: u64) {
+        self.record_with_unit(sampled, stage, value, ProfileUnit::Count);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_bytes(&self, sampled: bool, stage: &'static str, bytes: u64) {
+        self.record_with_unit(sampled, stage, bytes, ProfileUnit::Bytes);
+    }
+
+    pub(crate) fn record_network_outbound_resources(
+        &self,
+        sampled: bool,
+        snapshot: NetworkOutboundResourceSnapshot,
+    ) {
         if !sampled {
             return;
         }
+        self.record_value(
+            true,
+            "tx_network_outbound_queue_depth",
+            snapshot.channel_packets as u64,
+        );
+        self.record_value(
+            true,
+            "tx_network_outbound_actor_pending_packets",
+            snapshot.actor_pending_packets as u64,
+        );
+        self.record_bytes(
+            true,
+            "tx_network_outbound_actor_pending_bytes",
+            snapshot.actor_pending_bytes as u64,
+        );
+        self.record_value(
+            true,
+            "tx_network_outbound_active_flush_tasks",
+            snapshot.active_flush_tasks as u64,
+        );
+    }
+
+    fn record_with_unit(&self, sampled: bool, stage: &'static str, value: u64, unit: ProfileUnit) {
+        if !sampled {
+            return;
+        }
+        self.record_value_at(stage, value, unit, duration_us(self.started_at.elapsed()));
+    }
+
+    fn record_value_at(
+        &self,
+        stage: &'static str,
+        value: u64,
+        unit: ProfileUnit,
+        observed_at_us: u64,
+    ) {
         let report = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let samples = state.stages.entry(stage).or_default();
+            // Unit is part of the key so an accidental mixed-unit caller
+            // cannot combine durations and resource counts in one histogram.
+            let samples = state.stages.entry((stage, unit)).or_default();
             samples.total = samples.total.saturating_add(1);
             if samples.values.len() >= MAX_PROFILE_SAMPLES {
                 samples.values.pop_front();
             }
-            samples.values.push_back(value);
+            samples.values.push_back(ProfileSample {
+                value,
+                observed_at_us,
+            });
             samples
                 .total
                 .is_multiple_of(PROFILE_REPORT_EVERY)
-                .then(|| summarize_samples(samples))
+                .then(|| summarize_samples(samples, unit))
         };
 
-        if let Some((sample_count, p50_us, p95_us, p99_us, max_us)) = report {
+        if let Some(summary) = report {
+            let reported_at_elapsed_us = duration_us(self.started_at.elapsed());
             tracing::debug!(
                 target: "p2wlan_daemon::dataplane",
                 event = "dataplane_profile",
+                profile_schema_version = 2,
                 stage,
-                sample_count,
-                p50_us,
-                p95_us,
-                p99_us,
-                max_us,
+                unit = summary.unit.as_str(),
+                resource_scope = network_outbound_resource_scope(stage),
+                total_logical_bytes_measured = network_outbound_resource_scope(stage).map(|_| false),
+                sample_count = summary.sample_count,
+                window_sample_count = summary.window_sample_count,
+                window_kind = "latest_samples",
+                window_capacity = MAX_PROFILE_SAMPLES as u64,
+                sample_every_packets = PROFILE_SAMPLE_EVERY,
+                window_start_elapsed_us = summary.window_start_elapsed_us,
+                window_end_elapsed_us = summary.window_end_elapsed_us,
+                window_span_us = summary.window_span_us,
+                reported_at_elapsed_us,
+                window_last_sample_age_us = reported_at_elapsed_us
+                    .saturating_sub(summary.window_end_elapsed_us),
+                p50 = summary.p50,
+                p95 = summary.p95,
+                p99 = summary.p99,
+                max = summary.max,
+                p50_us = summary.unit.legacy_duration_value(summary.p50),
+                p95_us = summary.unit.legacy_duration_value(summary.p95),
+                p99_us = summary.unit.legacy_duration_value(summary.p99),
+                max_us = summary.unit.legacy_duration_value(summary.max),
                 "sampled userspace dataplane stage histogram"
             );
         }
@@ -329,27 +521,40 @@ impl DataplaneProfiler {
         if total < DATAPLANE_TAIL_WARNING_THRESHOLD {
             return;
         }
+        self.record_tail_event_at(
+            direction,
+            peer_id,
+            path,
+            total,
+            metrics,
+            candidate_gather_active,
+            network_generation,
+            duration_us(self.started_at.elapsed()),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_tail_event_at(
+        &self,
+        direction: &'static str,
+        peer_id: &str,
+        path: &'static str,
+        total: Duration,
+        metrics: DataplaneTailMetrics,
+        candidate_gather_active: bool,
+        network_generation: u64,
+        now_us: u64,
+    ) {
+        if total < DATAPLANE_TAIL_WARNING_THRESHOLD {
+            return;
+        }
         self.tail_events.fetch_add(1, Ordering::Relaxed);
 
-        let now_us = self
-            .started_at
-            .elapsed()
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64;
-        let previous = self.last_tail_event_us.load(Ordering::Relaxed);
-        if previous != 0
-            && now_us.saturating_sub(previous)
-                < TAIL_EVENT_RATE_LIMIT.as_micros().min(u128::from(u64::MAX)) as u64
-        {
+        if !self.claim_tail_event(now_us) {
+            self.tail_events_suppressed.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if self
-            .last_tail_event_us
-            .compare_exchange(previous, now_us, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
+        self.tail_events_emitted.fetch_add(1, Ordering::Relaxed);
 
         #[cfg(test)]
         self.tail_event_records
@@ -373,6 +578,7 @@ impl DataplaneProfiler {
         tracing::debug!(
             target: "p2wlan_daemon::dataplane",
             event = "dataplane_tail_event",
+            profile_schema_version = 2,
             severity,
             direction,
             peer_id,
@@ -390,8 +596,23 @@ impl DataplaneProfiler {
             tun_write_us = metrics.tun_write_us,
             candidate_gather_active,
             network_generation,
+            tail_events = self.tail_events.load(Ordering::Relaxed),
+            tail_events_emitted = self.tail_events_emitted.load(Ordering::Relaxed),
+            tail_events_suppressed = self.tail_events_suppressed.load(Ordering::Relaxed),
             "sampled dataplane packet crossed the tail-latency diagnostic threshold"
         );
+    }
+
+    fn claim_tail_event(&self, now_us: u64) -> bool {
+        // Encode zero uptime as one, reserving zero exclusively for "never
+        // emitted". This keeps the first microsecond rate limited as well.
+        let timestamp = now_us.saturating_add(1);
+        let previous = self.last_tail_event_us.load(Ordering::Relaxed);
+        (previous == 0 || timestamp.saturating_sub(previous) >= duration_us(TAIL_EVENT_RATE_LIMIT))
+            && self
+                .last_tail_event_us
+                .compare_exchange(previous, timestamp, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
     }
 
     #[cfg(test)]
@@ -435,23 +656,44 @@ impl DataplaneProfiler {
             state
                 .stages
                 .iter()
-                .map(|(stage, samples)| (*stage, summarize_samples(samples)))
+                .map(|((stage, unit), samples)| (*stage, summarize_samples(samples, *unit)))
                 .collect::<Vec<_>>()
         };
-        for (stage, (sample_count, p50_us, p95_us, p99_us, max_us)) in summaries {
+        let reported_at_elapsed_us = duration_us(self.started_at.elapsed());
+        for (stage, summary) in summaries {
             tracing::info!(
                 target: "p2wlan_daemon::dataplane",
                 event = "dataplane_profile_summary",
+                profile_schema_version = 2,
                 stage,
-                sample_count,
-                p50_us,
-                p95_us,
-                p99_us,
-                max_us,
+                unit = summary.unit.as_str(),
+                resource_scope = network_outbound_resource_scope(stage),
+                total_logical_bytes_measured = network_outbound_resource_scope(stage).map(|_| false),
+                sample_count = summary.sample_count,
+                window_sample_count = summary.window_sample_count,
+                window_kind = "latest_samples",
+                window_capacity = MAX_PROFILE_SAMPLES as u64,
+                sample_every_packets = PROFILE_SAMPLE_EVERY,
+                window_start_elapsed_us = summary.window_start_elapsed_us,
+                window_end_elapsed_us = summary.window_end_elapsed_us,
+                window_span_us = summary.window_span_us,
+                reported_at_elapsed_us,
+                window_last_sample_age_us = reported_at_elapsed_us
+                    .saturating_sub(summary.window_end_elapsed_us),
+                p50 = summary.p50,
+                p95 = summary.p95,
+                p99 = summary.p99,
+                max = summary.max,
+                p50_us = summary.unit.legacy_duration_value(summary.p50),
+                p95_us = summary.unit.legacy_duration_value(summary.p95),
+                p99_us = summary.unit.legacy_duration_value(summary.p99),
+                max_us = summary.unit.legacy_duration_value(summary.max),
                 fast_path_hits = self.fast_path_hits.load(Ordering::Relaxed),
                 fast_path_misses = self.fast_path_misses.load(Ordering::Relaxed),
                 fast_path_invalidated = self.fast_path_invalidated.load(Ordering::Relaxed),
                 tail_events = self.tail_events.load(Ordering::Relaxed),
+                tail_events_emitted = self.tail_events_emitted.load(Ordering::Relaxed),
+                tail_events_suppressed = self.tail_events_suppressed.load(Ordering::Relaxed),
                 "low-frequency sampled userspace dataplane summary"
             );
         }
@@ -462,16 +704,39 @@ fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
-fn summarize_samples(samples: &StageSamples) -> (u64, u64, u64, u64, u64) {
-    let mut sorted = samples.values.iter().copied().collect::<Vec<_>>();
+fn summarize_samples(samples: &StageSamples, unit: ProfileUnit) -> StageSummary {
+    let mut sorted = samples
+        .values
+        .iter()
+        .map(|sample| sample.value)
+        .collect::<Vec<_>>();
     sorted.sort_unstable();
-    (
-        samples.total,
-        percentile(&sorted, 50, 100),
-        percentile(&sorted, 95, 100),
-        percentile(&sorted, 99, 100),
-        sorted.last().copied().unwrap_or(0),
-    )
+    // Producers timestamp before taking the mutex, so insertion order need
+    // not be timestamp order. Report the actual retained timestamp range.
+    let window_start_elapsed_us = samples
+        .values
+        .iter()
+        .map(|sample| sample.observed_at_us)
+        .min()
+        .unwrap_or(0);
+    let window_end_elapsed_us = samples
+        .values
+        .iter()
+        .map(|sample| sample.observed_at_us)
+        .max()
+        .unwrap_or(0);
+    StageSummary {
+        unit,
+        sample_count: samples.total,
+        window_sample_count: samples.values.len() as u64,
+        window_start_elapsed_us,
+        window_end_elapsed_us,
+        window_span_us: window_end_elapsed_us.saturating_sub(window_start_elapsed_us),
+        p50: percentile(&sorted, 50, 100),
+        p95: percentile(&sorted, 95, 100),
+        p99: percentile(&sorted, 99, 100),
+        max: sorted.last().copied().unwrap_or(0),
+    }
 }
 
 fn percentile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
@@ -480,6 +745,17 @@ fn percentile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
     }
     let index = ((sorted.len() - 1) * numerator).div_ceil(denominator);
     sorted[index.min(sorted.len() - 1)]
+}
+
+fn network_outbound_resource_scope(stage: &str) -> Option<&'static str> {
+    match stage {
+        "tx_network_outbound_queue_depth" => Some("channel_queued_packets"),
+        "tx_network_outbound_actor_pending_packets" | "tx_network_outbound_actor_pending_bytes" => {
+            Some("actor_owned_pending_only")
+        }
+        "tx_network_outbound_active_flush_tasks" => Some("spawned_flush_tasks_including_unjoined"),
+        _ => None,
+    }
 }
 
 pub(crate) fn global_dataplane_profiler() -> &'static DataplaneProfiler {
@@ -501,8 +777,9 @@ mod profiling_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .stages
-            .get(stage)
-            .map(|samples| samples.values.iter().copied().collect())
+            .iter()
+            .find(|((name, _), _)| *name == stage)
+            .map(|(_, samples)| samples.values.iter().map(|sample| sample.value).collect())
             .unwrap_or_default()
     }
 
@@ -526,6 +803,86 @@ mod profiling_tests {
 
     fn allow_next_tail_event(profiler: &DataplaneProfiler) {
         profiler.last_tail_event_us.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn b03_pending_residence_accumulates_retry_wait_without_send_execution() {
+        let start = Instant::now();
+        let mut residence = PendingQueueResidence::start_at(start);
+        residence.pause_at(start + Duration::from_micros(10));
+        // Encryption and the failed send take 40us, outside pending queues.
+        residence.resume_at(start + Duration::from_micros(50));
+        residence.pause_at(start + Duration::from_micros(80));
+        // Repeated pause cannot double-count a completed interval.
+        residence.pause_at(start + Duration::from_micros(100));
+        assert_eq!(residence.finish(), Duration::from_micros(40));
+    }
+
+    #[test]
+    fn b03_pending_residence_ownership_moves_do_not_restart_queue_wait() {
+        let start = Instant::now();
+        let actor_owned = PendingQueueResidence::start_at(start);
+        let mut task_owned = actor_owned;
+        task_owned.resume_at(start + Duration::from_micros(20));
+        let mut merged_actor_owned = task_owned;
+        merged_actor_owned.resume_at(start + Duration::from_micros(30));
+        merged_actor_owned.pause_at(start + Duration::from_micros(50));
+        assert_eq!(merged_actor_owned.finish(), Duration::from_micros(50));
+    }
+
+    #[test]
+    fn b03_pending_residence_drop_and_unsampled_paths_are_bounded() {
+        assert!(PendingQueueResidence::start(false).is_none());
+        let start = Instant::now();
+        let mut residence = PendingQueueResidence::start_at(start + Duration::from_micros(1));
+        // A reversed diagnostic clock never underflows or changes routing.
+        residence.pause_at(start);
+        residence.resume_at(start + Duration::from_micros(10));
+        residence.pause_at(start + Duration::from_micros(35));
+        assert_eq!(residence.finish(), Duration::from_micros(25));
+    }
+
+    #[test]
+    fn b03_resource_snapshot_keeps_actor_counts_bytes_and_task_count_scoped() {
+        let profiler = DataplaneProfiler::new();
+        let snapshot = NetworkOutboundResourceSnapshot {
+            channel_packets: 7,
+            actor_pending_packets: 11,
+            actor_pending_bytes: 1200,
+            active_flush_tasks: 2,
+        };
+        profiler.record_network_outbound_resources(false, snapshot);
+        assert!(profiler.state.lock().unwrap().stages.is_empty());
+        profiler.record_network_outbound_resources(true, snapshot);
+        let state = profiler.state.lock().unwrap();
+        assert_eq!(state.stages.len(), 4);
+        for (stage, unit, expected) in [
+            ("tx_network_outbound_queue_depth", ProfileUnit::Count, 7),
+            (
+                "tx_network_outbound_actor_pending_packets",
+                ProfileUnit::Count,
+                11,
+            ),
+            (
+                "tx_network_outbound_actor_pending_bytes",
+                ProfileUnit::Bytes,
+                1200,
+            ),
+            (
+                "tx_network_outbound_active_flush_tasks",
+                ProfileUnit::Count,
+                2,
+            ),
+        ] {
+            let summary = summarize_samples(&state.stages[&(stage, unit)], unit);
+            assert_eq!(summary.p99, expected);
+            assert_eq!(summary.sample_count, 1);
+            assert!(network_outbound_resource_scope(stage).is_some());
+        }
+        assert_eq!(
+            network_outbound_resource_scope("tx_pending_residence_sent_us"),
+            None
+        );
     }
 
     #[test]
@@ -864,12 +1221,15 @@ mod profiling_tests {
             profiler.record_value(true, "queue_depth", value);
         }
         let state = profiler.state.lock().unwrap();
-        let samples = state.stages.get("queue_depth").expect("stage recorded");
+        let samples = state
+            .stages
+            .get(&("queue_depth", ProfileUnit::Count))
+            .expect("stage recorded");
         assert_eq!(samples.values.len(), MAX_PROFILE_SAMPLES);
-        assert_eq!(samples.values.front(), Some(&3));
+        assert_eq!(samples.values.front().map(|sample| sample.value), Some(3));
         assert_eq!(
-            samples.values.back(),
-            Some(&(MAX_PROFILE_SAMPLES as u64 + 2))
+            samples.values.back().map(|sample| sample.value),
+            Some(MAX_PROFILE_SAMPLES as u64 + 2)
         );
     }
 
@@ -910,6 +1270,259 @@ mod profiling_tests {
         let values = [10, 20, 30, 40, 50];
         assert!(percentile(&values, 99, 100) >= percentile(&values, 95, 100));
         assert!(percentile(&values, 95, 100) >= percentile(&values, 50, 100));
+    }
+
+    #[test]
+    fn b03_profile_window_excludes_evicted_outlier_and_tracks_retained_time_range() {
+        let profiler = DataplaneProfiler::new();
+        let unit = ProfileUnit::Microseconds;
+        profiler.record_value_at("rolling_window", 99_999, unit, 0);
+        for index in 1..=MAX_PROFILE_SAMPLES as u64 {
+            profiler.record_value_at("rolling_window", 7, unit, index * 10);
+        }
+
+        let state = profiler.state.lock().unwrap();
+        let summary = summarize_samples(state.stages.get(&("rolling_window", unit)).unwrap(), unit);
+        assert_eq!(summary.sample_count, MAX_PROFILE_SAMPLES as u64 + 1);
+        assert_eq!(summary.window_sample_count, MAX_PROFILE_SAMPLES as u64);
+        assert_eq!(summary.window_start_elapsed_us, 10);
+        assert_eq!(
+            summary.window_end_elapsed_us,
+            MAX_PROFILE_SAMPLES as u64 * 10
+        );
+        assert_eq!(
+            summary.window_span_us,
+            (MAX_PROFILE_SAMPLES as u64 - 1) * 10
+        );
+        assert_eq!(
+            (summary.p50, summary.p95, summary.p99, summary.max),
+            (7, 7, 7, 7)
+        );
+    }
+
+    #[test]
+    fn b03_profile_window_handles_empty_single_and_reordered_sample_timestamps() {
+        let unit = ProfileUnit::Count;
+        let mut samples = StageSamples::default();
+        let empty = summarize_samples(&samples, unit);
+        assert_eq!(empty.window_sample_count, 0);
+        assert_eq!(
+            (
+                empty.window_start_elapsed_us,
+                empty.window_end_elapsed_us,
+                empty.window_span_us
+            ),
+            (0, 0, 0)
+        );
+        samples.values.push_back(ProfileSample {
+            value: 1,
+            observed_at_us: 30,
+        });
+        samples.total = 1;
+        let single = summarize_samples(&samples, unit);
+        assert_eq!(single.window_span_us, 0);
+        assert_eq!(single.window_start_elapsed_us, 30);
+        samples.values.push_back(ProfileSample {
+            value: 2,
+            observed_at_us: 10,
+        });
+        samples.values.push_back(ProfileSample {
+            value: 3,
+            observed_at_us: 20,
+        });
+        samples.total = 3;
+        let reordered = summarize_samples(&samples, unit);
+        assert_eq!(
+            (
+                reordered.window_start_elapsed_us,
+                reordered.window_end_elapsed_us,
+                reordered.window_span_us
+            ),
+            (10, 30, 20)
+        );
+        assert_eq!(reordered.window_sample_count, 3);
+    }
+
+    #[test]
+    fn b03_profile_schema_keeps_duration_aliases_and_separates_resource_units() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use tracing::{
+            field::{Field, Visit},
+            Event, Subscriber,
+        };
+        use tracing_subscriber::{layer::Context, prelude::*, Layer};
+
+        #[derive(Default)]
+        struct Fields(BTreeMap<String, serde_json::Value>);
+        impl Visit for Fields {
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.0.insert(field.name().to_owned(), value.into());
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.0.insert(field.name().to_owned(), value.into());
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.0.insert(field.name().to_owned(), value.into());
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_owned(), value.into());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_owned(), format!("{value:?}").into());
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<Fields>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(records.clone()));
+        let profiler = DataplaneProfiler::new();
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..PROFILE_REPORT_EVERY {
+                profiler.record(true, "duration_stage", Duration::from_micros(19));
+                profiler.record_value(true, "count_stage", 3);
+                profiler.record_bytes(true, "bytes_stage", 4096);
+                profiler.record_network_outbound_resources(
+                    true,
+                    NetworkOutboundResourceSnapshot {
+                        channel_packets: 2,
+                        actor_pending_packets: 5,
+                        actor_pending_bytes: 1500,
+                        active_flush_tasks: 1,
+                    },
+                );
+            }
+        });
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 7);
+        for (stage, unit, value) in [
+            ("duration_stage", "microseconds", 19),
+            ("count_stage", "count", 3),
+            ("bytes_stage", "bytes", 4096),
+            ("tx_network_outbound_queue_depth", "count", 2),
+            ("tx_network_outbound_actor_pending_packets", "count", 5),
+            ("tx_network_outbound_actor_pending_bytes", "bytes", 1500),
+            ("tx_network_outbound_active_flush_tasks", "count", 1),
+        ] {
+            let fields = &records
+                .iter()
+                .find(|fields| fields.0.get("stage") == Some(&stage.into()))
+                .unwrap()
+                .0;
+            assert_eq!(fields.get("event"), Some(&"dataplane_profile".into()));
+            assert_eq!(fields.get("profile_schema_version"), Some(&2.into()));
+            if let Some(scope) = network_outbound_resource_scope(stage) {
+                assert_eq!(fields.get("resource_scope"), Some(&scope.into()));
+                assert_eq!(
+                    fields.get("total_logical_bytes_measured"),
+                    Some(&false.into())
+                );
+            } else {
+                assert!(!fields.contains_key("resource_scope"));
+                assert!(!fields.contains_key("total_logical_bytes_measured"));
+            }
+            assert_eq!(fields.get("unit"), Some(&unit.into()));
+            assert_eq!(
+                fields.get("sample_count"),
+                Some(&PROFILE_REPORT_EVERY.into())
+            );
+            assert_eq!(
+                fields.get("window_sample_count"),
+                Some(&PROFILE_REPORT_EVERY.into())
+            );
+            assert_eq!(
+                fields.get("window_capacity"),
+                Some(&(MAX_PROFILE_SAMPLES as u64).into())
+            );
+            assert_eq!(
+                fields.get("sample_every_packets"),
+                Some(&PROFILE_SAMPLE_EVERY.into())
+            );
+            for field in ["p50", "p95", "p99", "max"] {
+                assert_eq!(fields.get(field), Some(&serde_json::Value::from(value)));
+            }
+            for field in ["p50_us", "p95_us", "p99_us", "max_us"] {
+                if unit == "microseconds" {
+                    assert_eq!(fields.get(field), Some(&serde_json::Value::from(value)));
+                } else {
+                    assert!(!fields.contains_key(field));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn b03_tail_rate_limit_counts_suppression_and_accepts_interval_boundary() {
+        let profiler = DataplaneProfiler::new();
+        let interval_us = duration_us(TAIL_EVENT_RATE_LIMIT);
+        for now_us in [0, interval_us - 1, interval_us] {
+            profiler.record_tail_event_at(
+                "tx",
+                "peer-a",
+                "lan_direct",
+                Duration::from_millis(6),
+                DataplaneTailMetrics::default(),
+                false,
+                1,
+                now_us,
+            );
+        }
+        assert_eq!(profiler.tail_event_count(), 3);
+        assert_eq!(profiler.tail_events_emitted.load(Ordering::Relaxed), 2);
+        assert_eq!(profiler.tail_events_suppressed.load(Ordering::Relaxed), 1);
+        assert_eq!(profiler.tail_event_records().len(), 2);
+    }
+
+    #[test]
+    fn b03_tail_rate_limit_accounts_for_concurrent_candidates() {
+        use std::sync::{Arc, Barrier};
+
+        let profiler = Arc::new(DataplaneProfiler::new());
+        let barrier = Arc::new(Barrier::new(8));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let profiler = profiler.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    profiler.record_tail_event_at(
+                        "tx",
+                        "peer-a",
+                        "lan_direct",
+                        Duration::from_millis(6),
+                        DataplaneTailMetrics::default(),
+                        false,
+                        1,
+                        10,
+                    );
+                });
+            }
+        });
+        assert_eq!(profiler.tail_event_count(), 8);
+        assert_eq!(profiler.tail_events_emitted.load(Ordering::Relaxed), 1);
+        assert_eq!(profiler.tail_events_suppressed.load(Ordering::Relaxed), 7);
+        assert_eq!(profiler.tail_event_records().len(), 1);
+    }
+
+    #[test]
+    fn b03_unsampled_duration_counts_and_bytes_do_not_create_windows() {
+        let profiler = DataplaneProfiler::new();
+        profiler.record(false, "duration_stage", Duration::from_micros(19));
+        profiler.record_value(false, "count_stage", 3);
+        profiler.record_bytes(false, "bytes_stage", 4096);
+        assert!(profiler.state.lock().unwrap().stages.is_empty());
+        assert_eq!(profiler.last_summary_us.load(Ordering::Relaxed), 0);
+        assert_eq!(profiler.tail_event_count(), 0);
+        assert_eq!(profiler.tail_events_emitted.load(Ordering::Relaxed), 0);
+        assert_eq!(profiler.tail_events_suppressed.load(Ordering::Relaxed), 0);
     }
 
     #[test]

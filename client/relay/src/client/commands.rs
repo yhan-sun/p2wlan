@@ -3,7 +3,7 @@ use super::*;
 impl RelayClient {
     /// Send data to a peer via the relay.
     pub async fn send_data(&self, dst: &str, data: &[u8]) -> Result<()> {
-        self.send_data_inner(dst, data, None).await
+        self.send_data_inner(dst, data, None, None).await
     }
 
     /// Send data while committing caller state at the real writer boundary.
@@ -22,8 +22,39 @@ impl RelayClient {
     where
         F: FnOnce(Instant) -> bool + Send + 'static,
     {
-        self.send_data_inner(dst, data, Some(Box::new(write_boundary)))
+        self.send_data_inner(dst, data, Some(Box::new(write_boundary)), None)
             .await
+    }
+
+    /// Observe the original full application-frame write, with a prewrite guard.
+    ///
+    /// This opt-in API uses the same command queue and completion as send_data.
+    /// The observer runs synchronously in the original writer after full
+    /// write_all succeeds and before logging or sending completion. It receives
+    /// a neutral local write fact, not remote delivery or current-owner authority.
+    ///
+    /// An arbitrary observer may block or panic; no callback time bound is
+    /// promised. A panic after full write can stop the writer and lose completion:
+    /// WriterStoppedBeforeWrite then means delivery unknown, not prewrite refusal.
+    /// Keep observers short and nonpanicking. Existing APIs install no observer.
+    pub async fn send_data_with_write_boundary_and_observer<F, O>(
+        &self,
+        dst: &str,
+        data: &[u8],
+        write_boundary: F,
+        write_observer: O,
+    ) -> Result<()>
+    where
+        F: FnOnce(Instant) -> bool + Send + 'static,
+        O: FnOnce(OriginalRelayWriteFact) + Send + 'static,
+    {
+        self.send_data_inner(
+            dst,
+            data,
+            Some(Box::new(write_boundary)),
+            Some(Box::new(write_observer)),
+        )
+        .await
     }
 
     async fn send_data_inner(
@@ -31,6 +62,7 @@ impl RelayClient {
         dst: &str,
         data: &[u8],
         write_boundary: Option<WriteBoundaryHook>,
+        write_observer: Option<WriteObserver>,
     ) -> Result<()> {
         let data_len = data.len();
         let queued_at = std::time::Instant::now();
@@ -41,6 +73,7 @@ impl RelayClient {
             dst: dst.to_string(),
             data: data.to_vec(),
             write_boundary,
+            write_observer,
             completion: completion_tx,
         }) {
             let (reason_code, relay_error) = match error {

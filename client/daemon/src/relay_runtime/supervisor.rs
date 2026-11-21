@@ -16,11 +16,11 @@ impl RelaySupervisor {
                 Some(format!("candidates={}", self.relay_candidates.len())),
             );
 
-            let RelaySelectionOutcome {
+            let RelayReadSelectionOutcome {
                 transport,
                 relay_rx,
                 diagnostics,
-            } = select_relay_with_cooldowns(
+            } = select_relay_with_cooldowns_for_read::<OriginalRelayDelivery>(
                 &self.relay_candidates,
                 &self.preferred_regions,
                 self.selection_timeout,
@@ -96,7 +96,7 @@ impl RelaySupervisor {
                             // swapped) connection's own ticket deadline,
                             // bound to the current generation so a stale
                             // renewal can never register over a newer link.
-                            Box::pin(spawn_relay_renewal_task_impl(
+                            Box::pin(spawn_relay_renewal_task_for_read::<OriginalRelayDelivery>(
                                 renewal_ticket_cache.clone(),
                                 renewal_node_id.clone(),
                                 renewal_peers.clone(),

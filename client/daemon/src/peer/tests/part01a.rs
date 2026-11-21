@@ -458,6 +458,7 @@ fn diagnostics_keeps_non_current_peer_reflexive_pair_provisional() {
         Some(local),
         None,
         false,
+        true,
         None,
         None,
     );

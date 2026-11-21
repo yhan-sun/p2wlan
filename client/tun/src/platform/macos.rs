@@ -37,6 +37,10 @@ pub struct UtunDevice {
     address: String,
     /// Whether the device is still open.
     is_up: bool,
+    /// Per-device syscall seam. Tests retain the real AsyncFd/write boundary;
+    /// this is absent from production builds and never changes fd ownership.
+    #[cfg(test)]
+    test_write_syscall: Option<std::sync::Arc<write_tests::WriteSyscall>>,
 }
 
 impl UtunDevice {
@@ -161,6 +165,8 @@ impl UtunDevice {
             mtu: config.mtu,
             address: config.address.to_string(),
             is_up: true,
+            #[cfg(test)]
+            test_write_syscall: None,
         })
     }
 }
@@ -226,6 +232,10 @@ impl VirtualInterface for UtunDevice {
 
             match guard.try_io(|inner| {
                 let fd = inner.get_ref().as_raw_fd();
+                #[cfg(test)]
+                if let Some(syscall) = self.test_write_syscall.as_ref() {
+                    return syscall.write(fd, &write_buf);
+                }
                 // Safety: writing from a valid buffer to a valid fd.
                 let n = unsafe {
                     libc::write(
@@ -241,8 +251,19 @@ impl VirtualInterface for UtunDevice {
                 }
             }) {
                 Ok(result) => {
-                    let _n = result.map_err(Error::Io)?;
-                    // Return the original packet size (not including the prefix)
+                    let written = result.map_err(Error::Io)?;
+                    if written != write_buf.len() {
+                        // A utun write hands off one prefixed IP packet. Never
+                        // resume or replay a completed partial packet syscall.
+                        return Err(Error::Io(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            format!(
+                                "incomplete utun packet write: wrote {written} of {} bytes including the AF prefix",
+                                write_buf.len()
+                            ),
+                        )));
+                    }
+                    // Only a complete prefixed frame counts as raw IP bytes.
                     return Ok(buf.len());
                 }
                 Err(_would_block) => {
@@ -268,6 +289,10 @@ impl VirtualInterface for UtunDevice {
         self.is_up
     }
 }
+
+#[cfg(test)]
+#[path = "tests/macos_write.rs"]
+mod write_tests;
 
 impl Drop for UtunDevice {
     fn drop(&mut self) {

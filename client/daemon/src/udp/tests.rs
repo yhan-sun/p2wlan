@@ -10,6 +10,16 @@ include!("tests/part07.rs");
 include!("tests/part08.rs");
 include!("tests/part09.rs");
 include!("tests/socket_handoff.rs");
+include!("tests/keepalive_shadow.rs");
+
+#[path = "tests/keepalive_idle.rs"]
+mod keepalive_idle;
+
+#[path = "tests/keepalive_business.rs"]
+mod keepalive_business;
+
+#[path = "tests/candidate_cleanup_scope.rs"]
+mod candidate_cleanup_scope;
 
 #[tokio::test]
 async fn audit_cancel_inbound_must_release_primary_socket_with_ipv6() {
@@ -119,3 +129,28 @@ mod probe_admission_transaction;
 
 #[path = "tests/nat_ingress.rs"]
 mod nat_ingress;
+
+#[path = "tests/fresh_mapping_failures.rs"]
+mod fresh_mapping_failures;
+
+#[path = "tests/fresh_mapping_success_cost.rs"]
+mod fresh_mapping_success_cost;
+#[path = "tests/fresh_mapping_summary.rs"]
+mod fresh_mapping_summary;
+#[path = "tests/ordinary_probe_cancellation.rs"]
+mod ordinary_probe_cancellation;
+
+#[path = "tests/business_receipts.rs"]
+mod business_receipts;
+
+#[path = "tests/business_receipt_controls.rs"]
+mod business_receipt_controls;
+
+#[path = "tests/resource_capture.rs"]
+mod resource_capture;
+
+#[path = "tests/resource_capture_tx.rs"]
+mod resource_capture_tx;
+
+#[path = "tests/direct_origin.rs"]
+mod direct_origin;

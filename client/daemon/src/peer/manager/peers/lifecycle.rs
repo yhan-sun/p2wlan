@@ -205,6 +205,10 @@ impl PeerManager {
         let conn = conns
             .entry(info.node_id.clone())
             .or_insert_with(|| PeerConnection::new(&info.node_id, &info.virtual_ip));
+        if is_new {
+            // A same-node rejoin retains the original counter's high-water mark.
+            conn.direct_commit_seq = self.direct_commit_seq_sync(&info.node_id).unwrap_or(0);
+        }
         // Keep the synchronous Direct-set mirror attached to every connection
         // so its `transition` keeps the UDP eviction's nonevictable set fresh.
         conn.attach_direct_cache(self.direct_peers.clone());

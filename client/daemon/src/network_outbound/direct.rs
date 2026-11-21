@@ -91,6 +91,27 @@ pub(super) async fn send_direct_if_selected(
     udp_local_endpoint: Option<SocketAddr>,
     sampled: Option<bool>,
 ) -> DirectSendOutcome {
+    send_direct_if_selected_with_origin(
+        packet,
+        peers,
+        udp,
+        selection,
+        udp_local_endpoint,
+        sampled,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn send_direct_if_selected_with_origin(
+    packet: &EncryptedPeerPacket,
+    peers: &PeerManager,
+    udp: Option<UdpTransport>,
+    selection: &PathSelection,
+    udp_local_endpoint: Option<SocketAddr>,
+    sampled: Option<bool>,
+    origin: Option<&mut crate::udp::UdpSendCapture>,
+) -> DirectSendOutcome {
     // A candidate probe or nomination is not an encrypted data-plane proof.
     // Business packets must never use a Direct trial: sending the same
     // ciphertext as a relay hedge can create duplicate/reordered delivery,
@@ -117,7 +138,9 @@ pub(super) async fn send_direct_if_selected(
                 "encrypted packet handed to the Direct UDP socket"
             );
             let udp_send_started = Instant::now();
-            let send_result = udp.send_packet_to(packet, endpoint).await;
+            let send_result = udp
+                .send_packet_to_with_origin(packet, endpoint, origin)
+                .await;
             if let Some(sampled) = sampled {
                 global_dataplane_profiler().record(
                     sampled,

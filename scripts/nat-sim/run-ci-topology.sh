@@ -214,6 +214,12 @@ case "$PROFILE" in
       -s "$ROOT_DIR/scripts/nat-sim" \
       -p 'test_nat_sim.py' \
       -v 2>&1 | tee "${ARTIFACT_DIR}-attempt-1.log"
+    python3 -B "$ROOT_DIR/scripts/nat-sim/test_aggregate_failure_report.py"
+    python3 -B "$ROOT_DIR/scripts/nat-sim/test_round_finalization_regressions.py"
+    python3 -m unittest discover \
+      -s "$ROOT_DIR/scripts/nat-sim" \
+      -p 'test_monotonic_clock.py' \
+      -v 2>&1 | tee "${ARTIFACT_DIR}-clock.log"
     ;;
   direct)
     run_single_attempt \

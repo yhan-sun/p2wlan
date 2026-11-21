@@ -136,6 +136,7 @@ pub(crate) struct DirectBusinessSendGate {
 struct DirectBusinessWouldBlockInjection {
     remaining: usize,
     attempts_tx: watch::Sender<usize>,
+    pending_waker: Option<Arc<futures_util::task::AtomicWaker>>,
 }
 
 #[cfg(test)]
@@ -413,11 +414,53 @@ impl DirectValidationRegistry {
     /// shared by every caller so improving observability cannot weaken
     /// stale-worker invalidation.
     pub(crate) async fn cancel_peer_with_reason(&self, peer_id: &str, reason_code: &str) {
-        // Keep the session guard while taking the expectation guard. Session
-        // creation and expectation registration use this same order, so a
-        // same-ID rejoin cannot install a replacement expectation between the
-        // old session's removal and its conditional cleanup.
+        self.cancel_peer_scoped_with_reason(peer_id, reason_code, None)
+            .await;
+    }
+
+    /// A candidate handover's deferred cleanup owns only the predecessor
+    /// candidate epoch. Preserve workers and ACK expectations admitted into
+    /// the committed epoch, a later epoch, or another peer/network lifecycle.
+    pub(crate) async fn cancel_peer_before_remote_candidate_epoch(
+        &self,
+        peer_id: &str,
+        committed_epoch: crate::peer::PathEpoch,
+    ) {
+        self.cancel_peer_scoped_with_reason(
+            peer_id,
+            "remote_candidate_generation_changed",
+            Some(committed_epoch),
+        )
+        .await;
+    }
+
+    async fn cancel_peer_scoped_with_reason(
+        &self,
+        peer_id: &str,
+        reason_code: &str,
+        before_epoch: Option<crate::peer::PathEpoch>,
+    ) {
+        let in_scope = |generation, peer_session_generation, remote_candidate_epoch| {
+            before_epoch.is_none_or(|epoch| {
+                generation == epoch.network_generation
+                    && peer_session_generation == epoch.peer_session_generation
+                    && remote_candidate_epoch < epoch.remote_candidate_epoch
+            })
+        };
+        // Acquire both guards before revocation. A replacement cannot appear
+        // between the scope check, watch cancellation, and ACK removal.
         let mut sessions = self.sessions.lock().await;
+        let mut expectations = self.expectations.lock().await;
+        if sessions.get(peer_id).is_some_and(|session| {
+            let target = *session.target_tx.borrow();
+            !in_scope(
+                target.generation,
+                target.peer_session_generation,
+                target.remote_candidate_epoch,
+            )
+        }) {
+            return;
+        }
         let owner_token = if let Some(session) = sessions.remove(peer_id) {
             let current = *session.target_tx.borrow();
             session.target_tx.send_replace(DirectValidationTarget {
@@ -428,14 +471,21 @@ impl DirectValidationRegistry {
         } else {
             None
         };
-        let mut expectations = self.expectations.lock().await;
         let expectation_before = expectations.contains_key(peer_id);
         let mut expectation_cancelled = false;
+        let expectation_in_scope = expectations.get(peer_id).is_some_and(|expectation| {
+            in_scope(
+                expectation.generation,
+                expectation.peer_session_generation,
+                expectation.remote_candidate_epoch,
+            )
+        });
         match owner_token {
             Some(owner_token) => {
-                if expectations
-                    .get(peer_id)
-                    .is_some_and(|expectation| expectation.owner_token == owner_token)
+                if expectation_in_scope
+                    && expectations
+                        .get(peer_id)
+                        .is_some_and(|expectation| expectation.owner_token == owner_token)
                 {
                     expectations.remove(peer_id);
                     expectation_cancelled = true;
@@ -445,15 +495,22 @@ impl DirectValidationRegistry {
             // compatibility test helper can create one); clean it while the
             // session lock still excludes a concurrent replacement.
             None => {
-                expectation_cancelled = expectations.remove(peer_id).is_some();
+                if expectation_in_scope {
+                    expectation_cancelled = expectations.remove(peer_id).is_some();
+                }
             }
         }
-        let cooldown_cancelled = self
-            .slow_relay_cooldowns
-            .lock()
-            .await
-            .remove(peer_id)
-            .is_some();
+        // Slow-relay suppression spans the network generation, not candidate
+        // epochs. An old handover cannot clear a newer cooldown.
+        let cooldown_cancelled = if before_epoch.is_none() {
+            self.slow_relay_cooldowns
+                .lock()
+                .await
+                .remove(peer_id)
+                .is_some()
+        } else {
+            false
+        };
         debug!(target: "p2pnet_daemon::direct_validation",
             event = "direct_validation_registry_peer_cancelled",
             peer_id = %peer_id,
@@ -1128,6 +1185,19 @@ pub(crate) enum FreshMappingOutcome {
     Rejected(FreshMappingRejection),
 }
 
+impl FreshMappingOutcome {
+    /// Missing means no completed-call summary survived this outcome. In
+    /// particular, cancellation/Superseded and measurement-only are not zero
+    /// physical cost. This observation never grants a send or handoff permit.
+    pub(crate) fn ordinary_probe_summary(&self) -> Option<&FreshMappingProbeSummary> {
+        match self {
+            Self::Accepted(result, _) => result.ordinary_probe_summary.as_ref(),
+            Self::Rejected(FreshMappingRejection::NoProbesSent(summary)) => Some(summary),
+            Self::Rejected(_) => None,
+        }
+    }
+}
+
 /// Endpoint-free cost and timing facts for one local Hard↔Hard STUN
 /// measurement.  Durations use the transport's process-local monotonic clock;
 /// callers translate them onto the daemon timeline only after the measurement
@@ -1173,6 +1243,9 @@ pub(crate) struct FreshMappingResult {
     pub(crate) last_punch_sent_at_ms: u64,
     /// Measurement cost/timing exported for the Hard↔Hard attempt report.
     pub(crate) measurement: HardHardMeasurementStats,
+    /// Ordinary completed-call costs, excluding dropped futures and burst/ACK
+    /// workers. None for measurement-only; this is not a complete attempt ledger.
+    pub(crate) ordinary_probe_summary: Option<FreshMappingProbeSummary>,
 }
 
 /// One committed speculative mapping used by the bounded Hard↔Hard birthday
@@ -1235,9 +1308,10 @@ pub(crate) enum FreshMappingRejection {
     /// The generation was superseded or the peer went away.
     Superseded,
     /// The peer-facing punch loop sent no probe into the kernel queue
-    /// (attempts=0, all sends failed, or every send was aborted by
-    /// cancellation). The generation must not claim success.
-    NoProbesSent,
+    /// (attempts=0 or all completed calls failed). The returned fixed-size
+    /// summary retains actual classified failures and outer stop causes.
+    /// Explicit cancellation still returns the unit `Superseded` variant.
+    NoProbesSent(Box<FreshMappingProbeSummary>),
 }
 
 impl FreshMappingRejection {
@@ -1255,7 +1329,7 @@ impl FreshMappingRejection {
             Self::CapacityRejected => "capacity_rejected",
             Self::MissingProbeKey => "missing_probe_key",
             Self::Superseded => "superseded",
-            Self::NoProbesSent => "no_probes_sent",
+            Self::NoProbesSent(_) => "no_probes_sent",
         }
     }
 }
@@ -1655,6 +1729,9 @@ pub(crate) struct BirthdaySweepReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeSendFailureKind {
     PhysicalSend,
+    /// The bounded readiness/owner-lock wait expired before kernel handoff.
+    /// No successful datagram or physical syscall error belongs to this cost.
+    PreHandoffTimeout,
     NetworkGenerationChanged,
     CandidateEpochChanged,
     LocalProfileGenerationChanged,
@@ -1667,9 +1744,31 @@ pub(crate) enum ProbeSendFailureKind {
     ProbeEncodingFailed,
 }
 
+impl ProbeSendFailureKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::PhysicalSend => "physical_send",
+            Self::PreHandoffTimeout => "pre_handoff_timeout",
+            Self::NetworkGenerationChanged => "network_generation_changed",
+            Self::CandidateEpochChanged => "candidate_epoch_changed",
+            Self::LocalProfileGenerationChanged => "local_profile_generation_changed",
+            Self::RemoteProfileGenerationChanged => "remote_profile_generation_changed",
+            Self::PeerSessionChanged => "peer_session_changed",
+            Self::SessionRetired => "session_retired",
+            Self::SocketUnavailable => "socket_unavailable",
+            Self::SocketRevoked => "socket_revoked",
+            Self::ProbeRegistrationFailed => "probe_registration_failed",
+            Self::ProbeEncodingFailed => "probe_encoding_failed",
+        }
+    }
+}
+
+include!("fresh_mapping_summary.rs");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BirthdaySweepFailureKind {
     Send,
+    PreHandoffTimeout,
     WorkerJoin,
     NetworkGenerationChanged,
     CandidateEpochChanged,
@@ -1686,6 +1785,7 @@ impl BirthdaySweepFailureKind {
     pub(crate) const fn stop_reason(self) -> &'static str {
         match self {
             Self::Send => "send_error",
+            Self::PreHandoffTimeout => "probe_pre_handoff_timeout",
             Self::WorkerJoin => "worker_failed",
             Self::NetworkGenerationChanged => "network_generation_changed",
             Self::CandidateEpochChanged => "candidate_epoch_changed",
@@ -1702,6 +1802,7 @@ impl BirthdaySweepFailureKind {
     pub(crate) const fn from_probe_failure(kind: ProbeSendFailureKind) -> Self {
         match kind {
             ProbeSendFailureKind::PhysicalSend => Self::Send,
+            ProbeSendFailureKind::PreHandoffTimeout => Self::PreHandoffTimeout,
             ProbeSendFailureKind::NetworkGenerationChanged => Self::NetworkGenerationChanged,
             ProbeSendFailureKind::CandidateEpochChanged => Self::CandidateEpochChanged,
             ProbeSendFailureKind::LocalProfileGenerationChanged
@@ -1720,6 +1821,7 @@ impl BirthdaySweepFailureKind {
     pub(crate) fn from_stop_reason(reason: &str) -> Option<Self> {
         match reason {
             "send_error" => Some(Self::Send),
+            "probe_pre_handoff_timeout" => Some(Self::PreHandoffTimeout),
             "worker_failed" => Some(Self::WorkerJoin),
             "network_generation_changed" => Some(Self::NetworkGenerationChanged),
             "candidate_epoch_changed" => Some(Self::CandidateEpochChanged),

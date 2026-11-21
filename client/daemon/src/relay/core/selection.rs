@@ -54,6 +54,43 @@ pub(crate) async fn select_relay_with_cooldowns(
     ca_cert_path: Option<String>,
     cooldowns: &HashMap<String, Instant>,
 ) -> RelaySelectionOutcome {
+    let RelayReadSelectionOutcome {
+        transport,
+        relay_rx,
+        diagnostics,
+    } = select_relay_with_cooldowns_for_read::<RelayMessage>(
+        specs,
+        preferred_regions,
+        selection_timeout,
+        node_id,
+        peers,
+        ticket_cache,
+        static_relay_ticket,
+        allow_insecure_plaintext,
+        ca_cert_path,
+        cooldowns,
+    )
+    .await;
+    RelaySelectionOutcome {
+        transport,
+        relay_rx,
+        diagnostics,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn select_relay_with_cooldowns_for_read<I: RelayReadItem>(
+    specs: &[RelayCandidateConfig],
+    preferred_regions: &[String],
+    selection_timeout: Duration,
+    node_id: &str,
+    peers: Arc<PeerManager>,
+    ticket_cache: Option<Arc<RelayTicketCache>>,
+    static_relay_ticket: Option<String>,
+    allow_insecure_plaintext: bool,
+    ca_cert_path: Option<String>,
+    cooldowns: &HashMap<String, Instant>,
+) -> RelayReadSelectionOutcome<I> {
     let mut diagnostics = RelaySelectionDiagnostics::default();
     let mut candidates = Vec::new();
     let mut seen_endpoints = HashSet::new();
@@ -129,7 +166,7 @@ pub(crate) async fn select_relay_with_cooldowns(
             let result = timeout(selection_timeout, async {
                 let ticket: Option<(String, i64)> =
                     relay_ticket_for_candidate(&candidate, ticket_cache, static_ticket).await?;
-                let (transport, relay_rx) = RelayTransport::connect_in_region(
+                let (transport, relay_rx) = RelayTransport::connect_in_region_for_read::<I>(
                     &candidate.endpoint,
                     &candidate.region,
                     &node_id,
@@ -191,7 +228,7 @@ pub(crate) async fn select_relay_with_cooldowns(
         // Once we have a success, stop early if the best-ranked candidate has
         // succeeded (publish immediately) or the preference window elapsed.
         if first_success_at.is_some() {
-            if connected.iter().any(|c: &ConnectedCandidate| {
+            if connected.iter().any(|c: &ConnectedCandidate<I>| {
                 Some((c.candidate.preference_rank, c.candidate.index)) == best_rank
             }) {
                 break;
@@ -301,7 +338,7 @@ pub(crate) async fn select_relay_with_cooldowns(
         diagnostics.selected_region = Some(selected.candidate.region.clone());
         diagnostics.selected_endpoint = Some(selected.candidate.endpoint.clone());
         diagnostics.selected_connect_latency_ms = Some(transport.connect_latency_ms);
-        RelaySelectionOutcome {
+        RelayReadSelectionOutcome {
             transport: Some(transport),
             relay_rx: Some(relay_rx),
             diagnostics,
@@ -317,7 +354,7 @@ pub(crate) async fn select_relay_with_cooldowns(
         } else {
             diagnostics.last_error_code = Some("no_candidates".to_string());
         }
-        RelaySelectionOutcome {
+        RelayReadSelectionOutcome {
             transport: None,
             relay_rx: None,
             diagnostics,

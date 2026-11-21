@@ -517,7 +517,7 @@ pub struct PeerManager {
     /// a UDP transport replacement, so a modern peer cannot temporarily fall
     /// back to legacy business sending while the replacement exact path is
     /// still re-confirming BASE.
-    dplpmtud_capability_tx: tokio::sync::watch::Sender<Arc<HashMap<String, PeerSessionGeneration>>>,
+    dplpmtud_capability: DplpmtudCapabilityPublication,
     /// Latest-value wakeup for Direct business-budget publication changes.
     /// The actual budget remains owned by the concrete UDP transport; this
     /// sequence is only an event-driven queue wakeup.

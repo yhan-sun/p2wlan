@@ -120,6 +120,16 @@ pub fn parse_endpoint(
 }
 
 impl ParsedEndpoint {
+    /// Bare host for tuple DNS resolution and TLS IP-name verification.
+    /// Preserve the bracketed authority for host_port/to_socket_addr.
+    pub fn connect_host(&self) -> &str {
+        self.host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .filter(|host| host.parse::<std::net::Ipv6Addr>().is_ok())
+            .unwrap_or(&self.host)
+    }
+
     /// Returns a `SocketAddr` if the host is an IP address, otherwise returns an error.
     pub fn to_socket_addr(&self) -> Result<SocketAddr, RelayError> {
         let addr_str = format!("{}:{}", self.host, self.port);
@@ -268,6 +278,8 @@ mod tests {
         assert_eq!(ep.scheme, "tls");
         assert_eq!(ep.host, "relay.example.com");
         assert_eq!(ep.port, 18081);
+        assert_eq!(ep.connect_host(), "relay.example.com");
+        assert_eq!(ep.host_port(), "relay.example.com:18081");
     }
 
     #[test]
@@ -276,6 +288,11 @@ mod tests {
         assert_eq!(ep.scheme, "tls");
         assert_eq!(ep.host, "127.0.0.1");
         assert_eq!(ep.port, 18081);
+        assert_eq!(ep.connect_host(), "127.0.0.1");
+        assert_eq!(
+            ep.to_socket_addr().unwrap(),
+            "127.0.0.1:18081".parse().unwrap()
+        );
     }
 
     #[test]
@@ -284,6 +301,13 @@ mod tests {
         assert_eq!(ep.scheme, "tls");
         assert_eq!(ep.host, "[::1]");
         assert_eq!(ep.port, 18081);
+        assert_eq!(ep.host_port(), "[::1]:18081");
+        assert_eq!(ep.to_socket_addr().unwrap(), "[::1]:18081".parse().unwrap());
+        assert_eq!(ep.connect_host(), "::1");
+        assert!(matches!(
+            ServerName::try_from(ep.connect_host()).unwrap(),
+            ServerName::IpAddress(_)
+        ));
     }
 
     #[test]

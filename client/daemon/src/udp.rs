@@ -37,6 +37,7 @@ use crate::transport::{
 };
 
 mod probe_budget;
+pub(crate) use probe_budget::OutboundProbeSweepStop;
 use probe_budget::{
     default_global_outbound_probe_budget, default_global_relay_backoff_heartbeat_budget,
     outbound_probe_admission_reason, retain_live_budget_entries, GlobalOutboundProbeBudget,
@@ -50,6 +51,32 @@ use probe_budget::{
     OUTBOUND_PROBE_PERSISTENT_WINDOW,
 };
 include!("udp/state.rs");
+
+#[cfg(test)]
+pub(crate) fn hard_hard_report_with_epoch_credit_stop_for_test(
+    mut report: PunchSendReport,
+) -> PunchSendReport {
+    report.sweep_budget_stop = Some(probe_budget::OutboundProbeSweepStop::EpochCreditExhausted);
+    report.epoch_budget_exhausted = true;
+    report
+}
+
+#[cfg(test)]
+pub(crate) fn hard_hard_report_with_confirmation_reserve_stop_for_test(
+    mut report: PunchSendReport,
+) -> PunchSendReport {
+    report.sweep_budget_stop =
+        Some(probe_budget::OutboundProbeSweepStop::ConfirmationCreditReserved);
+    report
+}
+
+#[cfg(test)]
+pub(crate) fn hard_hard_report_with_stale_recovery_stop_for_test(
+    mut report: PunchSendReport,
+) -> PunchSendReport {
+    report.sweep_budget_stop = Some(probe_budget::OutboundProbeSweepStop::RecoveryIdentityStale);
+    report
+}
 
 mod stun_waiter;
 use stun_waiter::StunWaiters;
@@ -157,11 +184,15 @@ pub const IPV6_SOCKET_INDEX: usize = 2048;
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
 #[derive(Clone)]
 pub struct UdpTransport {
+    resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
     /// Process-local identity of this concrete UDP publication. Clones keep
     /// the identity; a newly bound/replaced transport gets a new one, so a
     /// cached fast-path socket index can never silently carry across a
     /// publication replacement that reused the same index.
     transport_instance_id: u64,
+    /// Explicit opt-in historical reader evidence; never path authority.
+    #[allow(dead_code)]
+    rx_business_capture: Option<Arc<crate::business_evidence::CaptureOwner>>,
     /// The primary socket is used for STUN and remains the single-socket
     /// fallback. Additional sockets, when explicitly enabled, are only used
     /// for bounded symmetric-NAT traversal experiments.
@@ -267,6 +298,13 @@ pub struct UdpTransport {
     probe_send_failure_hook: Arc<std::sync::Mutex<Option<ProbeSendFailureHook>>>,
     #[cfg(test)]
     probe_send_failure_hook_enabled: Arc<AtomicBool>,
+    /// Fixture-only ownership of this transport's original retransmit tasks.
+    #[cfg(test)]
+    probe_burst_capture_for_test: Option<Arc<ProbeBurstCaptureForTest>>,
+    /// Per-transport one-shot ordinary fresh-mapping lifecycle barrier.
+    /// Absent from production; it never supplies send authority or summaries.
+    #[cfg(test)]
+    fresh_mapping_generation_gate: Arc<StdMutex<Option<Arc<FreshMappingGenerationGate>>>>,
     /// One-shot lifecycle linearization seam used only by the remote-restart
     /// race regression.
     #[cfg(test)]
@@ -332,6 +370,11 @@ use learning::model_deltas;
 use learning::fresh_mapping_target_eligible;
 
 pub(crate) use dynamic_punch::monotonic_millis;
+#[cfg(test)]
+use dynamic_punch::{
+    FreshMappingGateContext, FreshMappingGateGuard, FreshMappingGateStage,
+    FreshMappingGenerationGate,
+};
 
 #[cfg(test)]
 use birthday::hard_hard_birthday_candidates;
@@ -375,6 +418,13 @@ mod birthday_tests;
 mod core;
 
 mod business_mtu;
+mod ingress_origin;
+mod send_origin;
+#[allow(unused_imports)] // Staged source/guard consumers; no final credit yet.
+pub(crate) use ingress_origin::{
+    DirectOriginFailure, DirectOriginPublicationGuard, OriginalUdpIngressSource,
+};
+pub(crate) use send_origin::{UdpFullSendFact, UdpSendCapture, UdpSendFence};
 
 mod socket_registry;
 
@@ -389,6 +439,14 @@ use hard_hard_pair_validation::HardHardSocketMode;
 pub(crate) use hard_hard_pair_validation::{HardHardValidationScope, HardHardValidationWork};
 
 mod diagnostics;
+
+mod ordinary_probe_cost;
+use ordinary_probe_cost::{OrdinaryProbeCall, OrdinaryProbeKind, OrdinaryProbeSocket};
+pub(crate) use ordinary_probe_cost::{OrdinaryProbeCost, OrdinaryProbeIdentity};
+mod ordinary_probe_task;
+#[cfg(test)]
+use ordinary_probe_cost::OrdinaryProbeTestStage;
+pub(crate) use ordinary_probe_task::OrdinaryProbeTask;
 
 mod dynamic_punch;
 mod hard_hard_measurement;

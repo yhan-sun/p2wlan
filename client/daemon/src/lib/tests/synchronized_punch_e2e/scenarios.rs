@@ -1,5 +1,4 @@
-// Split out of the former flat include!-ed test file so the module is a
-// real Rust scope. Everything below is unchanged test code.
+// Real control, UDP, ownership and lifecycle scenarios for synchronized punching.
 use super::*;
 
 #[tokio::test(flavor = "current_thread")]
@@ -35,6 +34,274 @@ fn hard_hard_fallback_signal(
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_initial_offer_uses_ordinary_primary_without_spending_hard_hard_quota() {
+    let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let harness = build_two_peer_harness(false, false, false).await;
+    assert!(!harness.peers_a.hard_hard_experiment_only());
+    assert!(!harness.peers_b.hard_hard_experiment_only());
+
+    // This case models the ordinary primary mappings in the NAT adapter.
+    // Protocol fixtures retain their original dynamic-socket-only delivery.
+    let primary_a = harness.udp_a.local_addr().unwrap();
+    let primary_b = harness.udp_b.local_addr().unwrap();
+    harness
+        .link
+        .a_to_b_routes
+        .outbound
+        .lock()
+        .unwrap()
+        .insert(primary_a, primary_b);
+    harness
+        .link
+        .b_to_a_routes
+        .outbound
+        .lock()
+        .unwrap()
+        .insert(primary_b, primary_a);
+    // Pause only the owned encrypted validation submitters, so we can inspect
+    // real matched Probe ACKs before Direct legitimately closes the ledger.
+    harness.validation_enabled_a.store(false, Ordering::Release);
+    harness.validation_enabled_b.store(false, Ordering::Release);
+    let RecoveryAdmission::Accepted { epoch } =
+        harness.peers_a.recovery_epoch_admit(HARD_HARD_B).await
+    else {
+        panic!("ordinary recovery admission");
+    };
+    let before = harness
+        .peers_a
+        .recovery_epoch_work_budget_report(HARD_HARD_B)
+        .await
+        .unwrap();
+    assert_eq!(before.stage, crate::peer::RecoveryStage::Initial);
+    assert!(
+        !harness
+            .peers_a
+            .recovery_hard_hard_available(HARD_HARD_B, epoch)
+            .await
+    );
+    let generation = harness.peers_a.current_network_generation_sync();
+    let probe_session = harness.peers_a.probe_session_id_for_peer(HARD_HARD_B).await;
+    let rx_before = harness
+        .udp_a
+        .probe_rx_snapshot_for_peer_session(HARD_HARD_B, generation, probe_session.as_deref())
+        .await;
+
+    // Keep the actual ordinary control offer and production selector in this
+    // test; never enter the explicit HH protocol helper above.
+    trigger_initial_offer(&harness).await;
+    wait_for_stage(&harness.peers_a, HARD_HARD_B, "punch_started").await;
+    timeout(HARD_HARD_E2E_TIMEOUT, async {
+        loop {
+            let rx = harness
+                .udp_a
+                .probe_rx_snapshot_for_peer_session(
+                    HARD_HARD_B,
+                    generation,
+                    probe_session.as_deref(),
+                )
+                .await;
+            if rx.delta_since(rx_before).probe_acks_received > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the real initial ordinary UDP punch must receive its matched ACK");
+    assert!(
+        !harness.peers_a.is_direct(HARD_HARD_B).await,
+        "Probe ACK alone must not bypass owned encrypted validation"
+    );
+    assert!(
+        !harness
+            .peers_a
+            .hard_hard_session_is_active(HARD_HARD_B)
+            .await
+    );
+    let after = harness
+        .peers_a
+        .recovery_epoch_work_budget_report(HARD_HARD_B)
+        .await
+        .unwrap();
+    assert_eq!(after.epoch, epoch);
+    assert_eq!(
+        after.hard_hard_generations_remaining,
+        before.hard_hard_generations_remaining
+    );
+    assert_eq!(after.stage, crate::peer::RecoveryStage::Initial);
+    assert!(
+        !harness
+            .peers_a
+            .recovery_hard_hard_available(HARD_HARD_B, epoch)
+            .await
+    );
+
+    harness.validation_enabled_a.store(true, Ordering::Release);
+    harness.validation_enabled_b.store(true, Ordering::Release);
+    // Paused submitters discard their observations. Send fresh real ordinary
+    // probes to trigger new owned validation; this is a functional test, not
+    // a measurement of first-attempt CI latency.
+    harness
+        .udp_a
+        .punch_candidates_primary_socket(
+            HARD_HARD_B,
+            vec![harness.link.b_public.local_addr().unwrap()],
+            Duration::ZERO,
+            1,
+        )
+        .await
+        .unwrap();
+    harness
+        .udp_b
+        .punch_candidates_primary_socket(
+            HARD_HARD_A,
+            vec![harness.link.a_public.local_addr().unwrap()],
+            Duration::ZERO,
+            1,
+        )
+        .await
+        .unwrap();
+    timeout(HARD_HARD_E2E_TIMEOUT, async {
+        while !harness.peers_a.is_direct(HARD_HARD_B).await
+            || !harness.peers_b.is_direct(HARD_HARD_A).await
+        {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ordinary primary paths must converge through owned validation");
+    assert_eq!(
+        harness
+            .udp_a
+            .affinity_pin_for_test(HARD_HARD_B)
+            .await
+            .unwrap()
+            .socket_index,
+        0
+    );
+    assert_eq!(
+        harness
+            .udp_b
+            .affinity_pin_for_test(HARD_HARD_A)
+            .await
+            .unwrap()
+            .socket_index,
+        0
+    );
+    for (peers, peer) in [
+        (&harness.peers_a, HARD_HARD_B),
+        (&harness.peers_b, HARD_HARD_A),
+    ] {
+        let conn = peers.get_connection(peer).await.unwrap();
+        assert!(!conn
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "hard_hard_plan_selected"));
+        assert!(!peers.hard_hard_session_is_active(peer).await);
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn production_ordinary_no_ack_opens_unused_hard_hard_retry_quota() {
+    // This scheduling control sends a real ordinary legacy probe to an owned
+    // loopback receiver that supplies no ACK; it does not prove authentication.
+    let no_ack_sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (_daemon, peers, udp, _control) = build_hard_hard_ordinary_fallback_fixture_with_policy(
+        false,
+        crate::config::PathPolicy::Auto,
+        no_ack_sink.local_addr().unwrap(),
+    )
+    .await;
+    let ordinary_source = udp.local_addr().unwrap();
+    // Model a relay-backed connection through its existing state owner. This
+    // fixture does not start or claim acceptance of a real relay transport.
+    peers.configure_relay_first(true).await;
+    let generation = peers.current_network_generation_sync();
+    let relay = "tcp://relay.invalid:443";
+    peers
+        .mark_relay_transport_ready(HARD_HARD_B, relay, generation)
+        .await;
+    assert!(
+        peers
+            .confirm_relay_peer(HARD_HARD_B, relay, generation)
+            .await
+    );
+    let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(HARD_HARD_B).await
+    else {
+        panic!("ordinary recovery admission");
+    };
+    let before = peers
+        .recovery_epoch_work_budget_report(HARD_HARD_B)
+        .await
+        .unwrap();
+    assert_eq!(before.stage, crate::peer::RecoveryStage::Initial);
+    assert!(!peers.recovery_hard_hard_available(HARD_HARD_B, epoch).await);
+    assert!(peers.has_relay_safety_net(HARD_HARD_B).await);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let attempts = PunchAttemptDeduplicator::default();
+    spawn_hole_punch_task_with_lifecycle(
+        udp,
+        peers.clone(),
+        attempts.clone(),
+        HARD_HARD_B.into(),
+        Duration::from_millis(1),
+        1,
+        None,
+        None,
+        None,
+        None,
+        Some(shutdown_rx),
+        None,
+    )
+    .await;
+    wait_for_stage(&peers, HARD_HARD_B, "punch_started").await;
+    let mut probe = [0_u8; 2048];
+    let (received, source) = timeout(Duration::from_secs(2), no_ack_sink.recv_from(&mut probe))
+        .await
+        .expect("ordinary punch must reach the real loopback receiver")
+        .unwrap();
+    assert!(received > 0);
+    assert_eq!(source, ordinary_source);
+    let feedback = wait_for_stage(&peers, HARD_HARD_B, "punch_ack_timeout").await;
+    assert!(feedback.detail.contains("matched_probe_ack_rx_delta=0"));
+    timeout(Duration::from_secs(2), async {
+        while !peers.recovery_hard_hard_available(HARD_HARD_B, epoch).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actual same-session ordinary no-ACK feedback must unlock HH retry");
+    let after = peers
+        .recovery_epoch_work_budget_report(HARD_HARD_B)
+        .await
+        .unwrap();
+    assert_eq!(after.epoch, epoch);
+    assert_ne!(after.stage, crate::peer::RecoveryStage::Initial);
+    assert_eq!(
+        after.hard_hard_generations_remaining,
+        before.hard_hard_generations_remaining
+    );
+    assert!(!peers.hard_hard_session_is_active(HARD_HARD_B).await);
+    assert!(!peers
+        .get_connection(HARD_HARD_B)
+        .await
+        .unwrap()
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "hard_hard_plan_selected"));
+    // The batch may already have released its receiver after reporting no ACK.
+    shutdown_tx.send_replace(true);
+    timeout(Duration::from_secs(1), async {
+        while attempts.active_session_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the real ordinary invocation must release its exact owner");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn hard_hard_experiment_lane_never_falls_into_ordinary_punching() {
     let (_daemon, peers, udp, _control) =
@@ -67,7 +334,8 @@ async fn hard_hard_experiment_lane_never_falls_into_ordinary_punching() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn hard_hard_initiator_is_cancelled_with_its_udp_invocation_only() {
-    let (_daemon, peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let (_daemon, peers, udp, control) =
+        build_hard_hard_ordinary_fallback_fixture_with_experiment(true).await;
     let blackholes = [
         UdpSocket::bind("127.0.0.1:0").await.unwrap(),
         UdpSocket::bind("127.0.0.1:0").await.unwrap(),
@@ -182,7 +450,8 @@ async fn hard_hard_initiator_preserves_candidate_publication_lifecycle() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn hard_hard_failed_preledger_measurement_releases_udp_lifecycle_watcher() {
-    let (_daemon, peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let (_daemon, peers, udp, control) =
+        build_hard_hard_ordinary_fallback_fixture_with_experiment(true).await;
     let blackholes = [
         UdpSocket::bind("127.0.0.1:0").await.unwrap(),
         UdpSocket::bind("127.0.0.1:0").await.unwrap(),
@@ -259,6 +528,20 @@ async fn hard_hard_preflight_failure_falls_through_to_ordinary_punch() {
     let (_daemon, peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
     let signal = hard_hard_fallback_signal(control, 0, Vec::new());
 
+    assert_eq!(
+        spawn_hard_hard_initiator(
+            udp.clone(),
+            peers.clone(),
+            PunchAttemptDeduplicator::default(),
+            HARD_HARD_B.into(),
+            signal.clone(),
+            None,
+            None,
+        )
+        .await,
+        HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::BootEpochUnavailable)
+    );
+
     spawn_hole_punch_task(
         udp,
         peers.clone(),
@@ -273,8 +556,6 @@ async fn hard_hard_preflight_failure_falls_through_to_ordinary_punch() {
     )
     .await;
 
-    let fallback = wait_for_stage(&peers, HARD_HARD_B, "hard_hard_fallback_to_ordinary").await;
-    assert!(fallback.detail.contains("reason=boot_epoch_unavailable"));
     wait_for_stage(&peers, HARD_HARD_B, "punch_started").await;
 }
 
@@ -294,6 +575,20 @@ async fn hard_hard_insufficient_stun_falls_through_to_ordinary_punch() {
             .collect(),
     );
 
+    assert_eq!(
+        spawn_hard_hard_initiator(
+            udp.clone(),
+            peers.clone(),
+            PunchAttemptDeduplicator::default(),
+            HARD_HARD_B.into(),
+            signal.clone(),
+            None,
+            None,
+        )
+        .await,
+        HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::InsufficientStunObservers)
+    );
+
     spawn_hole_punch_task(
         udp,
         peers.clone(),
@@ -308,10 +603,6 @@ async fn hard_hard_insufficient_stun_falls_through_to_ordinary_punch() {
     )
     .await;
 
-    let fallback = wait_for_stage(&peers, HARD_HARD_B, "hard_hard_fallback_to_ordinary").await;
-    assert!(fallback
-        .detail
-        .contains("reason=insufficient_stun_observers"));
     wait_for_stage(&peers, HARD_HARD_B, "punch_started").await;
 }
 
@@ -429,19 +720,21 @@ async fn hard_hard_async_failure_uses_next_trigger_for_ordinary_punch() {
             .commit();
     }
 
-    spawn_hole_punch_task(
-        udp.clone(),
-        peers.clone(),
-        deduplicator.clone(),
-        HARD_HARD_B.to_string(),
-        Duration::from_millis(1),
-        1,
-        None,
-        Some(signal.clone()),
-        None,
-        None,
-    )
-    .await;
+    // This is an explicit HH protocol attempt, not production's ordinary
+    // initial trigger. A handled asynchronous HH owner must remain exclusive.
+    assert_eq!(
+        spawn_hard_hard_initiator(
+            udp.clone(),
+            peers.clone(),
+            deduplicator.clone(),
+            HARD_HARD_B.into(),
+            signal.clone(),
+            None,
+            None,
+        )
+        .await,
+        HardHardInitiatorStart::Started
+    );
     wait_for_stage(&peers, HARD_HARD_B, "hard_hard_measurement_failed").await;
     assert!(
         !peers
@@ -456,6 +749,21 @@ async fn hard_hard_async_failure_uses_next_trigger_for_ordinary_punch() {
 
     // Once the final worker releases its permit, the next trigger observes
     // the exhausted quota and must continue through ordinary punching.
+    assert_eq!(
+        spawn_hard_hard_initiator(
+            udp.clone(),
+            peers.clone(),
+            deduplicator.clone(),
+            HARD_HARD_B.into(),
+            signal.clone(),
+            None,
+            None,
+        )
+        .await,
+        HardHardInitiatorStart::NotStarted(
+            HardHardInitiatorNotStarted::FreshGenerationQuotaExhausted
+        )
+    );
     spawn_hole_punch_task(
         udp,
         peers.clone(),
@@ -469,10 +777,6 @@ async fn hard_hard_async_failure_uses_next_trigger_for_ordinary_punch() {
         None,
     )
     .await;
-    let fallback = wait_for_stage(&peers, HARD_HARD_B, "hard_hard_fallback_to_ordinary").await;
-    assert!(fallback
-        .detail
-        .contains("reason=fresh_generation_quota_exhausted"));
     wait_for_stage(&peers, HARD_HARD_B, "punch_started").await;
 }
 
@@ -803,6 +1107,19 @@ async fn normal_background_retry_revisits_hard_hard_after_protected_owner_releas
         HardHardInitiatorStart::ExistingPunchOwner
     );
     drop(existing);
+    // Releasing a protected owner is not itself ordinary no-ACK feedback.
+    assert!(!peers.recovery_hard_hard_available(HARD_HARD_B, epoch).await);
+    assert!(
+        peers
+            .advance_recovery_stage_after_no_ack_for_peer_session(
+                HARD_HARD_B,
+                peers.current_network_generation_sync(),
+                peers.peer_session_generation_sync(HARD_HARD_B).unwrap(),
+                "fixture's ordinary owner finished with no matched ACK",
+            )
+            .await
+    );
+    assert!(peers.recovery_hard_hard_available(HARD_HARD_B, epoch).await);
     let task = tokio::spawn(run_direct_probe_loop(
         peers.clone(),
         Arc::new(RwLock::new(Some(udp))),
@@ -1162,7 +1479,7 @@ async fn hard_hard_two_peer_success_with_stun_and_mtu(stun: HarnessStunProfile, 
     for task in &harness.peer_reflexive_tasks {
         task.abort();
     }
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     wait_for_both_direct(&harness).await;
     // Reciprocal exact-socket traffic can promote both peers before the
     // non-owner reaches its scheduled sweep.  Require the authoritative path
@@ -1432,7 +1749,7 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
         );
     }
 
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     wait_for_both_direct_compact(&harness).await;
 
     for (peers, udp, remote_id, expected_remote) in [
@@ -1662,7 +1979,7 @@ async fn hard_hard_physical_send_error_reaches_one_consistent_terminal_reason() 
     let _peer_send_failures = harness.udp_b.set_probe_send_failures_for_test(1..=512);
     harness.link.set_drop_a_to_b(true);
     harness.link.set_drop_b_to_a(true);
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
 
     let report = wait_for_hard_hard_attempt_report(&harness.peers_a, HARD_HARD_B).await;
     assert_eq!(report.mode, "birthday");
@@ -1716,7 +2033,7 @@ async fn hard_hard_random_random_birthday_no_collision_cleans_up_without_direct(
     // dropping forwarded traffic. The harness's receive boundary also blocks
     // random targets from bypassing this link via real private UDP sockets.
     harness.link.set_hold_authenticated_punch(true);
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
 
     // Do not let the initial "not active and no sockets" state satisfy the
     // cleanup predicate before the control event has started either side's
@@ -1811,7 +2128,7 @@ async fn hard_hard_birthday_production_cleanup_waits_for_udp_completion() {
     .await;
     harness.link.set_drop_a_to_b(true);
     harness.link.set_drop_b_to_a(true);
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
 
     let record = timeout(HARD_HARD_E2E_TIMEOUT, async {
         loop {
@@ -1914,7 +2231,7 @@ async fn hard_hard_random_random_unauthenticated_packet_cannot_win() {
     .await;
     harness.link.set_drop_a_to_b(true);
     harness.link.set_drop_b_to_a(true);
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     let _ = wait_for_hard_hard_response_signal(&harness).await;
     // The exact dynamic socket is durable production state; the diagnostic
     // ring is intentionally bounded and may evict `hard_hard_sweep_started`
@@ -1990,7 +2307,7 @@ async fn hard_hard_random_random_unauthenticated_packet_cannot_win() {
     // first harness above already proves that a malformed datagram cannot
     // select a winner; this session must exercise the normal authenticated
     // birthday path without pausing or dropping its legal validation evidence.
-    trigger_initial_offer(&valid_harness).await;
+    trigger_hard_hard_protocol_attempt(&valid_harness).await;
     wait_for_both_direct_compact(&valid_harness).await;
     let valid_a_connection = timeout(HARD_HARD_E2E_TIMEOUT, async {
         loop {
@@ -2392,7 +2709,7 @@ async fn hard_hard_responder_measurement_candidate_epoch_change_fences_response(
     let harness = build_two_peer_harness(false, false, false).await;
     let gate = install_hard_hard_responder_measurement_gate_for_test();
 
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     timeout(Duration::from_secs(3), gate.reached.notified())
         .await
         .expect("B responder measurement must pause before its post-measurement plan fence");
@@ -2540,7 +2857,7 @@ async fn hard_hard_two_peer_first_send_protection_refunds_then_retries_response(
         }
     }));
 
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     let deferred = wait_for_stage(
         &harness.peers_b,
         HARD_HARD_A,
@@ -2584,7 +2901,7 @@ async fn hard_hard_two_peer_initiator_response_retries_first_send_protection_onc
     let harness = build_two_peer_harness(false, false, false).await;
     let responder_gate = install_hard_hard_responder_measurement_gate_for_test();
 
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     // The gate follows two sequential production-bounded measurements (the
     // initiator, then the responder). Their 1.2s budgets plus debug-runtime
     // scheduling leave too little headroom in a 3s fixture-only wait.
@@ -2688,7 +3005,7 @@ async fn hard_hard_two_peer_prediction_miss_keeps_relay_and_cleans_up() {
     let harness = build_two_peer_harness(true, false, true).await;
     harness.link.set_drop_a_to_b(true);
     harness.link.set_drop_b_to_a(true);
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     wait_for_hard_hard_response_signal(&harness).await;
 
     let actual_a = harness.link._a_source.local_addr().unwrap().port();
@@ -2736,7 +3053,7 @@ async fn hard_hard_two_peer_partial_reachability_never_stays_asymmetric_direct()
     let _clock = HardHardClockReset;
     let harness = build_two_peer_harness(true, false, false).await;
     harness.link.set_drop_b_to_a(true);
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     let reports = wait_for_both_sweep_failures(&harness).await;
     for report in reports {
         assert_eq!(report.mode, "predictable");
@@ -2764,7 +3081,7 @@ async fn hard_hard_two_peer_local_handover_cancels_waiting_session() {
     set_hard_hard_test_now_ms(Some(now));
     let _clock = HardHardClockReset;
     let harness = build_two_peer_harness(false, false, false).await;
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     let response = wait_for_hard_hard_response_signal(&harness).await;
     assert!(harness
         .peers_a
@@ -2820,7 +3137,7 @@ async fn hard_hard_two_peer_stale_ack_cannot_resurrect_retired_session() {
     harness.validation_enabled_a.store(false, Ordering::Release);
     harness.validation_enabled_b.store(false, Ordering::Release);
 
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     let response_s1 = wait_for_hard_hard_response_signal(&harness).await;
     timeout(HARD_HARD_E2E_TIMEOUT, response_gate.reached.notified())
         .await
@@ -2885,8 +3202,14 @@ async fn hard_hard_two_peer_stale_ack_cannot_resurrect_retired_session() {
     // pending probes; ACK packets remain held and are still replayed below.
     harness.link.set_hold_authenticated_punch(true);
     sleep(Duration::from_millis(2_100)).await;
-    trigger_retry_offer_with_current_candidates(&harness, &response_s1).await;
-    let response_s2 = wait_for_hard_hard_response_signal_number(&harness, 2).await;
+    // Input preparation and the actual second response share the original
+    // response window; the protocol-entry repair adds no S2 waiting budget.
+    let response_s2 = timeout(HARD_HARD_E2E_TIMEOUT, async {
+        trigger_retry_offer_with_current_candidates(&harness, &response_s1).await;
+        wait_for_hard_hard_response_signal_number(&harness, 2).await
+    })
+    .await
+    .expect("S2 candidate commit and explicit HH response must fit the original response window");
     timeout(Duration::from_secs(5), async {
         loop {
             if harness.udp_a.dynamic_socket_count().await == 1
@@ -3245,7 +3568,7 @@ async fn hard_hard_remote_candidate_epoch_fence_with_stun(stun: HarnessStunProfi
     set_hard_hard_test_now_ms(Some(now));
     let _clock = HardHardClockReset;
     let harness = build_two_peer_harness_with_stun(false, false, false, stun).await;
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     let response = wait_for_hard_hard_response_signal(&harness).await;
     let old_epoch = harness
         .peers_a
@@ -3354,7 +3677,7 @@ async fn hard_hard_two_peer_profile_generation_fences_old_session() {
     set_hard_hard_test_now_ms(Some(now));
     let _clock = HardHardClockReset;
     let harness = build_two_peer_harness(false, false, false).await;
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     let response = wait_for_hard_hard_response_signal(&harness).await;
     harness
         .peers_a
@@ -3385,7 +3708,7 @@ async fn hard_hard_two_peer_duplicate_and_stale_signals_do_not_reopen_session() 
     // binding one of the synthetic public targets directly.
     harness.link.set_drop_a_to_b(true);
     harness.link.set_drop_b_to_a(true);
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     let response = wait_for_hard_hard_response_signal(&harness).await;
     // The response signal is logged when it is admitted to the control lane,
     // while candidate-only work is applied by a separate newest-wins worker.
@@ -3523,7 +3846,7 @@ async fn hard_hard_two_peer_competing_primary_direct_supersedes_hard_hard() {
     set_hard_hard_test_now_ms(Some(now));
     let _clock = HardHardClockReset;
     let harness = build_two_peer_harness(false, true, false).await;
-    trigger_initial_offer(&harness).await;
+    trigger_hard_hard_protocol_attempt(&harness).await;
     let response = wait_for_hard_hard_response_signal(&harness).await;
     let punch_at_ms = response
         .punch_at_ms

@@ -25,6 +25,7 @@ fn sample_result() -> FreshMappingResult {
         first_punch_sent_at_ms: 1100,
         last_punch_sent_at_ms: 1120,
         measurement: crate::udp::HardHardMeasurementStats::default(),
+        ordinary_probe_summary: None,
     }
 }
 

@@ -54,15 +54,17 @@
 
 //! generation, the queue is flushed event-driven on RelayPeerConfirmed /
 
-//! DirectConfirmed, and all loss is structured-counted into the peer manager's
+//! DirectConfirmed. Loss decisions carry structured events. Aggregate drops
 
-//! `/status.stats.outbound_drops` (queue overflow, deadline expiry, peer
+//! in `/status.stats.outbound_drops` and detailed peer/generation attribution
 
-//! offline, generation change, session-queue loss) plus the observable
+//! are attempted within the report owner's deadline; unfinished accounting
 
-//! `outbound_send_failures` attempts map.
+//! is explicitly unknown. Transient attempts use `outbound_send_failures`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 
 use std::net::SocketAddr;
 
@@ -93,7 +95,10 @@ use crate::peer::{
 
 use crate::relay::RelayTransport;
 
-use crate::transport::{EncryptedPeerPacket, SessionBoundEncryption, WireGuardTransport};
+use crate::request_carriage::{
+    EncryptedRequestDelivery, RawOutboundReceiver, RawRequestDelivery, RequestEncryptionAttempt,
+};
+use crate::transport::{EncryptedPeerPacket, WireGuardTransport};
 
 use crate::udp::{
     DirectBusinessBudgetGate, DirectBusinessUdpSendError, PreparedDirectBusinessSend, UdpTransport,
@@ -184,8 +189,9 @@ pub(crate) async fn run_direct_first_deadline_loop(
 
 /// Bound a single path send so a stalled relay TCP write can never block the
 /// shared outbound worker (per-peer waits are already event-driven; this
-/// bounds the per-packet SEND).  The per-peer emit lock is held for at most
-/// this long, which also bounds how long a control probe can be locked out.
+/// bounds the physical operation). Preparation has its own bounded admission
+/// phase; the per-peer emit guard can span both phases. Once physical handoff
+/// starts, its timeout is terminal and never replays the same ciphertext.
 const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A packet that has reached a usable-path actor may not remain in retry
@@ -197,14 +203,16 @@ pub(crate) const OUTBOUND_DELIVERY_DEADLINE: Duration = Duration::from_secs(3);
 /// offline / generation-change cancellation, paced retries).
 pub(crate) const OUTBOUND_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Per-peer pending queue bounds.  A not-yet-usable peer cannot build
-/// unbounded memory pressure while it waits for a path.
+/// Bounds for each FIFO owner of a peer. The actor may hold live arrivals
+/// while the sole per-peer task owns the older batch, so two bounded batches
+/// can coexist. Completion merges them under these same limits; these are
+/// not a combined whole-peer or whole-pipeline resource ceiling.
 // A relay validation round can contain one 256-packet request burst and the
 // matching 256-packet echo burst.  The flush task owns part of the FIFO while
 // new TUN packets continue arriving, so the live ingress queue needs room for
 // the complete bidirectional burst without evicting its tail. Control and
 // handshake packets use a separate lane, so they consume none of this bound.
-// The independent 2 MiB cap prevents a peer from filling the limit with
+// The independent 2 MiB cap prevents one owner from filling the limit with
 // maximum-size IP packets.
 const MAX_PENDING_PACKETS_PER_PEER: usize = 512;
 
@@ -252,6 +260,8 @@ pub(crate) const REASON_DIRECT_DELIVERY_UNCERTAIN: &str = "direct_delivery_uncer
 
 pub(crate) const REASON_OUTBOUND_ENCRYPT_FAILED: &str = "outbound_encrypt_failed";
 
+pub(crate) const REASON_OUTBOUND_ADMISSION_TIMEOUT: &str = "outbound_pre_handoff_admission_timeout";
+
 pub(crate) const REASON_OUTBOUND_SESSION_NOT_READY: &str = "outbound_session_not_ready";
 
 pub(crate) const REASON_OUTBOUND_DELIVERY_DEADLINE: &str = "outbound_delivery_deadline_expired";
@@ -282,6 +292,8 @@ pub(crate) const REASON_DIRECT_BUDGET_REROUTE_EXHAUSTED: &str =
 pub(crate) const REASON_DIRECT_BUSINESS_MALFORMED: &str = "direct_business_malformed_ip";
 
 pub(crate) const REASON_IPV6_BUDGET_BELOW_MINIMUM_MTU: &str = "ipv6_budget_below_minimum_mtu";
+
+pub(crate) const REASON_ORIGINAL_ECHO_SOURCE_CONTENDED: &str = "original_echo_source_contended";
 
 /// Outcome of handing one business packet to the network.
 enum SendOutcome {
@@ -346,10 +358,6 @@ struct DirectBusinessSendPlan {
     prepared: PreparedDirectBusinessSend,
 }
 
-use fast_path::DirectFastPathEntry;
-
-use fast_path::FastPathEligibilityToken;
-
 use fast_path::FastPathAttempt;
 
 impl RetryableSendFailure {
@@ -378,32 +386,34 @@ use diagnostics::complete_inner_ip_packet_len;
 
 use fast_path::try_lan_direct_fast_path;
 
+#[cfg(test)]
 pub(crate) use queue::run_network_outbound;
+pub(crate) use queue::run_network_outbound_with_request_carriage;
 
 /// Outcome of encrypting and sending one RAW packet.
 enum EncryptSendOutcome {
     Sent,
     BudgetPending {
-        packet: OutboundPacket,
+        packet: RawRequestDelivery,
         reason: String,
     },
     Retryable {
-        packet: OutboundPacket,
+        packet: RawRequestDelivery,
         reason_code: &'static str,
         reason: String,
     },
     RetryableLocalBackpressure {
-        packet: OutboundPacket,
+        packet: RawRequestDelivery,
         reason: String,
     },
     Terminal {
-        packet: OutboundPacket,
+        packet: RawRequestDelivery,
         reason_code: &'static str,
         reason: String,
     },
 }
 
-use send::encrypt_then_send;
+use send::encrypt_then_send_with_deadline;
 
 use direct::direct_business_budget_ready_for_active_path;
 
@@ -417,12 +427,135 @@ use diagnostics::record_loss_event;
 use relay::send_via_relay;
 
 use direct::send_direct_if_selected;
+use direct::send_direct_if_selected_with_origin;
 mod diagnostics;
 mod direct;
 mod fast_path;
+mod physical_attempt;
 mod queue;
 mod relay;
 mod send;
+use physical_attempt::PhysicalAttempt;
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+pub(crate) use queue::echo_queue_test_support::OriginalEchoQueueForTest;
+
+/// Test entry into the original bounded sender, using genuine carriage input.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_original_for_test(
+    packet: RawRequestDelivery,
+    transport: &WireGuardTransport,
+    peers: &PeerManager,
+    generation: u64,
+    prefer_direct: bool,
+    udp: &RwLock<Option<UdpTransport>>,
+    relay: &RwLock<Option<RelayTransport>>,
+    relay_expected: bool,
+) -> bool {
+    let deadline = Instant::now() + OUTBOUND_SEND_TIMEOUT;
+    let send = async {
+        let mut packet = packet;
+        let mut fast_paths = HashMap::new();
+        let mut ineligible = HashMap::new();
+        loop {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            // Echo sources use the original guarded slow boundary. Ordinary
+            // LAN attempts retain only plaintext after a safe fast fallback.
+            if packet.original_echo().is_some() {
+                break;
+            }
+            // Only an unopened or proven not-handed original A may attempt
+            // again. A Full, uncertain or terminal publication ends dispatch.
+            if packet
+                .binding()
+                .and_then(|binding| binding.token().request())
+                .is_some_and(|request| {
+                    !matches!(request.physical_publication.state(),
+                    crate::overlay_requests::PhysicalPublicationState::Idle |
+                    crate::overlay_requests::PhysicalPublicationState::DefinitelyNotHanded)
+                })
+            {
+                return false;
+            }
+            packet = match fast_path::try_lan_direct_fast_path(
+                packet,
+                transport,
+                peers,
+                prefer_direct,
+                udp,
+                &mut fast_paths,
+                &mut ineligible,
+            ) {
+                fast_path::FastPathAttempt::Sent => return true,
+                fast_path::FastPathAttempt::Fallback(packet) => packet,
+                _ => return false,
+            };
+            if peers
+                .active_direct_path_snapshot(&packet.peer_id, generation, prefer_direct)
+                .await
+                .is_none()
+            {
+                break;
+            }
+            // A real current LAN does not turn a try-lock race into qualified
+            // slow Full. Retry the original fenced sender, never ciphertext.
+            tokio::task::yield_now().await;
+        }
+        matches!(
+            send::encrypt_then_send_with_deadline(
+                packet,
+                transport,
+                peers,
+                generation,
+                prefer_direct,
+                udp,
+                relay,
+                relay_expected,
+                Some(deadline),
+                None
+            )
+            .await,
+            EncryptSendOutcome::Sent
+        )
+    };
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), send)
+        .await
+        .unwrap_or(false)
+}
+
+/// The unmodified general sender; unmanaged Direct is intentionally Unknown.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_original_slow_for_test(
+    packet: RawRequestDelivery,
+    transport: &WireGuardTransport,
+    peers: &PeerManager,
+    generation: u64,
+    prefer_direct: bool,
+    udp: &RwLock<Option<UdpTransport>>,
+    relay: &RwLock<Option<RelayTransport>>,
+    relay_expected: bool,
+) -> bool {
+    matches!(
+        send::encrypt_then_send_with_deadline(
+            packet,
+            transport,
+            peers,
+            generation,
+            prefer_direct,
+            udp,
+            relay,
+            relay_expected,
+            Some(Instant::now() + OUTBOUND_SEND_TIMEOUT),
+            None,
+        )
+        .await,
+        EncryptSendOutcome::Sent
+    )
+}

@@ -18,3 +18,6 @@ include!("tests/limits.rs");
 include!("tests/guards.rs");
 include!("tests/lifecycle.rs");
 include!("tests/client_keepalive.rs");
+
+#[path = "tests/ipv6_endpoint.rs"]
+mod ipv6_endpoint;

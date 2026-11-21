@@ -98,26 +98,26 @@ static ssize_t real_sendto(int fd, const void *data, size_t length, int flags,
 #endif
 }
 
-static ssize_t wrapped_sendto(int fd, const void *data, size_t length, int flags,
-                              const struct sockaddr *destination, socklen_t destination_length) {
-    int saved_errno = errno;
-    if (!eligible(fd, destination, destination_length)) {
-        errno = saved_errno;
-        return real_sendto(fd, data, length, flags, destination, destination_length);
-    }
-    if (enabled < 0) { errno = EIO; return -1; }
-    if (length > MAX_PAYLOAD) { errno = EMSGSIZE; return -1; }
-    if (length && !data) { errno = EFAULT; return -1; }
-    unsigned char frame[65507];
+static ssize_t real_sendmsg(int fd, const struct msghdr *message, int flags) {
+#ifdef __APPLE__
+    return sendmsg(fd, message, flags);
+#else
+    if (!original_sendmsg) { errno = ENOSYS; return -1; }
+    return original_sendmsg(fd, message, flags);
+#endif
+}
+
+static void encode_header(unsigned char *header, const struct sockaddr *destination,
+                          size_t length) {
     const struct sockaddr_in *address = (const struct sockaddr_in *)destination;
-    memcpy(frame, "P2NAT001", 8);
-    memcpy(frame + 8, &address->sin_addr.s_addr, 4);
-    memcpy(frame + 12, &address->sin_port, 2);
+    memcpy(header, "P2NAT001", 8);
+    memcpy(header + 8, &address->sin_addr.s_addr, 4);
+    memcpy(header + 12, &address->sin_port, 2);
     uint16_t wire_length = htons((uint16_t)length);
-    memcpy(frame + 14, &wire_length, 2);
-    if (length) memcpy(frame + HEADER_SIZE, data, length);
-    ssize_t sent = real_sendto(fd, frame, length + HEADER_SIZE, flags,
-                               (const struct sockaddr *)&gateway, sizeof(gateway));
+    memcpy(header + 14, &wire_length, 2);
+}
+
+static ssize_t account_handoff(ssize_t sent, size_t length) {
     if (sent < 0) {
         if (stats) atomic_fetch_add_explicit(&stats->errors, 1, memory_order_relaxed);
         return sent;
@@ -130,30 +130,64 @@ static ssize_t wrapped_sendto(int fd, const void *data, size_t length, int flags
     return (ssize_t)length;
 }
 
+static ssize_t wrapped_sendto(int fd, const void *data, size_t length, int flags,
+                              const struct sockaddr *destination, socklen_t destination_length) {
+    int saved_errno = errno;
+    if (!eligible(fd, destination, destination_length)) {
+        errno = saved_errno;
+        return real_sendto(fd, data, length, flags, destination, destination_length);
+    }
+    if (enabled < 0) { errno = EIO; return -1; }
+    if (length > MAX_PAYLOAD) { errno = EMSGSIZE; return -1; }
+    if (length && !data) { errno = EFAULT; return -1; }
+    /* Keep packet-sized data off the caller's stack. The two buffers remain
+     * borrowed only during this synchronous original kernel handoff. */
+    unsigned char header[HEADER_SIZE];
+    encode_header(header, destination, length);
+    struct iovec parts[] = {{header, sizeof(header)}, {(void *)data, length}};
+    struct msghdr message = {0};
+    message.msg_name = &gateway;
+    message.msg_namelen = sizeof(gateway);
+    message.msg_iov = parts;
+    message.msg_iovlen = 2;
+    return account_handoff(real_sendmsg(fd, &message, flags), length);
+}
+
 static ssize_t wrapped_sendmsg(int fd, const struct msghdr *message, int flags) {
     int saved_errno = errno;
     if (!message || !eligible(fd, message->msg_name, message->msg_namelen)) {
         pthread_once(&initialize_once, initialize);
         errno = saved_errno;
-#ifdef __APPLE__
-        return sendmsg(fd, message, flags);
-#else
-        if (!original_sendmsg) { errno = ENOSYS; return -1; }
-        return original_sendmsg(fd, message, flags);
-#endif
+        return real_sendmsg(fd, message, flags);
     }
     /* Ancillary routing controls are not part of this loopback harness. */
     if (message->msg_controllen) { errno = EOPNOTSUPP; return -1; }
-    unsigned char payload[MAX_PAYLOAD];
+    if (message->msg_iovlen && !message->msg_iov) { errno = EFAULT; return -1; }
     size_t length = 0;
     for (size_t index = 0; index < (size_t)message->msg_iovlen; index++) {
         size_t count = message->msg_iov[index].iov_len;
         if (count > MAX_PAYLOAD - length) { errno = EMSGSIZE; return -1; }
         if (count && !message->msg_iov[index].iov_base) { errno = EFAULT; return -1; }
-        if (count) memcpy(payload + length, message->msg_iov[index].iov_base, count);
         length += count;
     }
-    return wrapped_sendto(fd, payload, length, flags, message->msg_name, message->msg_namelen);
+    if (enabled < 0) { errno = EIO; return -1; }
+    /* Flatten at most one UDP frame, preserving the old accepted iovec count
+     * without a packet-sized stack frame or a retained per-thread buffer. */
+    unsigned char *frame = malloc(HEADER_SIZE + length);
+    if (!frame) { errno = ENOMEM; return -1; }
+    encode_header(frame, message->msg_name, length);
+    size_t offset = HEADER_SIZE;
+    for (size_t index = 0; index < (size_t)message->msg_iovlen; index++) {
+        size_t count = message->msg_iov[index].iov_len;
+        if (count) memcpy(frame + offset, message->msg_iov[index].iov_base, count);
+        offset += count;
+    }
+    ssize_t sent = account_handoff(real_sendto(fd, frame, HEADER_SIZE + length, flags,
+                                  (const struct sockaddr *)&gateway, sizeof(gateway)), length);
+    int send_errno = errno;
+    free(frame);
+    errno = send_errno;
+    return sent;
 }
 
 #ifdef __APPLE__

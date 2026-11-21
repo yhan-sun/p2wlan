@@ -254,7 +254,12 @@ impl Daemon {
         let transport_token = expected_session_id.clone().or_else(|| session_id.clone());
         let replaced_existing_session = self
             .transport
-            .install_active_session_locked(from_node_id, transport_token, new_session)
+            .install_active_session_for_lifecycle_locked(
+                from_node_id,
+                transport_token,
+                new_session,
+                peer_session_generation,
+            )
             .await;
         if let Some(received_session_id) = session_id.clone() {
             let binding_token = expected_session_id

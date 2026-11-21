@@ -31,12 +31,16 @@
 
 pub mod acl;
 pub mod build_info;
+// Private, default-disabled registered RX evidence.
+#[allow(dead_code)]
+pub(crate) mod business_evidence;
 pub(crate) mod business_mtu;
 pub(crate) mod candidate_refresh;
 pub mod config;
 pub mod connection_timeline;
 pub mod control;
 pub mod dataplane;
+pub(crate) mod dataplane_resources;
 pub mod diagnostics;
 pub mod dns;
 pub(crate) mod dplpmtud;
@@ -45,12 +49,14 @@ pub mod gateway_mapping;
 pub mod incarnation;
 pub mod netenv;
 mod network_outbound;
+mod overlay_requests;
 pub(crate) mod path_commit;
 pub mod peer;
 pub mod port_mapping;
 pub mod relay;
 pub(crate) mod relay_probe;
 pub(crate) mod relay_runtime;
+mod request_carriage;
 pub mod rooms;
 pub mod route;
 pub mod tasks;
@@ -133,7 +139,11 @@ use diagnostics::{
 };
 use dns::DnsResolver;
 use gateway_mapping::{record_method_result, GatewayMappingDiagnostics, GatewayMappingRuntime};
-use network_outbound::{run_direct_first_deadline_loop, run_network_outbound, RelayStartupWait};
+#[cfg(test)]
+use network_outbound::run_network_outbound;
+use network_outbound::{
+    run_direct_first_deadline_loop, run_network_outbound_with_request_carriage, RelayStartupWait,
+};
 #[cfg(target_os = "android")]
 use p2pnet_tun::AndroidTunMode;
 use p2pnet_tun::{InterfaceConfig, Ipv4Packet, TunDevice, VirtualInterface};

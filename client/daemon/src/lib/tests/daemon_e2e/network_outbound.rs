@@ -2422,9 +2422,14 @@ async fn run_burst_confirmation_replay_test(count: usize) {
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        // This fixture checks counter/FIFO ordering immediately after Relay
+        // confirmation. The default DirectFirst window has separate tests;
+        // it must not race this fixture's five-second startup deadline.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     peers
         .add_peer(&control::PeerInfo {
             capabilities: crate::control::PeerCapabilities::default(),
@@ -2556,7 +2561,13 @@ async fn run_burst_confirmation_replay_test(count: usize) {
     for _ in 0..=count {
         let received = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
             .await
-            .expect("every frame must arrive within the timeout")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "every frame must arrive within the timeout: received {}/{}; {error:?}",
+                    counters.len(),
+                    count + 1
+                )
+            })
             .expect("channel open");
         let RelayMessage::Data { data, .. } = received else {
             panic!("unexpected relay frame");

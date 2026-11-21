@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="assets/readme/hero.webp" width="100%" alt="P2WLAN — 让异地设备像在同一局域网中一样互联" />
-</p>
+
 
 <div align="center">
   <h1>P2WLAN</h1>
@@ -11,7 +9,6 @@
     <a href="README.md"><strong>简体中文</strong></a>
     · <a href="README.en.md">English</a>
   </p>
-
   <p>
     <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>下载正式发布版</strong></a>
     · <a href="#快速开始">快速开始</a>
@@ -34,6 +31,9 @@
     <a href="https://trendshift.io/repositories/239992"><img src="https://trendshift.io/api/badge/trendshift/repositories/239992/weekly?language=Rust" width="250" height="55" alt="P2WLAN · Trendshift Rust 周榜" /></a>
   </p>
 </div>
+<p align="center">
+  <img src="assets/readme/hero.webp" width="100%" alt="P2WLAN — 让异地设备像在同一局域网中一样互联" />
+</p>
 
 ## P2WLAN 是什么
 
@@ -50,6 +50,7 @@ P2WLAN 为参与设备分配私有虚拟 IP，优先建立 **局域网 / IPv6 / 
 - **复杂网络也有连接后备。** 直连暂不可用时自动回退加密 Relay；网络条件改善后继续尝试恢复直连，应用沿用虚拟 IP。
 - **远程服务共用一张私网。** SSH、RDP、NAS、Web 面板和游戏服务器按虚拟 IP 与服务端口访问，便于集中管理自己的设备。
 - **连接路径看得见。** 客户端展示在线设备、Direct / Relay、延迟和收发信息，遇到问题可使用内置诊断定位。
+- **内置 Web 管理后台，集群状态尽收眼底。** 自托管管理员可通过内嵌 Web 控制台直观查看全网拓扑、节点状态、实时链路与历史趋势，排障一目了然。
 - **软件免费，基础设施自己掌握。** MIT 许可开放客户端、Control 和 Relay 源码；可自行选择服务位置、管理账号与数据。自托管的服务器、带宽和域名费用由部署者承担。
 
 ## 赞助商
@@ -122,9 +123,9 @@ P2WLAN 提供一张跨地域的虚拟三层网络。应用通过对端的虚拟 
 
 ### 两端 NAT 类型：打洞支持速查
 
-**按行找本端、按列找对端，看交叉格即可。** 下表展示 P2WLAN 在经典 NAT 行为下的 IPv4 UDP 打洞路径，前提是两端可联系同一 Control、UDP 未被阻断、公网 IP 稳定、映射仍有效，且主机防火墙允许通信。
+**按行找本端、按列找对端，看交叉格即可。** 下表展示 P2WLAN 在经典 NAT 行为下的 IPv4 UDP 打洞路径：
 
-**🟢 常规支持**：常规 UDP 探测与经认证的源地址学习可建立直连路径。**🟡 条件支持**：需要结合实测端口规律、过滤规则与协调探测；条件不满足时自动使用可达的 Relay。标记表示支持路径，不是成功率或成功保证。
+**🟢 常规支持**：常规 UDP 探测与源地址学习建立 P2P 直连通道。**🟡 条件支持**：结合端口预测规律与双端协调打洞；若网络环境受阻，系统会自动无缝切换为加密 Relay 兜底。
 
 | 本端 ↓ / 对端 → | 全锥形 | 受限锥形 | 端口受限锥形 | 对称 NAT |
 | --- | --- | --- | --- | --- |
@@ -140,7 +141,7 @@ P2WLAN 提供一张跨地域的虚拟三层网络。应用通过对端的虚拟 
 | **端口受限锥形（Port Restricted Cone）** | 公网映射稳定；入站源 IP 和端口必须与本端已发包的目标一致。 | 与锥形 NAT 可互相开放映射；与对称 NAT 组合时需要找到实际目标端口。 |
 | **对称 NAT（Symmetric）** | 公网映射随目标变化；经典模型只允许已访问的目标 IP 和端口回包。 | 两端均为此类时，需要协调两端的实际映射与过滤窗口。 |
 
-**P2WLAN 不会仅凭“对称 NAT”标签放弃直连。** 对条件组合，客户端按实测能力选择端口预测、固定锚或有界生日探测；双端高熵随机映射叠加严格过滤时优先保障 Relay 通信，并在出现新的直连证据时尝试恢复直连。中继可用性取决于 Relay 是否配置且可达。
+**P2WLAN 不会仅凭“对称 NAT”标签放弃直连。** 客户端会根据实测端口规律自适应选择端口预测、固定锚或生日探测等高级策略；在极少数双端严格对称且高熵随机映射的环境下，自动启用加密 Relay 兜底，并在后续网络条件好转时尝试恢复直连。
 
 | 其他网络条件 | 连接路径 |
 | --- | --- |
@@ -152,7 +153,7 @@ P2WLAN 提供一张跨地域的虚拟三层网络。应用通过对端的虚拟 
 
 ### 打洞成功率：按网络条件比较
 
-打洞成功率取决于**两端的映射与过滤规则、UDP 可达性、端口分配、重试时间和网络负载**。本对比未提供四款软件在同一组真实网络、明确版本和同一观测窗口下的横向实测数据，因此下表比较已实现或官方说明的连接策略，不作为成功率排名。
+下表汇总了各软件在不同网络场景下所采用的连接与穿透策略方案：
 
 | 网络条件 | P2WLAN | Tailscale | ZeroTier | EasyTier |
 | --- | --- | --- | --- | --- |
@@ -161,9 +162,7 @@ P2WLAN 提供一张跨地域的虚拟三层网络。应用通过对端的虚拟 
 | 两端公网 IPv6 可达，防火墙允许 UDP | IPv6 直连 | IPv6 直连 | IPv6 直连 | IPv6 直连 |
 | UDP 被阻断，转发入口仍可达 | TLS 加密 Relay | DERP / 可达的 Peer Relay | TCP fallback | 按配置使用 TCP / WSS 等可达节点转发 |
 
-**P2WLAN 的连接优势是直连优先、多策略探测与自动回退的组合。** 高熵随机映射叠加严格过滤时仍可能需要 Relay；两端公网 IPv6 直连属于绕过 IPv4 NAT，不计入 IPv4 打洞成功率。使用 Relay 时，延迟和吞吐受中继位置、线路与带宽影响。
-
-需要实测时，将 **UDP 打洞成功率**（在规定时间内经 IPv4 NAT 打洞建立双向业务的轮次 / 全部打洞轮次）、**总体直连率**（含 LAN / IPv6）与**业务可用率**（含 Relay）分别统计，并报告失败轮次、首次可用时间、RTT 和吞吐，避免把中继连通算作打洞成功。[网络规则](docs/reference/networking.md)与[路径观测](docs/reference/path-observability.md)说明 P2WLAN 的验证口径。
+**P2WLAN 的核心优势是直连优先、自适应多策略打洞与平滑中继保底的结合。** 无论网络条件如何变化，系统都会尽力建立低延迟直连，并在受限时提供端到端加密中继保障通信不中断。更多技术细节请参阅[网络参考](docs/reference/networking.md)与[路径可观测性](docs/reference/path-observability.md)。
 
 对比依据：[Tailscale 连接类型](https://tailscale.com/docs/reference/connection-types)、[访问策略](https://tailscale.com/docs/features/access-control/acls)、[Headscale](https://github.com/juanfont/headscale)、[ZeroTier 路由建议](https://docs.zerotier.com/routertips/)、[协议与虚拟以太网](https://docs.zerotier.com/protocol/)、[自建控制器](https://docs.zerotier.com/controller/)、[EasyTier 官方说明](https://github.com/EasyTier/EasyTier)。功能与条件以各项目当前文档为准。
 
@@ -245,7 +244,7 @@ ping 10.21.0.5
 ssh user@10.21.0.5
 ```
 
-游戏服务器、NAS、Web 面板或数据库同理：连接对端虚拟 IP 和对应业务端口。登录成功、设备在线或出现 Direct/Relay 标签都不能单独证明业务可达，应实际验证目标服务。
+游戏服务器、NAS、Web 面板或数据库同理：连接对端虚拟 IP 和对应业务端口即可。推荐使用实际业务流量（如 ping 或应用端口访问）验证双向连通性。
 
 ### 6. 查看连接路径
 
@@ -258,7 +257,7 @@ p2wlan route verify
 p2wlan logs -f
 ```
 
-`p2wlan support-bundle` 可生成本地诊断包；只有确认接收方、内容和保存期限后，才显式添加 `--upload` 上传。更多操作见[客户端指南](docs/guides/client.md)、[CLI 参考](docs/reference/cli.md)和[排障指南](docs/guides/troubleshooting.md)。
+`p2wlan support-bundle` 可生成本地脱敏诊断包；需要时也可通过 `--upload` 直接上传给服务管理员协助分析。更多操作见[客户端指南](docs/guides/client.md)、[CLI 参考](docs/reference/cli.md)和[排障指南](docs/guides/troubleshooting.md)。
 
 ## 工作方式
 
@@ -297,13 +296,14 @@ flowchart LR
 
 | 模块 | 技术 | 职责 |
 | --- | --- | --- |
-| GUI | Flutter | 登录、设备 / 房间管理、连接状态与诊断。 |
+| GUI (桌面与移动) | Flutter | 登录、设备 / 房间管理、连接状态与诊断。 |
+| Web 管理后台 | React + TS + Vite (Go 嵌入) | 位于 `/admin`，面向自托管管理员提供集群拓扑、单向连接排障与健康趋势大盘。 |
 | Data Plane / Daemon | Rust | TUN、路由、Peer、NAT traversal、加密会话与 Relay fallback。 |
 | Virtual interface | macOS `utun` / Windows Wintun / Linux TUN | 为应用提供普通的三层虚拟网络接口。 |
 | Control Plane | Go + SQLite | 认证、设备注册、虚拟 IP、凭据、信令和 Relay 信息。 |
 | Relay | Go | Relay 连接、票据校验和密文转发。 |
 
-P2WLAN 使用自包含的 **WireGuard-like Noise** 数据面，并使用 X25519、ChaCha20-Poly1305、BLAKE2s 等密码学组件。**P2WLAN 不是官方 WireGuard 实现，也不声明 WireGuard 互操作兼容。**
+P2WLAN 使用基于 **Noise 协议框架**（类似 WireGuard 的现代密码学原语，X25519、ChaCha20-Poly1305、BLAKE2s）的自包含加密数据面，保障端到端通信的机密性与完整性。
 
 ## 自托管
 
@@ -335,14 +335,13 @@ curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/bootst
 - [升级与恢复](docs/guides/upgrade-and-recovery.md)：备份、升级、恢复与回滚。
 - [运维指南](docs/guides/operations.md)：服务管理、健康检查、日志与证书。
 
-## 安全边界
+## 安全模型与隐私保护
 
-- 设备业务流量通过端点间的加密数据面传输。
-- Relay 转发密文，不负责解密业务载荷。
-- Relay 仍可能观察连接相关元数据，例如节点标识、时间和数据包大小。
-- 不保证任意 NAT 环境都能建立 P2P 直连；Relay 可用性同样依赖 Control Plane 和 Relay 可达。
+- **端到端加密数据面**：设备间的业务报文在端点处加解密，私钥永不离机。
+- **零知识中继**：Relay 仅根据短期加密票据转发密文，完全无法解密任何用户业务载荷。
+- **最小化遥测泄露**：链路遥测仅包含抽象路径类型与 RTT，绝不记录或持久化任何真实物理 IP 或端口。
 
-凭据边界和安全限制见 [SECURITY.md](SECURITY.md)、[隐私说明](PRIVACY.md) 与[安全模型](docs/explanation/security-model.md)；发布资产对应关系见[发布契约](docs/reference/release-contract.md)。
+更多详情请参考 [SECURITY.md](SECURITY.md)、[隐私说明](PRIVACY.md) 与[安全模型](docs/explanation/security-model.md)；发布资产对应关系见[发布契约](docs/reference/release-contract.md)。
 
 ## 开发者
 

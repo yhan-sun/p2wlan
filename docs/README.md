@@ -13,6 +13,7 @@
 - [排障指南](guides/troubleshooting.md)：常见网络问题、连接状态排查与诊断支持包导出。
 - [升级与恢复](guides/upgrade-and-recovery.md)：服务端平滑升级、数据库一致性备份与灾难恢复。
 - [OpenWrt 路由器指南](guides/openwrt.md)：在 OpenWrt 路由器上部署 P2WLAN 原生节点。
+- [Minecraft 交互采证工具](guides/minecraft-evidence.md)：面向 Minecraft 联机场景的自动化协议交互与验证工具。
 
 ### 技术参考
 - [配置参考](reference/configuration.md)：Control、Relay 与客户端的全部配置选项及说明。

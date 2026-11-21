@@ -78,6 +78,8 @@ impl UdpTransport {
         peers.register_dplpmtud_runtime(dplpmtud.clone()).await;
 
         Ok(Self {
+            resource_capture: None,
+            rx_business_capture: None,
             transport_instance_id: NEXT_UDP_TRANSPORT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             socket: primary_socket,
             sockets: Arc::new(Vec::new()),
@@ -131,6 +133,10 @@ impl UdpTransport {
             #[cfg(test)]
             probe_send_failure_hook_enabled: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
+            probe_burst_capture_for_test: None,
+            #[cfg(test)]
+            fresh_mapping_generation_gate: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
             remote_incarnation_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             direct_business_send_gate: Arc::new(std::sync::Mutex::new(None)),
@@ -151,6 +157,42 @@ impl UdpTransport {
             dplpmtud_local_virtual_ip: None,
             learning_cache: Arc::new(Mutex::new(LearningCache::new())),
         })
+    }
+
+    /// Aggregate diagnostics are optional and never grant send permission.
+    #[allow(dead_code)]
+    pub(crate) fn with_resource_capture(
+        mut self,
+        capture: Arc<crate::dataplane_resources::ResourceCapture>,
+    ) -> std::result::Result<Self, crate::dataplane_resources::EnableError> {
+        if self.resource_capture.is_some() {
+            return Err(crate::dataplane_resources::EnableError::AlreadyEnabled);
+        }
+        if capture.is_finished() {
+            return Err(crate::dataplane_resources::EnableError::CaptureFinished);
+        }
+        self.resource_capture = Some(capture);
+        Ok(self)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resource_capture(
+        &self,
+    ) -> Option<&Arc<crate::dataplane_resources::ResourceCapture>> {
+        self.resource_capture.as_ref()
+    }
+
+    /// Opt in before cloning/spawning; observations never gate delivery.
+    #[allow(dead_code)]
+    pub(crate) fn with_rx_business_capture(
+        mut self,
+        capture: Arc<crate::business_evidence::CaptureOwner>,
+    ) -> std::result::Result<Self, crate::business_evidence::EnableError> {
+        if self.rx_business_capture.is_some() {
+            return Err(crate::business_evidence::EnableError::AlreadyEnabled);
+        }
+        self.rx_business_capture = Some(capture);
+        Ok(self)
     }
 
     /// Interface currently enforced for public UDP egress, if any.
@@ -231,6 +273,43 @@ impl UdpTransport {
             hook: self.probe_send_failure_hook.clone(),
             enabled: self.probe_send_failure_hook_enabled.clone(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_fresh_mapping_gate_for_test(
+        &self,
+        stage: FreshMappingGateStage,
+        peer_id: &str,
+    ) -> (
+        FreshMappingGateGuard,
+        oneshot::Receiver<FreshMappingGateContext>,
+    ) {
+        let (arrived_tx, arrived_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let gate = Arc::new(FreshMappingGenerationGate {
+            stage,
+            peer_id: peer_id.to_owned(),
+            arrived_tx: StdMutex::new(Some(arrived_tx)),
+            release_rx: StdMutex::new(Some(release_rx)),
+        });
+        let mut slot = self
+            .fresh_mapping_generation_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            slot.is_none(),
+            "one lifecycle gate may be armed per transport"
+        );
+        *slot = Some(gate.clone());
+        drop(slot);
+        (
+            FreshMappingGateGuard {
+                slot: self.fresh_mapping_generation_gate.clone(),
+                gate,
+                release_tx: Some(release_tx),
+            },
+            arrived_rx,
+        )
     }
 
     /// Add up to `count - 1` ephemeral sockets for an explicitly enabled

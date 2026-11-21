@@ -573,6 +573,11 @@ fn websocket_tcp_target(url: &str) -> std::result::Result<(String, u16), String>
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| "WebSocket URL has no port".to_string())?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .filter(|host| host.parse::<std::net::Ipv6Addr>().is_ok())
+        .unwrap_or(host);
     Ok((host.to_string(), port))
 }
 
@@ -653,6 +658,30 @@ mod route_tests {
         assert!(websocket_host_is_local("127.0.0.1"));
         assert!(websocket_host_is_local("[::1]"));
         assert!(!websocket_host_is_local("control.example.com"));
+    }
+
+    #[test]
+    fn ipv6_websocket_authority_yields_an_unbracketed_tcp_host() {
+        // URL authority keeps brackets; the original tuple resolver expects
+        // a naked IP literal. This controls representation, not WS auth.
+        let (host, port) = websocket_tcp_target("wss://[::1]:8443/api/signaling").unwrap();
+        assert_eq!(
+            host, "::1",
+            "original IPv6 WS target must use a literal TCP host"
+        );
+        assert_eq!(port, 8443);
+        for (url, expected_host, expected_port) in [
+            ("wss://127.0.0.1/api/signaling", "127.0.0.1", 443),
+            (
+                "ws://control.example.com/api/signaling",
+                "control.example.com",
+                80,
+            ),
+        ] {
+            let (host, port) = websocket_tcp_target(url).unwrap();
+            assert_eq!(host, expected_host);
+            assert_eq!(port, expected_port);
+        }
     }
 
     #[test]

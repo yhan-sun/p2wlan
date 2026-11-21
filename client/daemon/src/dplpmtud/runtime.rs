@@ -176,6 +176,18 @@ pub(crate) struct DirectBusinessSendToken {
     pub(crate) udp_publication_owner: u64,
 }
 
+/// A borrowed original gate, never a transferable current-owner verdict.
+#[must_use]
+pub(crate) struct DirectBusinessPublicationGuard<'a> {
+    runtime: &'a DplpmtudRuntime,
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+impl DirectBusinessPublicationGuard<'_> {
+    pub(crate) fn matches_original_token(&self, token: &DirectBusinessSendToken) -> bool {
+        self.runtime.original_business_token_matches(token)
+    }
+}
+
 struct RuntimeEntry {
     machine: DplpmtudStateMachine,
     budget_revision: Option<u64>,
@@ -1090,6 +1102,20 @@ impl DplpmtudRuntime {
         operation()
     }
 
+    /// Fast-path admission must not wait behind another publication/send.
+    /// Poison recovery matches the authoritative blocking gate above.
+    pub(crate) fn try_with_business_publication_gate<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let _guard = match self.business_publication_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        Some(operation())
+    }
+
     /// Final budget linearization point. If this returns `Some`, the token was
     /// current for the entire synchronous operation (normally one
     /// `UdpSocket::try_send_to` syscall). A revocation that wins the gate makes
@@ -1100,23 +1126,38 @@ impl DplpmtudRuntime {
         operation: impl FnOnce() -> R,
     ) -> Option<R> {
         self.with_business_publication_gate(|| {
-            let publications = self.business_publications.borrow();
-            let entry = publications.get(&token.path_identity.peer_id)?;
-            if !entry.enforced
-                || entry.update.path_identity != token.path_identity
-                || entry.update.budget_revision != token.budget_revision
-            {
-                return None;
-            }
-            let publication = entry.update.budget.as_ref()?;
-            if publication.path_identity != token.path_identity
-                || publication.budget_revision != token.budget_revision
-                || publication.udp_datagram_size != token.max_udp_datagram_size
-                || publication.overlay_payload_budget != token.max_overlay_payload_size
-            {
-                return None;
-            }
-            Some(operation())
+            self.original_business_token_matches(token).then(operation)
+        })
+    }
+
+    fn original_business_token_matches(&self, token: &DirectBusinessSendToken) -> bool {
+        let publications = self.business_publications.borrow();
+        let Some(entry) = publications.get(&token.path_identity.peer_id) else {
+            return false;
+        };
+        entry.enforced
+            && entry.update.path_identity == token.path_identity
+            && entry.update.budget_revision == token.budget_revision
+            && entry.update.budget.as_ref().is_some_and(|publication| {
+                publication.path_identity == token.path_identity
+                    && publication.budget_revision == token.budget_revision
+                    && publication.udp_datagram_size == token.max_udp_datagram_size
+                    && publication.overlay_payload_budget == token.max_overlay_payload_size
+            })
+    }
+
+    /// Borrow the original publication gate without waiting or creating a mirror.
+    pub(crate) fn try_original_business_publication_guard(
+        &self,
+    ) -> Option<DirectBusinessPublicationGuard<'_>> {
+        let guard = match self.business_publication_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        Some(DirectBusinessPublicationGuard {
+            runtime: self,
+            _guard: guard,
         })
     }
 

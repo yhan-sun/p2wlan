@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Iterable, Mapping, Sequence
 
@@ -238,7 +238,7 @@ class GitHubClient:
         self.token = token
         self.api = api.rstrip("/")
         self.retries = retries
-        self._job_cache: dict[int, tuple[JobResult, ...]] = {}
+        self._job_cache: dict[tuple[int, int], tuple[JobResult, ...]] = {}
 
     def _paginate(self, path: str, key: str, params: Mapping[str, str]) -> list[dict]:
         items: list[dict] = []
@@ -282,30 +282,47 @@ class GitHubClient:
             if page > MAX_PAGES:
                 raise GateRequestError(f"GET {path} did not finish paginating within {MAX_PAGES} pages")
 
-    def jobs(self, run_id: int, *, final: bool) -> tuple[JobResult, ...]:
+    def jobs(self, run_id: int, *, final: bool, run_attempt: int = 1) -> tuple[JobResult, ...]:
         # A job list is only stable once the run is completed: caching the jobs
         # of an in-flight run freezes the "job not published yet" state and
         # later reports a finished run as missing that gate.
-        if final and run_id in self._job_cache:
-            return self._job_cache[run_id]
-        raw = self._paginate(f"/repos/{self.repo}/actions/runs/{run_id}/jobs", "jobs", {})
+        key = (run_id, run_attempt)
+        if final and key in self._job_cache:
+            return self._job_cache[key]
+        raw = self._paginate(
+            f"/repos/{self.repo}/actions/runs/{run_id}/attempts/{run_attempt}/jobs", "jobs", {}
+        )
         parsed: list[JobResult] = []
         for job in raw:
+            if not isinstance(job, dict):
+                raise GateRequestError(f"run {run_id} returned a non-object job")
             name = job.get("name")
             status = job.get("status")
             if not isinstance(name, str) or not isinstance(status, str):
                 raise GateRequestError(f"run {run_id} returned a job without name/status")
-            parsed.append(JobResult(name=name, status=status, conclusion=job.get("conclusion")))
-        if final:
-            self._job_cache[run_id] = tuple(parsed)
+            conclusion = job.get("conclusion")
+            if conclusion is not None and not isinstance(conclusion, str):
+                raise GateRequestError(f"run {run_id} returned an invalid job conclusion")
+            parsed.append(JobResult(name=name, status=status, conclusion=conclusion))
+        # A completed run's API snapshot may still expose unfinished jobs.
+        # Retain no pending/empty result as a completed attempt's authority.
+        if final and parsed and all(
+            job.status == "completed" and job.conclusion is not None for job in parsed
+        ):
+            self._job_cache[key] = tuple(parsed)
         return tuple(parsed)
 
-    def runs_for(self, head_sha: str) -> list[WorkflowRun]:
+    def runs_for(
+        self, head_sha: str, *, required_workflows: Iterable[str] | None = None
+    ) -> list[WorkflowRun]:
+        wanted = None if required_workflows is None else frozenset(required_workflows)
         raw = self._paginate(
             f"/repos/{self.repo}/actions/runs", "workflow_runs", {"head_sha": head_sha}
         )
         runs: list[WorkflowRun] = []
         for run in raw:
+            if not isinstance(run, dict):
+                raise GateRequestError("runs query returned a non-object run")
             if run.get("head_sha") != head_sha:
                 # The head_sha filter is authoritative; anything else means the
                 # response cannot be trusted for this commit.
@@ -313,13 +330,27 @@ class GitHubClient:
                     f"runs query for {head_sha} returned head_sha={run.get('head_sha')!r}"
                 )
             try:
-                run_id = int(run["id"])
+                run_id = run["id"]
                 workflow_name = run["name"]
                 event = run["event"]
                 status = run["status"]
                 created_at = run["created_at"]
+                run_attempt = run["run_attempt"]
             except (KeyError, TypeError, ValueError) as error:
                 raise GateRequestError(f"run entry is missing a required field: {error}") from error
+            if (
+                type(run_id) is not int or run_id <= 0
+                or type(run_attempt) is not int or run_attempt <= 0
+            ):
+                raise GateRequestError("run entry has no positive integer id/attempt")
+            if not all(
+                isinstance(value, str) and value
+                for value in (workflow_name, event, status, created_at)
+            ):
+                raise GateRequestError("run entry has invalid workflow/event/status/created_at metadata")
+            conclusion = run.get("conclusion")
+            if conclusion is not None and not isinstance(conclusion, str):
+                raise GateRequestError("run entry has invalid conclusion metadata")
             runs.append(
                 WorkflowRun(
                     run_id=run_id,
@@ -327,13 +358,20 @@ class GitHubClient:
                     event=event,
                     head_sha=head_sha,
                     status=status,
-                    conclusion=run.get("conclusion"),
-                    run_attempt=int(run.get("run_attempt") or 1),
+                    conclusion=conclusion,
+                    run_attempt=run_attempt,
                     created_at=created_at,
-                    jobs=self.jobs(run_id, final=status == "completed"),
                 )
             )
-        return runs
+        # Validate every head-filtered metadata page before omitting unrelated
+        # jobs. Compatibility callers without a scope still read all jobs.
+        return [
+            replace(run, jobs=self.jobs(
+                run.run_id, final=run.status == "completed", run_attempt=run.run_attempt
+            ))
+            if wanted is None or run.workflow_name in wanted else run
+            for run in runs
+        ]
 
 
 def _client() -> GitHubClient:
@@ -367,6 +405,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    required_workflows = frozenset(GATE_WORKFLOWS[name] for name in args.require)
 
     try:
         client = _client()
@@ -378,7 +417,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     last_line = ""
     while True:
         try:
-            runs = client.runs_for(args.sha)
+            runs = client.runs_for(args.sha, required_workflows=required_workflows)
             findings = evaluate(args.require, runs, head_sha=args.sha)
         except GateRequestError as error:
             # A query that cannot be completed is an API error, not a pass.

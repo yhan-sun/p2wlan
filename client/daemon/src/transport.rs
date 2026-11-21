@@ -40,6 +40,8 @@ use crate::peer::{PeerManager, PeerSessionGeneration, PendingProbeBindingCommitO
 
 use crate::relay::RelayTransport;
 
+pub(crate) use inbound::OverlayIngressDelivery;
+
 pub(crate) use wire::wire_fingerprint;
 
 pub(crate) use wire::wire_counter;
@@ -146,7 +148,7 @@ pub enum ResponderSessionConfirmation {
 
 struct PendingOutboundPacket {
     queued_at: Instant,
-    packet: OutboundPacket,
+    packet: crate::request_carriage::RawRequestDelivery,
 }
 
 #[derive(Clone)]
@@ -245,13 +247,17 @@ impl SessionUnavailableReason {
 /// Result of an encryption attempt that is bound to one cached session
 /// instance. Returning the plaintext on a stale-session miss avoids a
 /// per-packet clone on the successful LAN fast path while preserving the
-/// existing slow-path FIFO fallback.
+/// existing slow-path FIFO fallback. Successful encryption also retains that
+/// same plaintext until an exact nonblocking syscall has accepted the datagram;
+/// a known not-sent result abandons the counter and re-enters the plaintext FIFO.
 pub(crate) enum SessionBoundEncryption {
     Encrypted {
         packet: EncryptedPeerPacket,
+        plaintext: OutboundPacket,
         session_lock_wait_us: u64,
         crypto_us: u64,
     },
+    Contended(OutboundPacket),
     Unavailable {
         packet: OutboundPacket,
         reason: SessionUnavailableReason,
@@ -316,9 +322,16 @@ pub struct ReceivedEncryptedPacket {
     pub(crate) transport_queue_send_started: Option<Instant>,
     /// Serialized WireGuard transport message.
     pub wire_bytes: Vec<u8>,
+    /// Opt-in historical reader carrier; None allocates no metadata.
+    pub(crate) physical_ingress: Option<Arc<crate::business_evidence::PhysicalIngressContext>>,
+    /// Original concrete Relay reader identity, never a current-owner grant.
+    /// Cloning this immutable fact retains only a Weak reference to its client.
+    pub(crate) original_relay_read: Option<p2pnet_relay::OriginalRelayFrameRead>,
+    /// Exact original UDP reader; Weak provenance, not current-owner authority.
+    pub(crate) original_udp_read: Option<crate::udp::OriginalUdpIngressSource>,
 }
 
-// The socket handle is an in-process lifetime guard, not packet identity.
+// Socket handles and historical reader facts are not packet identity.
 // Keep equality useful for transport tests without treating two envelopes
 // that carry the same wire bytes differently merely because one was queued
 // by a dynamic UDP reader.
@@ -332,6 +345,7 @@ impl PartialEq for ReceivedEncryptedPacket {
             && self.socket_index == other.socket_index
             && self.udp_transport_owner == other.udp_transport_owner
             && self.network_generation == other.network_generation
+            && self.physical_ingress == other.physical_ingress
             && self.wire_bytes == other.wire_bytes
     }
 }
@@ -377,7 +391,7 @@ pub(crate) struct InboundEvidenceFeed {
     /// feed below. A decrypted non-control packet is therefore recorded as
     /// first-usable evidence on the normal production path too.
     pub(crate) timeline: Option<Arc<crate::connection_timeline::ConnectionTimeline>>,
-    pub(crate) overlay_ingress_tx: Option<mpsc::Sender<OverlayIngressEvent>>,
+    pub(crate) overlay_ingress_tx: Option<mpsc::Sender<OverlayIngressDelivery>>,
 }
 
 struct RelayProbeIngress<'a> {
@@ -398,6 +412,83 @@ struct PathCommitIngress<'a> {
     relay_endpoint: &'a str,
     relay_connection_id: Option<u64>,
     token: crate::path_commit::PathCommitToken,
+}
+
+/// The successful original key's role, before any subsequent promotion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OriginalSessionRole {
+    Active,
+    Pending,
+    Previous,
+}
+
+/// Immutable identity of the exact receive key which authenticated a packet.
+/// This is provenance, not a transferable current-owner or business-credit guard.
+#[derive(Clone)]
+#[allow(dead_code)] // S1 captures provenance; S2/S3 will carry and fence it.
+pub(crate) struct OriginalSessionSource {
+    owner: Weak<Mutex<HashMap<String, PeerTransportSessions>>>,
+    peer_id: String,
+    session_instance: u64,
+    original_role: OriginalSessionRole,
+    authorized_peer_lifecycle: Option<PeerSessionGeneration>,
+    authenticated_at: Instant,
+}
+
+#[allow(dead_code)]
+impl OriginalSessionSource {
+    pub(crate) fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+
+    pub(crate) fn session_instance(&self) -> u64 {
+        self.session_instance
+    }
+
+    pub(crate) fn is_previous_session(&self) -> bool {
+        self.original_role == OriginalSessionRole::Previous
+    }
+
+    pub(crate) fn original_role(&self) -> OriginalSessionRole {
+        self.original_role
+    }
+
+    pub(crate) fn authorized_peer_lifecycle(&self) -> Option<PeerSessionGeneration> {
+        self.authorized_peer_lifecycle
+    }
+
+    pub(crate) fn authenticated_at(&self) -> Instant {
+        self.authenticated_at
+    }
+
+    pub(crate) fn belongs_to(&self, transport: &WireGuardTransport) -> bool {
+        Weak::ptr_eq(&self.owner, &Arc::downgrade(&transport.sessions))
+    }
+}
+
+pub(crate) struct DecryptedInboundWithSource {
+    pub(crate) packet: InboundPacket,
+    pub(crate) source: OriginalSessionSource,
+}
+
+impl WireGuardTransport {
+    // Called only under the successful key's sessions guard, before any await.
+    fn original_session_source(
+        &self,
+        peer_id: &str,
+        session_instance: u64,
+        original_role: OriginalSessionRole,
+        authorized_peer_lifecycle: Option<PeerSessionGeneration>,
+    ) -> OriginalSessionSource {
+        OriginalSessionSource {
+            owner: Arc::downgrade(&self.sessions),
+            peer_id: peer_id.to_string(),
+            session_instance,
+            original_role,
+            authorized_peer_lifecycle,
+            authenticated_at: Instant::now(),
+        }
+    }
 }
 
 enum CurrentSessionEvidenceGuardOutcome {
@@ -455,6 +546,19 @@ impl InboundUdpTransport {
 /// Encrypts routed TUN packets with peer WireGuard sessions.
 #[derive(Clone)]
 pub struct WireGuardTransport {
+    #[cfg(test)]
+    previous_overlay_observer: Arc<std::sync::Mutex<Option<mpsc::Sender<OverlayIngressDelivery>>>>,
+    resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
+    #[cfg(test)]
+    resource_queue_gate: Option<Arc<ResourceQueueTestGate>>,
+    #[cfg(test)]
+    request_handoff_probe:
+        Option<Arc<crate::request_carriage::test_probe::RequestHandoffArgumentProbe>>,
+    /// Default-disabled evidence owner; never session/path authority.
+    #[allow(dead_code)]
+    rx_business_capture: Option<Arc<crate::business_evidence::CaptureOwner>>,
+    #[allow(dead_code)]
+    wg_evidence_owner: crate::business_evidence::WgEvidenceOwnerId,
     sessions: Arc<Mutex<HashMap<String, PeerTransportSessions>>>,
     /// Monotonic local identity for every installed transport session. This
     /// is not exposed on the wire and is never used as a WireGuard counter.
@@ -477,7 +581,7 @@ pub struct WireGuardTransport {
     /// send.  Parking plaintext while a path is unavailable means a queued
     /// business packet can never hold the emit lock, occupy a counter, or be
     /// overtaken on the wire by a higher-counter control packet.
-    outbound_tx: mpsc::Sender<OutboundPacket>,
+    outbound_tx: crate::request_carriage::RawOutboundSink,
     /// Shared structural outbound-loss counters (terminal drops + send
     /// failures), wired by the daemon to the peer manager's map so `/status`
     /// reports the transport-level session queue loss together with the
@@ -541,7 +645,27 @@ mod accounting;
 mod direct_validation;
 mod dplpmtud;
 mod inbound;
+pub(crate) use inbound::OriginalOverlayIngressSource;
 mod relay_control;
+#[cfg(test)]
+mod resource_queue_test_gate;
 mod sessions;
+#[cfg(test)]
+pub(crate) use resource_queue_test_gate::ResourceQueueTestGate;
+#[cfg(test)]
+pub(crate) use resource_queue_test_gate::{WorkerLossObservation, WorkerLossPoint};
+#[allow(unused_imports)] // Compatibility result types may be unused by a build.
+pub(crate) use sessions::{
+    EncryptedOutboundWithSource, OriginalEchoSessionGuard, OriginalEncryptionSource,
+    OriginalOverlaySessionFailure, OriginalOverlaySessionGuard, SessionBoundEncryptionWithSource,
+};
 mod wire;
 use sessions::PeerTransportSessions;
+#[allow(unused_imports)] // Opaque rollback API is available for future qualified callers.
+pub(crate) use sessions::{
+    SessionRollback, SessionRollbackIdentityMismatch, SessionRollbackRejection,
+};
+
+#[cfg(test)]
+#[path = "transport/tests/actor_shutdown_test_support.rs"]
+pub(crate) mod actor_shutdown_test_support;

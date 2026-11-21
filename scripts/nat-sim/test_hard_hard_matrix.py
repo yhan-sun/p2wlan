@@ -753,6 +753,194 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
         self.assertFalse(output.exists())
 
 
+class HardHardAttemptSchemaCompatibilityTests(unittest.TestCase):
+    """Schema-2 compatibility controls; Rust owns failure-class selection."""
+
+    def report(self, failure_class: str, terminal_reason: str = "no_authenticated_direct_confirmation"):
+        scenario = MATRIX_RUNNER.SCENARIO_BY_NAME["equal-step"]
+        return {
+            "schema_version": 2,
+            "source_git_commit": SOURCE_SHA,
+            "baseline_git_commit": BASELINE_SHA,
+            "scenario_id": scenario.name,
+            "seed": scenario.seed,
+            "build_id": "test-build",
+            "role": "initiator",
+            "mode": "predictable",
+            "session_tag": "0123456789abcdef",
+            "plan_tag": "fedcba9876543210",
+            "network_generation": 1,
+            "peer_session_generation": 2,
+            "remote_candidate_epoch": 3,
+            "local_profile_generation": 4,
+            "remote_profile_generation": 5,
+            "punch_generation": 6,
+            "socket_index": 4096,
+            "attempt": 1,
+            "candidate_cap": 32,
+            "counts": {
+                "requested": 2, "generated": 2, "unique": 1, "advertised": 1,
+                "parsed_targets_for_plan": 1, "planned_targets": 1, "planned_sockets": 1,
+                "planned_socket_target_combinations": 1,
+                "planned_logical_probes": 2, "planned_physical_datagram_cap": 4,
+                "attempted_targets": 1, "logical_probes_attempted": 1,
+                "logical_probes_sent": 1, "send_success_datagrams": 2,
+                "send_success_bytes": 120, "send_errors": 0, "send_error_bytes": 0,
+                "budget_skipped": 0, "planned_logical_probes_not_attempted": 1,
+                "stun_send_success_datagrams": 3, "stun_send_success_bytes": 60,
+                "stun_send_errors": 0, "stun_send_error_bytes": 0, "stun_responses": 3,
+                "candidate_signal_payload_logic_bytes": 48,
+            },
+            "timeline": {
+                "planned_send_at_ms": 3500, "actual_first_send_at_ms": 3502,
+                "schedule_deviation_ms": 2,
+                "encrypted_validation_completed_at_ms": None,
+                "last_probe_hit_to_validation_ms": None,
+            },
+            "target_order_tags": ["fedcba9876543210"],
+            "confirmed_target_rank": None,
+            "direct_confirmed": False,
+            "failure_class": failure_class,
+            "terminal_reason": terminal_reason,
+        }
+
+    def validate(self, report):
+        scenario = MATRIX_RUNNER.SCENARIO_BY_NAME["equal-step"]
+        return MATRIX_RUNNER.validate_attempt(
+            report, "a", scenario, scenario.seed, SOURCE_SHA, BASELINE_SHA,
+            {"path": "unknown"}, None, None, "not_attributable:attempt_identity_missing",
+        )
+
+    def aggregate(self, attempts, *, incomplete=False, extra_rounds=None):
+        record = {
+            "result": "invalid" if incomplete else "valid",
+            "first_usable_path": "unknown",
+            "direct_within_protection": False,
+            "final_path_a": None,
+            "final_path_b": None,
+            "cleanup": {"duration_ms": 12},
+            "partial_attempts" if incomplete else "attempts": attempts,
+        }
+        return MATRIX_RUNNER.aggregate_runs([{
+            "exit_code": 1 if incomplete else 0,
+            "rounds": [record, *(extra_rounds or [])],
+        }])
+
+    def test_schema2_execution_incomplete_and_unknown_keep_missing_work_unknown(self):
+        for failure_class in ("execution_incomplete", "unknown"):
+            with self.subTest(failure_class=failure_class):
+                raw = self.report(failure_class, "probe_path_error")
+                attempt = self.validate(raw)
+                summary = self.aggregate([attempt])
+                self.assertEqual(attempt["experiment_outcome_class"], failure_class)
+                self.assertEqual(summary["attempt_failure_classes"], {failure_class: 1})
+                self.assertEqual(summary["direct_within_protection_rounds"], 0)
+                self.assertEqual(summary["final_direct_rounds"], 0)
+                self.assertIsNone(attempt["timeline"]["first_business_success_at_ms"])
+                self.assertEqual(
+                    summary["costs"]["all_requested"]["planned_minus_attempted_by_reason"],
+                    {"unknown": 1},
+                )
+                self.assertEqual(attempt["counts"], raw["counts"])
+
+    def test_schema2_partial_budget_preserves_successful_handoff_costs_once(self):
+        raw = self.report("budget_rejected")
+        raw["counts"]["budget_skipped"] = 1
+        attempt = self.validate(raw)
+        summary = self.aggregate([attempt])
+        costs = summary["costs"]["all_requested"]
+        self.assertEqual(summary["attempt_failure_classes"], {"budget_rejected": 1})
+        self.assertEqual(costs["known_observed_costs"]["probe_datagrams"], 2)
+        self.assertEqual(costs["known_observed_costs"]["probe_bytes"], 120)
+        self.assertEqual(costs["known_observed_costs"]["budget_skipped"], 1)
+        self.assertEqual(costs["planned_minus_attempted_by_reason"], {"budget_rejected": 1})
+        self.assertEqual(sum(costs["planned_minus_attempted_by_reason"].values()), 1)
+
+    def test_schema2_stale_and_deadline_preserve_terminal_reason_attribution(self):
+        for failure_class, terminal_reason, cause in (
+            ("cancelled_generation_changed", "socket_revoked", "lifecycle_invalidated"),
+            ("missed_schedule", "deadline", "expired"),
+        ):
+            with self.subTest(failure_class=failure_class):
+                raw = self.report(failure_class, terminal_reason)
+                attempt = self.validate(raw)
+                summary = self.aggregate([attempt])
+                self.assertEqual(summary["attempt_failure_classes"], {failure_class: 1})
+                self.assertEqual(summary["attempt_terminal_reasons"], {terminal_reason: 1})
+                costs = summary["costs"]["all_requested"]
+                self.assertEqual(costs["planned_minus_attempted_by_reason"], {cause: 1})
+                self.assertEqual(costs["known_observed_costs"]["probe_datagrams"], 2)
+                self.assertEqual(attempt["counts"], raw["counts"])
+
+    def test_schema2_mixed_causes_do_not_duplicate_or_guess_missing_work(self):
+        raw = self.report("execution_incomplete", "probe_path_error")
+        raw["counts"].update({
+            "planned_logical_probes": 4, "planned_physical_datagram_cap": 8,
+            "logical_probes_attempted": 2, "planned_logical_probes_not_attempted": 2,
+            "budget_skipped": 1, "send_errors": 1, "send_error_bytes": 60,
+        })
+        attempt = self.validate(raw)
+        summary = self.aggregate([attempt])
+        costs = summary["costs"]["all_requested"]
+        self.assertEqual(costs["planned_minus_attempted_by_reason"], {"unknown": 2})
+        self.assertEqual(costs["known_observed_costs"]["budget_skipped"], 1)
+        self.assertEqual(costs["known_observed_costs"]["probe_send_errors"], 1)
+        self.assertEqual(costs["known_observed_costs"]["probe_datagrams"], 2)
+        self.assertEqual(costs["known_observed_costs"]["probe_bytes"], 120)
+        self.assertEqual(summary["attempt_count"], 1)
+        self.assertEqual(attempt["counts"], raw["counts"])
+
+    def test_schema2_direct_confirmation_only_accepts_encrypted_validation_completed(self):
+        for failure_class in (
+            "execution_incomplete", "budget_rejected", "cancelled_generation_changed",
+            "missed_schedule", "send_error", "unknown", "no_response",
+        ):
+            with self.subTest(failure_class=failure_class):
+                raw = self.report(failure_class, "direct_confirmed")
+                raw["direct_confirmed"] = True
+                raw["confirmed_target_rank"] = 0
+                raw["timeline"]["encrypted_validation_completed_at_ms"] = 3520
+                with self.assertRaisesRegex(MATRIX_RUNNER.EvidenceError, "success_class_mismatch"):
+                    self.validate(raw)
+        raw["failure_class"] = "encrypted_validation_completed"
+        attempt = self.validate(raw)
+        self.assertTrue(attempt["direct_confirmed"])
+        self.assertEqual(attempt["failure_class"], "encrypted_validation_completed")
+        self.assertEqual(attempt["counts"], raw["counts"])
+
+    def test_schema2_partial_cost_fields_stay_unknown_and_keep_requested_denominator(self):
+        raw = self.report("execution_incomplete", "probe_path_error")
+        self.validate(raw)
+        del raw["counts"]["send_success_bytes"]
+        with self.assertRaisesRegex(MATRIX_RUNNER.EvidenceError, "counts_send_success_bytes"):
+            self.validate(raw)
+        scenario = MATRIX_RUNNER.SCENARIO_BY_NAME["equal-step"]
+        with tempfile.TemporaryDirectory() as directory:
+            round_dir = Path(directory)
+            (round_dir / "node-a.status.json").write_text(json.dumps({"peers": [{
+                "direct_events": [{"stage": "hard_hard_attempt_report", "hard_hard_attempt": raw}],
+            }]}), encoding="utf-8")
+            attempts, errors = MATRIX_RUNNER.extract_partial_attempt_reports(
+                round_dir, scenario, scenario.seed, SOURCE_SHA, BASELINE_SHA,
+            )
+        self.assertEqual(errors, ["b_status_missing"])
+        summary = self.aggregate(attempts, incomplete=True, extra_rounds=[{
+            "result": "invalid", "partial_attempts": [],
+        }])
+        self.assertEqual(summary["requested_rounds"], 2)
+        self.assertEqual(summary["invalid_rounds"], 2)
+        self.assertEqual(summary["valid_only_attempt_count"], 0)
+        self.assertEqual(summary["attempt_failure_classes"], {"execution_incomplete": 1})
+        costs = summary["costs"]["all_requested"]
+        self.assertEqual(costs["observed_attempt_reports"], 1)
+        self.assertEqual(costs["requested_rounds_without_attempt_costs"], 1)
+        self.assertEqual(costs["known_observed_costs"]["probe_datagrams"], 2)
+        self.assertEqual(costs["known_observed_costs"]["probe_bytes"], 0)
+        self.assertEqual(costs["unknown_field_counts"]["probe_bytes"], 1)
+        self.assertEqual(costs["planned_minus_attempted_by_reason"], {"unknown": 1})
+        self.assertEqual(costs["confirmation_costs"]["complete_attempt_reports"], 0)
+
+
 class HardHardConfirmationCostsTests(unittest.TestCase):
     def test_old_and_partial_reports_keep_missing_confirmation_costs_unknown(self):
         confirmation = {

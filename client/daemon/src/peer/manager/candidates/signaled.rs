@@ -467,6 +467,13 @@ impl PeerManager {
                 );
             }
         }
+        // Capture the committed handover identity before releasing the writer.
+        // Deferred cleanup may run after a new epoch's validation has started.
+        let validation_cleanup_epoch = PathEpoch::new(
+            generation,
+            peer_session_generation,
+            conn.remote_candidate_epoch(),
+        );
         drop(connections);
         drop(_epoch_guard);
         if remote_transport_handover {
@@ -479,8 +486,11 @@ impl PeerManager {
             // turn candidate refreshes into an unbounded punch storm.
             self.recovery_reopen_on_evidence(node_id, "remote_candidate_handover")
                 .await;
-            self.cancel_direct_validation_for_remote_candidate_change(node_id)
-                .await;
+            self.cancel_direct_validation_for_remote_candidate_change(
+                node_id,
+                validation_cleanup_epoch,
+            )
+            .await;
             // DPLPMTUD is deliberately NOT cancelled here. Its worker
             // re-validates the committed pair on every loop iteration via
             // `dplpmtud_path_is_current_sync`; when a handover really moves

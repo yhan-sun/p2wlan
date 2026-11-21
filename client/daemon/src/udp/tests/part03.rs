@@ -511,33 +511,89 @@ async fn matching_keepalive_ack_preserves_direct_health() {
         .record_direct_success("peer-b", Some(remote_addr))
         .await;
 
+    let success_count_before = peers
+        .get_connection("peer-b")
+        .await
+        .unwrap()
+        .direct_health
+        .success_count;
+
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap();
     let local_addr = transport.local_addr().unwrap();
     let (tx, _rx) = mpsc::channel(1);
-    let inbound_worker = tokio::spawn(transport.clone().run_inbound(tx));
-    let responder = tokio::spawn(async move {
+    let mut inbound_worker = tokio::spawn(transport.clone().run_inbound(tx));
+    let mut responder = Some(tokio::spawn(async move {
         let mut buf = [0u8; 256];
-        let (n, _) = remote.recv_from(&mut buf).await.unwrap();
-        let probe = decode_punch_packet(&buf[..n]).unwrap();
+        let (n, _) = remote
+            .recv_from(&mut buf)
+            .await
+            .map_err(|e| e.to_string())?;
+        let probe = decode_punch_packet(&buf[..n]).ok_or("invalid keepalive probe")?;
         remote
             .send_to(&build_punch_ack(probe.nonce), local_addr)
             .await
-            .unwrap();
-    });
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>(())
+    }));
 
-    // The production consent deadline is two seconds.  Keep this fixture
-    // comfortably below that limit while leaving enough scheduling margin for
-    // the inbound worker and responder to run on a loaded workspace test host.
-    transport
-        .run_keepalive_round(Duration::from_millis(500))
-        .await;
-    responder.await.unwrap();
+    // Keep the original 500 ms ACK wait and two-second production consent
+    // deadline. This outer fixture bound also covers responder/adoption waits.
+    let outcome = timeout(Duration::from_secs(2), async {
+        transport
+            .run_keepalive_round(Duration::from_millis(500))
+            .await;
+        let response = responder.as_mut().unwrap().await;
+        // Take only after completion: timeout must leave a running child owned,
+        // while cleanup must never poll an already-completed JoinHandle twice.
+        responder.take();
+        response.map_err(|e| e.to_string())??;
 
-    let conn = peers.get_connection("peer-b").await.unwrap();
+        // The original ACK guard extends through the final consent event.
+        // Release it with this body before aborting/joining the inbound worker.
+        let _ack_transaction = transport
+            .lock_peer_adoption_for_direct_validation("peer-b")
+            .await;
+        peers
+            .get_connection("peer-b")
+            .await
+            .ok_or_else(|| "missing keepalive peer".to_string())
+    })
+    .await;
+
+    // Reclaim both actual workers on success, error and fixture timeout before
+    // any assertion. One common cleanup deadline cannot extend business time.
+    inbound_worker.abort();
+    if let Some(worker) = responder.as_ref() {
+        worker.abort();
+    }
+    let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let inbound_join = tokio::time::timeout_at(cleanup_deadline, &mut inbound_worker).await;
+    let responder_join = if let Some(worker) = responder.as_mut() {
+        Some(tokio::time::timeout_at(cleanup_deadline, worker).await)
+    } else {
+        None
+    };
+    assert!(
+        matches!(inbound_join, Ok(Ok(Ok(()))))
+            || matches!(inbound_join, Ok(Err(ref e)) if e.is_cancelled())
+    );
+    assert!(
+        responder_join.is_none()
+            || matches!(responder_join, Some(Ok(Ok(Ok(())))))
+            || matches!(responder_join, Some(Ok(Err(ref e))) if e.is_cancelled())
+    );
+    let conn = outcome
+        .expect("matching ACK fixture exceeded deadline after owned cleanup")
+        .expect("matching ACK fixture failed after owned cleanup");
     assert_eq!(conn.state, ConnectionState::Direct);
     assert_eq!(conn.direct_health.consecutive_failures, 0);
+    assert_eq!(
+        conn.direct_health.success_count,
+        success_count_before + 1,
+        "one matching ACK must commit one new Direct health sample",
+    );
     assert!(conn
         .direct_events
         .iter()
@@ -550,8 +606,6 @@ async fn matching_keepalive_ack_preserves_direct_health() {
         .direct_events
         .iter()
         .any(|event| event.stage == "consent_timeout"));
-
-    inbound_worker.abort();
 }
 
 #[tokio::test]

@@ -682,10 +682,11 @@ impl Daemon {
         let responder_transport_session = TransportSession::new(keys.clone());
         let initial_stage = tokio::time::timeout(
             RESPONDER_SESSION_STAGE_TIMEOUT,
-            self.transport.stage_responder_session(
+            self.transport.stage_responder_session_for_lifecycle(
                 from_node_id.to_string(),
                 handshake_token.clone(),
                 responder_transport_session,
+                responder_lifecycle.peer_session_generation,
             ),
         )
         .await
@@ -698,11 +699,13 @@ impl Daemon {
             ResponderSessionStage::StaleDuplicate if cached_replay => {
                 match tokio::time::timeout(
                     RESPONDER_SESSION_STAGE_TIMEOUT,
-                    self.transport.restage_cached_responder_session(
-                        from_node_id.to_string(),
-                        handshake_token.clone(),
-                        TransportSession::new(keys.clone()),
-                    ),
+                    self.transport
+                        .restage_cached_responder_session_for_lifecycle(
+                            from_node_id.to_string(),
+                            handshake_token.clone(),
+                            TransportSession::new(keys.clone()),
+                            responder_lifecycle.peer_session_generation,
+                        ),
                 )
                 .await
                 .map_err(|_| {

@@ -9,7 +9,12 @@ use tokio::sync::mpsc;
 
 use crate::config::InterfaceConfig;
 use crate::error::{Error, Result};
-use crate::interface::VirtualInterface;
+use crate::interface::{PacketReadContext, VirtualInterface};
+
+struct ReadPacket {
+    data: Vec<u8>,
+    context: Option<PacketReadContext>,
+}
 
 /// A mock TUN device that uses channels to simulate packet I/O.
 ///
@@ -41,7 +46,8 @@ pub struct MockTunDevice {
     address: String,
     is_up: bool,
     /// Packets that the device will read (injected by controller).
-    read_rx: mpsc::Receiver<Vec<u8>>,
+    read_rx: mpsc::Receiver<ReadPacket>,
+    last_read_context: Option<PacketReadContext>,
     /// Packets that the device writes (received by controller).
     write_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -51,7 +57,7 @@ pub struct MockTunDevice {
 pub struct MockTunController {
     name: String,
     /// Inject packets into the device (device reads these).
-    read_tx: mpsc::Sender<Vec<u8>>,
+    read_tx: mpsc::Sender<ReadPacket>,
     /// Receive packets written by the device.  Shared (Arc) so clones of the
     /// controller can concurrently inject AND drain the bounded write channel.
     write_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>>,
@@ -74,6 +80,7 @@ impl MockTunDevice {
             address: address.to_string(),
             is_up: true,
             read_rx,
+            last_read_context: None,
             write_tx,
         };
 
@@ -95,18 +102,26 @@ impl MockTunDevice {
 #[async_trait]
 impl VirtualInterface for MockTunDevice {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.last_read_context = None;
         if !self.is_up {
             return Err(Error::DeviceClosed);
         }
 
         match self.read_rx.recv().await {
-            Some(data) => {
-                let n = data.len().min(buf.len());
-                buf[..n].copy_from_slice(&data[..n]);
+            Some(packet) => {
+                let n = packet.data.len().min(buf.len());
+                buf[..n].copy_from_slice(&packet.data[..n]);
+                if n > 0 && n == packet.data.len() {
+                    self.last_read_context = packet.context;
+                }
                 Ok(n)
             }
             None => Err(Error::DeviceClosed),
         }
+    }
+
+    fn take_last_read_context(&mut self) -> Option<PacketReadContext> {
+        self.last_read_context.take()
     }
 
     async fn write(&mut self, buf: &[u8]) -> Result<usize> {
@@ -142,14 +157,35 @@ impl MockTunDevice {
     /// Shut down the mock device.
     pub fn close(&mut self) {
         self.is_up = false;
+        self.last_read_context = None;
     }
 }
 
 impl MockTunController {
     /// Inject a packet into the device (the device will read it).
     pub async fn inject(&self, data: Vec<u8>) -> Result<()> {
+        self.inject_read_packet(data, None).await
+    }
+
+    /// Inject opaque local context through the same bounded packet queue.
+    ///
+    /// Context is available only after one complete, nonempty device read and
+    /// conveys no authority until the consumer validates it against the packet.
+    pub async fn inject_with_context(
+        &self,
+        data: Vec<u8>,
+        context: PacketReadContext,
+    ) -> Result<()> {
+        self.inject_read_packet(data, Some(context)).await
+    }
+
+    async fn inject_read_packet(
+        &self,
+        data: Vec<u8>,
+        context: Option<PacketReadContext>,
+    ) -> Result<()> {
         self.read_tx
-            .send(data)
+            .send(ReadPacket { data, context })
             .await
             .map_err(|_| Error::DeviceClosed)
     }
@@ -165,6 +201,10 @@ impl MockTunController {
         &self.name
     }
 }
+
+#[cfg(test)]
+#[path = "mock/read_context_tests.rs"]
+mod read_context_tests;
 
 #[cfg(test)]
 mod tests {

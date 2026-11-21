@@ -112,11 +112,11 @@ impl RelaySupervisor {
     /// Returns the end of the CURRENT connection: `Ok(())` for a clean
     /// server-side close, `Err` for a real transport failure.  Renewal
     /// handoffs never surface here.
-    pub(super) async fn supervise_relay_connection<F>(
+    pub(super) async fn supervise_relay_connection<I: RelayReadItem, F>(
         &self,
         endpoint: &str,
         current_transport: RelayTransport,
-        relay_rx: mpsc::Receiver<RelayMessage>,
+        relay_rx: mpsc::Receiver<I>,
         connection_generation: Arc<std::sync::atomic::AtomicU64>,
         mut spawn_renewal: F,
     ) -> Result<()>
@@ -125,7 +125,7 @@ impl RelaySupervisor {
             u64,
             RelayTransport,
         )
-            -> Pin<Box<dyn std::future::Future<Output = Option<ArmedRelayRenewal>> + Send>>,
+            -> Pin<Box<dyn std::future::Future<Output = Option<ArmedRelayRenewal<I>>> + Send>>,
     {
         // `generation` is the local label of the connection currently serving;
         // `connection_generation` is the SHARED token the renewal tasks check
@@ -428,18 +428,18 @@ impl RelaySupervisor {
 impl RelaySupervisor {
     /// Spawn the inbound drain for one connection generation, returning the
     /// oneshot that reports `(generation, end result)`.
-    pub(super) fn spawn_inbound_task(
+    pub(super) fn spawn_inbound_task<I: RelayReadItem>(
         &self,
         generation: u64,
         transport: RelayTransport,
-        relay_rx: mpsc::Receiver<RelayMessage>,
+        relay_rx: mpsc::Receiver<I>,
     ) -> Option<oneshot::Receiver<RelayInboundEnd>> {
         let (ended_tx, ended_rx) = oneshot::channel();
         let inbound_tx = self.inbound_tx.clone();
         let diags = self.relay_selection.clone();
         tokio::spawn(async move {
             let result = transport
-                .run_inbound(relay_rx, inbound_tx, Some(diags))
+                .run_inbound_for_read(relay_rx, inbound_tx, Some(diags))
                 .await;
             let _ = ended_tx.send((generation, result));
         });
@@ -491,13 +491,13 @@ pub(super) type RelayInboundEnd = (u64, Result<()>);
 
 /// Result of a renewal attempt: the replacement transport (with its new
 /// ticket metadata attached) plus its inbound receiver.
-pub(super) type RelayRenewalResult = Option<(RelayTransport, mpsc::Receiver<RelayMessage>)>;
+pub(super) type RelayRenewalResult<I = RelayMessage> = Option<(RelayTransport, mpsc::Receiver<I>)>;
 
 /// An armed make-before-break renewal.
-pub(super) struct ArmedRelayRenewal {
+pub(super) struct ArmedRelayRenewal<I = RelayMessage> {
     /// Result of the renewal task (awaited BY REFERENCE when the select branch
     /// polls it, so an un-selected branch future never consumes the receiver).
-    result: Option<oneshot::Receiver<RelayRenewalResult>>,
+    result: Option<oneshot::Receiver<RelayRenewalResult<I>>>,
     /// Set by the renewal task immediately BEFORE it connects the replacement
     /// transport.  The supervisor uses it to tell a genuine connection end
     /// apart from the hub's newest-wins close of the superseded connection:
@@ -511,7 +511,7 @@ pub(super) struct ArmedRelayRenewal {
     abort_handle: Option<tokio::task::AbortHandle>,
 }
 
-impl Drop for ArmedRelayRenewal {
+impl<I> Drop for ArmedRelayRenewal<I> {
     fn drop(&mut self) {
         if let Some(abort_handle) = self.abort_handle.take() {
             abort_handle.abort();
@@ -552,9 +552,9 @@ pub(super) fn relay_close_reason_label_from_error(error: &DaemonError) -> Option
 /// would drop the pending renewal result and leave `armed.result` consumed,
 /// tripping the caller's next round.  Awaiting by reference means a dropped
 /// branch future loses nothing and the receiver stays re-pollable.
-pub(super) async fn relay_renewal_wait(
-    renewal: &mut Option<ArmedRelayRenewal>,
-) -> Option<std::result::Result<RelayRenewalResult, oneshot::error::RecvError>> {
+pub(super) async fn relay_renewal_wait<I>(
+    renewal: &mut Option<ArmedRelayRenewal<I>>,
+) -> Option<std::result::Result<RelayRenewalResult<I>, oneshot::error::RecvError>> {
     match renewal {
         Some(armed) => {
             let receiver = armed.result.as_mut().expect("renewal result missing");
@@ -582,6 +582,7 @@ pub(super) async fn relay_renewal_wait(
 /// the first swap.
 ///
 /// Returns `None` when the connection has no ticket (legacy relay).
+#[allow(dead_code)] // Original private legacy fixture entry; delegates to the same renewal task.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn spawn_relay_renewal_task_impl(
     ticket_cache: Option<Arc<RelayTicketCache>>,
@@ -593,6 +594,30 @@ pub(super) async fn spawn_relay_renewal_task_impl(
     expected_generation: u64,
     transport: RelayTransport,
 ) -> Option<ArmedRelayRenewal> {
+    spawn_relay_renewal_task_for_read::<RelayMessage>(
+        ticket_cache,
+        node_id,
+        peers,
+        allow_insecure_plaintext,
+        ca_cert_path,
+        generation_token,
+        expected_generation,
+        transport,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn spawn_relay_renewal_task_for_read<I: RelayReadItem>(
+    ticket_cache: Option<Arc<RelayTicketCache>>,
+    node_id: String,
+    peers: Arc<PeerManager>,
+    allow_insecure_plaintext: bool,
+    ca_cert_path: Option<String>,
+    generation_token: Arc<std::sync::atomic::AtomicU64>,
+    expected_generation: u64,
+    transport: RelayTransport,
+) -> Option<ArmedRelayRenewal<I>> {
     let (audience, region, expires_at_unix) = transport.ticket_expiry()?;
     let ticket_cache = ticket_cache?;
     let endpoint = transport.endpoint().to_string();
@@ -635,7 +660,7 @@ pub(super) async fn spawn_relay_renewal_task_impl(
             if generation_token.load(std::sync::atomic::Ordering::SeqCst) != expected_generation {
                 return None;
             }
-            let (transport, relay_rx) = RelayTransport::connect_secure(
+            let (transport, relay_rx) = RelayTransport::connect_secure_for_read::<I>(
                 &endpoint,
                 &region,
                 &node_id,

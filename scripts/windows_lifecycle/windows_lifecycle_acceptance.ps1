@@ -446,28 +446,85 @@ public static class P2WlanLifecycleNative {
     [P2WlanLifecycleNative]::IgnoreCtrlCInCurrentProcess()
 }
 
+function Initialize-CtrlCDiagnosticDirectory {
+    param([Parameter(Mandatory = $true)][string]$Directory)
+    try {
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        if (-not (Test-Path -LiteralPath $Directory)) {
+            [void][System.IO.Directory]::CreateDirectory($Directory)
+            $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+            $acl.SetOwner($sid)
+            $acl.SetAccessRuleProtection($true, $false)
+            $inheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, [System.Security.AccessControl.FileSystemRights]::FullControl,
+                $inheritance, [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow)
+            $acl.AddAccessRule($rule)
+            Set-Acl -LiteralPath $Directory -AclObject $acl
+        }
+        $actual = Get-Acl -LiteralPath $Directory
+        $rules = @($actual.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+        if (-not $actual.AreAccessRulesProtected -or
+            $actual.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or
+            $rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or
+            $rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+            $rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
+            $rules[0].InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit') {
+            throw 'Ctrl+C diagnostic directory lacks the protected owner-only ACL'
+        }
+        return $true
+    } catch {
+        Write-Warning -WarningAction Continue "Ctrl+C diagnostic directory unavailable: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Write-ExclusiveCtrlCDiagnostic {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Record
+    )
+    try {
+        $encoding = [System.Text.UTF8Encoding]::new($false)
+        $bytes = $encoding.GetBytes(($Record | ConvertTo-Json -Depth 5 -Compress) + "`n")
+        if ($bytes.Length -gt 2048) { throw 'Ctrl+C diagnostic record exceeded 2048 bytes' }
+        $stream = [System.IO.FileStream]::new(
+            $Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::Read)
+        try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+    } catch {
+        # Diagnostics never substitute a successful native result or mask the
+        # original injector failure. Missing/partial records remain unknown.
+        Write-Warning -WarningAction Continue "Ctrl+C diagnostic record unavailable: $($_.Exception.Message)"
+    }
+}
+
 function Send-ConsoleCtrlC {
     param([Parameter(Mandatory = $true)][int]$ProcessId)
-    $injectorPath = Join-Path $runRoot 'send-ctrl-c.ps1'
-    if (-not (Test-Path -LiteralPath $injectorPath)) {
-        @'
-param([Parameter(Mandatory = $true)][int]$ProcessId)
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public static class P2WlanCtrlCInjector {
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GenerateConsoleCtrlEvent(uint type, uint group);
-  public static void Send(int processId) {
-    FreeConsole();
-    if (!AttachConsole((uint)processId)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-    if (!GenerateConsoleCtrlEvent(0, 0)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-  }
-}
-"@
-[P2WlanCtrlCInjector]::Send($ProcessId)
-'@ | Set-Content -LiteralPath $injectorPath -Encoding utf8
+    $injectorPath = Join-Path $PSScriptRoot 'send_console_ctrl_c.ps1'
+    $evidenceRoot = if ($env:P2WLAN_TRAY_DIAGNOSTICS_DIR) {
+        Join-Path $env:P2WLAN_TRAY_DIAGNOSTICS_DIR 'ctrl-c'
+    } else { Join-Path $runRoot 'ctrl-c' }
+    New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
+    $requestId = [guid]::NewGuid().ToString('N')
+    $evidencePath = Join-Path $evidenceRoot "injector-$requestId.json"
+    if (Test-Path -LiteralPath $evidencePath) { throw 'Ctrl+C evidence path already exists' }
+    $diagnosticDirectory = $null
+    $diagnosticStarted = 0
+    $diagnosticReady = $false
+    try {
+        $diagnosticStarted = [System.Diagnostics.Stopwatch]::GetTimestamp()
+        $diagnosticDirectory = [System.IO.Path]::GetFullPath($evidencePath + '.diagnostic')
+        if (Test-Path -LiteralPath $diagnosticDirectory) {
+            Write-Warning -WarningAction Continue 'Ctrl+C diagnostic directory already exists; diagnostics disabled'
+        } else {
+            $diagnosticReady = Initialize-CtrlCDiagnosticDirectory -Directory $diagnosticDirectory
+        }
+    } catch {
+        $diagnosticDirectory = $null
+        $diagnosticReady = $false
+        Write-Warning -WarningAction Continue "Ctrl+C parent diagnostic setup unavailable: $($_.Exception.Message)"
     }
     $pwshPath = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -484,26 +541,83 @@ public static class P2WlanCtrlCInjector {
             '-File',
             $injectorPath,
             '-ProcessId',
-            $ProcessId.ToString()
+            $ProcessId.ToString(),
+            '-RequestId',
+            $requestId,
+            '-EvidencePath',
+            $evidencePath
         )) {
         $null = $startInfo.ArgumentList.Add($argument)
     }
+    if ($diagnosticReady -and -not [string]::IsNullOrWhiteSpace($diagnosticDirectory)) {
+        $null = $startInfo.ArgumentList.Add('-DiagnosticDirectory')
+        $null = $startInfo.ArgumentList.Add($diagnosticDirectory)
+    }
     $injector = [System.Diagnostics.Process]::new()
     $injector.StartInfo = $startInfo
-    if (-not $injector.Start()) { throw 'failed to start Ctrl+C injector' }
-    $result = Wait-ProcessExited -Process $injector -TimeoutSeconds 5
-    if (-not $result.exited) {
-        # The injector attaches to the daemon console, so it also receives the
-        # CTRL_C_EVENT it broadcast. Its own lifetime is a helper concern and
-        # not the assertion -- the daemon's graceful exit is. Reap it under a
-        # bounded budget, record the outcome, and let the daemon decide.
-        try { Stop-Process -Id $injector.Id -Force -ErrorAction SilentlyContinue } catch {}
-        $result = Wait-ProcessExited -Process $injector -TimeoutSeconds 10
+    $injectorStarted = $false
+    $forcedInjector = $false
+    $initialWait = $null
+    $finalWait = $null
+    $failureDetail = ''
+    try {
+        if (-not $injector.Start()) { throw 'failed to start Ctrl+C injector' }
+        $injectorStarted = $true
+        $initialWait = Wait-ProcessExited -Process $injector -TimeoutSeconds 5
+        $result = $initialWait
+        $finalWait = $initialWait
         if (-not $result.exited) {
-            throw 'Ctrl+C injector could not be reaped after the broadcast'
+            # Preserve the original emergency cleanup and failure semantics.
+            try { Stop-Process -Id $injector.Id -Force -ErrorAction SilentlyContinue } catch {}
+            $forcedInjector = $true
+            $finalWait = Wait-ProcessExited -Process $injector -TimeoutSeconds 10
+            $result = $finalWait
+            if (-not $result.exited) {
+                throw 'Ctrl+C injector could not be reaped after the broadcast'
+            }
+        }
+        if ($forcedInjector -or $result.exit_code -ne 0) {
+            throw "Ctrl+C injector failed (exit=$($result.exit_code), forced=$forcedInjector)"
+        }
+        if (-not (Test-Path -LiteralPath $evidencePath)) {
+            throw 'Ctrl+C injector did not write native broadcast evidence'
+        }
+        $native = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
+        if ($native.request_id -cne $requestId -or $native.target_process_id -ne $ProcessId -or
+            $native.broadcast_succeeded -isnot [bool] -or -not $native.broadcast_succeeded) {
+            throw "Ctrl+C injector did not prove the target broadcast: $($native.detail)"
+        }
+        [pscustomobject]@{ injector_exited = $true; injector_exit_code = $result.exit_code; broadcast_succeeded = $true }
+    } catch {
+        $failureDetail = $_.Exception.Message
+        throw
+    } finally {
+        try {
+            if ($diagnosticReady) {
+                Write-ExclusiveCtrlCDiagnostic -Path (Join-Path $diagnosticDirectory 'parent.json') -Record ([ordered]@{
+                    schema_version = 1
+                    request_id = $requestId
+                    target_process_id = $ProcessId
+                    helper_process_id = if ($injectorStarted) { $injector.Id } else { $null }
+                    helper_started = $injectorStarted
+                    initial_wait_seconds = 5
+                    initial_wait = $initialWait
+                    forced = $forcedInjector
+                    final_wait = $finalWait
+                    forced_reap_wait_seconds = 10
+                    native_evidence_exists = [bool](Test-Path -LiteralPath $evidencePath)
+                    phase_files_present = @(Get-ChildItem -LiteralPath $diagnosticDirectory -Filter 'phase-*.json' -File | Select-Object -First 12).Count
+                    elapsed_monotonic_ticks = [System.Diagnostics.Stopwatch]::GetTimestamp() - $diagnosticStarted
+                    monotonic_frequency_hz = [System.Diagnostics.Stopwatch]::Frequency
+                    failure_detail = $failureDetail.Substring(0, [Math]::Min(512, $failureDetail.Length))
+                })
+            }
+        } catch {
+            # A diagnostic construction/read failure must not replace the
+            # original native return or the exception already being rethrown.
+            Write-Warning -WarningAction Continue "Ctrl+C parent diagnostic unavailable: $($_.Exception.Message)"
         }
     }
-    [pscustomobject]@{ injector_exited = $true }
 }
 
 function Invoke-ProductionCycle {
@@ -648,6 +762,8 @@ function Invoke-ProductionCycle {
         # diagnosable instead of only reporting that something remained.
         surviving_child_pids = @($survivingChildPids)
         ctrl_c_injector_exited = if ($ctrlCResult) { $ctrlCResult.injector_exited } else { $null }
+        ctrl_c_injector_exit_code = if ($ctrlCResult) { $ctrlCResult.injector_exit_code } else { $null }
+        ctrl_c_broadcast_succeeded = if ($ctrlCResult) { $ctrlCResult.broadcast_succeeded } else { $null }
         diagnostics_port_released = $portReleased
         auth_token_removed = $authRemoved
         wintun_stale = $wintunStale

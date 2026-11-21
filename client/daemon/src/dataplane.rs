@@ -17,6 +17,7 @@ use tracing::{debug, trace, warn};
 use crate::acl::AclEngine;
 use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
+use crate::request_carriage::{RawOutboundSink, RawRequestDelivery, RequestBinding};
 
 include!("dataplane/core.rs");
 include!("dataplane/normalization.rs");

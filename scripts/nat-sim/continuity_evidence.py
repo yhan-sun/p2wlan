@@ -7,15 +7,15 @@ from collections import Counter
 import json
 from pathlib import Path
 import re
-import time
 
 from network_conditions import load_profiles
+from monotonic_clock import monotonic_ns
 
 
 def sample(round_dir: Path) -> None:
     # Timestamp before reading: a post-fault baseline includes all earlier
     # business. Only subsequent counter growth proves post-fault traffic.
-    row = {"monotonic_ns": time.monotonic_ns(), "direct": {}}
+    row = {"monotonic_ns": monotonic_ns(), "direct": {}}
     for side in ("a", "b"):
         text = (round_dir / f"node-{side}.log").read_text(errors="replace")
         row[side] = text.count("overlay_payload_verified")
@@ -23,7 +23,7 @@ def sample(round_dir: Path) -> None:
             and bool(re.search(r"\bingress=direct(?:\s|$)", line)) for line in text.splitlines())
     # A pre-fault proof must have finished reading before the fault, while a
     # post-fault baseline must have started reading after it.
-    row["completed_monotonic_ns"] = time.monotonic_ns()
+    row["completed_monotonic_ns"] = monotonic_ns()
     with (round_dir / "business-samples.jsonl").open("a") as stream:
         stream.write(json.dumps(row) + "\n")
 

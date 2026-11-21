@@ -509,6 +509,8 @@ struct NatPacketLink {
     held_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
     held_punch_a_to_b: Arc<StdMutex<Vec<Vec<u8>>>>,
     held_punch_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
+    a_to_b_routes: NatRouteTable,
+    b_to_a_routes: NatRouteTable,
     mtu: Arc<[NatMtuDirection; 2]>,
     route_dynamic_socket: bool,
     worker: Option<tokio::task::JoinHandle<()>>,
@@ -666,6 +668,8 @@ impl NatPacketLink {
             held_b_to_a,
             held_punch_a_to_b,
             held_punch_b_to_a,
+            a_to_b_routes,
+            b_to_a_routes,
             mtu,
             route_dynamic_socket,
             worker,
@@ -1183,6 +1187,8 @@ struct TwoPeerHarness {
     udp_b: UdpTransport,
     control_a: ControlClient,
     control_b: ControlClient,
+    hard_hard_signal_a: HolePunchSignalContext,
+    candidate_postprocess_slot_a: CandidatePostprocessTestGateSlot,
     signals_a: Arc<StdMutex<Vec<TestControlSignal>>>,
     signals_b: Arc<StdMutex<Vec<TestControlSignal>>>,
     signal_hook_a_to_b: Arc<StdMutex<Option<TestSignalHook>>>,
@@ -1705,7 +1711,15 @@ async fn build_two_peer_harness_with_stun_mode(
     }
 
     let control_a = daemon_a.control.clone();
+    let candidate_postprocess_slot_a = daemon_a.candidate_postprocess_test_gate.clone();
     let control_b = daemon_b.control.clone();
+    let hard_hard_signal_a = HolePunchSignalContext {
+        control: control_a.clone(),
+        candidate_snapshot: daemon_a.candidate_snapshot.clone(),
+        stun_servers: daemon_a.runtime_stun_servers.read().await.clone(),
+        stun_timeout: *daemon_a.runtime_stun_timeout.read().await,
+        boot_epoch_ms: daemon_a.boot_epoch_ms,
+    };
     let shutdown_a = daemon_a.shutdown_tx.clone();
     let shutdown_b = daemon_b.shutdown_tx.clone();
     let (network_tx_a, _network_rx_a) = mpsc::channel(32);
@@ -1732,6 +1746,8 @@ async fn build_two_peer_harness_with_stun_mode(
         udp_b,
         control_a,
         control_b,
+        hard_hard_signal_a,
+        candidate_postprocess_slot_a,
         signals_a,
         signals_b,
         signal_hook_a_to_b,
@@ -1784,6 +1800,34 @@ async fn install_committed_birthday_predecessor(
     guard
 }
 
+// These protocol scenarios deliberately enter the real HH initiator, rather
+// than making an ordinary initial offer select HH implicitly. The production
+// experiment flag stays false, including in the competing-primary scenario;
+// all subsequent signaling, pair validation, ownership and cleanup are real.
+async fn trigger_hard_hard_protocol_attempt(harness: &TwoPeerHarness) {
+    assert!(!harness.peers_a.hard_hard_experiment_only());
+    let lifecycle = (
+        harness.peers_a.current_network_generation_sync(),
+        harness
+            .peers_a
+            .peer_session_generation_sync(HARD_HARD_B)
+            .unwrap(),
+    );
+    assert_eq!(
+        spawn_hard_hard_initiator(
+            harness.udp_a.clone(),
+            harness.peers_a.clone(),
+            harness.punch_attempts_a.clone(),
+            HARD_HARD_B.into(),
+            harness.hard_hard_signal_a.clone(),
+            None,
+            Some(lifecycle),
+        )
+        .await,
+        HardHardInitiatorStart::Started
+    );
+}
+
 async fn trigger_initial_offer(harness: &TwoPeerHarness) {
     let sources = HashMap::from([(
         harness.link.b_public.local_addr().unwrap().to_string(),
@@ -1812,6 +1856,23 @@ async fn trigger_retry_offer_with_current_candidates(
     harness: &TwoPeerHarness,
     previous_response: &TestControlSignal,
 ) {
+    // Keep the actual ordinary candidate publication. Pause only its existing
+    // test seam after mutation commits, before ordinary owner admission, then
+    // explicitly enter the HH protocol under its unchanged real owner fences.
+    let gate = Arc::new(CandidatePostprocessTestGate::new());
+    {
+        let mut slot = harness
+            .candidate_postprocess_slot_a
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(slot.is_none());
+        *slot = Some((HARD_HARD_B.to_string(), gate.clone()));
+    }
+    let previous_signal_count = harness
+        .signals_a
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len();
     let sources = previous_response
         .candidates
         .iter()
@@ -1830,6 +1891,28 @@ async fn trigger_retry_offer_with_current_candidates(
         )
         .await
         .unwrap();
+    let retry_signal = harness
+        .signals_a
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())[previous_signal_count]
+        .clone();
+    assert!(retry_signal.session_id.is_none());
+    assert_eq!(retry_signal.candidates, previous_response.candidates);
+    gate.reached.notified().await;
+    let current = harness.peers_a.get_connection(HARD_HARD_B).await.unwrap();
+    assert_eq!(
+        current.last_candidate_generation(),
+        retry_signal.candidate_generation
+    );
+    assert!(current.remote_nat_profile_matches_candidate_epoch());
+    assert!(harness
+        .peers_a
+        .hard_hard_plan_for_peer(HARD_HARD_B)
+        .await
+        .is_some());
+    trigger_hard_hard_protocol_attempt(harness).await;
+    gate.release.wait().await;
+    gate.completed.notified().await;
 }
 
 async fn wait_for_both_direct(harness: &TwoPeerHarness) {
@@ -2507,6 +2590,19 @@ async fn build_hard_hard_ordinary_fallback_fixture(
 async fn build_hard_hard_ordinary_fallback_fixture_with_experiment(
     hard_hard_experiment_only: bool,
 ) -> (Daemon, Arc<PeerManager>, UdpTransport, ControlClient) {
+    build_hard_hard_ordinary_fallback_fixture_with_policy(
+        hard_hard_experiment_only,
+        crate::config::PathPolicy::DirectFirst,
+        "198.51.100.20:42000".parse().unwrap(),
+    )
+    .await
+}
+
+async fn build_hard_hard_ordinary_fallback_fixture_with_policy(
+    hard_hard_experiment_only: bool,
+    path_policy: crate::config::PathPolicy,
+    remote_public: SocketAddr,
+) -> (Daemon, Arc<PeerManager>, UdpTransport, ControlClient) {
     let mut config =
         Config::generate_default("http://hard-hard-fallback.test", "phase-2-2-fallback").unwrap();
     config.node.node_id = HARD_HARD_A.to_string();
@@ -2517,11 +2613,11 @@ async fn build_hard_hard_ordinary_fallback_fixture_with_experiment(
     config.network.hard_hard_experiment_only = hard_hard_experiment_only;
     config.network.birthday_probing_enabled = false;
     config.relay.servers = vec!["relay.invalid:443".to_string()];
+    config.relay.path_policy = path_policy;
     let daemon = Daemon::new(config);
     let peers = daemon.peers.clone();
 
     let local_public: SocketAddr = "198.51.100.10:41000".parse().unwrap();
-    let remote_public: SocketAddr = "198.51.100.20:42000".parse().unwrap();
     let local_profile = hard_hard_profile(local_public, 4);
     let remote_profile = hard_hard_profile(remote_public, 3);
     peers.update_nat_profile(local_profile).await;

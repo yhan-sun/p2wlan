@@ -11,8 +11,19 @@ on:
       - ".github/workflows/windows-lifecycle.yml"
       - ".github/workflows/mobile-lifecycle.yml"
       - "client/daemon/**"
+      - "client/tun/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - ".github/workflows/**"
+      - "client/netbind/**"
+      - "client/wireguard/**"
+      - "client/relay/**"
+      - "scripts/dplpmtud/**"
+      - "contracts/dplpmtud_acceptance.json"
+      - "docs/reference/networking.md"
+      - "scripts/mtu-smoke.sh"
+      - "scripts/quality/**"
   workflow_dispatch:
 
 permissions:
@@ -104,6 +115,9 @@ jobs:
 
   lifecycle_and_topology_gates:
     name: Existing lifecycle and topology gates
+    needs:
+      - rust_required
+      - windows_path_state_machine
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 55

@@ -130,6 +130,7 @@ async fn room_inbound_requires_exact_sender_ip_and_records_tun_delivery_only() {
     for source in ["192.168.50.2", "10.21.2.3", "10.21.1.3"] {
         f.plane
             .write_inbound(InboundPacket {
+                authenticated_ingress: None,
                 peer_id: "b".into(),
                 packet: echo(source, "10.21.1.2"),
                 session_instance: None,

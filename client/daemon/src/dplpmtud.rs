@@ -16,9 +16,9 @@ mod wire;
 
 pub(crate) use identity::{DplpmtudAckIngress, DplpmtudPathIdentity, DplpmtudSocketIdentity};
 pub(crate) use runtime::{
-    build_encrypted_probe_plaintext, DirectBusinessSendToken, DplpmtudInstallDecision,
-    DplpmtudProbePlan, DplpmtudRuntime, DplpmtudWorkerIngress, DplpmtudWorkerStart,
-    DPLPMTUD_WORKER_MAX_LIFETIME, MAX_TRACKED_DPLPMTUD_PEERS,
+    build_encrypted_probe_plaintext, DirectBusinessPublicationGuard, DirectBusinessSendToken,
+    DplpmtudInstallDecision, DplpmtudProbePlan, DplpmtudRuntime, DplpmtudWorkerIngress,
+    DplpmtudWorkerStart, DPLPMTUD_WORKER_MAX_LIFETIME, MAX_TRACKED_DPLPMTUD_PEERS,
 };
 pub(crate) use sizes::{
     OuterIpFamily, DPLPMTUD_BASE_UDP_DATAGRAM_SIZE, WIREGUARD_UDP_DATAGRAM_OVERHEAD,

@@ -646,8 +646,10 @@ impl PeerManager {
             .unwrap_or(0)
     }
 
-    /// Retry hint only; the initiator must still reserve against this exact
-    /// allocation and revalidate the owner before starting any measurement.
+    /// Retry hint only. Ordinary cold-start probing receives the initial
+    /// opportunity; HH becomes available after its same-epoch recovery feedback.
+    /// The initiator must still reserve against this exact allocation and
+    /// revalidate the owner before starting any measurement.
     pub(crate) async fn recovery_hard_hard_available(&self, peer: &str, epoch: u64) -> bool {
         self.recovery_epochs
             .read()
@@ -655,6 +657,7 @@ impl PeerManager {
             .get(peer)
             .is_some_and(|state| {
                 state.epoch == epoch
+                    && state.stage != RecoveryStage::Initial
                     && state.network_generation == self.current_network_generation_sync()
                     && state.peer_session_generation == self.peer_session_generation_sync(peer)
                     && state.epoch_hard_hard_generation_quota_remaining > 0

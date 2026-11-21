@@ -157,6 +157,12 @@ def verify(args: argparse.Namespace) -> None:
                 "/etc/init.d/network restart",
                 "echo nameserver 192.168.1.3 > /etc/resolv.conf",
                 f"date -s @{int(time.time())}",
+                # These fixed service ports are inside the guest's ephemeral
+                # range. Reserve them before downloads/CLI HTTP connections;
+                # explicit binds and the service readiness checks stay intact.
+                "vm_reserved_ports=$(cat /proc/sys/net/ipv4/ip_local_reserved_ports); "
+                "printf '%s\\n' \"${vm_reserved_ports:+$vm_reserved_ports,}39277,39278\" "
+                "> /proc/sys/net/ipv4/ip_local_reserved_ports",
                 "mkdir -p /etc/dropbear",
                 "for attempt in 1 2 3 4 5 6 7 8 9 10; do "
                 f"wget -q -T 5 -O /etc/dropbear/authorized_keys {address}/key.pub && break; sleep 1; done",
@@ -176,6 +182,11 @@ def verify(args: argparse.Namespace) -> None:
                 time.sleep(2)
             else:
                 raise RuntimeError("OpenWrt SSH did not become ready")
+            reserved_ports = remote("cat /proc/sys/net/ipv4/ip_local_reserved_ports").strip()
+            reserved_ranges = [part.partition("-") for part in reserved_ports.split(",")]
+            if not all(any(int(start) <= port <= int(end or start)
+                           for start, _, end in reserved_ranges) for port in (39277, 39278)):
+                raise ValueError("VM diagnostics ports are not reserved from automatic allocation")
             guest_package = "/tmp/" + package.name
             remote(f"wget -q -O {guest_package} {address}/{package.name}")
             downloaded = remote(f"sha256sum {guest_package}").split()[0]
@@ -261,11 +272,13 @@ def verify(args: argparse.Namespace) -> None:
             remote("! pidof p2wlan-daemon")
             report = {"series": args.series, "arch": args.arch, "firmware": release["version"],
                       "source_sha": args.source_sha, "package": package.name, "sha256": sha256(package),
+                      "vm_ip_local_reserved_ports": reserved_ports,
                       "checks": ["native-dependencies", "build-identity", "real-tun", "single-owner-up",
                                  "procd-down-no-respawn", "invalid-config-stop", "glibc-update-refused",
                                  "native-installer-selection", "private-runtime-permissions",
                                  "sysupgrade-config-backup", "disabled-service-refused", "firewall-example",
-                                 "loopback-diagnostics", "native-installer-manifest"]}
+                                 "loopback-diagnostics", "native-installer-manifest",
+                                 "diagnostics-port-reservation"]}
             (work / "verification.json").write_text(json.dumps(report, indent=2) + "\n")
             print("PASS OpenWrt VM", json.dumps(report), flush=True)
         except Exception as error:
@@ -276,6 +289,8 @@ def verify(args: argparse.Namespace) -> None:
                     "tail -c 12000 /var/run/p2wlan/p2wlan-daemon.log 2>/dev/null; "
                     "logread -e p2wlan | tail -c 12000; "
                     "ubus call service list '{\"name\":\"p2wlan\"}'; "
+                    "cat /proc/sys/net/ipv4/ip_local_port_range /proc/sys/net/ipv4/ip_local_reserved_ports; "
+                    "netstat -lntp 2>/dev/null; cat /proc/net/tcp /proc/net/tcp6; "
                     "ls -ld /etc/p2wlan /var/run/p2wlan"],
                     capture_output=True, text=True, timeout=10)
                 (work / "service-diagnostics.log").write_text((diagnostics.stdout + diagnostics.stderr)[-26000:])

@@ -95,6 +95,7 @@ async fn does_not_lose_tun_packets_when_inbound_work_is_ready() {
             );
             inbound_tx
                 .send(InboundPacket {
+                    authenticated_ingress: None,
                     peer_id: "peer-b".to_string(),
                     packet,
                     session_instance: None,
@@ -133,6 +134,163 @@ async fn does_not_lose_tun_packets_when_inbound_work_is_ready() {
     inbound_task.await.unwrap();
     drain_task.await.unwrap();
     task.abort();
+}
+
+async fn poll_packet_pump_once(
+    mut pump: std::pin::Pin<&mut impl std::future::Future<Output = Result<()>>>,
+) {
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(pump.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+
+async fn assert_feedback_cannot_cancel_consumed_fallback_packet(close_inbound: bool) {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("http://ctrl.test", "default").unwrap(),
+    ));
+    peers.add_peer(&peer("peer-b", "10.20.0.2")).await;
+    let acl = Arc::new(RwLock::new(AclEngine::allow_all()));
+    let acl_guard = acl.write().await;
+    let (tun, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+    let (dataplane, mut outbound_rx) = if close_inbound {
+        let (dataplane, outbound_rx, inbound_tx) = DataPlane::new_bidirectional(tun, peers);
+        drop(inbound_tx);
+        (dataplane, outbound_rx)
+    } else {
+        DataPlane::new(tun, peers)
+    };
+    let mut dataplane = dataplane.with_acl(acl.clone(), "local-node");
+    let (feedback_tx, feedback_rx) = tokio::sync::broadcast::channel(1);
+    dataplane.local_feedback_rx = Some(feedback_rx);
+    let mut pump = Box::pin(dataplane.run());
+    // With no TUN packet yet, a closed inbound channel is the only ready
+    // branch. This poll enters the outbound-only fallback before the race.
+    poll_packet_pump_once(pump.as_mut()).await;
+
+    let packet = Ipv4Packet::build_icmp_echo_request(
+        Ipv4Addr::new(10, 20, 0, 1),
+        Ipv4Addr::new(10, 20, 0, 2),
+        0x1234,
+        1,
+        b"must-survive-feedback",
+    );
+    ctrl.inject(packet.clone()).await.unwrap();
+    // TUN read completes synchronously; routing then waits for the held ACL
+    // lock. No timing or task scheduling assumption drives this interleaving.
+    poll_packet_pump_once(pump.as_mut()).await;
+    assert!(outbound_rx.try_recv().is_err());
+    let feedback = crate::business_mtu::build_local_mtu_feedback(
+        &packet,
+        crate::business_mtu::LocalMtuFeedbackKind::PacketTooBig { inner_ip_mtu: 1280 },
+    )
+    .unwrap();
+    feedback_tx.send(feedback.clone()).unwrap();
+    poll_packet_pump_once(pump.as_mut()).await;
+
+    drop(acl_guard);
+    poll_packet_pump_once(pump.as_mut()).await;
+    let routed = outbound_rx
+        .try_recv()
+        .expect("local PMTU feedback cancelled a packet already consumed from TUN");
+    assert_eq!(routed.packet, packet);
+    assert_eq!(routed.peer_id, "peer-b");
+    assert!(outbound_rx.try_recv().is_err(), "packet was routed twice");
+    assert_eq!(
+        timeout(Duration::from_secs(1), ctrl.recv_written())
+            .await
+            .expect("local PMTU feedback was not written after routing completed")
+            .unwrap(),
+        feedback
+    );
+}
+
+#[tokio::test]
+async fn outbound_only_feedback_cannot_cancel_consumed_tun_packet() {
+    assert_feedback_cannot_cancel_consumed_fallback_packet(false).await;
+}
+
+#[tokio::test]
+async fn closed_inbound_feedback_cannot_cancel_consumed_tun_packet() {
+    assert_feedback_cannot_cancel_consumed_fallback_packet(true).await;
+}
+
+async fn assert_closed_feedback_keeps_packet_pump_running(bidirectional: bool) {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("http://ctrl.test", "default").unwrap(),
+    ));
+    peers.add_peer(&peer("peer-b", "10.20.0.2")).await;
+    let (tun, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+    let (mut dataplane, mut outbound_rx, inbound_tx) = if bidirectional {
+        let (dataplane, outbound_rx, inbound_tx) = DataPlane::new_bidirectional(tun, peers);
+        (dataplane, outbound_rx, Some(inbound_tx))
+    } else {
+        let (dataplane, outbound_rx) = DataPlane::new(tun, peers);
+        (dataplane, outbound_rx, None)
+    };
+    let (feedback_tx, feedback_rx) = tokio::sync::broadcast::channel(1);
+    dataplane.local_feedback_rx = Some(feedback_rx);
+    let mut pump = Box::pin(dataplane.run());
+    poll_packet_pump_once(pump.as_mut()).await;
+    drop(feedback_tx);
+    // A permanently closed feedback receiver is disabled. Polling the pump
+    // must still yield, and must preserve the live inbound channel.
+    poll_packet_pump_once(pump.as_mut()).await;
+
+    let outbound = Ipv4Packet::build_icmp_echo_request(
+        Ipv4Addr::new(10, 20, 0, 1),
+        Ipv4Addr::new(10, 20, 0, 2),
+        0x1234,
+        1,
+        b"outbound-after-feedback-close",
+    );
+    let inbound = Ipv4Packet::build_icmp_echo_request(
+        Ipv4Addr::new(10, 20, 0, 2),
+        Ipv4Addr::new(10, 20, 0, 1),
+        0x5678,
+        1,
+        b"inbound-after-feedback-close",
+    );
+    ctrl.inject(outbound.clone()).await.unwrap();
+    if let Some(inbound_tx) = inbound_tx.as_ref() {
+        inbound_tx
+            .try_send(InboundPacket {
+                authenticated_ingress: None,
+                peer_id: "peer-b".into(),
+                packet: inbound.clone(),
+                session_instance: None,
+                from_previous_session: false,
+                trace: None,
+            })
+            .expect("feedback closure discarded the live inbound receiver");
+    }
+    poll_packet_pump_once(pump.as_mut()).await;
+    assert_eq!(outbound_rx.try_recv().unwrap().packet, outbound);
+    assert!(outbound_rx.try_recv().is_err(), "packet was routed twice");
+    if bidirectional {
+        assert_eq!(
+            timeout(Duration::from_secs(1), ctrl.recv_written())
+                .await
+                .expect("feedback closure prevented inbound TUN delivery")
+                .unwrap(),
+            inbound
+        );
+    }
+
+    // Closing TUN remains terminal even after feedback has been disabled.
+    drop(ctrl);
+    assert!(matches!(pump.await, Err(DaemonError::Network(_))));
+}
+
+#[tokio::test]
+async fn closed_feedback_keeps_outbound_only_tun_active() {
+    assert_closed_feedback_keeps_packet_pump_running(false).await;
+}
+
+#[tokio::test]
+async fn closed_feedback_keeps_bidirectional_tun_active() {
+    assert_closed_feedback_keeps_packet_pump_running(true).await;
 }
 
 #[tokio::test]
@@ -182,6 +340,7 @@ async fn writes_inbound_peer_packet_to_tun() {
 
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".to_string(),
             packet: packet.clone(),
             session_instance: None,
@@ -224,6 +383,7 @@ async fn drops_inbound_packet_with_spoofed_peer_virtual_ip() {
 
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".to_string(),
             packet,
             session_instance: None,
@@ -265,6 +425,7 @@ async fn normalizes_inbound_non_overlay_source_pollution() {
 
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".to_string(),
             packet,
             session_instance: None,
@@ -311,6 +472,7 @@ async fn keeps_blocking_inbound_overlay_source_spoofing() {
 
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".to_string(),
             packet,
             session_instance: None,
@@ -426,6 +588,7 @@ async fn live_acl_denies_matching_inbound_packet() {
 
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".to_string(),
             packet,
             session_instance: None,
@@ -487,6 +650,7 @@ async fn room_revocation_blocks_both_directions_even_with_cached_peers() {
     );
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".into(),
             packet: inbound.clone(),
             session_instance: None,
@@ -507,6 +671,7 @@ async fn room_revocation_blocks_both_directions_even_with_cached_peers() {
     ctrl.inject(outbound).await.unwrap();
     inbound_tx
         .send(InboundPacket {
+            authenticated_ingress: None,
             peer_id: "peer-b".into(),
             packet: inbound,
             session_instance: None,

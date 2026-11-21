@@ -154,51 +154,132 @@ async fn ordinary_preflight_rejects_wrong_request_or_socket_without_reserving_it
 #[tokio::test]
 async fn preflight_receipt_preserves_original_request_when_same_class_target_moves() {
     let (udp, receiver, identity, prepared) = fixture().await;
-    let completion = udp
-        .send_validation_preflight("peer-b", identity, &prepared, deadline(), deadline())
+    let original_deadline = deadline();
+    // The fixture uses the same fixed receipt deadline as production. A lost
+    // datagram or declined receipt must fail here, not park the whole suite.
+    tokio::time::timeout_at(original_deadline, async {
+        let completion = udp
+            .send_validation_preflight(
+                "peer-b",
+                identity,
+                &prepared,
+                original_deadline,
+                original_deadline,
+            )
+            .await
+            .unwrap();
+        let mut bytes = [0u8; 512];
+        eprintln!("preflight_same_class_wait stage=probe_datagram original_budget_ms=150");
+        let (length, _) = receiver.recv_from(&mut bytes).await.unwrap();
+        let key = udp.peers.probe_key_for_peer("peer-b").await.unwrap();
+        let packet = decode_authenticated_punch_packet(&bytes[..length], &key).unwrap();
+        let pending = udp
+            .pending_probes
+            .lock()
+            .await
+            .remove(&packet.nonce)
+            .unwrap();
+        // A genuine Probe ACK may merge another public port into the worker while
+        // the in-flight request keeps its original destination and exact lease.
+        let drift = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let drift_endpoint = drift.local_addr().unwrap();
+        {
+            let sessions = udp.direct_validation.sessions.lock().await;
+            let session = sessions.get("peer-b").unwrap();
+            let current = *session.target_tx.borrow();
+            session.target_tx.send_replace(DirectValidationTarget {
+                endpoint: drift_endpoint,
+                ..current
+            });
+        }
+        let epoch = udp.network_epoch_gate.lock().await;
+        assert!(
+            udp.peers
+                .learn_authenticated_endpoint_in_epoch(&epoch, "peer-b", drift_endpoint)
+                .await
+        );
+        udp.complete_validation_preflight_in_epoch("peer-b", &pending)
+            .await;
+        let sender_retained = pending
+            .validation_preflight
+            .as_ref()
+            .is_some_and(|receipt| receipt.completion.lock().unwrap().is_some());
+        eprintln!(
+            "preflight_same_class_wait stage=receipt expired={} sender_retained={sender_retained}",
+            pending.is_expired(Instant::now()),
+        );
+        assert_eq!(completion.await, Ok(()));
+        assert_eq!(
+            udp.direct_validation
+                .expectations
+                .lock()
+                .await
+                .get("peer-b")
+                .unwrap()
+                .endpoint,
+            identity.request_endpoint()
+        );
+    })
+    .await
+    .expect("same-class preflight exceeded its original 150ms receipt deadline");
+}
+
+#[tokio::test]
+async fn expired_receipt_retained_by_pending_cannot_hide_the_original_deadline() {
+    let (udp, receiver, identity, prepared) = fixture().await;
+    let original_deadline = deadline();
+    let mut completion = udp
+        .send_validation_preflight(
+            "peer-b",
+            identity,
+            &prepared,
+            original_deadline,
+            original_deadline,
+        )
         .await
         .unwrap();
     let mut bytes = [0u8; 512];
-    let (length, _) = receiver.recv_from(&mut bytes).await.unwrap();
+    let (length, _) = tokio::time::timeout_at(original_deadline, receiver.recv_from(&mut bytes))
+        .await
+        .expect("the original preflight datagram must arrive before its deadline")
+        .unwrap();
     let key = udp.peers.probe_key_for_peer("peer-b").await.unwrap();
     let packet = decode_authenticated_punch_packet(&bytes[..length], &key).unwrap();
-    let pending = udp
+    let mut pending = udp
         .pending_probes
         .lock()
         .await
         .remove(&packet.nonce)
         .unwrap();
-    // A genuine Probe ACK may merge another public port into the worker while
-    // the in-flight request keeps its original destination and exact lease.
-    let drift = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let drift_endpoint = drift.local_addr().unwrap();
+    // Force the actual production receipt's expired branch without sleeping,
+    // changing its request identity or extending the original deadline.
+    pending.expires_at = Instant::now();
     {
-        let sessions = udp.direct_validation.sessions.lock().await;
-        let session = sessions.get("peer-b").unwrap();
-        let current = *session.target_tx.borrow();
-        session.target_tx.send_replace(DirectValidationTarget {
-            endpoint: drift_endpoint,
-            ..current
-        });
+        let _epoch = udp.network_epoch_gate.lock().await;
+        udp.complete_validation_preflight_in_epoch("peer-b", &pending)
+            .await;
     }
-    let epoch = udp.network_epoch_gate.lock().await;
+    assert!(matches!(
+        completion.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
     assert!(
-        udp.peers
-            .learn_authenticated_endpoint_in_epoch(&epoch, "peer-b", drift_endpoint)
+        tokio::time::timeout_at(original_deadline, &mut completion)
             .await
+            .is_err(),
+        "a retained expired sender must not turn the original deadline into an unbounded wait"
     );
-    udp.complete_validation_preflight_in_epoch("peer-b", &pending)
-        .await;
-    assert_eq!(completion.await, Ok(()));
-    assert_eq!(
-        udp.direct_validation
-            .expectations
-            .lock()
-            .await
-            .get("peer-b")
-            .unwrap()
-            .endpoint,
-        identity.request_endpoint()
+    assert!(matches!(
+        completion.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    drop(pending);
+    assert!(
+        matches!(
+            completion.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ),
+        "dropping the sole pending owner must close the real receipt synchronously"
     );
 }
 

@@ -243,7 +243,15 @@ async fn run_direct_probe_loop(
                         udp.socket_count()
                     },
                 );
-                let outcome = run_owned_punch_session_with_deadline(&session, deadline, async {
+                let session_deadline = sleep(deadline).deadline();
+                let ordinary_cost = udp.ordinary_probe_cost(
+                    session.session_id(),
+                    generation,
+                    peer_session_generation,
+                    epoch,
+                );
+                let mut fresh_mapping_task: Option<crate::udp::OrdinaryProbeTask> = None;
+                let outcome = run_owned_punch_session_until(&session, session_deadline, async {
                     if session.is_cancelled()
                         || !peers
                             .peer_session_is_current_sync(&peer_id, peer_session_generation)
@@ -481,13 +489,14 @@ async fn run_direct_probe_loop(
                     {
                         return;
                     }
-                    let fresh_mapping_task = {
+                    fresh_mapping_task = Some({
                         let udp = udp.clone();
                         let peers = peers.clone();
                         let peer_id = peer_id.clone();
                         let signal = signal.clone();
                         let cancellation = session.cancellation_handle();
-                        tokio::spawn(async move {
+                        let child_cost = ordinary_cost.clone();
+                        crate::udp::OrdinaryProbeTask::spawn(ordinary_cost.clone(), session_deadline, async move {
                             let targets =
                                 peers.stable_remote_punch_targets_for(&peer_id).await;
                             if cancellation.is_cancelled()
@@ -536,7 +545,7 @@ async fn run_direct_probe_loop(
                             let recovery_identity = reservation.identity();
                             reservation.commit();
                             let mut generation = udp
-                                .run_fresh_mapping_generation(
+                                .run_fresh_mapping_generation_observed(
                                     &peer_id,
                                     &signal.stun_servers,
                                     signal.stun_timeout,
@@ -544,6 +553,7 @@ async fn run_direct_probe_loop(
                                     probe_interval,
                                     attempts.min(2),
                                     Some(&cancellation),
+                                    &child_cost,
                                 )
                                 .await;
                             if cancellation.is_cancelled()
@@ -554,6 +564,12 @@ async fn run_direct_probe_loop(
                             {
                                 return;
                             }
+                            debug!(
+                                event = "ordinary_probe_returned_cost",
+                                peer_id = %peer_id,
+                                summary = ?generation.ordinary_probe_summary(),
+                                "completed primary/compatibility call observation; cancellation and burst costs may be missing"
+                            );
                             match &mut generation {
                                 FreshMappingOutcome::Accepted(result, handoff) => {
                                     if cancellation.is_cancelled()
@@ -690,7 +706,7 @@ async fn run_direct_probe_loop(
                             }
                             drop(generation);
                         })
-                    };
+                    });
 
                     for endpoint in peers.direct_nat_maintainer_targets_for(&peer_id).await {
                         if session.is_cancelled()
@@ -1049,7 +1065,10 @@ async fn run_direct_probe_loop(
                             warn!("Failed to retry direct UDP probes for peer {peer_id}: {err}");
                         }
                     }
-                    if let Err(error) = fresh_mapping_task.await {
+                    if let Some(error) = match fresh_mapping_task.as_mut() {
+                        Some(task) => task.finish(false).await,
+                        None => None,
+                    } {
                         peers
                             .record_direct_event(
                                 &peer_id,
@@ -1063,6 +1082,21 @@ async fn run_direct_probe_loop(
                     }
                 })
                 .await;
+
+                // The handle survives cancellation of the body. Abort first,
+                // then actually join only within this original session deadline.
+                let cleanup_join_error = match fresh_mapping_task.as_mut() {
+                    Some(task) => task.finish(outcome != PunchSessionOutcome::Completed).await,
+                    None => None,
+                };
+                debug!(
+                    event = "ordinary_probe_retained_cost",
+                    original_peer_id = %peer_id,
+                    snapshot = ?ordinary_cost.snapshot(),
+                    join_error = ?cleanup_join_error,
+                    scope = "observed_primary_compatibility_returns_only",
+                    "original invocation lower bound; excludes bursts and ACKs; overlaps returned-call view"
+                );
 
                 match outcome {
                     PunchSessionOutcome::Completed => {}

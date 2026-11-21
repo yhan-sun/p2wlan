@@ -157,30 +157,46 @@ impl PeerManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
         };
-        // Canonical epoch -> connection order, without waiting for another
-        // async resource under either guard. Contention preserves the exact
-        // observation in the terminal log instead of delaying path cleanup.
-        let Ok((epoch, mut connections)) = tokio::time::timeout(
-            Duration::from_millis(100),
-            self.lock_epoch_and_connections_write(),
-        )
-        .await
-        else {
-            terminal.archive("commit_contended");
-            return false;
-        };
-        let Ok(profile) = self.local_nat_profile.try_read() else {
-            drop(connections);
-            drop(epoch);
-            terminal.archive("profile_publication_contended");
-            return false;
-        };
-        let Ok(sessions) = self.hard_hard_sessions.try_lock() else {
-            drop(profile);
-            drop(connections);
-            drop(epoch);
-            terminal.archive("session_publication_contended");
-            return false;
+        // One original commit budget covers every guard, not one budget per
+        // retry. A short receive/validation owner may hold the session mutex
+        // at this boundary; release all guards before yielding, then recheck
+        // the original identity under the complete guard set. Continued
+        // contention still archives the sealed observation for path cleanup.
+        let commit_end = tokio::time::Instant::now() + Duration::from_millis(100);
+        let mut contention_reason = "commit_contended";
+        let (epoch, mut connections, profile, sessions) = loop {
+            if tokio::time::Instant::now() >= commit_end {
+                terminal.archive(contention_reason);
+                return false;
+            }
+            let Ok((epoch, connections)) =
+                tokio::time::timeout_at(commit_end, self.lock_epoch_and_connections_write()).await
+            else {
+                terminal.archive("commit_contended");
+                return false;
+            };
+            let profile = match self.local_nat_profile.try_read() {
+                Ok(profile) => profile,
+                Err(_) => {
+                    contention_reason = "profile_publication_contended";
+                    drop(connections);
+                    drop(epoch);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            };
+            let sessions = match self.hard_hard_sessions.try_lock() {
+                Ok(sessions) => sessions,
+                Err(_) => {
+                    contention_reason = "session_publication_contended";
+                    drop(profile);
+                    drop(connections);
+                    drop(epoch);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            };
+            break (epoch, connections, profile, sessions);
         };
         let Some(report) = terminal.report.as_ref() else {
             return false;
@@ -223,6 +239,14 @@ impl PeerManager {
             drop(connections);
             drop(epoch);
             terminal.archive("terminal_identity_superseded");
+            return false;
+        }
+        if tokio::time::Instant::now() >= commit_end {
+            drop(sessions);
+            drop(profile);
+            drop(connections);
+            drop(epoch);
+            terminal.archive("commit_contended");
             return false;
         }
         let Some(report) = terminal.report.take() else {

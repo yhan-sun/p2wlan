@@ -25,6 +25,14 @@ on:
       # the wire format; both sides must stay in lockstep).
       - "contracts/**"
       - ".github/workflows/**"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - "client/netbind/**"
+      - "client/wireguard/**"
+      - "client/relay/**"
+      - "scripts/dplpmtud/**"
+      - "docs/reference/networking.md"
+      - "scripts/mtu-smoke.sh"
+      - "scripts/quality/**"
   pull_request:
     branches: [ main ]
     paths:
@@ -42,6 +50,14 @@ on:
       - "client/tray/**"
       - "contracts/**"
       - ".github/workflows/**"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - "client/netbind/**"
+      - "client/wireguard/**"
+      - "client/relay/**"
+      - "scripts/dplpmtud/**"
+      - "docs/reference/networking.md"
+      - "scripts/mtu-smoke.sh"
+      - "scripts/quality/**"
   workflow_dispatch:
     inputs:
       android_tun_mode:

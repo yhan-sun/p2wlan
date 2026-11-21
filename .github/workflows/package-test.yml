@@ -14,6 +14,12 @@ on:
       - "contracts/**"
       - "scripts/build_android_native.sh"
       - "scripts/release/**"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - ".github/workflows/**"
+      - "scripts/dplpmtud/**"
+      - "docs/reference/networking.md"
+      - "scripts/mtu-smoke.sh"
+      - "scripts/quality/**"
   pull_request:
     branches: [main]
     paths:
@@ -26,6 +32,12 @@ on:
       - "contracts/**"
       - "scripts/build_android_native.sh"
       - "scripts/release/**"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - ".github/workflows/**"
+      - "scripts/dplpmtud/**"
+      - "docs/reference/networking.md"
+      - "scripts/mtu-smoke.sh"
+      - "scripts/quality/**"
 
 permissions:
   contents: read

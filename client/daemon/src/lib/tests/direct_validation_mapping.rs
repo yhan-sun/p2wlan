@@ -2,6 +2,55 @@ use super::*;
 use p2pnet_nat::{decode_authenticated_punch_packet, PunchPacketKind};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::prelude::*;
+
+/// One diagnostic observation from this fixture's original validation worker.
+/// It never changes admission, the request deadline, or an assertion result.
+#[derive(Clone, Default)]
+struct PreflightOutcomeCapture(Arc<std::sync::Mutex<Option<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PreflightOutcomeCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "p2pnet_daemon::direct_validation" {
+            return;
+        }
+        struct EventName(bool);
+        impl tracing::field::Visit for EventName {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "event" {
+                    self.0 = value == "direct_validation_preflight_completed";
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        let mut name = EventName(false);
+        event.record(&mut name);
+        if !name.0 {
+            return;
+        }
+        struct Outcome(Option<String>);
+        impl tracing::field::Visit for Outcome {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "outcome" {
+                    // This producer records only the fixed preflight enum and
+                    // its static reason; retain one bounded diagnostic value.
+                    self.0 = Some(format!("{value:?}").chars().take(256).collect());
+                }
+            }
+        }
+        let mut outcome = Outcome(None);
+        event.record(&mut outcome);
+        let mut first = self.0.lock().unwrap();
+        if first.is_none() {
+            *first = outcome.0;
+        }
+    }
+}
 
 fn mapping_config(identity: &NodeIdentity, node_id: &str, virtual_ip: &str) -> Config {
     let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
@@ -217,29 +266,45 @@ async fn ordinary_validation_preflight_authenticates_return_mapping_without_chas
     let worker_udp = udp_a.clone();
     let worker_peers = peers_a.clone();
     let (completed_tx, completed_rx) = oneshot::channel();
-    tasks.spawn(async move {
-        run_direct_encrypted_validation(
-            PeerReflexiveObservation {
-                peer_id: "node-b".to_string(),
-                observed_endpoint: original_addr,
-            },
-            worker_udp,
-            worker_peers,
-            wg_a,
-            "10.20.0.1",
-        )
-        .await;
-        let _ = completed_tx.send(());
-    });
+    let preflight = PreflightOutcomeCapture::default();
+    let subscriber = tracing_subscriber::registry().with(preflight.clone());
+    tasks.spawn(
+        async move {
+            run_direct_encrypted_validation(
+                PeerReflexiveObservation {
+                    peer_id: "node-b".to_string(),
+                    observed_endpoint: original_addr,
+                },
+                worker_udp,
+                worker_peers,
+                wg_a,
+                "10.20.0.1",
+            )
+            .await;
+            let _ = completed_tx.send(());
+        }
+        .with_subscriber(subscriber),
+    );
 
     timeout(Duration::from_secs(3), async {
         let request = request_rx
             .await
             .expect("proxy must observe the first request/ACK");
+        // Evaluate the original predicate once, at its original protocol
+        // boundary. Diagnostics must never wait for it to become true.
+        let independent_authentication = peers_a
+            .is_authenticated_direct_endpoint("node-b", returning_addr, generation)
+            .await;
+        eprintln!(
+            "mapping_preflight outcome={:?} independent_authenticated={independent_authentication}",
+            preflight.0.lock().unwrap().as_ref(),
+        );
+        if !independent_authentication {
+            let counters = timeout(Duration::from_millis(20), udp_a.probe_rx_snapshot()).await;
+            eprintln!("mapping_preflight original_failure_rx={counters:?}");
+        }
         assert!(
-            peers_a
-                .is_authenticated_direct_endpoint("node-b", returning_addr, generation)
-                .await,
+            independent_authentication,
             "independent Probe authentication must precede encrypted ACK acceptance"
         );
         assert!(

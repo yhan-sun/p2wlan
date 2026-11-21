@@ -64,6 +64,7 @@ pub(super) const fn birthday_failure_priority(kind: BirthdaySweepFailureKind) ->
         BirthdaySweepFailureKind::SocketRevoked => 40,
         BirthdaySweepFailureKind::SocketUnavailable => 30,
         BirthdaySweepFailureKind::ProbeRegistrationFailed => 20,
+        BirthdaySweepFailureKind::PreHandoffTimeout => 15,
         BirthdaySweepFailureKind::ProbeEncodingFailed => 10,
         BirthdaySweepFailureKind::Send => 1,
     }

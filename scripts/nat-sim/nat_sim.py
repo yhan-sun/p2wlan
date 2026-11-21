@@ -41,6 +41,7 @@ import struct
 import time
 from background_traffic import run_background, validate_background_limits
 from network_conditions import Impairments, NetworkProfile, load_profiles
+from monotonic_clock import monotonic_ns
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
 
@@ -87,7 +88,7 @@ class NatTrace:
         self._sequence += 1
         row = {
             "sequence": self._sequence,
-            "monotonic_ns": time.monotonic_ns(),
+            "monotonic_ns": monotonic_ns(),
             "event": event,
             **fields,
         }

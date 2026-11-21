@@ -7,6 +7,10 @@
 include!("tests/part01a.rs");
 include!("tests/part01c.rs");
 include!("tests/part01b.rs");
+#[path = "tests/ordinary_recovery.rs"]
+mod ordinary_recovery;
+#[path = "tests/ordinary_session_deadline.rs"]
+mod ordinary_session_deadline;
 include!("tests/part02a.rs");
 include!("tests/part02b.rs");
 #[path = "tests/daemon_e2e/mod.rs"]
@@ -21,6 +25,7 @@ include!("tests/part06.rs");
 mod synchronized_punch_e2e;
 
 include!("tests/business_budget.rs");
+include!("tests/business_budget_affinity.rs");
 include!("tests/mobile_lifecycle_evidence.rs");
 include!("tests/dplpmtud_final_acceptance.rs");
 

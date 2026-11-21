@@ -364,7 +364,7 @@ impl Daemon {
             .spawn(
                 "network-outbound",
                 true,
-                run_network_outbound(
+                run_network_outbound_with_request_carriage(
                     outbound_rx,
                     self.transport.clone(),
                     self.peers.clone(),

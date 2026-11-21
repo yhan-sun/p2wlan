@@ -106,6 +106,38 @@ impl UdpTransport {
         self.socket_for_peer(peer_id).await
     }
 
+    /// Read the existing socket registry without waiting or partly running a
+    /// stale-socket detach. Lifecycle cleanup belongs to the ordinary resolver.
+    pub(crate) fn try_socket_for_peer_endpoint(
+        &self,
+        peer_id: &str,
+        endpoint: SocketAddr,
+    ) -> Option<(usize, Arc<UdpSocket>)> {
+        if endpoint.is_ipv6() {
+            return self
+                .ipv6_socket
+                .clone()
+                .map(|socket| (IPV6_SOCKET_INDEX, socket));
+        }
+        let state = self.socket_state.try_lock().ok()?;
+        let index = state
+            .affinity
+            .get(peer_id)
+            .map_or(0, |pin| pin.socket_index);
+        if index >= DYNAMIC_SOCKET_INDEX_BASE {
+            let entry = state.dynamic.get(&index)?;
+            return (entry.peer_id == peer_id
+                && entry.phase.is_usable()
+                && entry.network_generation == self.peers.current_network_generation_sync()
+                && entry.permits_ordinary_traffic())
+            .then(|| (index, entry.socket.clone()));
+        }
+        self.active_sockets()
+            .get(index)
+            .cloned()
+            .map(|socket| (index, socket))
+    }
+
     /// Exact encrypted sends must not consume an unproven rendezvous mapping.
     /// Isolation is established while provisional and never re-enabled after
     /// authentication, so a successful check cannot race a later reservation.
@@ -500,6 +532,55 @@ impl UdpTransport {
         DYNAMIC_SOCKET_INDEX_BASE
             + self.dynamic_socket_counter.fetch_add(1, Ordering::Relaxed)
                 % (usize::MAX - DYNAMIC_SOCKET_INDEX_BASE)
+    }
+
+    /// Resolve the local socket named by the authoritative Direct pair.
+    /// Probe affinity may move independently while that pair remains current.
+    /// This lookup neither changes affinity nor falls back to another mapping;
+    /// callers still qualify the complete Direct identity and MTU budget.
+    pub(crate) async fn resolve_committed_direct_socket_with_lease(
+        &self,
+        peer_id: &str,
+        local_endpoint: SocketAddr,
+        generation: u64,
+    ) -> Option<(usize, Arc<UdpSocket>, DynamicSocketSendLease)> {
+        let state = self.socket_state.lock().await;
+        if generation != self.peers.current_network_generation_sync() {
+            return None;
+        }
+        for (index, socket) in self.active_sockets().iter().enumerate() {
+            if socket.local_addr().ok() == Some(local_endpoint) {
+                return Some((index, socket.clone(), DynamicSocketSendLease::noop(index)));
+            }
+        }
+        if let Some(socket) = self
+            .ipv6_socket
+            .as_ref()
+            .filter(|socket| socket.local_addr().ok() == Some(local_endpoint))
+        {
+            return Some((
+                IPV6_SOCKET_INDEX,
+                socket.clone(),
+                DynamicSocketSendLease::noop(IPV6_SOCKET_INDEX),
+            ));
+        }
+        let (&index, entry) = state.dynamic.iter().find(|(_, entry)| {
+            entry.peer_id == peer_id
+                && entry.network_generation == generation
+                && entry.phase.is_usable()
+                && entry.permits_ordinary_traffic()
+                && entry.socket.local_addr().ok() == Some(local_endpoint)
+        })?;
+        let leases = entry.send_leases.clone();
+        leases.acquire();
+        Some((
+            index,
+            entry.socket.clone(),
+            DynamicSocketSendLease {
+                state: leases,
+                socket_index: index,
+            },
+        ))
     }
 
     pub(crate) async fn resolve_send_socket_with_lease_for_endpoint(

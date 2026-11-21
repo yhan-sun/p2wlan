@@ -444,17 +444,28 @@ extension DaemonControllerPids on DaemonController {
 
     Process? process;
     try {
-      final started = await Process.start(executable, [
-        '-NoLogo',
-        '-NoProfile',
-        '-NonInteractive',
-        '-WindowStyle',
-        'Hidden',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-Command',
-        wrappedScript,
-      ], mode: ProcessStartMode.normal);
+      // A GUI launched by PowerShell 7 inherits its module paths. Windows
+      // PowerShell must construct its own defaults instead of trying to load
+      // incompatible Core modules through this intermediate Dart process.
+      final environment = Map<String, String>.of(Platform.environment)
+        ..removeWhere((key, _) => key.toUpperCase() == 'PSMODULEPATH');
+      final started = await Process.start(
+        executable,
+        [
+          '-NoLogo',
+          '-NoProfile',
+          '-NonInteractive',
+          '-WindowStyle',
+          'Hidden',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          wrappedScript,
+        ],
+        mode: ProcessStartMode.normal,
+        environment: environment,
+        includeParentEnvironment: false,
+      );
       process = started;
 
       const decoder = Utf8Decoder(allowMalformed: true);

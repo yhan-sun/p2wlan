@@ -762,10 +762,25 @@ async fn run_owned_punch_session_with_deadline<F>(
 where
     F: std::future::Future<Output = ()>,
 {
+    // Use the original Tokio duration conversion, including its checked-add
+    // overflow behavior, then share that actual timer deadline.
+    run_owned_punch_session_until(session, sleep(deadline).deadline(), work).await
+}
+
+/// The original body and retained optimization child share this same instant.
+/// No spawn or cleanup phase may restart the invocation's duration.
+async fn run_owned_punch_session_until<F>(
+    session: &PunchSessionPermit,
+    deadline: tokio::time::Instant,
+    work: F,
+) -> PunchSessionOutcome
+where
+    F: std::future::Future<Output = ()>,
+{
     tokio::select! {
         biased;
         _ = session.cancelled() => PunchSessionOutcome::Cancelled,
-        _ = sleep(deadline) => PunchSessionOutcome::DeadlineExceeded,
+        _ = tokio::time::sleep_until(deadline) => PunchSessionOutcome::DeadlineExceeded,
         _ = work => PunchSessionOutcome::Completed,
     }
 }

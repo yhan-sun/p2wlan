@@ -14,6 +14,7 @@ import sys
 import time
 
 from network_conditions import load_profiles
+from launch_identity import read_launch_evidence, source_identity
 
 
 # These are synthetic stress configurations, not calibrated mobile operators.
@@ -74,17 +75,6 @@ SCENARIOS = {
 }
 
 
-def source_identity(root: Path) -> dict:
-    def git(*args):
-        return subprocess.check_output(["git", *args], cwd=root)
-    digest = hashlib.sha256(git("diff", "--binary", "HEAD"))
-    for name in sorted(git("ls-files", "--others", "--exclude-standard", "-z").split(b"\0")):
-        if name:
-            digest.update(name + b"\0")
-            digest.update((root / os.fsdecode(name)).read_bytes())
-    return {"commit": git("rev-parse", "HEAD").decode().strip(), "patch_sha256": digest.hexdigest()}
-
-
 def case_environment(base: dict, changes: dict, directory: Path, profile: Path, seed: int) -> dict:
     # Do not inherit another experiment's fault flags or a forced traversal lane.
     env = {key: value for key, value in base.items() if key in {
@@ -100,7 +90,8 @@ def case_environment(base: dict, changes: dict, directory: Path, profile: Path, 
     return env
 
 
-def read_case(directory: Path, exit_code: int, require_direct: bool = False) -> dict:
+def read_case(directory: Path, exit_code: int, require_direct: bool = False,
+              expected_source: dict | None = None) -> dict:
     errors, evidence = [], {}
     for name in ("nat-evidence", "mapping-evidence", "continuity-evidence", "cleanup"):
         try:
@@ -112,6 +103,8 @@ def read_case(directory: Path, exit_code: int, require_direct: bool = False) -> 
             errors.append(f"missing_or_invalid:{name}:{type(error).__name__}")
     if exit_code:
         errors.append(f"smoke_exit:{exit_code}")
+    launch_identity = read_launch_evidence(directory, expected_source)
+    errors.extend(f"launch_identity:{reason}" for reason in launch_identity["errors"])
     checks = {"nat-evidence": ("result", "pass"), "mapping-evidence": ("valid", True),
               "continuity-evidence": ("valid", True), "cleanup": ("all_reaped", True)}
     for name, (field, expected) in checks.items():
@@ -155,6 +148,7 @@ def read_case(directory: Path, exit_code: int, require_direct: bool = False) -> 
         except (OSError, ValueError, KeyError, TypeError, IndexError, StopIteration):
             errors.append("direct_business_evidence_invalid")
     return {"valid": not errors, "errors": errors,
+            "launch_identity": launch_identity,
             "direct_required": require_direct, "recent_direct_business_delta": direct_progress,
             "first_business_paths": {side: observed.get(side, {}).get("first_usable", {}).get("path") for side in ("a", "b")},
             "final_paths": final_paths, "continuity": evidence.get("continuity-evidence"),
@@ -222,7 +216,7 @@ def main(argv=None):
                         process.wait()
                     interrupted = isinstance(error, KeyboardInterrupt)
                     code = 130 if interrupted else 124
-            row = read_case(directory, code, args.require_direct)
+            row = read_case(directory, code, args.require_direct, source)
             row.update(scenario=name, repetition=repetition + 1, seed_base=seed,
                        actual_nat_seed=seed + 1, environment_overrides=changes,
                        network_profile={"schema_version": 1, **options},

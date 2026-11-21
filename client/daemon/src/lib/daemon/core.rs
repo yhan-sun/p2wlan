@@ -44,7 +44,7 @@ pub struct Daemon {
     /// RAW routed outbound packets emitted by the WireGuard adapter to the
     /// network outbound worker (which is the only place that encrypts
     /// business packets).
-    outbound_rx: Option<mpsc::Receiver<OutboundPacket>>,
+    outbound_rx: Option<crate::request_carriage::RawOutboundReceiver>,
     /// In-flight initiator handshakes keyed by responder node ID (shared so timeout tasks can clean up).
     pending_handshakes: Arc<PendingHandshakeStore>,
     /// Serializes offer, answer, and maintenance mutations for one peer.
@@ -212,7 +212,19 @@ impl Daemon {
             Some(health.clone()),
             Some(peers.telemetry_hub()),
         );
-        let (transport, outbound_rx) = WireGuardTransport::new();
+        let (transport, outbound_rx) = if config.network.validate_overlay {
+            let (transport, rx) = WireGuardTransport::new_with_request_carriage();
+            (
+                transport,
+                crate::request_carriage::RawOutboundReceiver::from(rx),
+            )
+        } else {
+            let (transport, rx) = WireGuardTransport::new();
+            (
+                transport,
+                crate::request_carriage::RawOutboundReceiver::from(rx),
+            )
+        };
         let acl_engine = AclEngine::from_config(&config.acl);
         let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
 

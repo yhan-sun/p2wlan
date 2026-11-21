@@ -27,7 +27,7 @@ if p["token"]: headers["Authorization"] = "Bearer " + p["token"]
 data = None if p["body"] is None else json.dumps(p["body"]).encode()
 r = urllib.request.Request(p["url"], data=data, headers=headers, method=p["method"])
 try:
-    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r, timeout=3) as response:
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r, timeout=min(3, p.get("timeout", 3))) as response:
         text = response.read(1048576).decode()
         try: body = json.loads(text)
         except ValueError: body = text
@@ -318,7 +318,10 @@ def validate_stop_traffic_coverage(
 
 
 def run(args: list[str], *, check: bool = True, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, text=True, capture_output=True, check=check, timeout=20, **kwargs)
+    timeout = min(20, kwargs.pop('timeout', 20))
+    if timeout <= 0:
+        raise TimeoutError('original synchronous command deadline')
+    return subprocess.run(args, text=True, capture_output=True, check=check, timeout=timeout, **kwargs)
 
 
 class Lab:
@@ -400,11 +403,16 @@ class Lab:
             process.stdin.close()
         return process
 
-    def http(self, label: str, path: str, *, token: str = '', method: str = 'GET', body: Any = None, port: int | None = None) -> Any:
+    def http(self, label: str, path: str, *, token: str = '', method: str = 'GET', body: Any = None, port: int | None = None,
+             deadline: float | None = None) -> Any:
         url = f'http://127.0.0.1:{port}{path}' if port else 'http://192.0.2.2:8080' + path
+        timeout = 3 if deadline is None else min(3, deadline - time.monotonic())
+        if timeout <= 0:
+            raise TimeoutError('original diagnostics phase deadline')
         result = self.cmd(label, [sys.executable, '-c', HTTP_HELPER], input=json.dumps({
             'url': url, 'method': method, 'token': token, 'body': body,
-        }))
+            **({'timeout': timeout} if deadline is not None else {}),
+        }), **({'timeout': timeout} if deadline is not None else {}))
         response = json.loads(result.stdout)
         if not 200 <= response['status'] < 300:
             raise RuntimeError(f'HTTP {response["status"]} at {method} {path}')
@@ -471,12 +479,13 @@ class Lab:
         self.daemons[name] = entry
         return entry
 
-    def status(self, name: str) -> dict[str, Any]:
+    def status(self, name: str, *, deadline: float | None = None) -> dict[str, Any]:
         entry = self.daemons[name]
         if entry['process'].poll() is not None:
             raise RuntimeError(f'{name} instance {entry["instance"]} exited with {entry["process"].returncode}')
         token = (entry['directory'] / 'p2wlan-daemon.diag-auth').read_text().strip()
-        status = self.http(entry['namespace'], '/status', token=token, port=entry['port'])
+        status = self.http(entry['namespace'], '/status', token=token, port=entry['port'],
+                           **({'deadline': deadline} if deadline is not None else {}))
         if status.get('process_id') != entry['process'].pid:
             raise RuntimeError(f'{name} diagnostics process_id does not match launched PID')
         if status.get('network_id') != entry['room']['id'] or not status.get('virtual_ip'):
@@ -488,7 +497,7 @@ class Lab:
         verify_same_profile_restart(previous, status, self.daemons[name]['process'].pid)
         return status
 
-    def _safe_status(self, name: str, status: dict[str, Any]) -> dict[str, Any]:
+    def _safe_status(self, name: str, status: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
         entry = self.daemons[name]
         timeline = status.get('connection_timeline') or {}
         peer_ids = sorted(
@@ -502,12 +511,15 @@ class Lab:
             token = diag_token_path.read_text().strip()
             for peer_id in peer_ids:
                 try:
+                    peer_started = time.monotonic_ns()
                     peer = self.http(
                         entry['namespace'],
                         '/status/peer/' + peer_id,
                         token=token,
                         port=entry['port'],
+                        **({'deadline': deadline} if deadline is not None else {}),
                     )
+                    peer_completed = time.monotonic_ns()
                     scoped = peer.get('peer') or {}
                     peer_status[peer_id] = {
                         key: scoped.get(key)
@@ -516,8 +528,22 @@ class Lab:
                             'remote_candidate_generation', 'remote_candidate_epoch',
                             'bytes_sent', 'bytes_received',
                             'direct', 'selected_pair', 'current_direct_pair',
+                            'consent_endpoint', 'current_path_selection', 'last_path_selection',
                         )
                     }
+                    peer_status[peer_id]['direct_events'] = [
+                        {key: event.get(key) for key in ('age_ms', 'network_generation', 'stage', 'endpoint')}
+                        for event in (scoped.get('direct_events') or [])[-64:]
+                        if event.get('stage') in ('consent_check_sent', 'consent_ack_received', 'consent_timeout')
+                    ]
+                    for selector_name in ('current_path_selection', 'last_path_selection'):
+                        selector = scoped.get(selector_name)
+                        peer_status[peer_id][selector_name] = (
+                            {key: selector.get(key) for key in ('path', 'direct_endpoint', 'direct_confirmed', 'relay_hedged', 'reason_code')}
+                            if isinstance(selector, dict) else None
+                        )
+                    peer_status[peer_id]['observed_begin_monotonic_ns'] = peer_started
+                    peer_status[peer_id]['observed_end_monotonic_ns'] = peer_completed
                     probe_session_id = scoped.get('probe_session_id')
                     peer_status[peer_id]['probe_session_id_fingerprint'] = (
                         hashlib.sha256(probe_session_id.encode()).hexdigest()[:16]
@@ -547,6 +573,8 @@ class Lab:
             'udp_local_addr': status.get('udp_local_addr'),
             'udp_socket_count': status.get('udp_socket_count'),
             'peer_snapshot_stale': status.get('peer_snapshot_stale'),
+            'revision': status.get('revision'),
+            'captured_revision': status.get('captured_revision'),
             'health': {
                 'status': (status.get('health') or {}).get('status'),
                 'reason': redact_text((status.get('health') or {}).get('reason') or '')[:300],

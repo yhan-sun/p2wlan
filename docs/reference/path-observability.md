@@ -2,6 +2,10 @@
 
 路径观测只读取已提交的 Direct/Relay 状态，不做路径决策、不写 socket、不阻塞数据面。唯一的状态转换入口是 commit_path_transition；每个 peer 最多保留 32 条转换记录，动态标签不包含 peer id、endpoint、IP、session id 或任意错误文本。
 
+`peers[].traversal_plan` 是当前资料下的尝试建议，不表示运行时已取得探测许可或 Direct 已建立。生日扫描建议遵守 `birthday_probing_enabled`，可预测的 Hard↔Hard 计划不受该生日开关影响；IPv6 依据本地 NAT 能力中的端点及远端当前候选，诊断显示的本地 socket 地址仍用于候选对展示。
+
+`peers[].remote_nat_profile_fresh` 表示资料的时间新鲜度；`traversal_plan.remote_profile_fresh` 还要求资料属于当前 remote candidate epoch。时间仍新鲜的旧 epoch 资料不能授权 Hard↔Hard。运行时的 Relay 回退建议来自配置及拓扑要求，带路径选择的诊断使用实时 Relay 可用性；两者都不代表对端已确认。历史 fresh-mapping 校准记录只描述已有观察，不授予当前映射或探测许可。诊断可能返回缓存，实际发送和 Direct 提交仍复核当前生命周期及预算。
+
 本地认证的 GET /status 响应附带进程内递增的 X-P2WLAN-Status-Request-ID 响应头，用于把同主机客户端的连接/首字节耗时与 daemon 快照、序列化和写回阶段对应起来。诊断日志只记录请求编号、进程编号、耗时和快照重试/回退状态，不记录授权头、token 或 peer 身份；JSON schema 不依赖该可选响应头。
 
 状态对象带 schema_version、network_generation、peer_session_generation、remote_candidate_epoch、lifecycle、current_path、previous_path、transition_reason、last_path_change_reason、path_age_ms、first_direct_commit_age_ms、direct_state、relay_state、recovery_state、selected_path_mtu 和 selected_udp_datagram_size。`transition_reason` 是最后一次被接纳事件的原因，可能没有改变活动路径；`last_path_change_reason` 仅在活动路径实际切换时更新。首个 Direct 提交的 age 保留到本网络代际结束，不依赖 32 条转换事件环。
@@ -38,6 +42,41 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 `connection_timeline.hot_path_observations` 保留进程生命周期内的精确分类计数，包括会话证据锁竞争、身份过期、业务 ingress 暂缓、出站队列冲刷批次，以及匹配 ACK 被验证调度器接纳、合并、限流或因健康 Direct 而忽略的次数。高频会话事件只在每类计数达到 1、2、4、8 等 2 的幂时写入时间线和状态事件流；计数本身不会按包推动状态 revision。`session_evidence_contended` 表示当前身份围栏暂时竞争，`stale_session_evidence` 表示身份已过期，不应仅凭采样事件数反推总包数。
 
+## 本地数据面采样
+
+`dataplane_profile` 与 `dataplane_profile_summary` 使用 `profile_schema_version=2`。发送与接收按固定 1/64 包频率选择诊断样本，各阶段按名称和单位分别保存最近最多 512 个样本，不按 30 秒清空。快慢路径和不同阶段的样本量可能不同，不能由一个阶段的计数推算另一个阶段。
+
+| 字段 | 口径 |
+| --- | --- |
+| `unit` | `microseconds`、`count` 或 `bytes`；通用 `p50`、`p95`、`p99`、`max` 使用该单位 |
+| `sample_count` | 该阶段和单位自 profiler 创建以来接纳的累计样本数，包含已被窗口淘汰的样本 |
+| `window_sample_count` | 本次分位数实际使用的样本数，范围 1–512 |
+| `window_kind` / `window_capacity` | 固定为 `latest_samples` / `512`，表示最近样本窗口，不是固定时长窗口 |
+| `window_start_elapsed_us` / `window_end_elapsed_us` | 窗口内样本记录时刻的最小值和最大值，相对本进程 profiler 起点的单调时间 |
+| `window_span_us` | 上述记录时间范围的非负跨度；单样本为 0 |
+| `reported_at_elapsed_us` / `window_last_sample_age_us` | 本次报告时刻，以及最近窗口样本距报告的非负时间差 |
+
+兼容字段 `p50_us`、`p95_us`、`p99_us`、`max_us` 仅随 `unit=microseconds` 输出；队列包数和字节数不带这些字段。读取 schema 2 时应先检查 `unit`，使用通用分位数字段。P99 的样本量来自 `window_sample_count`，不能使用可能很大的累计 `sample_count`，也不能把窗口最大值当作完整运行期间的峰值。
+
+阶段 debug 报告每累计 8 个样本产生一次；info 汇总由新采样触发，最短间隔 30 秒，闲置时没有独立定时报告。`dataplane_tail_event` 以 2 ms 为候选阈值、5 ms 为 severe 阈值，进程内限频间隔为 100 ms。`tail_events` 累计达到阈值的候选，`tail_events_emitted` 统计限频器接纳的事件，`tail_events_suppressed` 统计限频器省略的候选；emitted 不保证日志订阅器或落盘系统已经保存该事件。它们不表示所有业务包的尾延迟分布。
+
+这些数据仅描述端点本地 userspace 阶段，不是对端应用延迟、公网 RTT 或端到端业务成功证据；采样、日志和直方图均不参与路径选择。
+
+`tx_pending_residence_sent_us` 与 `tx_pending_residence_dropped_us` 分别记录采样包经显式发送成功或丢弃终态完成的 pending 驻留时间。初次进入 network-outbound FIFO 开始计时，actor 到 flush 任务的转移及队列合并不重置；真正进入加密/发送尝试时暂停，重试或预算暂缓后重新排队时继续累计。它是同一包所有排队区间之和，包含重试后的排队，排除加密/发送执行时间。成功与丢弃分开，不能只用成功样本判断积压情况，也不能从这些采样数推算完整丢包数。
+
+这两个阶段只覆盖执行了上述显式终态记录的样本。任务 abort、panic 或关闭期间的取消若发生在记录之前，该样本的最终驻留时间未知，不能按零驻留或发送成功处理。
+
+出站 actor 在采样包从 channel 取出后读取以下资源量；当前已取出的包不再属于 channel。这些仍是采样窗口内的读数，不是连续监测的全程峰值：
+
+| `stage` | `unit` | `resource_scope` 与范围 |
+| --- | --- | --- |
+| `tx_network_outbound_queue_depth` | `count` | `channel_queued_packets`：该 channel 中尚未取出的包数 |
+| `tx_network_outbound_actor_pending_packets` | `count` | `actor_owned_pending_only`：当前 actor 持有的 FIFO 包数之和 |
+| `tx_network_outbound_actor_pending_bytes` | `bytes` | `actor_owned_pending_only`：上述 FIFO 中原始 IP 包长度之和 |
+| `tx_network_outbound_active_flush_tasks` | `count` | `spawned_flush_tasks_including_unjoined`：JoinSet 中的任务数，包含已结束但尚未 join 的任务 |
+
+已移交 flush 任务的 FIFO 及任务正在处理的包不在 actor pending 读数内；任务数不能换算成包数。channel 字节深度、session 层 pending、上游队列、生产者等待提交的包及加密/重试副本不由这些字段覆盖。资源报告携带 `total_logical_bytes_measured=false`，表示整条逻辑流水线的总字节尚未计量；上述原始包长度也不是实际分配内存或 RSS。
+
 ## Hard↔Hard attempt report
 
 控制客户端的阶段追踪同时识别 `hh1` 与 `hh2`，服务端在 `P2WLAN_A0_SIGNAL_TRACE=1` 时记录对应信令接纳阶段。关联字段使用短摘要标签，不输出原始 session token；信令持久化仅表示服务端接纳，不能证明对端已执行探测或建立 Direct。
@@ -73,7 +112,9 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 生日扫描的正式报告可带 `birthday_sweep`，保留同一终态快照中的 socket 可用性、计划与完成波次、目标覆盖、按 socket 的物理发送量、错误和停止原因；辅助事件环缺项不再承担这些计数的唯一存储。该对象缺失表示旧版本或没有生日扫描明细，不能解释为零发送。其 `first_send_at_ms` / `last_send_at_ms` 保留原扫描账本的本端墙钟口径；过程耗时仍使用报告 `timeline` 中的单调时间，不混用两种时钟。
 
-`target_order_tags` 保留实际目标顺序，重复目标仍重复出现；`confirmed_target_rank` 在加密验证选中的远端地址属于该计划时记录其从 0 开始的位置，不暴露地址，空值表示未确认 Direct 或确认的是计划外学习地址。`candidate_cap` 与 `truncation_reason` 说明裁剪边界。分类包括 `measurement_insufficient`、`model_unpredictable`、`budget_rejected`、`send_error`、`missed_schedule`、`candidate_not_executed`、`no_response`、`probe_hit_validation_failed`、`cancelled_generation_changed`、`encrypted_validation_completed` 和证据不足时的 `unknown`。最后一个验证阶段不是业务成功；采集器只有在真实业务 ingress 存在时才派生 `direct_business_succeeded`。探测命中不等于加密验证，验证也不等于业务已可用。
+`target_order_tags` 保留实际目标顺序，重复目标仍重复出现；`confirmed_target_rank` 在加密验证选中的远端地址属于该计划时记录其从 0 开始的位置，不暴露地址，空值表示未确认 Direct 或确认的是计划外学习地址。`candidate_cap` 与 `truncation_reason` 说明裁剪边界。分类包括 `measurement_insufficient`、`model_unpredictable`、`budget_rejected`、`send_error`、`missed_schedule`、`candidate_not_executed`、`execution_incomplete`、`no_response`、`probe_hit_validation_failed`、`cancelled_generation_changed`、`encrypted_validation_completed` 和证据不足时的 `unknown`。最后一个验证阶段不是业务成功；采集器只有在真实业务 ingress 存在时才派生 `direct_business_succeeded`。探测命中不等于加密验证，验证也不等于业务已可用。
+
+`failure_class` 是终态诊断主类，不授予发送、路径提升或负学习许可。`no_response` 要求本地计划完整执行、成功物理发送、无错误/跳过/取消/精确预算停止，且原会话没有认证 Probe、匹配 ACK 或未匹配认证 ACK；它不证明远端已准备或 NAT 不可达。路径/注册失败、发送前等待超时、开始执行后的 pacing/outer deadline 或缺少完整执行证据归 `execution_incomplete`；零执行的 deadline 仍归 `missed_schedule`。HH2 发送前 owner/readiness 等待超时不记物理错误；明确 syscall 错误及兼容副本部分失败保留原物理成本。`send_error` 可以与已成功 datagram 并存，`budget_rejected` 可以表示剩余计划被预算阻止，均不能反推零发送。过期恢复身份归生命周期失效，原成本和终止原因保持。认证 Probe/匹配 ACK 命中优先保留验证阶段事实；完整执行且没有更高优先级本地失败原因时，仅未匹配认证 ACK 归证据不足。多原因并存时，主类不提供每种原因的精确因果量。矩阵的 `planned_minus_attempted_by_reason` 按终态主类或 deadline 粗分缺失工作，不能当作各原因的精确计数；未落入这些桶的缺失工作及未采到的成本保持未知。
 
 `timeline` 时间字段来自同一 daemon 进程的单调时钟。`planned_send_at_ms` 在 `hh2` 完成最终首发协商时更新为约定时间，发送偏差不再与此前的最晚截止比较。`candidate_signal_accepted_at_ms` 表示本端发布流程获得接受证据的观察时刻：证据可以是信令 API 成功返回，也可以是同一 `hh2` 轮次已通过身份检查的后续消息。它不是服务端持久化或对端实际接收的时间戳，也不表示双方已经完成整个交换，不能用它计算 HTTP RTT。`probe_last_hit_at_ms` 与 `probe_last_hit_source` 表示验证前最后一次认证 Probe 或匹配 ACK，不是首次命中。`measurement_age_at_send_ms`、`measurement_to_first_send_ms`、`last_probe_hit_to_validation_ms` 使用非负差值；缺时间或顺序逆置时为空，不把异常压成零。它们分别描述测量新鲜度、测量到首发、最后命中到验证。最终 SYNC_ACK 的本地入队、服务端接受与对端实际接收是不同证据；本地入队不会授予 Direct，也不能单独作为无响应策略失败的依据。
 
@@ -95,6 +136,8 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 `--help` 列出完整参数。输出目录必须是仓库外尚不存在的绝对路径，创建为仅当前用户可访问；runner 不覆盖或清理已有目录。每个固定 seed 只执行一次，不做诊断重试，原始 stdout/stderr、两端日志/status、NAT trace、进程清理耗时和普通 `nat-evidence.json` 均保留。缺任一侧 typed attempt、首业务证据、健康的 critical task、完整进程回收或原始 trace 时，manifest 失败关闭。
 
 矩阵包含等/异步长、负步长回绕、端口竞争、单/双侧严格过滤、非对称 NAT/STUN/信令/准备延迟、丢包/乱序/重复，以及固定 seed 的高熵随机映射和 Relay 重连。Hard↔Hard 模式默认 `EGRESS_CAPTURE=shim`，在 macOS/Linux 测试子进程中拦截生产 daemon 的 loopback UDP `sendto` / `sendmsg`，保留原 socket 和目的地址；发往尚未绑定目的端口的包也先创建源 NAT 映射，再执行对端过滤。此模式关闭预建监听槽。普通 Direct/Relay gate 保留原入口；shim 不链接进生产程序，也不安装到全局环境。
+
+同一次本机采证的绝对截止时间、启动记录、HTTP 样本、NAT trace 和业务连续性样本使用同一进程间共享的单调时钟；macOS 使用 `CLOCK_UPTIME_RAW`，其他平台使用 Python 的单调时钟。截止时间不能跨主机或系统重启比较。收尾子进程收到已经耗尽的截止时间时不得启动命令；切换解释器或启动新进程不会重置原有预算。
 
 `CONSUME_A` / `CONSUME_B` 在每个已测量 socket 的最后一次 STUN 与首次 peer 出站之间注入分配；`SWEEP_NOISE_EVERY` / `SWEEP_NOISE_COUNT` 在发送期间按新映射数量注入，并受 `SWEEP_NOISE_LIMIT` 总量约束。trace 区分两个阶段、源 socket、新映射和未绑定目的。`mapping_fidelity` 核对两端 shim 成功发送的包数/字节与网关捕获完全一致，并检查严格过滤与注入配置确实生效；本机 UDP 捕获丢包、缺计数或噪声阶段不符都会使该轮证据无效。互惠映射对数量是整轮模拟器事实，不能代替 attempt 命中、加密验证或业务成功。
 
@@ -156,6 +199,43 @@ manifest 分开报告 requested 场景/轮次、smoke 执行结果、证据有�
 
 正常模式还生成 `business-samples.jsonl` 与 `continuity-evidence.json`。它们使用同一主机单调时钟，要求结束前的观测窗口仍有双向业务增长；发生中断或映射重建时，还要求最后一个故障边界之后持续观察至少 2 秒，并看到新的双向业务。仅有故障前的累计成功不能通过。`established-direct-outage` 和 `established-direct-rebind` 还要求首次故障前双方各有至少两个验证通过的 Direct 业务包；采样读取完成时间必须早于故障，只有连接提升日志或故障后才建立 Direct 都不能满足该前置条件。单轮可用 `NORMAL_REQUIRE_DIRECT_BEFORE_FAULT=1` 启用这一检查。故障后允许正常选择 Direct 或 Relay，最终快照还必须保有活动路径。故障事件、抖动值、重建后的新映射与超时必须在 trace 中实际出现；未触发配置故障会报告 `fault_not_exercised`。背景流的成功和超时分别记录，配置会影响 STUN 时允许实际超时，但所有已请求流仍须结束且至少有成功回复。测试进程与任务健康、原始发送捕获、损坏报文、业务首包时限和完整回收的检查继续保留。
 
+## 成对批次实验
+
+`benchmark_campaign.py` 在正常矩阵之上冻结场景、种子和批次，分别执行 baseline 与 candidate。每场景允许 1–1000 轮，每 variant 总计最多 10000 轮，单批最多 32 轮。两个 variant 使用相同的场景与种子；失败不重跑，产品自身的正常有界重试仍生效。命令在包含该脚本的 checkout 根目录运行，计划和证据输出必须是仓库外尚不存在的绝对路径：
+
+```sh
+python3 scripts/nat-sim/benchmark_campaign.py plan \
+  --scenario strict-normal --scenario udp-queue-pressure \
+  --rounds 100 --seed 931200 --batch-size 32 \
+  --output /absolute/path/outside/repository/campaign-plan.json
+
+python3 scripts/nat-sim/benchmark_campaign.py run \
+  --plan /absolute/path/outside/repository/campaign-plan.json \
+  --variant baseline --repository /absolute/path/to/baseline-checkout \
+  --output /absolute/path/outside/repository/baseline-evidence
+
+python3 scripts/nat-sim/benchmark_campaign.py run \
+  --plan /absolute/path/outside/repository/campaign-plan.json \
+  --variant candidate --repository /absolute/path/to/candidate-checkout \
+  --output /absolute/path/outside/repository/candidate-evidence
+
+python3 scripts/nat-sim/benchmark_campaign.py summarize \
+  --plan /absolute/path/outside/repository/campaign-plan.json \
+  --campaign /absolute/path/outside/repository/baseline-evidence/campaign.json \
+  --campaign /absolute/path/outside/repository/candidate-evidence/campaign.json \
+  --output /absolute/path/outside/repository/campaign-summary.json
+```
+
+`--repository` 选择实际构建和运行的 checkout，省略时使用脚本所在仓库。两份 checkout 的已冻结模拟 harness 必须相同；每个 variant 的源码 commit 和补丁摘要在批次间保持一致。计划另绑定契约与场景摘要；收集时复核批次 manifest 的路径、摘要、内容、variant 和源码身份。原始输出应与 manifest 一起保存，不能只复制汇总数字。
+
+汇总的成功率分母为全部预定轮次，包括失败、超时、缺失 manifest 和尚未收集的批次；Wilson 95% 区间沿用同一预定分母。`complete` 只表示两个 variant 的全部预定结果已被计入，失败或缺失 manifest 也可以完成计数，不表示实验通过或 candidate 改善。
+
+每轮构建后将 daemon、Control、Relay 及使用的 UDP shim 复制到私有 `artifacts/`，目录权限为 `0700`，快照权限为 `0500`。最终 exec 包装器在 shim 之后复核快照大小和 SHA-256，再记录源码身份、组件、角色、PID 与本机单调时钟；实际 exec 使用同一快照。`exec_requested` 只表示已请求执行，成功仍须满足既有就绪、双向业务和回收门禁。采集和汇总重新核对原始启动记录、artifact-set 与快照；缺失、篡改或身份不一致使该轮无效，仍保留在预定分母中。
+
+配置身份范围为 `argv_and_allowlisted_environment`：对实际参数、明确列出的环境变量以及启动时存在的指定配置文件计算摘要，不保存原始参数或环境值，不读取授权 stdin。配置文件尚不存在时记录 `absent_at_launch`，后续自动生成的文件不能替代启动时事实。`configuration_identity_scope` 明示这份输入范围，`resolved_runtime_configuration_sha256` 保持未知；生成后的运行配置、未列出的宿主环境和 stdin 授权不由该摘要覆盖。
+
+当前范围为 `synthetic_ipv4_udp_normal_join`：mock TUN、同主机进程和人工网络条件。成功可经 Direct 或 Relay；`direct_at_10s`、`first_business_ms`、`application_p99_ms` 保持 `null` 并给出未知原因。启动身份不能据此证明发布产物性能、真实运营商成功率或 Minecraft 交互延迟。不同种子也不构成独立真实网络样本。
+
 ## 活动路径遥测契约（path_telemetry_v1）
 
 daemon 通过异步非阻塞 sidecar 向 Control 上报权威活动路径状态。遥测通道优先复用 WebSocket 信令连接（通过 ready 消息中的 `path_telemetry_v1` 协商），支持 HTTP `POST /api/v1/telemetry/paths` 作为断连或无 WebSocket 时的回退通道。
@@ -210,3 +290,13 @@ Control 额外维护有界的 `connection_metric_hourly` 聚合，用于比每�
 `GET /admin/api/v1/connection-trends` 默认返回最近 24 个小时 bucket，支持 `window_hours=1..720` 与可选 `network_id`。响应固定补齐缺失小时为零 bucket，因此调用方不需要把“没有 sample”误读成丢失数据。全局查询按小时汇总所有 network，network-scoped 查询只读取指定 network。
 
 当前 Rust telemetry wire 的 `selected_mtu`、`last_direct_latency_ms`、`last_relay_latency_ms` 会在 Control ingestion 时兼容映射到 authoritative snapshot 的 `selected_path_mtu` / 当前路径 validation RTT 字段；该映射只修正字段命名差异，不改变 daemon 的路径决策。
+
+## Ordinary fresh-mapping 零成功摘要
+
+daemon 内部 `FreshMappingRejection::NoProbesSent(summary)` 保留固定大小的 typed 摘要，原 fallback label 仍为 `no_probes_sent`。`logical_calls_attempted` 统计已进入 ordinary classified send 的调用；`successful_primary_sends` 保持原 `sent` 的语义，每次返回 Ok 的 primary 计一次，兼容副本失败不会抹掉 primary 成功。`first_failure` 与十二类固定计数只来自返回 Err 的 `ProbeSendFailureKind`，取消、Direct 确认和本机 network generation 改变等外层停止另存为 `outer_stop`，不能当成 physical send error。零 attempts 的 first failure 为 None，调用和成本均为零。
+
+`physical_send_errors` / `physical_send_error_bytes` 只累加现有 classified failure 或成功结果中的实际成本字段，不由失败类型、包长或 logical call 数推算。它们描述该次已完成发送 transaction，不包含后续 retransmit task 的全部成本，不是预算扣款、对端收包或 TUN 交付证明。计数使用饱和加法；`counters_saturated=true` 时饱和值只作下界，不能称为精确总数。
+
+零成功分支的 UDP owner 在原 `fresh_mapping_skipped` 事件追加一次 first failure、调用数、primary 成功数、physical 成本、outer stop 和 saturation 展示，并明确 `sent_probes=0`。ordinary caller 保留原 label/fallback，不重复展示或累加该成本。诊断事件环、时间线和日志均为 best effort；事件可能因竞争、替换或输出丢失而不可见，不能用事件条数反推累计成本。
+
+该 producer 事件在 cleanup 前记录。完整 detach 的最后 await 返回后再次检查显式 cancellation，并保持 unit `Superseded` 终态优先；cleanup 期间才到达的 cancellation 不会回填先前事件的 outer stop，也不会返回 NoProbesSent payload。Superseded 的事件不是 durable 成本账本。future 被 drop/abort/panic 而未返回时，这份局部摘要的最终覆盖未知，不能补成零成本或已成功。此改动不新增发送 owner/预算/队列，不收紧 ordinary retained-Arc 或 HH2 授权规则，诊断字段不参与路径选择。

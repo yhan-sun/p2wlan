@@ -1,4 +1,5 @@
 use super::*;
+use crate::dataplane_resources::{VecOperation, VecSite};
 
 impl WireGuardTransport {
     /// Decrypt one inbound WireGuard transport packet.
@@ -12,7 +13,24 @@ impl WireGuardTransport {
         &self,
         wire_bytes: &[u8],
     ) -> std::result::Result<Option<InboundPacket>, InboundDecryptError> {
+        self.decrypt_inbound_with_source(wire_bytes)
+            .await
+            .map(|inbound| inbound.map(|inbound| inbound.packet))
+    }
+
+    pub(in crate::transport) async fn decrypt_inbound_with_source(
+        &self,
+        wire_bytes: &[u8],
+    ) -> std::result::Result<Option<DecryptedInboundWithSource>, InboundDecryptError> {
         let msg = MessageTransport::from_bytes(wire_bytes).map_err(InboundDecryptError::Parse)?;
+        if let Some(capture) = self.resource_capture() {
+            capture.observe_vec(
+                VecSite::RxParsedPayloadCopy,
+                VecOperation::SliceCopy,
+                Some(msg.encrypted_payload.len()),
+                &msg.encrypted_payload,
+            );
+        }
         let receiver_index = msg.receiver_index;
 
         let mut sessions = self.sessions.lock().await;
@@ -43,13 +61,32 @@ impl WireGuardTransport {
             }
             match active.session.decrypt(&msg) {
                 Ok(packet) => {
+                    if let Some(capture) = self.resource_capture() {
+                        capture.observe_vec(
+                            VecSite::RxAuthenticatedPlaintext,
+                            VecOperation::CryptoOutput,
+                            None,
+                            &packet,
+                        );
+                    }
                     let token = active
                         .awaiting_confirmation
                         .then(|| active.token.clone())
                         .flatten();
                     active.awaiting_confirmation = false;
-                    confirmed_active =
-                        Some((peer_id.clone(), packet, token, active.session_instance));
+                    let source = self.original_session_source(
+                        peer_id,
+                        active.session_instance,
+                        OriginalSessionRole::Active,
+                        active.authorized_peer_lifecycle,
+                    );
+                    confirmed_active = Some((
+                        peer_id.clone(),
+                        packet,
+                        token,
+                        active.session_instance,
+                        source,
+                    ));
                     break;
                 }
                 Err(error) => {
@@ -63,17 +100,21 @@ impl WireGuardTransport {
                 }
             }
         }
-        if let Some((peer_id, packet, token, session_instance)) = confirmed_active {
+        if let Some((peer_id, packet, token, session_instance, source)) = confirmed_active {
             drop(sessions);
             if let Some(token) = token {
                 self.remember_promoted_responder_token(&peer_id, token);
             }
-            return Ok(Some(InboundPacket {
-                peer_id,
-                packet,
-                session_instance: Some(session_instance),
-                from_previous_session: false,
-                trace: None,
+            return Ok(Some(DecryptedInboundWithSource {
+                packet: InboundPacket {
+                    authenticated_ingress: None,
+                    peer_id,
+                    packet,
+                    session_instance: Some(session_instance),
+                    from_previous_session: false,
+                    trace: None,
+                },
+                source,
             }));
         }
 
@@ -88,11 +129,26 @@ impl WireGuardTransport {
                 }
                 match pending.slot.session.decrypt(&msg) {
                     Ok(packet) => {
+                        if let Some(capture) = self.resource_capture() {
+                            capture.observe_vec(
+                                VecSite::RxAuthenticatedPlaintext,
+                                VecOperation::CryptoOutput,
+                                None,
+                                &packet,
+                            );
+                        }
+                        let source = self.original_session_source(
+                            peer_id,
+                            pending.slot.session_instance,
+                            OriginalSessionRole::Pending,
+                            pending.slot.authorized_peer_lifecycle,
+                        );
                         promoted = Some((
                             peer_id.clone(),
                             packet,
                             pending_token.clone(),
                             pending.slot.session_instance,
+                            source,
                         ));
                         break 'pending_sessions;
                     }
@@ -109,7 +165,7 @@ impl WireGuardTransport {
                 }
             }
         }
-        if let Some((peer_id, packet, token, session_instance)) = promoted {
+        if let Some((peer_id, packet, token, session_instance, source)) = promoted {
             drop(sessions);
             // The first packet under a staged responder key promotes that key
             // to active.  Do not perform that replacement while only the
@@ -160,12 +216,16 @@ impl WireGuardTransport {
                 );
                 self.flush_pending_outbound_for_peer(&peer_id).await;
             }
-            return Ok(Some(InboundPacket {
-                peer_id,
-                packet,
-                session_instance: Some(session_instance),
-                from_previous_session: false,
-                trace: None,
+            return Ok(Some(DecryptedInboundWithSource {
+                packet: InboundPacket {
+                    authenticated_ingress: None,
+                    peer_id,
+                    packet,
+                    session_instance: Some(session_instance),
+                    from_previous_session: false,
+                    trace: None,
+                },
+                source,
             }));
         }
 
@@ -178,12 +238,30 @@ impl WireGuardTransport {
             }
             match previous.slot.session.decrypt(&msg) {
                 Ok(packet) => {
-                    return Ok(Some(InboundPacket {
-                        peer_id: peer_id.clone(),
-                        packet,
-                        session_instance: Some(previous.slot.session_instance),
-                        from_previous_session: true,
-                        trace: None,
+                    if let Some(capture) = self.resource_capture() {
+                        capture.observe_vec(
+                            VecSite::RxAuthenticatedPlaintext,
+                            VecOperation::CryptoOutput,
+                            None,
+                            &packet,
+                        );
+                    }
+                    let source = self.original_session_source(
+                        peer_id,
+                        previous.slot.session_instance,
+                        OriginalSessionRole::Previous,
+                        previous.slot.authorized_peer_lifecycle,
+                    );
+                    return Ok(Some(DecryptedInboundWithSource {
+                        packet: InboundPacket {
+                            authenticated_ingress: None,
+                            peer_id: peer_id.clone(),
+                            packet,
+                            session_instance: Some(previous.slot.session_instance),
+                            from_previous_session: true,
+                            trace: None,
+                        },
+                        source,
                     }));
                 }
                 Err(error) => {

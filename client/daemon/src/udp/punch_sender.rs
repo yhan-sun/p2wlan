@@ -112,6 +112,42 @@ impl UdpTransport {
         profile_fence: Option<(u64, u64)>,
         hard_hard_session_token: Option<&str>,
     ) -> Result<PunchSendReport> {
+        self.punch_candidates_from_dynamic_socket_index_with_progress(
+            peer_id,
+            socket_index,
+            candidates,
+            probe_interval,
+            attempts,
+            profile_fence,
+            hard_hard_session_token,
+            None,
+        )
+        .await
+    }
+
+    /// Share the existing session ledger with the owner of a predictable
+    /// sweep, so dropping its future cannot erase a committed kernel send.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn punch_candidates_from_dynamic_socket_index_with_progress(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+        profile_fence: Option<(u64, u64)>,
+        hard_hard_session_token: Option<&str>,
+        progress: Option<Arc<Mutex<BirthdaySweepProgress>>>,
+    ) -> Result<PunchSendReport> {
+        let live = match progress {
+            Some(progress) => Some(progress.lock().await.live.clone()),
+            None => None,
+        };
+        update_live_birthday_counters(&live, |counters| {
+            counters.targets_assigned = counters
+                .targets_assigned
+                .max(u32::try_from(candidates.len()).unwrap_or(u32::MAX));
+        });
         let mut report = self
             .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session_and_live(
                 peer_id,
@@ -121,7 +157,7 @@ impl UdpTransport {
                 attempts,
                 profile_fence,
                 hard_hard_session_token,
-                None,
+                live,
                 hard_hard_session_token.map(|_| Arc::new(HardHardProbePacer::new())),
             )
             .await?;
