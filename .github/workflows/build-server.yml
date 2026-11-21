@@ -206,7 +206,7 @@ jobs:
   image:
     name: Publish fixed server image
     needs: build
-    if: ${{ startsWith(github.ref, 'refs/tags/server-v') && vars.SERVER_PUBLISH_IMAGE == 'true' }}
+    if: ${{ startsWith(github.ref, 'refs/tags/server-v') && vars.SERVER_PUBLISH_IMAGE != 'false' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     permissions:
@@ -575,7 +575,7 @@ jobs:
   image_release:
     name: Append optional prebuilt image deployment assets
     needs: [release, image]
-    if: ${{ startsWith(github.ref, 'refs/tags/server-v') && vars.SERVER_PUBLISH_IMAGE == 'true' }}
+    if: ${{ startsWith(github.ref, 'refs/tags/server-v') && vars.SERVER_PUBLISH_IMAGE != 'false' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write

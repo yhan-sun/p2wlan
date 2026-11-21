@@ -383,6 +383,14 @@ printf fixture-key > "$output/tls.key"
         self.assertEqual((self.config / 'control.env').read_bytes(), sentinel)
         self.assertFalse(self.calls.exists())
 
+    def test_unattended_partial_pair_stops_before_manager_init(self):
+        self.config.mkdir()
+        (self.config / 'control.env').write_text('PORT=18080\n')
+        result = self.run_installer('--role', 'all', '--no-start')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('partial existing configuration', result.stderr)
+        self.assertFalse(self.calls.exists())
+
     @unittest.skipUnless(os.name == 'posix', 'a real controlling terminal requires POSIX')
     def test_no_argument_wizard_completes_using_its_controlling_terminal(self):
         shutil.copyfile(ROOT / 'scripts/install-server.sh', self.script)

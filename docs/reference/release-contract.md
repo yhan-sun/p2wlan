@@ -24,7 +24,7 @@ daemon 构建脚本使用只读 Git 查询，避免身份检查自身刷新已�
 
 默认 Docker 部署由独立 Compose builder 构建该固定源码包中的管理台和 Go 服务，核验本地镜像的 OCI 版本、提交标签及 Control/Relay 二进制身份，再以准确的本地 `sha256:` 镜像 ID 运行生产服务。宿主机无需安装 Node 或 Go；源码包发布和默认安装不依赖 GHCR 应用镜像。
 
-预构建镜像是可选发布能力：构建同一源码 SHA 的 `linux/amd64`、`linux/arm64` GHCR 镜像，并分别核验 Control/Relay 身份。该模式另外提供四个资产：`SERVER-IMAGE.json`、`p2wlan-server-docker.tar.gz` 及各自同名 `.sha256`。JSON 绑定服务端 tag、`source_sha`、多架构摘要和平台；部署包包含该 metadata、checksum、交互安装器和生产 Compose 模板。显式镜像部署使用 `repository@sha256:...`，不依赖可变 tag。默认源码 Release 不等待镜像构建或 GHCR 发布任务。
+预构建镜像是可选发布能力：构建同一源码 SHA 的 `linux/amd64`、`linux/arm64` GHCR 镜像，并分别核验 Control/Relay 身份。该模式另外提供四个资产：`SERVER-IMAGE.json`、`p2wlan-server-docker.tar.gz` 及各自同名 `.sha256`。JSON 绑定服务端 tag、`source_sha`、多架构摘要和平台；部署包包含该 metadata、checksum、交互安装器和生产 Compose 模板。显式镜像部署使用 `repository@sha256:...`，不依赖可变 tag。新服务端标签默认独立运行镜像构建和验收任务。仓库变量 `SERVER_PUBLISH_IMAGE=false` 可关闭此任务。原生包和源码包可先行发布，四个镜像资产仅在多架构摘要、匿名拉取和二进制身份通过后追加。
 
 Android 生产签名只在受保护的 release-signing 环境和版本 tag 中执行。分支构建不能取得生产签名秘密。Android 原生桥使用当前 Flutter SDK 声明的固定 NDK 版本；找不到该版本时发布失败，不扫描并选择 runner 上任意最新 NDK。
 

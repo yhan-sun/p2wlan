@@ -33,7 +33,7 @@ dependencies:
   crypto: ^3.0.8
   flutter:
     sdk: flutter
-  flutter_svg: ^2.4.0
+  flutter_svg: ^2.5.0
   tray_manager: ^0.5.3
   url_launcher: ^6.3.3
   window_manager: ^0.5.2

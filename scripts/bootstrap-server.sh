@@ -41,7 +41,7 @@ Options:
                              native program/configuration/database directories
   --relay-endpoint URL        public tls://host:port
   --tls-cert FILE --tls-key FILE
-  --tls-mode auto|files       Docker: request a Let's Encrypt certificate or use files
+  --tls-mode auto|selfsigned|files  Docker: request, generate or supply a certificate
   --tls-domain DOMAIN         Docker: certificate domain (must equal the Relay host)
   --tls-email EMAIL           Docker: ACME account email
   --publish-host IP          Docker Relay host bind address (Docker only)
@@ -84,11 +84,11 @@ HELP
       --non-interactive) BOOT_INTERACTIVE=0; shift ;;
       --install-deps) BOOT_INSTALL_DEPS=1; shift ;;
       --dry-run) BOOT_DRY_RUN=1; shift ;;
-      --dir|--publish-host|--wait-timeout)
+      --dir|--publish-host|--wait-timeout|--tls-mode|--tls-domain|--tls-email)
         value "$@"; BOOT_FORWARD+=("$1" "$2"); BOOT_DOCKER_OPTIONS=1; shift 2 ;;
       --root|--config-dir|--data-dir)
         value "$@"; BOOT_FORWARD+=("$1" "$2"); BOOT_NATIVE_OPTIONS=1; shift 2 ;;
-      --relay-endpoint|--tls-cert|--tls-key|--tls-mode|--tls-domain|--tls-email|--control-port|--metrics-port)
+      --relay-endpoint|--tls-cert|--tls-key|--control-port|--metrics-port)
         value "$@"; BOOT_FORWARD+=("$1" "$2"); shift 2 ;;
       --start) BOOT_FORWARD+=("$1"); BOOT_NATIVE_OPTIONS=1; shift ;;
       --no-start) BOOT_FORWARD+=("$1"); BOOT_NO_START=1; shift ;;
@@ -127,7 +127,7 @@ HELP
   fi
   BOOT_METHOD=${BOOT_METHOD:-docker}
   if [ "$BOOT_METHOD" = native ]; then
-    [ "$BOOT_DOCKER_OPTIONS" -eq 0 ] || die '--docker-mode, --dir, --publish-host and --wait-timeout apply only to Docker; use --root/--config-dir/--data-dir for native installation'
+    [ "$BOOT_DOCKER_OPTIONS" -eq 0 ] || die '--docker-mode, --dir, --publish-host, --wait-timeout and automatic TLS options apply only to Docker; use --root/--config-dir/--data-dir for native installation'
     if [ "$BOOT_DRY_RUN" -eq 0 ]; then
       command -v systemctl >/dev/null 2>&1 && [ -d "${P2WLAN_SYSTEMD_DIR:-/run/systemd/system}" ] || die 'native installation requires a running systemd host'
     fi

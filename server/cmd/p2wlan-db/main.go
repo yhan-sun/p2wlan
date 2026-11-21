@@ -4,6 +4,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"flag"
@@ -20,21 +21,71 @@ func main() {
 	source := flag.String("source", "", "SQLite database to snapshot")
 	output := flag.String("output", "", "snapshot file to create")
 	verify := flag.String("verify", "", "SQLite database snapshot to verify")
+	schema := flag.String("schema-id", "", "read the SQLite schema identity for release recovery")
 	flag.Parse()
 
 	var err error
 	switch {
-	case *verify != "" && *source == "" && *output == "":
+	case *schema != "" && *source == "" && *output == "" && *verify == "":
+		var identity string
+		identity, err = schemaID(*schema)
+		if err == nil {
+			fmt.Println(identity)
+		}
+	case *verify != "" && *source == "" && *output == "" && *schema == "":
 		err = verifyDatabase(*verify)
-	case *source != "" && *output != "" && *verify == "":
+	case *source != "" && *output != "" && *verify == "" && *schema == "":
 		err = backupDatabase(*source, *output)
 	default:
-		err = errors.New("use --source FILE --output FILE or --verify FILE")
+		err = errors.New("use --source FILE --output FILE, --verify FILE or --schema-id FILE")
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "p2wlan-db: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// Read all compatibility fields from one SQLite read transaction, including WAL.
+func schemaID(path string) (string, error) {
+	absolute, err := filesystemPath(path)
+	if err != nil {
+		return "", err
+	}
+	db, err := sql.Open("sqlite", dsn(absolute)+"?mode=ro")
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	var version, application int64
+	if err := tx.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return "", err
+	}
+	if err := tx.QueryRow("PRAGMA application_id").Scan(&application); err != nil {
+		return "", err
+	}
+	rows, err := tx.Query("SELECT type, name, tbl_name, coalesce(sql,'') FROM sqlite_schema ORDER BY type, name")
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	hash := sha256.New()
+	fmt.Fprintf(hash, "%d %d\n", version, application)
+	for rows.Next() {
+		var kind, name, table, definition string
+		if err := rows.Scan(&kind, &name, &table, &definition); err != nil {
+			return "", err
+		}
+		fmt.Fprintf(hash, "%q %q %q %q\n", kind, name, table, definition)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
 func filesystemPath(path string) (string, error) {

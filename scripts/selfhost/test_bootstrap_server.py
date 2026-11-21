@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 from pathlib import Path
 import select
 import shutil
@@ -708,7 +709,9 @@ FIXTURE
         first = self.run_bootstrap('--dev-localhost')
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         config = self.target / 'config'
-        (config / 'data/p2pnet.db').write_bytes(b'fixture-existing-database')
+        with sqlite3.connect(str(config / 'data/p2pnet.db')) as db:
+            db.execute('CREATE TABLE entries (value TEXT)')
+            db.execute("INSERT INTO entries VALUES ('preserved')")
         before = {str(path.relative_to(config)): path.read_bytes() for path in config.rglob('*') if path.is_file()}
         new_version = 'server-v9.9.10'
         new_commit = 'e' * 40

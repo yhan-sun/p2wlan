@@ -15,8 +15,10 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import shutil
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -87,6 +89,7 @@ def read_env(path, content=None):
                'RELAY_PUBLISH_HOST', 'P2WLAN_IMAGE', 'P2WLAN_CONFIG_DIR', 'COMPOSE_PROJECT_NAME',
                'P2WLAN_VERSION', 'P2WLAN_COMMIT', 'P2WLAN_DEV_LOCALHOST',
                'P2WLAN_INSTALL_MODE', 'P2WLAN_SOURCE_DIR', 'P2WLAN_BUILD_IMAGE',
+               'P2WLAN_BUILD_MANIFEST', 'P2WLAN_BUILD_PLATFORM',
                'P2WLAN_TLS_MODE', 'P2WLAN_TLS_DOMAIN', 'COMPOSE_PROFILES'}
     for line in (path.read_text() if content is None else content.decode()).splitlines():
         if not line or line.startswith('#'):
@@ -276,13 +279,161 @@ def certificate_email(value):
     return value
 
 def port_available(port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    for family, host in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
         try:
-            probe.bind(('0.0.0.0', port))
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6:
+                    probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                probe.bind((host, port))
         except OSError as error:
-            return error.errno != errno.EADDRINUSE
+            if error.errno == errno.EADDRINUSE:
+                return False
     return True
+
+def check_edge_ports(control, relay):
+    if control in (80, 443) or relay in (80, 443):
+        fail('the HTTPS edge reserves host TCP 80/443; select another Control or Relay port')
+
+def check_panel(host, config, mode):
+    authority = '[' + host.strip('[]') + ']' if ':' in host else host
+    command = ['curl', '--silent', '--show-error', '--fail', '--noproxy', '*',
+               '--connect-timeout', '3', '--max-time', '10', '--connect-to',
+               f'{authority}:443:127.0.0.1:443', '--output', os.devnull, '--write-out', '%{http_code}']
+    if mode == 'selfsigned':
+        command += ['--cacert', str(config / 'relay-ca.crt')]
+    elif mode == 'files':
+        command += ['--cacert', str(config / 'tls.crt')]
+    try:
+        if run(command + ['https://' + authority + '/health']) == '200':
+            return
+    except InstallError:
+        pass
+    fail('HTTPS edge verification failed: check the certificate chain, hostname and Control /health')
+
+def atomic_write(path, content, mode=0o600):
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+        name = Path(temporary.name)
+        try:
+            temporary.write(content)
+            temporary.flush()
+            os.fchmod(temporary.fileno(), mode)
+            name.replace(path)
+        finally:
+            name.unlink(missing_ok=True)
+
+def database_path(config):
+    raw = next((line[8:] for line in (config / 'control.env').read_text().splitlines()
+                if line.startswith('DB_PATH=')), '/data/p2pnet.db')
+    try:
+        relative = Path(raw).relative_to('/data')
+    except ValueError:
+        fail('cannot snapshot DB_PATH outside the mounted /data directory')
+    data = config / 'data'
+    result = data / relative
+    if '..' in relative.parts or result.resolve() != result:
+        fail('unsafe DB_PATH for upgrade recovery')
+    return result
+
+def sqlite_schema(connection):
+    version = connection.execute('PRAGMA user_version').fetchone()
+    app = connection.execute('PRAGMA application_id').fetchone()
+    rows = connection.execute('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name')
+    return version, app, tuple(rows)
+
+def snapshot_database(database, directory):
+    if not database.exists():
+        return None, None
+    recovery = Path(tempfile.mkdtemp(prefix='.upgrade-', dir=directory))
+    snapshot = recovery / 'database.sqlite'
+    try:
+        with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as source, \
+                contextlib.closing(sqlite3.connect(str(snapshot))) as copy:
+            source.backup(copy)
+            if copy.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                fail('SQLite upgrade snapshot failed integrity_check')
+            return snapshot, sqlite_schema(copy)
+    except (sqlite3.Error, InstallError, OSError):
+        shutil.rmtree(recovery)
+        fail('could not verify the pre-upgrade SQLite snapshot; current deployment files were preserved')
+
+def same_schema(database, previous):
+    if not database.exists():
+        return previous is None
+    try:
+        with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as connection:
+            connection.execute('BEGIN')
+            return sqlite_schema(connection) == previous
+    except sqlite3.Error:
+        return False
+
+def activate_compose(directory, stage, settings, previous_env, no_start, wait):
+    config = directory / 'config'
+    env_file, compose_file = directory / '.env', directory / 'compose.yml'
+    receipt = directory / '.last-healthy.json'
+    blocked = directory / '.recovery-required'
+    recovery_pending = blocked.exists()
+    previous = None
+    if receipt.exists():
+        protected(receipt)
+        previous = json.loads(receipt.read_text())
+    elif previous_env is not None:
+        previous = [previous_env.decode(), compose_file.read_text()]
+    command = ['docker', 'compose', '--project-name', settings['COMPOSE_PROJECT_NAME'],
+               '--env-file', str(env_file), '-f', str(compose_file)]
+    candidate = [(stage / '.env').read_text(), (stage / 'compose.yml').read_text()]
+    starting = ['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', str(wait)]
+    environment = dict(os.environ, **settings)
+    snapshot = database = schema = None
+    running, stopped = [], []
+    if previous:
+        old = read_env(env_file, previous[0].encode())
+        old_environment = dict(os.environ, **old)
+        if not receipt.exists():
+            atomic_write(receipt, json.dumps(previous).encode())
+        if not no_start:
+            running = run(command + ['ps', '--status', 'running', '--services'], env=old_environment).splitlines()
+            present = run(command + ['ps', '--all', '--services'], env=old_environment).splitlines()
+            stopped = sorted(set(present) - set(running))
+            if (set(running) | set(present)) - {'control', 'relay', 'edge'}:
+                fail('unexpected service in the deployment')
+            if old['P2WLAN_IMAGE'] != settings['P2WLAN_IMAGE']:
+                database = database_path(config)
+                snapshot, schema = snapshot_database(database, directory)
+                atomic_write(blocked, f'Activation in progress. Snapshot: {snapshot or "no prior database"}\n'.encode())
+    (stage / 'compose.yml').replace(compose_file)
+    (stage / '.env').replace(env_file)
+    if no_start:
+        return
+    try:
+        run(command + starting, timeout=wait + 60, capture=False, env=environment)
+        if settings.get('COMPOSE_PROFILES') == 'edge':
+            check_panel(settings['P2WLAN_TLS_DOMAIN'], config, settings['P2WLAN_TLS_MODE'])
+    except InstallError as error:
+        if snapshot:
+            print(f'Pre-upgrade SQLite snapshot: {snapshot}', file=sys.stderr)
+        run(command + ['stop'], timeout=120, env=environment)
+        if previous:
+            if recovery_pending or (database and not same_schema(database, schema)):
+                fail(f'{error}; services stopped after database schema changed. Snapshot: {snapshot or "no prior database"}')
+            run(command + ['rm', '--force'], env=environment)
+            atomic_write(compose_file, previous[1].encode())
+            atomic_write(env_file, previous[0].encode())
+            if stopped:
+                run(command + ['up', '--no-start', '--no-deps', '--no-build', '--pull', 'never'] + stopped,
+                    timeout=wait + 60, env=old_environment)
+            if running:
+                run(command + starting + ['--no-deps'] + running, timeout=wait + 60, env=old_environment)
+                if 'edge' in running:
+                    check_panel(old['P2WLAN_TLS_DOMAIN'], config, old['P2WLAN_TLS_MODE'])
+            blocked.unlink(missing_ok=True)
+            print('Restored the prior deployment files and previously running services.', file=sys.stderr)
+        raise
+    atomic_write(receipt, json.dumps(candidate).encode())
+    blocked.unlink(missing_ok=True)
+    if snapshot:
+        snapshot.unlink()
+        snapshot.parent.rmdir()
 
 def ensure_certbot():
     if shutil.which('certbot'):
@@ -295,7 +446,7 @@ def ensure_certbot():
     except InstallError:
         fail('installing certbot failed; install it with apt-get, or use --tls-mode files')
 
-def request_certificate(domain, contact):
+def request_certificate(domain, contact, hooks):
     ensure_certbot()
     if not port_available(80):
         fail('HTTP-01 standalone needs TCP 80 free on this host; stop that service or use --tls-mode selfsigned')
@@ -304,7 +455,8 @@ def request_certificate(domain, contact):
                          else ['--register-unsafely-without-email'])
     try:
         run(['certbot', 'certonly', '--standalone', '--non-interactive', '--agree-tos',
-             '--keep-until-expiring'] + contact_arguments + ['-d', domain], timeout=900, capture=False)
+             '--keep-until-expiring', '--cert-name', domain, '--pre-hook', str(hooks / 'pre'),
+             '--post-hook', str(hooks / 'post'), '--deploy-hook', str(hooks / 'deploy')] + contact_arguments + ['-d', domain], timeout=900, capture=False)
     except InstallError:
         fail('certificate request failed; verify DNS, inbound TCP 80 and ACME rate limits')
     live = ACME_LIVE_DIR / domain
@@ -357,34 +509,97 @@ def write_edge_config(config, domain, control_port):
     target.write_text(EDGE_NGINX.replace('__DOMAIN__', domain).replace('__CONTROL_PORT__', str(control_port)))
     target.chmod(0o644)
 
-def install_renewal_hooks(directory, domain, uid, gid):
-    edge = directory / 'config' / 'edge'
-    compose = ('docker compose --env-file ' + str(directory / '.env')
-               + ' -f ' + str(directory / 'compose.yml'))
-    live = ACME_LIVE_DIR / domain
+def install_renewal_hooks(directory, domain, uid, gid, publish, relay_port):
+    # Certbot runs these commands as root. Keep all executables and state in its
+    # own directory, outside the bind mounts writable by application containers.
+    name = 'p2wlan-' + hashlib.sha256(str(directory).encode()).hexdigest()[:12]
+    hooks = RENEWAL_HOOKS_DIR / name
+    hooks.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if protected(hooks, directory=True).st_uid != os.geteuid():
+        fail('renewal hook directory has an unexpected owner')
+    address = ipaddress.ip_address(publish)
+    if address.is_unspecified:
+        address = ipaddress.ip_address('127.0.0.1' if address.version == 4 else '::1')
+    relay = f'[{address}]:{relay_port}' if address.version == 6 else f'{address}:{relay_port}'
+    header = ('#!/bin/sh\nset -eu\numask 077\n'
+              + 'directory=' + shlex.quote(str(directory)) + '\n'
+              + 'live=' + shlex.quote(str(ACME_LIVE_DIR / domain)) + '\n'
+              + 'marker=' + shlex.quote(str(hooks / 'edge-stopped')) + '\n'
+              + 'domain=' + shlex.quote(domain) + '\n'
+              + 'relay=' + shlex.quote(relay) + '\n'
+              + f'uid={int(uid)}\ngid={int(gid)}\n'
+              + """[ -f "$directory/.env" ] && [ -f "$directory/compose.yml" ] || exit 0
+compose() { docker compose --env-file "$directory/.env" -f "$directory/compose.yml" "$@"; }
+recreate() { compose up -d --no-deps --force-recreate --no-build --pull never --wait --wait-timeout 90 "$1"; }
+verify() {
+    expected=$(openssl x509 -in "$directory/config/tls.crt" -noout -fingerprint -sha256)
+    served=$(timeout 8 openssl s_client -connect "$1" -servername "$domain" </dev/null 2>/dev/null |
+             openssl x509 -noout -fingerprint -sha256)
+    [ "$served" = "$expected" ] || { echo "renewed certificate is not served on $1" >&2; return 1; }
+}
+""")
     scripts = {
-        'pre': ('#!/bin/sh\nset -eu\n' + '[ -f "' + str(directory / 'compose.yml') + '" ] || exit 0\n'
-                + compose + ' stop edge >/dev/null 2>&1 || true\n'),
-        'post': ('#!/bin/sh\nset -eu\n' + '[ -f "' + str(directory / 'compose.yml') + '" ] || exit 0\n'
-                 + compose + ' start edge >/dev/null 2>&1 || true\n'),
-        'deploy': ('#!/bin/sh\nset -eu\n' + '[ -f "' + str(directory / 'compose.yml') + '" ] || exit 0\n'
-                   + 'install -m 0600 -o ' + str(uid) + ' -g ' + str(gid) + ' "' + str(live / 'fullchain.pem')
-                   + '" "' + str(directory / 'config/tls.crt') + '"\n'
-                   + 'install -m 0600 -o ' + str(uid) + ' -g ' + str(gid) + ' "' + str(live / 'privkey.pem')
-                   + '" "' + str(directory / 'config/tls.key') + '"\n'
-                   + compose + ' restart relay >/dev/null 2>&1 || true\n'
-                   + compose + ' exec -T edge nginx -s reload >/dev/null 2>&1 || true\n'),
+        'pre': """running=$(compose ps --status running --services)
+if echo "$running" | grep -Fxq edge; then
+    : > "$marker"
+    compose stop edge
+fi
+""",
+        'post': """[ -f "$marker" ] || exit 0
+recreate edge
+verify 127.0.0.1:443
+rm -f "$marker"
+""",
+        'deploy': """[ "${RENEWED_LINEAGE:-}" = "$live" ] || exit 0
+running=$(compose ps --status running --services)
+stage=$(mktemp -d "$directory/.renew-XXXXXXXX")
+trap 'rm -rf "$stage"' EXIT
+install -m 0600 -o "$uid" -g "$gid" "$live/fullchain.pem" "$stage/tls.crt"
+install -m 0600 -o "$uid" -g "$gid" "$live/privkey.pem" "$stage/tls.key"
+python3 - "$stage" "$directory/config" <<'REPLACE'
+from pathlib import Path
+import sys
+source, destination = map(Path, sys.argv[1:])
+for name in ('tls.crt', 'tls.key'):
+    (source / name).replace(destination / name)
+REPLACE
+if echo "$running" | grep -Fxq relay; then recreate relay; verify "$relay"; fi
+if echo "$running" | grep -Fxq edge; then recreate edge; verify 127.0.0.1:443; fi
+""",
     }
-    for kind, body in scripts.items():
-        path = edge / (kind + '.sh')
-        path.write_text(body)
-        path.chmod(0o700)
-        hooks = RENEWAL_HOOKS_DIR / kind
-        hooks.mkdir(parents=True, exist_ok=True)
-        link = hooks / ('p2wlan-' + hashlib.sha256(str(directory).encode()).hexdigest()[:12] + '.sh')
-        if link.is_symlink() or link.exists():
-            link.unlink()
-        link.symlink_to(path)
+    for kind, script in scripts.items():
+        atomic_write(hooks / kind, (header + script).encode(), 0o700)
+    return hooks
+
+def bind_renewal_hooks(directory, domain, hooks):
+    # Older releases used three global symlinks. Move just this registration
+    # to its own lineage while preserving Certbot's comments and other options.
+    renewal = ACME_LIVE_DIR.parent / 'renewal' / (domain + '.conf')
+    original = renewal.read_text()
+    match = re.search(r'(?m)^\[renewalparams\][ \t]*$', original)
+    if not match:
+        fail('missing [renewalparams] in ' + str(renewal))
+    start = match.end()
+    next_section = re.search(r'(?m)^\[', original[start:])
+    end = start + next_section.start() if next_section else len(original)
+    section = original[start:end]
+    add = []
+    for kind, key in (('pre', 'pre_hook'), ('post', 'post_hook'), ('deploy', 'renew_hook')):
+        value = str(hooks / kind)
+        existing = re.findall(r'(?m)^[ \t]*' + key + r'[ \t]*=[ \t]*(.*?)[ \t]*$', section)
+        if existing and existing != [value]:
+            fail(f'custom Certbot {key} in {renewal}; integrate the hook at {value} before upgrading')
+        if not existing:
+            add.append(key + ' = ' + value)
+    if add:
+        backup = hooks / 'renewal.conf.before-p2wlan'
+        if not backup.exists():
+            atomic_write(backup, original.encode())
+        atomic_write(renewal, (original[:start] + '\n' + '\n'.join(add) + original[start:]).encode())
+    for kind in ('pre', 'post', 'deploy'):
+        legacy = RENEWAL_HOOKS_DIR / kind / (hooks.name + '.sh')
+        if legacy.is_symlink() and Path(os.readlink(legacy)) == (directory / 'config/edge' / (kind + '.sh')):
+            legacy.unlink()
 
 def bind_address(value, dev=False):
     try:
@@ -751,6 +966,8 @@ def install(resources):
                 relay_port = endpoint_parts(endpoint, args.dev_localhost)[1]
                 port_number(control_port, (relay_port,))
                 port_number(metrics_port, (relay_port, control_port))
+                if not args.dev_localhost:
+                    check_edge_ports(control_port, relay_port)
         if source_bundle is not None:
             print('Would build source ' + expected['version'] + ' commit=' + expected['source_sha'] + ' with Docker Compose')
         else:
@@ -914,6 +1131,12 @@ def install(resources):
     args.dev_localhost, args.relay_endpoint = plan['dev'], plan['endpoint']
     args.tls_mode, args.tls_domain, args.tls_email = plan['tls_mode'], plan['tls_domain'], plan['tls_email']
     edge_enabled = (not args.dev_localhost) and (not existing or settings.get('COMPOSE_PROFILES') == 'edge')
+    if edge_enabled:
+        check_edge_ports(plan['control_port'], plan['relay_port'])
+        if not existing and not plan['no_start']:
+            for port in (80, 443):
+                if not port_available(port):
+                    fail(f'HTTPS edge host port {port} is already in use')
     args.tls_cert, args.tls_key = plan['tls_cert'], plan['tls_key']
     args.control_port, args.metrics_port = plan['control_port'], plan['metrics_port']
     args.publish_host, args.no_start = plan['publish_host'], plan['no_start']
@@ -953,6 +1176,7 @@ def install(resources):
             stage = Path(temporary)
             saved_source = None
             build_image = None
+            metadata = None
             if source_bundle:
                 saved_source = persist_source(directory, source_bundle, resources)
                 project = 'p2wlan-' + hashlib.sha256(str(directory).encode()).hexdigest()[:12]
@@ -960,13 +1184,32 @@ def install(resources):
                 build_env = dict(os.environ, P2WLAN_BUILD_CONTEXT=str(saved_source / 'server'),
                                  P2WLAN_BUILD_IMAGE=build_image, P2WLAN_VERSION=expected['version'],
                                  P2WLAN_COMMIT=expected['source_sha'])
-                print('[1/3] Building the verified source with Docker Compose')
-                try:
-                    run(['docker', 'compose', '--project-name', project + '-build', '--env-file', '/dev/null',
-                         '-f', str(saved_source / 'deploy/selfhost/compose.build.yml'), 'build', 'builder'],
-                        timeout=1800, capture=False, env=build_env)
-                except InstallError:
-                    fail('source build failed; existing runtime configuration and data were preserved')
+                arch = info.get('Architecture', '')
+                arch = {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(arch, arch)
+                platform = os.environ.get('DOCKER_DEFAULT_PLATFORM') or 'linux/' + arch
+                previous_id = settings.get('P2WLAN_IMAGE', '')
+                if (existing and settings.get('P2WLAN_INSTALL_MODE') == 'source'
+                        and settings.get('P2WLAN_BUILD_MANIFEST') == source_bundle['metadata_hash']
+                        and arch and settings.get('P2WLAN_BUILD_PLATFORM') == platform
+                        and re.fullmatch(r'sha256:[a-f0-9]{64}', previous_id)):
+                    try:
+                        cached = json.loads(run(['docker', 'image', 'inspect', previous_id, '--format', '{{json .}}']))
+                    except InstallError:
+                        cached = {}
+                    actual = '/'.join(filter(None, (cached.get('Os'), cached.get('Architecture'), cached.get('Variant'))))
+                    if cached.get('Id') == previous_id and (actual == platform or
+                            ('/'.join(actual.split('/')[:2]) == platform and platform.count('/') == 1)):
+                        metadata = cached
+                if metadata is None:
+                    print('[1/3] Building the verified source with Docker Compose')
+                    try:
+                        run(['docker', 'compose', '--project-name', project + '-build', '--env-file', '/dev/null',
+                             '-f', str(saved_source / 'deploy/selfhost/compose.build.yml'), 'build', 'builder'],
+                            timeout=1800, capture=False, env=build_env)
+                    except InstallError:
+                        fail('source build failed; existing runtime configuration and data were preserved')
+                else:
+                    print('[1/3] Verifying the previously built image by immutable ID')
                 image = build_image
             elif not args.local_image:
                 print('[1/3] Pulling the fixed image digest')
@@ -974,7 +1217,8 @@ def install(resources):
                     run(['docker', 'pull', image], timeout=600, capture=False)
                 except InstallError:
                     fail('image pull failed; check registry access/network and docker login if the image is private')
-            metadata = json.loads(run(['docker', 'image', 'inspect', image, '--format', '{{json .}}']))
+            if metadata is None:
+                metadata = json.loads(run(['docker', 'image', 'inspect', image, '--format', '{{json .}}']))
             labels = metadata.get('Config', {}).get('Labels') or {}
             version = labels.get('org.opencontainers.image.version', '')
             commit = labels.get('org.opencontainers.image.revision', '')
@@ -1012,7 +1256,10 @@ def install(resources):
                     fail('new deployment requires --relay-endpoint and TLS files, or --dev-localhost')
                 self_signed_ca = None
                 if args.tls_mode == 'auto':
-                    args.tls_cert, args.tls_key = request_certificate(args.tls_domain, args.tls_email)
+                    hooks = install_renewal_hooks(directory, args.tls_domain, os.geteuid() or 10001,
+                                                  os.getegid() if os.geteuid() else 10001,
+                                                  args.publish_host, plan['relay_port'])
+                    args.tls_cert, args.tls_key = request_certificate(args.tls_domain, args.tls_email, hooks)
                 elif args.tls_mode == 'selfsigned':
                     args.tls_cert, args.tls_key, self_signed_ca = self_signed_certificate(
                         stage, endpoint_parts(endpoint, False)[0])
@@ -1072,10 +1319,11 @@ def install(resources):
                 settings.update(COMPOSE_PROFILES='edge', P2WLAN_TLS_MODE=args.tls_mode or 'files',
                                 P2WLAN_TLS_DOMAIN=args.tls_domain or endpoint_parts(args.relay_endpoint, False)[0])
             if source_bundle:
-                settings.update(P2WLAN_SOURCE_DIR=str(saved_source), P2WLAN_BUILD_IMAGE=build_image)
+                settings.update(P2WLAN_SOURCE_DIR=str(saved_source), P2WLAN_BUILD_IMAGE=build_image,
+                                P2WLAN_BUILD_MANIFEST=source_bundle['metadata_hash'], P2WLAN_BUILD_PLATFORM=platform)
             else:
-                settings.pop('P2WLAN_SOURCE_DIR', None)
-                settings.pop('P2WLAN_BUILD_IMAGE', None)
+                for field in ('P2WLAN_SOURCE_DIR', 'P2WLAN_BUILD_IMAGE', 'P2WLAN_BUILD_MANIFEST', 'P2WLAN_BUILD_PLATFORM'):
+                    settings.pop(field, None)
             staged_compose = stage / 'compose.yml'
             shutil.copyfile(template, staged_compose)
             staged_env = stage / '.env'
@@ -1087,27 +1335,23 @@ def install(resources):
             if edge_enabled:
                 base += ['--profile', 'edge']
             run(base + ['--env-file', str(staged_env), '-f', str(staged_compose), 'config', '--quiet'], env=validation_env)
+            if edge_enabled and not args.no_start:
+                print('[3/3] Pulling the HTTPS edge image')
+                run(['docker', 'pull', os.environ.get('P2WLAN_EDGE_IMAGE', EDGE_IMAGE_DEFAULT)],
+                    timeout=600, capture=False)
+            if edge_enabled and args.tls_mode == 'auto':
+                if existing:
+                    hooks = install_renewal_hooks(directory, args.tls_domain, settings['P2WLAN_UID'],
+                                                  settings['P2WLAN_GID'], settings['RELAY_PUBLISH_HOST'],
+                                                  settings['RELAY_PORT'])
+                bind_renewal_hooks(directory, args.tls_domain, hooks)
             if not existing:
                 (candidate / 'compose.env').unlink()
                 candidate.rename(config)
-            staged_compose.replace(directory / 'compose.yml')
-            staged_env.replace(settings_path)
-            if not args.dev_localhost and args.tls_mode == 'auto':
-                install_renewal_hooks(directory, args.tls_domain,
-                                      int(settings['P2WLAN_UID']), int(settings['P2WLAN_GID']))
-            command = base + ['--env-file', str(settings_path), '-f', str(directory / 'compose.yml')]
             if not args.no_start:
-                if edge_enabled:
-                    print('[3/3] Pulling the HTTPS edge image')
-                    run(['docker', 'pull', os.environ.get('P2WLAN_EDGE_IMAGE', EDGE_IMAGE_DEFAULT)],
-                        timeout=600, capture=False)
                 print('[3/3] Starting Control/Relay and waiting for health')
-                try:
-                    run(command + ['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', str(args.wait_timeout)],
-                        timeout=args.wait_timeout + 60, capture=False, env=dict(os.environ, **settings))
-                except InstallError:
-                    print(f'Deployment files were preserved. Inspect: cd {directory} && docker compose ps', file=sys.stderr)
-                    raise
+            activate_compose(directory, stage, settings, settings_snapshot, args.no_start, args.wait_timeout)
+            if not args.no_start:
                 print('P2WLAN Docker deployment is healthy locally.')
             else:
                 print('P2WLAN Docker deployment prepared; services were not started or recreated.')
@@ -1119,7 +1363,9 @@ def install(resources):
             print(f'{label}: http://127.0.0.1:{settings["CONTROL_PORT"]}')
             print(f'Admin path: http://127.0.0.1:{settings["CONTROL_PORT"]}/admin/')
             if edge_enabled:
-                panel = args.tls_domain or endpoint_parts(args.relay_endpoint, False)[0]
+                panel = settings['P2WLAN_TLS_DOMAIN']
+                if ':' in panel:
+                    panel = '[' + panel.strip('[]') + ']'
                 print('Panel: https://' + panel + '/')
                 print('Admin path: https://' + panel + '/admin/')
             print('Relay endpoint: ' + plan['endpoint'])
@@ -1136,6 +1382,6 @@ def install(resources):
 try:
     with contextlib.ExitStack() as resources:
         install(resources)
-except (InstallError, OSError, ValueError, KeyError) as error:
+except (InstallError, OSError, ValueError, KeyError, sqlite3.Error) as error:
     sys.exit('install-server-docker: ' + str(error))
 PY

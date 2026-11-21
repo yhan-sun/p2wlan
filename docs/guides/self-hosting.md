@@ -13,9 +13,9 @@
 
 原生安装直接使用发布二进制；Docker 默认构建已校验的发布源码。两种方式均不需要在宿主机安装 Go 或 Node.js。Linux systemd manager 的安装、升级和 doctor 需要 Python 3 标准库，以固定文件句柄检查和准备私有日志存储；该检查代码随同一归档的 manager 发布，不在线下载。管理台使用 React/TypeScript/Vite 开发，构建后的静态产物由 `go:embed` 编译进 `p2wlan-control`，运行时仍然是单一 Control 进程。
 
-Docker 默认使用 `p2wlan-server-source.tar.gz` 和同名 `.sha256`。包内含完整 `server/` 源码、同版本安装器、构建与生产 Compose 模板，以及 `SERVER-SOURCE.json` 和该元数据的 checksum。元数据绑定固定 tag、源码 SHA、构建上下文和每个源码文件的摘要。校验后，由独立 Compose builder 在容器内构建 Node 管理台和 Go 服务，再用核验后的本地镜像 ID 运行生产服务；首次构建通常比拉取镜像慢，需要可访问构建基础镜像和依赖源。
+Docker 默认使用 `p2wlan-server-source.tar.gz` 和同名 `.sha256`。包内含完整 `server/` 源码、同版本安装器、构建与生产 Compose 模板，以及 `SERVER-SOURCE.json` 和该元数据的 checksum。元数据绑定固定 tag、源码 SHA、构建上下文和每个源码文件的摘要。校验后，由独立 Compose builder 在容器内构建 Node 管理台和 Go 服务，再用核验后的本地镜像 ID 运行生产服务；首次构建通常比拉取镜像慢，需要可访问构建基础镜像和依赖源。 同一部署重复安装时，如果源码清单、目标平台和本地不可变镜像 ID 都匹配，安装器直接复核镜像标签和两个程序的版本、提交后复用。
 
-发布者可额外提供预构建镜像模式，使用 `p2wlan-server-docker.tar.gz`、`SERVER-IMAGE.json` 及各自 checksum，绑定 GHCR 多架构固定摘要。引导入口只有显式指定 `--docker-mode image` 才使用该模式；默认源码部署不依赖这些可选资产或 GHCR 应用镜像。
+发布者可额外提供预构建镜像模式，使用 `p2wlan-server-docker.tar.gz`、`SERVER-IMAGE.json` 及各自 checksum，绑定 GHCR 多架构固定摘要。引导入口只有显式指定 `--docker-mode image` 才使用该模式；默认源码部署不依赖这些可选资产或 GHCR 应用镜像。 新服务端标签默认尝试构建和验收这组资产，仓库变量 `SERVER_PUBLISH_IMAGE=false` 可关闭。
 
 ## 支持与验证范围
 
@@ -42,6 +42,9 @@ Docker 默认使用 `p2wlan-server-source.tar.gz` 和同名 `.sha256`。包内�
 这一下载入口需要系统已有 `curl` 和 `sudo`；root 终端可去掉 `sudo`。首屏先选择 `1` 直接安装（原生 systemd）、`2` Docker 部署（默认）或 `0` 退出，然后检查并询问是否安装该方式的缺失依赖。直接安装准备原生运行工具；Docker 方式准备 Docker Engine / Compose。自动准备环境支持 Ubuntu 22.04 / 24.04 / 26.04、Debian 12 / 13 的 amd64 / arm64 systemd 主机，Docker 使用官方 apt 源；其他 Linux 主机可在自行准备好对应运行环境后使用。
 
 脚本只发现非 draft、非 prerelease、包含所选方式资产的正式 `server-vX.Y.Z`。直接安装要求与主机架构匹配的原生归档及同名 checksum；默认 Docker 要求源码部署包及同名 checksum 均上传完成。显式镜像模式另要求 Docker 部署包、镜像元数据及各自 checksum。确认版本后下载同一 tag 的包，校验摘要与发布身份，再运行包内向导。按提示填写路径、Relay 地址和可信 TLS 文件，完成配套配置、启动与健康检查。整个流程通过当前终端交互，支持从 `curl` 管道启动。
+
+公网 Docker 部署为 HTTPS 入口预留主机 TCP 80 和 443。安装器使用配置的域名和证书信任链，经本机 443 请求 Control 的 `/health`，收到 HTTP 200 后才报告成功。ACME 钩子保存在 Certbot 管理目录中，仅注册到选中的证书。续期会按原运行状态重建受影响的容器，并核对 HTTPS 和 Relay 端口实际提供的证书指纹。已有的托管全局钩子会迁移，原续期配置保存在专用钩子目录；检测到自定义钩子时会提示整合。
+
 
 这个入口要求 `main` 已提供 `bootstrap-server.sh`，并已有包含对应安装器与资产的正式服务端 Release。原生列表与 Docker 列表分别筛选，只有原生归档的版本不会出现在 Docker 列表中；历史归档仍须具备相应安装器接口。查找不到匹配发布或校验失败时会停止，不回退到未校验源码部署。Docker 公网部署可在向导内自动申请并续期 Let's Encrypt 证书，也可以继续使用自带证书；原生 systemd 部署仍需部署者准备可信 HTTPS/WSS 反向代理和 Relay 证书。
 
