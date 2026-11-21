@@ -80,6 +80,11 @@ exit 0
         self.assertNotIn('health check passed', result.stdout)
         self.assertIn('relay /readyz failed', result.stderr)
 
+    def test_all_requires_both_units_and_control_only_still_succeeds(self):
+        self.executable(self.bin / 'systemctl', '#!/bin/sh\n[ "$1 $2" != "cat p2wlan-relay.service" ]\n')
+        self.assertNotEqual(self.run_check('all').returncode, 0)
+        self.assertEqual(self.run_check('control').returncode, 0)
+
     def test_missing_metrics_is_not_reported_as_verified(self):
         (self.config/'relay.env').write_text('')
         result=self.run_check('relay')
@@ -173,8 +178,17 @@ class ManagerUpdateTests(unittest.TestCase):
         real_install = shutil.which('install')
         self.assertIsNotNone(real_install)
         self.env['REAL_INSTALL'] = real_install
+        if not shutil.which('flock'):
+            self.executable(self.bin / 'flock', '#!/bin/sh\nexit 0\n')
+        self.executable(self.bin / 'sleep', '#!/bin/sh\nexit 0\n')
+        self.executable(self.root / 'release/p2wlan-server', '#!/bin/sh\nexit 0\n')
         self.executable(self.bin / 'systemctl', '''#!/bin/sh
 printf 'systemctl %s\\n' "$*" >> "$MANAGER_CALLS"
+if [ "$1" = is-active ] && [ "$3" = "${FIXTURE_INACTIVE:-none}" ]; then exit 3; fi
+if [ "$1" = restart ] && [ "$2" = "${FIXTURE_FAIL_RESTART:-none}" ]; then
+  if [ -n "${FIXTURE_MIGRATE:-}" ]; then echo new-schema > "$P2WLAN_SERVER_DATA/p2pnet.db"; fi
+  exit 1
+fi
 ''')
         self.executable(self.bin / 'python3', '''#!/bin/sh
 printf 'storage %s\\n' "$*" >> "$MANAGER_CALLS"
@@ -202,6 +216,13 @@ exec "$REAL_INSTALL" "$@"
                          'p2wlan-server', 'install-server.sh', 'deploy-server.sh')
         }
         members['BUILD-METADATA.txt'] = f'version={self.version}\n'.encode()
+        members['p2wlan-db'] = b'''#!/bin/sh
+case "$1" in
+  --source) cp "$2" "$4";;
+  --schema-id) sha256sum "$2" | cut -d' ' -f1;;
+  *) exit 1;;
+esac
+'''
         with tarfile.open(self.archive, 'w:gz') as archive:
             for name, content in members.items():
                 member = tarfile.TarInfo(name)
@@ -243,6 +264,27 @@ exec "$REAL_INSTALL" "$@"
                 self.assertEqual(restarts, expected)
                 self.assertIn('systemctl daemon-reload', calls)
                 self.assertEqual(any(call.startswith('storage ') for call in calls), service != 'relay')
+
+    def test_failed_activation_after_prepare_restores_only_previously_active_units(self):
+        self.assertEqual(self.run_update('--no-restart').returncode, 0)
+        self.env.update(FIXTURE_FAIL_RESTART='p2wlan-relay.service', FIXTURE_INACTIVE='p2wlan-relay.service')
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('restored', result.stderr)
+        self.assertEqual((self.root / 'current').resolve(), self.root / 'release')
+        calls = self.manager_calls.read_text().splitlines()
+        self.assertIn('systemctl start p2wlan-control.service', calls)
+        self.assertNotIn('systemctl start p2wlan-relay.service', calls)
+        self.assertEqual(next(self.root.glob('.upgrade-*/database.sqlite')).read_text(), 'test-db')
+
+    def test_migrated_database_is_preserved_with_snapshot_and_services_stopped(self):
+        self.env.update(FIXTURE_FAIL_RESTART='p2wlan-control.service', FIXTURE_MIGRATE='1')
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('database compatibility', result.stderr)
+        self.assertEqual((self.data / 'p2pnet.db').read_text().strip(), 'new-schema')
+        self.assertEqual(next(self.root.glob('.upgrade-*/database.sqlite')).read_text(), 'test-db')
+        self.assertNotIn('systemctl start ', self.manager_calls.read_text())
 
 
 if __name__ == '__main__':

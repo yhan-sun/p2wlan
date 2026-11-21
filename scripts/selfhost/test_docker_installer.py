@@ -6,6 +6,7 @@ from pathlib import Path
 import select
 import signal
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -46,6 +47,7 @@ with open(os.environ['DOCKER_FIXTURE_LOG'], 'a') as log:
 if args[:1] == ['info']:
     if os.environ.get('FAIL_DOCKER_INFO'): sys.exit(1)
     print(json.dumps({'OSType': os.environ.get('DOCKER_FIXTURE_OS', 'linux'),
+                      'Architecture': 'x86_64',
                       'SecurityOptions': [os.environ['DOCKER_FIXTURE_SECURITY']] if os.environ.get('DOCKER_FIXTURE_SECURITY') else []}))
 elif args[:2] == ['context', 'inspect']:
     print(os.environ.get('DOCKER_FIXTURE_CONTEXT', 'unix:///fixture/docker.sock'))
@@ -55,6 +57,7 @@ elif args[:2] == ['compose', 'up'] and '--help' in args:
     print('' if os.environ.get('DOCKER_FIXTURE_NO_WAIT') else '--wait --wait-timeout')
 elif args[:2] == ['image', 'inspect']:
     print(json.dumps({'Id': os.environ['DOCKER_FIXTURE_ID'], 'RepoDigests': [os.environ['DOCKER_FIXTURE_IMAGE']],
+          'Os': 'linux', 'Architecture': 'amd64',
           'Config': {'Labels': {'org.opencontainers.image.revision': os.environ.get('DOCKER_FIXTURE_LABEL_COMMIT', os.environ['DOCKER_FIXTURE_COMMIT']),
                                'org.opencontainers.image.version': os.environ.get('DOCKER_FIXTURE_VERSION', 'server-v9.9.9')}}}))
 elif args[:1] == ['pull']:
@@ -111,15 +114,25 @@ elif args[:1] == ['compose']:
     elif 'config' in args:
         if os.environ.get('FAIL_COMPOSE_CONFIG'): sys.exit(1)
     elif 'up' in args:
+        if os.environ.get('FAIL_FIXTURE_IMAGE') == os.environ.get('P2WLAN_IMAGE') and os.environ.get('FAIL_FIXTURE_IMAGE'):
+            import sqlite3
+            with sqlite3.connect(os.environ['FIXTURE_DATABASE']) as db:
+                db.execute("INSERT INTO entries VALUES ('during-upgrade')")
+                if os.environ.get('FIXTURE_MIGRATION'):
+                    db.execute("ALTER TABLE entries ADD COLUMN device TEXT")
+            sys.exit(1)
         if os.environ.get('FAIL_COMPOSE_UP'): sys.exit(1)
     elif 'ps' in args:
-        print('[]')
+        services = os.environ.get('DOCKER_FIXTURE_RUNNING', '')
+        if '--all' in args: services = os.environ.get('DOCKER_FIXTURE_PRESENT', services)
+        print(services if '--services' in args else '[]')
 else:
     print('unsupported fake Docker command', file=sys.stderr)
     sys.exit(92)
 ''')
         # A deployment must not unexpectedly install Docker or build source.
-        for command in ('curl', 'apt-get', 'dnf', 'sudo'):
+        self.executable(self.bin / 'curl', '#!/bin/sh\ncase "$*" in *--connect-to*https://*/health) echo "${FIXTURE_PANEL_CODE:-200}";; *) exit 94;; esac\n')
+        for command in ('apt-get', 'dnf', 'sudo'):
             self.executable(self.bin / command, '#!/bin/sh\necho unexpected-external-command >&2\nexit 94\n')
 
     def assert_no_application_pull(self, calls):
@@ -388,6 +401,8 @@ urllib.request.urlopen = fixture_urlopen
             'printf "%s\\n" "$*" >> "$CERTBOT_LOG"\n'
             'live="$P2WLAN_ACME_LIVE_DIR/' + domain + '"\n'
             'mkdir -p "$live"\n'
+            'mkdir -p "$P2WLAN_ACME_LIVE_DIR/../renewal"\n'
+            'printf "[renewalparams]\\nauthenticator = standalone\\n" > "$P2WLAN_ACME_LIVE_DIR/../renewal/' + domain + '.conf"\n'
             'echo fixture-chain > "$live/fullchain.pem"\n'
             'echo fixture-key > "$live/privkey.pem"\n')
 
@@ -414,12 +429,57 @@ urllib.request.urlopen = fixture_urlopen
         self.assertIn('P2WLAN_TLS_DOMAIN=relay.example.test', settings)
         self.assertTrue(any('--profile' in call['args'] and 'edge' in call['args'] for call in self.calls()))
         hooks = self.path / 'acme-hooks'
+        registration = next(hooks.glob('p2wlan-*'))
+        renewal = (Path(self.env['P2WLAN_ACME_LIVE_DIR']).parent / 'renewal/relay.example.test.conf').read_text()
         for kind in ('pre', 'post', 'deploy'):
-            links = list((hooks / kind).glob('p2wlan-*.sh'))
-            self.assertEqual(len(links), 1, kind)
-            self.assertTrue(links[0].is_symlink(), kind)
-            self.assertTrue(links[0].resolve().is_file(), kind)
+            hook = registration / kind
+            self.assertTrue(hook.is_file() and not hook.is_symlink(), kind)
+            self.assertEqual(hook.stat().st_mode & 0o777, 0o700)
+            self.assertIn(str(hook), renewal)
+            self.assertFalse((hooks / kind).exists())
+        before = len(self.calls())
+        for kind in ('pre', 'post', 'deploy'):
+            result_hook = subprocess.run([str(registration / kind)], env=dict(self.env, RENEWED_LINEAGE='/unrelated'),
+                                         capture_output=True, text=True)
+            self.assertEqual(result_hook.returncode, 0, result_hook.stderr)
+        self.assertFalse(any('up' in call['args'] or 'stop' in call['args'] for call in self.calls()[before:]))
         self.assertIn('https://relay.example.test/', result.stdout)
+
+    def test_renewal_recreates_running_services_and_rejects_a_stale_served_certificate(self):
+        domain = 'relay.example.test'
+        live = self.path / 'live'
+        hooks = self.path / 'hooks'
+        self.env.update(CERTBOT_LOG=str(self.path / 'certbot.log'), P2WLAN_ACME_LIVE_DIR=str(live),
+                        P2WLAN_RENEWAL_HOOKS_DIR=str(hooks))
+        self.certbot_stub(domain)
+        result = self.run_installer('--relay-endpoint', 'tls://' + domain + ':18081', '--tls-mode', 'auto',
+                                    '--tls-domain', domain, '--publish-host', '127.0.0.1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        registration = next(hooks.glob('p2wlan-*'))
+        self.executable(self.bin / 'timeout', '#!/bin/sh\nshift\nexec "$@"\n')
+        self.executable(self.bin / 'openssl', '''#!/bin/sh
+case "$*" in
+  s_client*) echo "$SERVED_FINGERPRINT";;
+  *' -in '*) cat "$3";;
+  *) cat;;
+esac
+''')
+        def hook(kind, running, fingerprint='renewed'):
+            return subprocess.run([str(registration / kind)], env=dict(self.env, DOCKER_FIXTURE_RUNNING=running,
+                                  RENEWED_LINEAGE=str(live / domain), SERVED_FINGERPRINT=fingerprint),
+                                  capture_output=True, text=True)
+        (live / domain / 'fullchain.pem').write_text('renewed\n')
+        before = len(self.calls())
+        self.assertEqual(hook('pre', 'edge\nrelay').returncode, 0)
+        self.assertTrue((registration / 'edge-stopped').exists())
+        applied = hook('deploy', 'relay')
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        restored = hook('post', 'relay')
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertFalse((registration / 'edge-stopped').exists())
+        recreated = [call['args'][-1] for call in self.calls()[before:] if '--force-recreate' in call['args']]
+        self.assertEqual(recreated, ['relay', 'edge'])
+        self.assertNotEqual(hook('deploy', 'relay', 'stale').returncode, 0)
 
     def test_self_signed_tls_covers_an_ip_relay_without_a_domain_or_email(self):
         result = self.run_installer('--relay-endpoint', 'tls://203.0.113.10:18081',
@@ -581,6 +641,17 @@ urllib.request.urlopen = fixture_urlopen
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.calls(), [])
                 self.assertFalse(self.target.exists())
+
+    def test_new_public_edge_reserves_http_and_https_before_build(self):
+        source = self.source_bundle()
+        for port in (80, 443):
+            for options in (('--dry-run',), ('--no-start',)):
+                with self.subTest(port=port, options=options):
+                    result = self.run_installer('--source', str(source), '--tls-mode', 'selfsigned',
+                        '--relay-endpoint', f'tls://relay.example.test:{port}', *options, image=None)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('80/443', result.stderr)
+                    self.assert_not_deployed()
 
     def test_invalid_publish_hosts_are_rejected_before_docker(self):
         for host in ('relay.example.com', '0.0.0.0\nOTHER=value', '127.0.0.1:18081'):
@@ -897,9 +968,19 @@ tempfile.TemporaryDirectory = forbidden
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertEqual(before, {str(path.relative_to(config)): path.read_bytes() for path in config.rglob('*') if path.is_file()})
         calls = self.calls()
-        self.assertEqual(sum(call['args'][:1] == ['compose'] and 'build' in call['args'] for call in calls), 2)
+        self.assertEqual(sum(call['args'][:1] == ['compose'] and 'build' in call['args'] for call in calls), 1)
         self.assertEqual(sum('--output' in call['args'] for call in calls), 1)
         self.assert_no_application_pull(calls)
+
+    def test_source_rebuilds_when_the_cached_image_id_is_missing(self):
+        source = self.source_bundle()
+        first = self.run_installer('--source', str(source), '--dev-localhost', '--no-start', image=None)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.env['DOCKER_FIXTURE_ID'] = 'sha256:' + 'e' * 64
+        second = self.run_installer('--no-start', image=None)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(sum('build' in call['args'] for call in self.calls()), 2)
+        self.assertIn('P2WLAN_IMAGE=' + self.env['DOCKER_FIXTURE_ID'], (self.target / '.env').read_text())
 
     def test_source_build_failure_preserves_the_existing_runtime_configuration(self):
         source = self.source_bundle()
@@ -921,6 +1002,56 @@ tempfile.TemporaryDirectory = forbidden
         later = self.calls()[calls_before:]
         self.assertFalse(any(call['args'][:1] == ['run'] for call in later))
         self.assertFalse(any('up' in call['args'] and '--help' not in call['args'] for call in later))
+
+    def failed_upgrade(self, migration=False):
+        first = self.run_installer('--dev-localhost')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        previous = (self.target / '.env').read_bytes()
+        database = self.target / 'config/data/p2pnet.db'
+        with sqlite3.connect(str(database)) as db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('CREATE TABLE entries (value TEXT)')
+            db.execute("INSERT INTO entries VALUES ('before-upgrade')")
+        newer = IMAGE.replace('a' * 64, 'd' * 64)
+        self.env.update(DOCKER_FIXTURE_IMAGE=newer, FAIL_FIXTURE_IMAGE=newer, FIXTURE_DATABASE=str(database),
+                        DOCKER_FIXTURE_RUNNING='control', DOCKER_FIXTURE_PRESENT='control\nrelay',
+                        DOCKER_FIXTURE_VERSION='server-v9.9.10')
+        prepared = self.run_installer('--no-start', image=newer)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.assertNotEqual((self.target / '.env').read_bytes(), previous)
+        if migration:
+            self.env['FIXTURE_MIGRATION'] = 'yes'
+        result = self.run_installer(image=None)
+        self.assertNotEqual(result.returncode, 0)
+        snapshot = next(self.target.glob('.upgrade-*/database.sqlite'))
+        with sqlite3.connect(str(snapshot)) as before, sqlite3.connect(str(database)) as after:
+            self.assertEqual(before.execute('SELECT value FROM entries').fetchall(), [('before-upgrade',)])
+            self.assertEqual(after.execute('SELECT value FROM entries').fetchall(), [('before-upgrade',), ('during-upgrade',)])
+        return previous, result
+
+    def test_failed_prepared_upgrade_preserves_writes_and_restores_only_running_services(self):
+        previous, result = self.failed_upgrade()
+        self.assertIn('Restored the prior deployment', result.stderr)
+        self.assertEqual((self.target / '.env').read_bytes(), previous)
+        activation = self.calls()[-1]
+        self.assertEqual(activation['args'][-2:], ['--no-deps', 'control'])
+        self.assertEqual(activation['env']['P2WLAN_IMAGE'], IMAGE)
+        self.assertTrue(any('--no-start' in call['args'] and call['args'][-1] == 'relay'
+                            for call in self.calls()))
+
+    def test_failed_upgrade_with_changed_schema_keeps_the_snapshot_and_stops(self):
+        previous, result = self.failed_upgrade(migration=True)
+        self.assertIn('schema changed', result.stderr)
+        self.assertNotEqual((self.target / '.env').read_bytes(), previous)
+        self.assertEqual(self.calls()[-1]['args'][-1], 'stop')
+        self.assertTrue((self.target / '.recovery-required').is_file())
+
+    def test_public_activation_requires_the_real_panel_route(self):
+        self.env['FIXTURE_PANEL_CODE'] = '502'
+        result = self.run_installer('--relay-endpoint', 'tls://relay.example.test:28081', '--tls-mode', 'selfsigned')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('HTTPS edge verification failed', result.stderr)
+        self.assertEqual(self.calls()[-1]['args'][-1], 'stop')
 
     def test_saved_source_corruption_is_rejected_before_rebuilding(self):
         source = self.source_bundle()

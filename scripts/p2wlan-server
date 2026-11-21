@@ -37,6 +37,12 @@ EOF
 
 die() { echo "p2wlan-server: $*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "this command requires root; run with sudo"; }
+lock_release() {
+  need_root
+  if [ ! -d "$ROOT_DIR" ]; then install -d -m 0755 "$ROOT_DIR"; fi
+  exec 9>"$ROOT_DIR/.update.lock"
+  flock -n 9 || die "another release operation is in progress"
+}
 service_list() {
   case "${1:-all}" in
     control) printf '%s\n' p2wlan-control.service ;;
@@ -50,10 +56,10 @@ systemd_available() { command -v systemctl >/dev/null 2>&1 && [ -d "${P2WLAN_SYS
 restart_services() {
   local selected=${1:-all}
   if ! systemd_available; then return 0; fi
-  systemctl daemon-reload
+  systemctl daemon-reload || return 1
   while IFS= read -r unit; do
     if systemctl cat "$unit" >/dev/null 2>&1; then
-      systemctl restart "$unit"
+      systemctl restart "$unit" || return 1
     fi
   done < <(service_list "$selected")
 }
@@ -366,11 +372,9 @@ check_server() {
   local selected=${1:-all}
   verify_server "$selected"
   if systemd_available; then
-    service_units_exist "$selected" || die "no installed systemd unit matches service=$selected"
     while IFS= read -r unit; do
-      if systemctl cat "$unit" >/dev/null 2>&1 && ! systemctl is-active --quiet "$unit"; then
-        die "systemd unit is not active: $unit"
-      fi
+      systemctl cat "$unit" >/dev/null 2>&1 || die "required systemd unit is missing: $unit"
+      systemctl is-active --quiet "$unit" || die "systemd unit is not active: $unit"
     done < <(service_list "$selected")
   fi
 
@@ -381,10 +385,6 @@ check_server() {
     relay) relay_enabled=1 ;;
     all) control_enabled=1; relay_enabled=1 ;;
   esac
-  if systemd_available; then
-    systemctl cat p2wlan-control.service >/dev/null 2>&1 || control_enabled=0
-    systemctl cat p2wlan-relay.service >/dev/null 2>&1 || relay_enabled=0
-  fi
   if [ "$control_enabled" -eq 1 ]; then
     local bind host port
     bind=$(env_value "$CONFIG_DIR/control.env" CONTROL_BIND)
@@ -453,7 +453,7 @@ init_server() {
   if ! id p2wlan >/dev/null 2>&1; then
     useradd --system --home-dir "$DATA_DIR" --no-create-home --shell /usr/sbin/nologin p2wlan
   fi
-  if [ ! -f "$CONFIG_DIR/control.env" ]; then
+  if [ "$role" != relay ] && [ ! -f "$CONFIG_DIR/control.env" ]; then
     install -m 0600 /dev/null "$CONFIG_DIR/control.env"
     command -v openssl >/dev/null 2>&1 || die "openssl is required to generate deployment credentials"
     printf '%s\n' \
@@ -464,7 +464,7 @@ init_server() {
       "JWT_SECRET=$(openssl rand -hex 32)" \
       "CONTROL_ADMIN_TOKEN=$(openssl rand -hex 32)" >> "$CONFIG_DIR/control.env"
   fi
-  if [ ! -f "$CONFIG_DIR/relay.env" ]; then
+  if [ "$role" != control ] && [ ! -f "$CONFIG_DIR/relay.env" ]; then
     install -m 0600 /dev/null "$CONFIG_DIR/relay.env"
     printf '%s\n' "# Configure TLS, keyring, audience, region and revocation feed before starting; see docs/guides/self-hosting.md" "RELAY_BIND=:18081" "RELAY_REQUIRE_AUTH=true" "RELAY_METRICS_BIND=127.0.0.1:18082" >> "$CONFIG_DIR/relay.env"
   fi
@@ -695,26 +695,111 @@ archive_install() {
     [ -x "$stage/$required" ] || die "archive is missing required member: $required"
   done
   prepare_managed_support_storage "${selected:-all}"
-  if [ -d "$RELEASE_DIR/$version" ]; then
-    if cmp -s "$stage/p2wlan-control" "$RELEASE_DIR/$version/p2wlan-control" &&
-      cmp -s "$stage/p2wlan-relay" "$RELEASE_DIR/$version/p2wlan-relay"; then
-      rm -rf "$stage"
-      ln -sfn "$RELEASE_DIR/$version" "$CURRENT_LINK"
-      if [ -x "$RELEASE_DIR/$version/p2wlan-server" ]; then
-        install -m 0755 "$RELEASE_DIR/$version/p2wlan-server" /usr/local/bin/p2wlan-server
-      fi
-      echo "release already installed $version"
-      return 0
-    fi
-    die "release directory already exists with different binary content: $version"
+  local target="$RELEASE_DIR/$version"
+  if [ -d "$target" ]; then
+    diff -qr "$stage" "$target" >/dev/null || die "release already installed with different content: $version"
+    rm -rf "$stage"
+  else
+    chown -R root:root "$stage"
+    mv "$stage" "$target"
   fi
-  mv "$stage" "$RELEASE_DIR/$version"
-  ln -sfn "$RELEASE_DIR/$version" "$CURRENT_LINK"
-  if [ -x "$RELEASE_DIR/$version/p2wlan-server" ]; then
-    install -m 0755 "$RELEASE_DIR/$version/p2wlan-server" /usr/local/bin/p2wlan-server
-  fi
-  chown -R root:root "$RELEASE_DIR/$version" "$CURRENT_LINK"
+  activate_native_release "$target" "${selected:-all}" "$no_restart"
   echo "installed $version"
+}
+
+wait_service_health() {
+  local attempt
+  for ((attempt=1; attempt<=12; attempt++)); do
+    if (check_server "$1") > /dev/null 2>&1; then return 0; fi
+    [ "$attempt" -eq 12 ] || sleep 2
+  done
+  (check_server "$1")
+}
+
+activate_native_release() {
+  local target=$1 role=$2 prepare_only=$3 previous= unit active= db= snapshot= prior_schema= current_schema=
+  local component checkpoint original= primary=control blocked="$ROOT_DIR/.recovery-required"
+  local recovery_pending=0
+  [ ! -f "$blocked" ] || recovery_pending=1
+  [ "$role" != relay ] || primary=relay
+  if [ -L "$CURRENT_LINK" ]; then
+    original=$(readlink -f "$CURRENT_LINK")
+    for component in control relay; do
+      checkpoint="$ROOT_DIR/.previous-$component-release"
+      if [ ! -L "$checkpoint" ] && [ -f "$CONFIG_DIR/$component.env" ]; then ln -s "$original" "$checkpoint"; fi
+    done
+  fi
+  previous=$(readlink "$ROOT_DIR/.previous-$primary-release") || previous=$original
+  if ! systemd_available; then prepare_only=1; fi
+  if [ "$prepare_only" -eq 0 ]; then
+    while IFS= read -r unit; do
+      systemctl cat "$unit" >/dev/null 2>&1 || die "required systemd unit is missing: $unit"
+      if systemctl is-active --quiet "$unit"; then active="$active $unit"; fi
+    done < <(service_list "$role")
+    if [ "$role" != relay ] && [ -n "$previous" ] && [ "$previous" != "$target" ]; then
+      db=$(resolve_db_path)
+      if [ -f "$db" ]; then
+        snapshot=$(mktemp -d "$ROOT_DIR/.upgrade-XXXXXXXX")
+        if ! "$target/p2wlan-db" --source "$db" --output "$snapshot/database.sqlite" >/dev/null; then
+          rm -rf "$snapshot"
+          die "could not take a pre-upgrade SQLite snapshot"
+        fi
+        local schema_tool="$target/p2wlan-db"
+        if ! prior_schema=$("$schema_tool" --schema-id "$snapshot/database.sqlite" 2>/dev/null); then
+          schema_tool="$previous/p2wlan-db"
+          prior_schema=$("$schema_tool" --schema-id "$snapshot/database.sqlite") || die "cannot identify schema; snapshot: $snapshot"
+        fi
+        [[ "$prior_schema" =~ ^[0-9a-f]{64}$ ]] || die "could not identify the pre-upgrade database schema"
+      fi
+    fi
+  fi
+  if [ "$prepare_only" -eq 1 ]; then
+    install -m 0755 "$target/p2wlan-server" /usr/local/bin/p2wlan-server
+    ln -sfn "$target" "$CURRENT_LINK"
+    return 0
+  fi
+  if [ -n "$db" ]; then printf 'Snapshot: %s\n' "${snapshot:-no prior database}" > "$blocked"; fi
+  ln -sfn "$target" "$CURRENT_LINK"
+  if restart_services "$role" && wait_service_health "$role" &&
+      install -m 0755 "$target/p2wlan-server" /usr/local/bin/p2wlan-server; then
+    clear_checkpoints "$role"
+    if [ -n "$snapshot" ]; then rm -rf "$snapshot"; fi
+    return 0
+  fi
+
+  while IFS= read -r unit; do
+    systemctl stop "$unit" || die "could not stop $unit after failed activation; inspect $ROOT_DIR"
+  done < <(service_list "$role")
+  if [ -n "$snapshot" ]; then echo "Pre-upgrade SQLite snapshot: $snapshot/database.sqlite" >&2; fi
+  if [ -n "$db" ] && [ -e "$db" ]; then
+    current_schema=$("${schema_tool:-$target/p2wlan-db}" --schema-id "$db") || current_schema=unreadable
+    [[ "$current_schema" =~ ^[0-9a-f]{64}$ ]] || current_schema=unreadable
+  fi
+  if [ "$prior_schema" != "$current_schema" ] || [ "$recovery_pending" -eq 1 ]; then
+    touch "$blocked"
+    die "activation failed and database compatibility is unverified; selected services stopped, inspect $ROOT_DIR"
+  fi
+  [ -n "$previous" ] || die "first activation failed; selected services stopped"
+  install -m 0755 "$previous/p2wlan-server" /usr/local/bin/p2wlan-server
+  ln -sfn "$previous" "$CURRENT_LINK"
+  for unit in $active; do
+    case "$unit" in
+      p2wlan-control.service) component=control ;;
+      p2wlan-relay.service) component=relay ;;
+    esac
+    checkpoint=$(readlink "$ROOT_DIR/.previous-$component-release") || checkpoint=$previous
+    ln -sfn "$checkpoint" "$CURRENT_LINK"
+    systemctl start "$unit" || die "failed to restore $unit"
+    wait_service_health "$component" || die "previous $component failed readiness"
+  done
+  ln -sfn "$previous" "$CURRENT_LINK"
+  clear_checkpoints "$role"
+  die "activation failed; restored $previous and previously active services"
+}
+
+clear_checkpoints() {
+  if [ "$1" != relay ]; then rm -f "$ROOT_DIR/.previous-control-release" "$ROOT_DIR/.recovery-required"; fi
+  if [ "$1" != control ]; then rm -f "$ROOT_DIR/.previous-relay-release"; fi
 }
 
 status_server() {
@@ -988,7 +1073,7 @@ restore_server() {
 }
 
 rollback_server() {
-  need_root
+  lock_release
   local version=
   if [ "$#" -gt 0 ]; then version=$1; fi
   [ -L "$CURRENT_LINK" ] || die "current release link is missing: $CURRENT_LINK"
@@ -1002,18 +1087,26 @@ rollback_server() {
     done < <(find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*.tmp' -printf '%f\n' | sort -V -r)
   fi
   [ -n "$version" ] || die "no previous release is installed"
+  [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid release version"
   [ -d "$RELEASE_DIR/$version" ] || die "release not found: $version"
   for required in p2wlan-control p2wlan-relay p2wlan-config p2wlan-db p2wlan-server install-server.sh deploy-server.sh; do
     [ -x "$RELEASE_DIR/$version/$required" ] || die "rollback target is incomplete: $version (missing $required)"
   done
   "$RELEASE_DIR/$version/p2wlan-control" --version >/dev/null
   "$RELEASE_DIR/$version/p2wlan-relay" --version >/dev/null
+  local role=all
+  if systemd_available; then
+    if ! systemctl cat p2wlan-relay.service >/dev/null 2>&1; then role=control
+    elif ! systemctl cat p2wlan-control.service >/dev/null 2>&1; then role=relay; fi
+  fi
   ln -sfn "$RELEASE_DIR/$version" "$CURRENT_LINK"
-  if ! restart_services all || ! check_server all; then
+  if ! restart_services "$role" || ! wait_service_health "$role"; then
     ln -sfn "$old_target" "$CURRENT_LINK"
-    restart_services all || true
+    restart_services "$role" || die "rollback failed and the previous services could not be restarted"
     die "rollback target failed health verification; restored current=$current_version"
   fi
+  install -m 0755 "$CURRENT_LINK/p2wlan-server" /usr/local/bin/p2wlan-server
+  clear_checkpoints "$role"
   echo "rolled back to $version"
 }
 
@@ -1076,9 +1169,9 @@ case "$cmd" in
     while [ "$#" -gt 0 ]; do
       case "$1" in --archive) archive=${2:?missing archive}; shift 2 ;; --version) version=${2:?missing version}; shift 2 ;; --service) selected=${2:?missing service}; shift 2 ;; --base-url) base_url=${2:?missing URL}; shift 2 ;; --no-restart) no_restart=1; shift ;; *) die "unknown update option: $1" ;; esac
     done
-    if [ -n "${archive:-}" ]; then
-      archive_install "$archive"
-    elif [ -n "${version:-}" ]; then
+    service_list "${selected:-all}" >/dev/null
+    lock_release
+    if [ -z "${archive:-}" ] && [ -n "${version:-}" ]; then
       command -v curl >/dev/null 2>&1 || die "curl is required for --version updates"
       arch=$(uname -m)
       case "$arch" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) die "unsupported architecture: $arch" ;; esac
@@ -1089,14 +1182,12 @@ case "$cmd" in
       curl -fL --retry 3 -o "$archive" "$base_url/$version/p2wlan-server-linux-$arch.tar.gz"
       curl -fL --retry 3 -o "$archive.sha256" "$base_url/$version/p2wlan-server-linux-$arch.tar.gz.sha256"
       (cd "$tmp_dir" && sha256sum -c "$(basename "$archive.sha256")")
-      archive_install "$archive"
-    else
-      die "update requires --archive FILE or --version server-vX.Y.Z"
     fi
-    if [ "$no_restart" -eq 0 ]; then restart_services "${selected:-all}"; fi
+    [ -n "${archive:-}" ] || die "update requires --archive FILE or --version server-vX.Y.Z"
+    archive_install "$archive"
     ;;
   backup) backup_server "$@" ;;
-  restore) restore_server "$@" ;;
+  restore) lock_release; restore_server "$@" ;;
   rollback)
     rollback_version=
     while [ "$#" -gt 0 ]; do

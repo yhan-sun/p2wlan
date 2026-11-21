@@ -88,7 +88,9 @@ jobs:
       - name: Manager and source contracts
         if: runner.os == 'Linux'
         run: |
-          bash -n scripts/bootstrap-server.sh scripts/install-server.sh scripts/install-server-docker.sh scripts/deploy-server.sh scripts/p2wlan-server
+          for script in scripts/bootstrap-server.sh scripts/install-server.sh scripts/install-server-docker.sh scripts/deploy-server.sh scripts/p2wlan-server; do
+            bash -n "$script" || exit 1
+          done
           python3 -m unittest discover -s scripts/selfhost -p 'test_*.py'
   docker:
     name: Docker selfhost and static server compatibility
@@ -166,6 +168,24 @@ jobs:
           authenticate('login')
           print('PASS: real Docker installer retained credentials and authenticated database state after redeployment')
           PY
+      - name: Verify the packaged public HTTPS edge with a private CA
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/edge-source"
+          deployment="$RUNNER_TEMP/selfhost-edge"
+          mkdir -p "$bundle"
+          python3 scripts/selfhost/package_server_source.py --repo-root . --source-sha "$(git rev-parse HEAD)" \
+            --version server-v0.0.0 --output-dir "$bundle/assets"
+          tar -xzf "$bundle/assets/p2wlan-server-source.tar.gz" -C "$bundle"
+          sudo bash "$bundle/scripts/install-server-docker.sh" --source "$bundle" --dir "$deployment" \
+            --non-interactive --tls-mode selfsigned --relay-endpoint tls://relay.example.test:28081 \
+            --publish-host 127.0.0.1 --control-port 28080 --metrics-port 28082 --wait-timeout 120
+          compose=(sudo docker compose --env-file "$deployment/.env" -f "$deployment/compose.yml")
+          test "$("${compose[@]}" exec -T edge id -u)" = 10001
+          test "$(sudo stat -c '%a' "$deployment/config/tls.key")" = 600
+          sudo curl --noproxy '*' --fail --silent --show-error --max-time 10 --output /dev/null \
+            --resolve relay.example.test:443:127.0.0.1 --cacert "$deployment/config/relay-ca.crt" \
+            https://relay.example.test/health
       - name: Verify static ELF and Ubuntu 20.04 server loader compatibility
         working-directory: server
         run: |
@@ -185,8 +205,9 @@ jobs:
         run: |
           status=0
           docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml down --remove-orphans || status=1
-          deployment="$RUNNER_TEMP/selfhost-installer"
-          if sudo test -f "$deployment/compose.yml"; then
-            sudo docker compose --env-file "$deployment/.env" -f "$deployment/compose.yml" down --remove-orphans || status=1
-          fi
+          for deployment in "$RUNNER_TEMP/selfhost-installer" "$RUNNER_TEMP/selfhost-edge"; do
+            if sudo test -f "$deployment/compose.yml"; then
+              sudo docker compose --env-file "$deployment/.env" -f "$deployment/compose.yml" down --remove-orphans || status=1
+            fi
+          done
           exit "$status"

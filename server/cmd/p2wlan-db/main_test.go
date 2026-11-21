@@ -66,3 +66,41 @@ func TestFilesystemPathRejectsNonFileDatabaseNames(t *testing.T) {
 		}
 	}
 }
+
+func TestSchemaIdentitySurvivesLiveDataWritesAndDetectsMigrations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "live.db")
+	db, err := openDatabase(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exec := func(statement string) {
+		t.Helper()
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	identity := func() string {
+		t.Helper()
+		id, err := schemaID(path)
+		if err != nil || len(id) != 64 {
+			t.Fatalf("schema identity %q, error %v", id, err)
+		}
+		return id
+	}
+	exec("PRAGMA journal_mode = WAL")
+	exec("CREATE TABLE devices (id INTEGER PRIMARY KEY)")
+	previous := identity()
+	exec("INSERT INTO devices VALUES (1)")
+	if identity() != previous {
+		t.Fatal("a data write changed the schema identity")
+	}
+	for _, statement := range []string{"PRAGMA user_version = 2", "PRAGMA application_id = 17", "ALTER TABLE devices ADD COLUMN name TEXT"} {
+		exec(statement)
+		current := identity()
+		if current == previous {
+			t.Fatalf("missed migration %q", statement)
+		}
+		previous = current
+	}
+}

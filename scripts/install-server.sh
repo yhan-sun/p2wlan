@@ -448,6 +448,12 @@ while true; do
   configured=0
   if [ -e "$CONFIG_DIR/control.env" ] || [ -e "$CONFIG_DIR/relay.env" ]; then
     configured=1
+    if [ "$ROLE" = all ] && { [ ! -f "$CONFIG_DIR/control.env" ] || [ ! -f "$CONFIG_DIR/relay.env" ]; }; then
+      die 'partial existing configuration was preserved; both control.env and relay.env are required for --role all'
+    fi
+    if [ "$ROLE" != all ] && [ ! -f "$CONFIG_DIR/$ROLE.env" ]; then
+      die "partial existing configuration was preserved; --role $ROLE requires $ROLE.env"
+    fi
     if [ "$edit_configuration" -eq 0 ]; then
       [ -z "$ENDPOINT$TLS_CERT$TLS_KEY" ] && [ "$DEV_LOCALHOST" -eq 0 ] || die "existing configuration is preserved; change certificates/configuration explicitly before reinstalling"
     else
@@ -457,9 +463,6 @@ while true; do
   [ "$INTERACTIVE" -eq 1 ] || break
   if [ "$configured" -eq 1 ]; then
     printf '\n[2-5/7] 检测到已有配置：保留配置、证书、凭据、数据库与端口，只升级/重装选定版本。\n' >&3
-    if [ "$ROLE" = all ] && { [ ! -f "$CONFIG_DIR/control.env" ] || [ ! -f "$CONFIG_DIR/relay.env" ]; }; then
-      die 'partial existing configuration was preserved; complete matching service files explicitly before guided setup'
-    fi
   else
     [ "$ROLE" = all ] || die "guided first setup supports --role all; split hosts require preconfigured matching files"
     wizard_new_configuration "$edit_configuration"
@@ -540,15 +543,21 @@ fi
 echo '[2/4] Installing release and systemd units'
 manager_env=(P2WLAN_SERVER_ROOT="$INSTALL_ROOT" P2WLAN_SERVER_CONFIG="$CONFIG_DIR" P2WLAN_SERVER_DATA="$DATA_DIR")
 install -d -m 0755 /usr/local/bin
-install -m 0755 "$stage/p2wlan-server" /usr/local/bin/p2wlan-server
-env "${manager_env[@]}" "$stage/p2wlan-server" init --role "$ROLE"
-env "${manager_env[@]}" "$stage/p2wlan-server" update --archive "$ARCHIVE" --service "$ROLE" --no-restart
+if [ ! -L "$INSTALL_ROOT/current" ]; then
+  env "${manager_env[@]}" "$stage/p2wlan-server" init --role "$ROLE"
+elif [ -d "${P2WLAN_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+  for component in control relay; do
+    if { [ "$ROLE" = all ] || [ "$ROLE" = "$component" ]; } && ! systemctl cat "p2wlan-$component.service" > /dev/null 2>&1; then
+      env "${manager_env[@]}" "$stage/p2wlan-server" init --role "$component"
+    fi
+  done
+fi
+update_args=(--archive "$ARCHIVE" --service "$ROLE")
+if [ "$existing" -ne 1 ] || [ "$START" -eq 0 ]; then update_args+=(--no-restart); fi
+env "${manager_env[@]}" "$stage/p2wlan-server" update "${update_args[@]}"
 env "${manager_env[@]}" "$stage/p2wlan-server" verify --service "$ROLE"
 if [ "$START" -eq 1 ]; then
   echo '[3/4] Starting services'
-  if [ "$existing" -eq 1 ]; then
-    env "${manager_env[@]}" "$stage/p2wlan-server" restart --service "$ROLE"
-  fi
   env "${manager_env[@]}" "$stage/p2wlan-server" start --service "$ROLE"
   echo '[4/4] Waiting for local health/readiness'
   healthy=0

@@ -67,6 +67,7 @@ services:
   edge:
     profiles: ["edge"]
     image: "${P2WLAN_EDGE_IMAGE:-nginxinc/nginx-unprivileged:1.27-alpine}"
+    user: "${P2WLAN_UID:-10001}:${P2WLAN_GID:-10001}"
     restart: unless-stopped
     read_only: true
     tmpfs: [/tmp, /var/cache/nginx, /var/run]
