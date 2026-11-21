@@ -64,10 +64,16 @@ pub mod tasks;
 pub mod transport;
 pub mod traversal_history;
 pub mod udp;
+#[cfg(windows)]
+mod windows_identity;
+#[cfg(windows)]
+pub mod windows_service_paths;
 
 // Re-export key types
 pub use config::{Config, PathPolicy};
 pub use error::{DaemonError, Result};
+#[cfg(windows)]
+pub use windows_identity::{same_windows_device, WindowsIdentityLease};
 
 use crate::udp::estimate_remote_scatter_punch_deadline;
 

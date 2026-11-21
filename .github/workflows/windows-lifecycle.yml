@@ -14,6 +14,7 @@ on:
       - "client/desktop-host/**"
       - "apps/flutter_client/**"
       - "scripts/release/**"
+      - "scripts/windows/**"
       - "scripts/windows_lifecycle/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -39,6 +40,7 @@ on:
       - "client/desktop-host/**"
       - "apps/flutter_client/**"
       - "scripts/release/**"
+      - "scripts/windows/**"
       - "scripts/windows_lifecycle/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -197,6 +199,15 @@ jobs:
       - name: Bundle Wintun for the production harness
         shell: pwsh
         run: .\apps\flutter_client\scripts\fetch_wintun.ps1 -DestinationDirectory "${{ github.workspace }}\target\release" -Architecture amd64
+
+      - name: Verify Wake-on-LAN configuration and service lifecycle
+        shell: pwsh
+        run: |
+          .\scripts\windows\test-enable-wol.ps1
+          .\scripts\windows\test-wake-service.ps1 `
+            -CliPath target\release\p2wlan.exe `
+            -DaemonPath target\release\p2wlan-daemon.exe `
+            -WintunPath target\release\wintun.dll
 
       - name: Run Rust lifecycle regression
         env:

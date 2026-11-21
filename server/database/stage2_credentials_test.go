@@ -1,6 +1,41 @@
 package database
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestDeviceCredentialFirstSigningKeyBindingIsAtomic(t *testing.T) {
+	db, _ := tmpDB(t)
+	user := newUser(t, db, "register@test")
+	device := newDevice(t, db, user.ID, "default")
+	type outcome struct {
+		key, token string
+		err        error
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, 2)
+	for _, key := range []string{strings.Repeat("11", 32), strings.Repeat("22", 32)} {
+		go func() {
+			<-start
+			_, token, err := db.CreateDeviceCredentialForSigningKey(device.ID, user.ID, key, 3600)
+			results <- outcome{key: key, token: token, err: err}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	if first.err != nil {
+		first, second = second, first
+	}
+	if first.err != nil || !errors.Is(second.err, ErrDeviceSigningKeyMismatch) || second.token != "" {
+		t.Fatalf("expected exactly one identity to enroll, got %v and %v", first.err, second.err)
+	}
+	_, stored, err := db.ValidateDeviceCredential(first.token)
+	if err != nil || stored.Ed25519PublicKey != first.key {
+		t.Fatalf("first enrolled key not pinned: %v", err)
+	}
+}
 
 // 9. Device credential expiration and revocation
 func TestDatabase_DeviceCredentialLifecycle(t *testing.T) {

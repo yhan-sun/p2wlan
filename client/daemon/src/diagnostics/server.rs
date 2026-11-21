@@ -243,6 +243,10 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             let body = serde_json::to_string_pretty(&snapshot)?;
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
         }
+        ("GET", "/wake") => {
+            let body = serde_json::to_string(&context.wake_status.snapshot())?;
+            write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
+        }
         ("GET", "/resources") => {
             // Bounded atomics only: do not queue behind peer/session/UDP locks
             // or include this independent read in /status revision semantics.
@@ -533,7 +537,7 @@ fn is_public_endpoint(method: &str, path: &str) -> bool {
 fn is_supported_endpoint(method: &str, path: &str) -> bool {
     match (method, path) {
         ("GET", "/health" | "/status.version" | "/status.runtime" | "/status")
-        | ("GET", "/routes" | "/events" | "/peers" | "/logs/tail" | "/resources")
+        | ("GET", "/routes" | "/events" | "/peers" | "/logs/tail" | "/resources" | "/wake")
         | ("POST", "/speedtest" | "/shutdown" | "/routes/verify" | "/routes/repair") => true,
         ("GET", path) if path.starts_with("/status/peer/") => true,
         _ => false,

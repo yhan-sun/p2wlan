@@ -106,6 +106,7 @@ async fn lease_release_resolves_the_replacement_pool_after_auth_recovers() {
             pool_id,
             primary: Some(client.clone()),
             candidate: Some(client),
+            wake: None,
             unavailable_reason: None,
         }
     }

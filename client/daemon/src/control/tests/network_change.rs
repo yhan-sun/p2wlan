@@ -55,6 +55,8 @@ async fn edge_before_notification_registration_is_not_a_lost_wakeup() {
 
 fn current_auth() -> CriticalControlAuth {
     CriticalControlAuth {
+        wake_device_credential: false,
+        wake_proxy_v1: false,
         accepted_peer_capabilities: PeerCapabilities::current(),
         base_url: "http://control.invalid".into(),
         token: "synthetic-credential".into(),

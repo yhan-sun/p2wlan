@@ -16,6 +16,7 @@ class _NodeToolbar extends StatelessWidget {
     required this.onSortChanged,
     required this.onQueryChanged,
     required this.onClearSearch,
+    this.onOpenWakeCatalog,
   });
 
   final TextEditingController searchController;
@@ -30,6 +31,7 @@ class _NodeToolbar extends StatelessWidget {
   final ValueChanged<_NodeSort> onSortChanged;
   final VoidCallback onQueryChanged;
   final VoidCallback onClearSearch;
+  final VoidCallback? onOpenWakeCatalog;
 
   @override
   Widget build(BuildContext context) {
@@ -111,6 +113,17 @@ class _NodeToolbar extends StatelessWidget {
           ),
       ],
     );
+    final wakeButton = onOpenWakeCatalog == null
+        ? null
+        : SizedBox.square(
+            dimension: controlHeight,
+            child: IconButton(
+              key: const ValueKey('devices-remote-wake'),
+              tooltip: WakeStrings(strings.isZh).title,
+              onPressed: onOpenWakeCatalog,
+              icon: const Icon(Icons.power_settings_new_rounded, size: 18),
+            ),
+          );
     if (desktop) {
       return LayoutBuilder(
         builder: (context, constraints) {
@@ -128,6 +141,7 @@ class _NodeToolbar extends StatelessWidget {
                 segment,
                 const SizedBox(width: AppTokens.space12),
                 sortButton,
+                ?wakeButton,
               ],
             );
           }
@@ -139,13 +153,22 @@ class _NodeToolbar extends StatelessWidget {
               Wrap(
                 spacing: AppTokens.space12,
                 runSpacing: AppTokens.space8,
-                children: [segment, sortButton],
+                children: [segment, sortButton, ?wakeButton],
               ),
             ],
           );
         },
       );
     }
+    final mobileSearch = wakeButton == null
+        ? search
+        : Row(
+            children: [
+              Expanded(child: search),
+              const SizedBox(width: AppTokens.space8),
+              wakeButton,
+            ],
+          );
     final summary = Text(
       scopeConnections
           ? (strings.isZh
@@ -191,7 +214,7 @@ class _NodeToolbar extends StatelessWidget {
             children: [
               Row(
                 children: [
-                  Expanded(child: search),
+                  Expanded(child: mobileSearch),
                   const SizedBox(width: AppTokens.space8),
                   menus,
                 ],
@@ -204,7 +227,7 @@ class _NodeToolbar extends StatelessWidget {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            search,
+            mobileSearch,
             const SizedBox(height: AppTokens.space8),
             if (constraints.maxWidth >= 320 && !largeText)
               Row(

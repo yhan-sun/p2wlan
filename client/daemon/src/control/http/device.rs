@@ -37,7 +37,7 @@ pub(super) async fn register_device(
     Vec<String>,
     Vec<RelayCatalogEntry>,
     Option<u64>,
-    super::PeerCapabilities,
+    super::AcceptedRegistrationCapabilities,
 )> {
     register_device_with_cidr_policy(http, base_url, token, config, false).await
 }
@@ -57,7 +57,7 @@ pub(super) async fn register_device_with_authoritative_cidr(
     Vec<String>,
     Vec<RelayCatalogEntry>,
     Option<u64>,
-    super::PeerCapabilities,
+    super::AcceptedRegistrationCapabilities,
 )> {
     register_device_with_cidr_policy(http, base_url, token, config, true).await
 }
@@ -75,7 +75,7 @@ async fn register_device_with_cidr_policy(
     Vec<String>,
     Vec<RelayCatalogEntry>,
     Option<u64>,
-    super::PeerCapabilities,
+    super::AcceptedRegistrationCapabilities,
 )> {
     let res = http
         .post(format!("{base_url}/api/v1/devices"))
@@ -169,7 +169,7 @@ async fn register_device_with_cidr_policy(
         body.relay_servers,
         body.relay_catalog,
         body.registration_seq,
-        super::PeerCapabilities::default(),
+        super::AcceptedRegistrationCapabilities::default(),
     ))
 }
 
@@ -181,6 +181,21 @@ pub(super) fn register_device_payload_with_incarnation(
     config: &Config,
     incarnation: u64,
 ) -> serde_json::Value {
+    registration_payload(
+        config,
+        incarnation,
+        super::remote_wake::request_proxy_capability(
+            config,
+            &normalize_http_base_url(&config.control.server_url),
+        ),
+    )
+}
+
+pub(super) fn registration_payload(
+    config: &Config,
+    incarnation: u64,
+    wake_proxy: bool,
+) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "public_key": config.node.public_key,
         "ed25519_public_key": config.node.ed25519_public_key,
@@ -190,6 +205,10 @@ pub(super) fn register_device_payload_with_incarnation(
         "capabilities": super::PeerCapabilities::current(),
         "network_id": config.network.network_id,
     });
+
+    if incarnation != 0 && wake_proxy {
+        payload["capabilities"]["wake_proxy_v1"] = serde_json::json!(true);
+    }
 
     // A zero value means the durable state file was unavailable. Do not invent
     // a wall-clock fallback: doing so could make an old daemon appear newer.

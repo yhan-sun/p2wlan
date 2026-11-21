@@ -387,6 +387,7 @@ pub struct PermissionPreflightResponse {
 /// Shared state needed to build diagnostics responses.
 #[derive(Clone)]
 pub struct DiagnosticsContext {
+    wake_status: Arc<crate::control::remote_wake::WakeStatus>,
     resource_capture: Option<Arc<crate::dataplane_resources::RuntimeResourceCapture>>,
     room_authorization: Option<Arc<crate::rooms::RoomAuthorization>>,
     config: Arc<Config>,
@@ -427,6 +428,14 @@ pub struct DiagnosticsContext {
 }
 
 impl DiagnosticsContext {
+    pub(crate) fn with_wake_status(
+        mut self,
+        status: Arc<crate::control::remote_wake::WakeStatus>,
+    ) -> Self {
+        self.wake_status = status;
+        self
+    }
+
     pub(crate) fn with_resource_capture(
         mut self,
         capture: Option<Arc<crate::dataplane_resources::RuntimeResourceCapture>>,
@@ -464,6 +473,7 @@ impl DiagnosticsContext {
         runtime_incarnation: Option<u64>,
     ) -> Self {
         Self {
+            wake_status: Arc::new(crate::control::remote_wake::WakeStatus::default()),
             room_authorization: None,
             resource_capture: None,
             config,

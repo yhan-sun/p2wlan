@@ -93,6 +93,36 @@ fn prepared_boot_incarnations() -> &'static Mutex<HashMap<PathBuf, u64>> {
 /// Call [`take_prepared_or_next_boot_incarnation`] when constructing the
 /// daemon.  Other callers should continue to use [`next_boot_incarnation`].
 pub fn reserve_boot_incarnation(config: &Config) -> Option<u64> {
+    reserve_boot_incarnation_with_state(config, config)
+}
+
+/// Use the same counter when a Windows identity moves between the interactive
+/// desktop and its protected boot-time service profile.
+#[cfg(windows)]
+pub fn reserve_boot_incarnation_for_machine_profile(
+    config: &Config,
+    machine: &Config,
+) -> Option<u64> {
+    reserve_boot_incarnation_with_state(config, machine)
+}
+
+#[cfg(windows)]
+pub fn read_boot_incarnation(source: impl std::io::Read) -> std::io::Result<IncarnationState> {
+    use std::io::Read;
+
+    const MAX_BYTES: u64 = 4096;
+    let mut content = Vec::new();
+    source.take(MAX_BYTES + 1).read_to_end(&mut content)?;
+    if content.len() as u64 > MAX_BYTES {
+        return Err(std::io::Error::other(
+            "persisted daemon incarnation is too large",
+        ));
+    }
+    deserialize_incarnation(&content)
+        .map_err(|()| std::io::Error::other("invalid persisted daemon incarnation"))
+}
+
+fn reserve_boot_incarnation_with_state(config: &Config, state_config: &Config) -> Option<u64> {
     let Some(config_path) = config.config_path.clone() else {
         return next_boot_incarnation(config);
     };
@@ -105,7 +135,7 @@ pub fn reserve_boot_incarnation(config: &Config) -> Option<u64> {
         return Some(incarnation);
     }
 
-    let incarnation = next_boot_incarnation(config)?;
+    let incarnation = next_boot_incarnation(state_config)?;
     prepared.insert(config_path, incarnation);
     Some(incarnation)
 }
@@ -209,11 +239,15 @@ fn load(path: Option<&Path>) -> Result<Option<IncarnationState>, ()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(()),
     };
-    let state = serde_json::from_str::<IncarnationState>(&content).map_err(|_| ())?;
+    deserialize_incarnation(content.as_bytes()).map(Some)
+}
+
+fn deserialize_incarnation(content: &[u8]) -> Result<IncarnationState, ()> {
+    let state = serde_json::from_slice::<IncarnationState>(content).map_err(|_| ())?;
     if state.version != INCARNATION_VERSION || state.incarnation == 0 {
         return Err(());
     }
-    Ok(Some(state))
+    Ok(state)
 }
 
 /// Persist the state atomically: write the fixed temporary file, fsync it,
@@ -227,9 +261,17 @@ fn load(path: Option<&Path>) -> Result<Option<IncarnationState>, ()> {
 /// is fsynced.
 fn save(state: &IncarnationState, path: &Path) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let content = serde_json::to_vec_pretty(state)?;
+    #[cfg(windows)]
+    if let Ok(paths) = crate::windows_service_paths::ServicePaths::resolve() {
+        if parent == paths.root {
+            // A desktop administration token can have an interactive user as
+            // its default file owner. Preserve the machine ACL on every write.
+            return paths.write_new_private_file(path, &content);
+        }
+    }
     fs::create_dir_all(parent)?;
     let tmp_path = parent.join(INCARNATION_TMP_FILE_NAME);
-    let content = serde_json::to_vec_pretty(state)?;
     {
         let mut tmp = fs::File::create(&tmp_path)?;
         tmp.write_all(&content)?;

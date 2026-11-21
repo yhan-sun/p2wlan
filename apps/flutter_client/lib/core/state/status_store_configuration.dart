@@ -11,6 +11,7 @@ typedef _PrimaryLaunchConfiguration = ({
   String udpAdvertise,
   String socketPool,
   String relayServers,
+  bool? wakeAllowRemote,
 });
 
 _PrimaryLaunchConfiguration _primaryLaunchConfiguration(
@@ -29,6 +30,7 @@ _PrimaryLaunchConfiguration _primaryLaunchConfiguration(
   udpAdvertise: settings.udpAdvertise.trim(),
   socketPool: normalizeSocketPool(settings.socketPool),
   relayServers: settings.relayServers.trim(),
+  wakeAllowRemote: Platform.isWindows ? wakeAllowRemoteSetting(settings) : null,
 );
 
 /// One bounded witness for the post-start catalog refresh. The first accepted

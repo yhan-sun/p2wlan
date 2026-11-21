@@ -864,8 +864,16 @@ func (db *DB) DeleteRoomDevice(actorID, roomID, deviceID string) error {
 }
 
 func (db *DB) ListVisibleDevices(userID, networkID string) ([]Device, error) {
-	return db.listDevices(`FROM devices d WHERE d.network_id = ? AND NOT EXISTS(SELECT 1 FROM room_device_access a WHERE a.network_id=d.network_id AND a.public_key=d.public_key AND a.state!='allowed') AND ((d.user_id = ? AND NOT EXISTS(SELECT 1 FROM rooms WHERE network_id = d.network_id)) OR (EXISTS (SELECT 1 FROM network_memberships self WHERE self.network_id = d.network_id AND self.user_id = ?) AND EXISTS (SELECT 1 FROM rooms WHERE network_id = d.network_id) AND EXISTS (SELECT 1 FROM network_memberships peer WHERE peer.network_id = d.network_id AND peer.user_id = d.user_id)))`, networkID, userID, userID)
+	return db.listDevices(`FROM devices d WHERE d.network_id = ? AND `+deviceRoomAllowedSQL+` AND `+deviceAccountVisibleSQL, networkID, userID, userID)
 }
+
+const deviceRoomAllowedSQL = `NOT EXISTS(SELECT 1 FROM room_device_access a
+	WHERE a.network_id=d.network_id AND a.public_key=d.public_key AND a.state!='allowed')`
+
+const deviceAccountVisibleSQL = `((d.user_id = ? AND NOT EXISTS(SELECT 1 FROM rooms WHERE network_id = d.network_id))
+	OR (EXISTS (SELECT 1 FROM network_memberships self WHERE self.network_id = d.network_id AND self.user_id = ?)
+		AND EXISTS (SELECT 1 FROM rooms WHERE network_id = d.network_id)
+		AND EXISTS (SELECT 1 FROM network_memberships peer WHERE peer.network_id = d.network_id AND peer.user_id = d.user_id)))`
 
 func (db *DB) DevicesMayCommunicate(fromID, toID string) (bool, error) {
 	var allowed bool

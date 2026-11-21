@@ -45,6 +45,16 @@ Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemet
 
 该命令同时启用本地诊断；重新启动对应 daemon 后生效。读取使用 `p2wlan status --resources`，经原有实例诊断令牌访问 `GET /resources`。关闭使用 `p2wlan config set resource-capture false` 后重启，不会关闭其他诊断。资源观测的单位、不可用状态和覆盖限制见[路径可观测性](path-observability.md#软件缓冲资源观测)。
 
+## 远程开机
+
+| 配置 | 生效条件 |
+| --- | --- |
+| `wake.proxy` | 默认 `false`。设为 `true` 后，兼容的桌面或 OpenWrt daemon 使用设备凭据登记代理能力，并轮询当前注册所属网络的任务。 |
+| `wake.proxy_interface` | 可选。限定发送魔术包使用的本地接口，例如 `br-lan`。未配置时使用符合条件的局域网接口。 |
+| `wake.allow_remote` | 默认 `false`。设为 `true` 后，Windows daemon 使用设备凭据登记可用的有线网卡 MAC。关闭后，daemon 连到 Control 时撤销登记。 |
+
+修改后重启对应 daemon。使用 `p2wlan wake proxy on` 启用代理，使用 `p2wlan config set wake-allow-remote true` 启用目标登记。代理限流按 daemon 进程计算，每分钟最多八个发包任务，对同一 MAC 至少间隔五秒。Control 另外限制每个网络和目标的活跃任务数量。Windows 服务使用 `%ProgramData%\p2wlan\` 下的机器级配置。配置权限、硬件准备和 LAN 测试见 [Windows 远程开机](../guides/remote-wake.md)。
+
 ## 客户端路径策略
 
 `relay.path_policy` 缺省值为 `direct-first`。首次在线 peer 生命周期保留 5 秒直连窗口；健康的加密确认 Direct 保持优先。Relay 可提前建立和认证，但窗口到期前不承载本端首个业务包。确认 Direct 失活后立即允许已认证 Relay 兜底，不为已建立连接重跑冷启动等待。

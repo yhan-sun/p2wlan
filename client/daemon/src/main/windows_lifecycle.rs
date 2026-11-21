@@ -146,6 +146,18 @@ struct WindowsServiceContext {
 static SERVICE_NAME: OnceLock<Vec<u16>> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
+const PRODUCT_SERVICE_NAME: &str = "P2WLAN";
+
+#[cfg(target_os = "windows")]
+fn product_windows_service() -> bool {
+    SERVICE_NAME.get().is_some_and(|name| {
+        name.iter()
+            .copied()
+            .eq(PRODUCT_SERVICE_NAME.encode_utf16().chain([0]))
+    })
+}
+
+#[cfg(target_os = "windows")]
 pub(crate) fn windows_service_requested() -> bool {
     std::env::args_os().any(|arg| arg == "--windows-service")
 }
@@ -172,6 +184,11 @@ fn windows_service_name_from_args() -> String {
 #[cfg(target_os = "windows")]
 pub(crate) fn run_windows_service() -> p2pnet_daemon::Result<()> {
     let name = windows_service_name_from_args();
+    if name == PRODUCT_SERVICE_NAME {
+        prepare_product_windows_environment().map_err(|error| {
+            DaemonError::Network(format!("Windows service environment is unsafe: {error}"))
+        })?;
+    }
     let wide_name =
         SERVICE_NAME.get_or_init(|| name.encode_utf16().chain(std::iter::once(0)).collect());
     let entry = SERVICE_TABLE_ENTRYW {
@@ -220,8 +237,6 @@ unsafe extern "system" fn windows_service_main(
     (*context_ptr).status_handle = handle;
 
     set_windows_service_status(handle, SERVICE_START_PENDING, 0);
-    set_windows_service_status(handle, SERVICE_RUNNING, 0);
-
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -234,6 +249,7 @@ unsafe extern "system" fn windows_service_main(
             return;
         }
     };
+    set_windows_service_status(handle, SERVICE_RUNNING, 0);
     let result = runtime.block_on(run_daemon(signal.clone()));
     let exit_code = if result.is_ok() { 0 } else { 1 };
     set_windows_service_status(handle, SERVICE_STOPPED, exit_code);
@@ -266,6 +282,9 @@ unsafe extern "system" fn windows_service_handler(
         return 1;
     }
     let context = &*(context.cast::<WindowsServiceContext>());
+    if control == SERVICE_CONTROL_SESSIONCHANGE && product_windows_service() {
+        return 0;
+    }
     let Some(reason) = service_lifecycle_reason(control, event_type) else {
         return if control == SERVICE_CONTROL_INTERROGATE {
             0
@@ -293,7 +312,11 @@ fn set_windows_service_status(
             SERVICE_ACCEPT_STOP
                 | SERVICE_ACCEPT_PRESHUTDOWN
                 | SERVICE_ACCEPT_SHUTDOWN
-                | SERVICE_ACCEPT_SESSIONCHANGE
+                | if product_windows_service() {
+                    0
+                } else {
+                    SERVICE_ACCEPT_SESSIONCHANGE
+                }
         } else {
             0
         },

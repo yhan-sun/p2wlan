@@ -10,6 +10,8 @@ fn registration(
     base_url: &str,
 ) -> tokio::sync::watch::Sender<Option<super::super::CriticalControlAuth>> {
     tokio::sync::watch::channel(Some(super::super::CriticalControlAuth {
+        wake_device_credential: false,
+        wake_proxy_v1: false,
         accepted_peer_capabilities: super::super::PeerCapabilities::current(),
         base_url: base_url.to_string(),
         token: "ack-test-token".into(),

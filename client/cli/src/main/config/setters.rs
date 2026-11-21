@@ -109,6 +109,17 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
                 config.network.socket_pool_size = count;
             }
         }
+        "wake-allow-remote" => {
+            config.wake.allow_remote = parse_bool_config(value, "wake-allow-remote")?;
+        }
+        "wake-proxy-interface" => {
+            let interface = value.trim();
+            if interface.len() > 256 || interface.chars().any(char::is_control) {
+                return Err("wake-proxy-interface 必须是有效网卡名称".to_string());
+            }
+            config.wake.proxy_interface =
+                (!is_clear_value(interface)).then(|| interface.to_string());
+        }
         "resource-capture" => {
             let enabled = value
                 .parse::<bool>()

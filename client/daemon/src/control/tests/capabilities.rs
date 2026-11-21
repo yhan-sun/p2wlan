@@ -19,7 +19,7 @@ fn capabilities_require_both_explicit_bits_and_never_infer_app_version() {
     }
     assert!(PeerCapabilities {
         hh2_pair_nomination: true,
-        hh2_plan_v2: true
+        hh2_plan_v2: true,
     }
     .supports_hh2());
     let mut upgraded = legacy.clone();
@@ -77,13 +77,13 @@ async fn legacy_server_features_never_authorize_local_peer_capabilities() {
         "capabilities": ["hh2_pair_nomination", "hh2_plan_v2"]
     }))
     .unwrap();
-    assert!(!response.accepted_peer_capabilities.supports_hh2());
+    assert!(!response.accepted_peer_capabilities.peer.supports_hh2());
     let client = ControlClient::disabled_for_test();
     client.set_local_registration_for_test(Some(8), PeerCapabilities::current());
     assert!(client.local_supports_hh2());
     client.set_local_registration_for_test(
         response.registration_seq,
-        response.accepted_peer_capabilities,
+        response.accepted_peer_capabilities.peer,
     );
     assert_eq!(client.local_registration_seq(), Some(9));
     assert!(!client.local_supports_hh2());

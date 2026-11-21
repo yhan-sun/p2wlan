@@ -14,6 +14,16 @@
 | p2wlan room list | 列出房间 |
 | p2wlan room connect ID | 连接房间 |
 | p2wlan room disconnect ID | 断开房间 |
+| p2wlan wake send --mac MAC [--interface IFACE] | 在本机局域网发送 Wake-on-LAN 魔术包，用于验证硬件 |
+| p2wlan wake status | 读取当前 daemon 的代理及目标登记状态 |
+| p2wlan wake proxy on / off | 设置对应配置的唤醒代理开关，重启 daemon 后生效 |
+| p2wlan config set wake-allow-remote true / false | 设置对应 Windows 配置是否登记为唤醒目标，重启 daemon 后生效 |
+| p2wlan config set wake-proxy-interface IFACE | 选定代理用于发送魔术包的 LAN 接口，设为 `unset` 可恢复自动选择 |
+| p2wlan wake target add --name NAME --mac MAC [--network ID] | 在 Control 登记手填 MAC 的目标 |
+| p2wlan wake target list [--network ID] | 列出有权查看的手填目标 |
+| p2wlan wake target remove ID | 删除手填目标 |
+| p2wlan service install --migrate-identity | Windows 管理员安装自动启动的系统服务，迁移已登记的设备身份 |
+| p2wlan service status / uninstall | Windows 查询或卸载 P2WLAN 系统服务 |
 | p2wlan route verify / repair | 检查或修复本机路由 |
 | p2wlan logs -f | 跟随 daemon 日志 |
 | p2wlan support-bundle | 生成本地支持包 |
@@ -23,6 +33,8 @@
 准确参数以 p2wlan help 和当前 Release 内的 CLI 为准。登录、配置和查询不要使用 sudo；创建 TUN、路由和 systemd 服务可能需要权限。
 
 ## 本地节点诊断
+
+`GET /wake` 使用实例的本地诊断令牌。它提供远程开机开关、代理状态和目标登记状态。远程开机的操作步骤见 [Windows 远程开机](../guides/remote-wake.md)。
 
 认证后的 `GET /status/peer/<node_id>` 返回当前节点快照。连接表短暂争用时执行有界读取；持续争用返回 HTTP 503 与 `peer_snapshot_busy`，不使用旧缓存代替当前快照。只有实际读取连接表并确认节点不存在时才返回 HTTP 404。完整快照仍受原请求超时限制，连接取消会结束对应读取。
 

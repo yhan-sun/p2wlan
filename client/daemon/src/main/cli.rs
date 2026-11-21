@@ -130,6 +130,11 @@ struct Cli {
     #[arg(long, name = "diagnostics-bind")]
     diagnostics_bind: Option<String>,
 
+    /// Allow this Windows profile to register its wired MAC for remote wake.
+    #[cfg(target_os = "windows")]
+    #[arg(long, action = clap::ArgAction::Set)]
+    wake_allow_remote: Option<bool>,
+
     /// Disable diagnostics endpoint
     #[arg(long, name = "diagnostics-disable")]
     diagnostics_disable: bool,

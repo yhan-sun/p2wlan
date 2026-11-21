@@ -70,6 +70,11 @@ async fn run_daemon_inner(
     // This guarantees --help and --version exit cleanly without side effects.
     let cli = Cli::parse();
 
+    #[cfg(windows)]
+    if product_windows_service() {
+        validate_product_windows_profile(&cli)?;
+    }
+
     if let Err(error) = validate_cli(&cli) {
         let error = DaemonError::Config(format!("STARTUP_CONFIG_INVALID: {error}"));
         append_early_startup_error(cli.log_file.as_ref(), &error);
@@ -245,6 +250,8 @@ async fn run_daemon_inner(
     // with this device identity. A duplicate daemon can consume the other
     // process's offer/answer signals and invalidate authenticated probe MACs.
     let instance_lock = DaemonInstanceLock::acquire(config_path)?;
+    #[cfg(windows)]
+    let _windows_identity = prepare_windows_managed_identity(&config)?;
     info!(
         "Acquired daemon instance lock at {}",
         instance_lock.path.display()

@@ -16,6 +16,8 @@ use std::sync::{Mutex, OnceLock};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
+pub mod wake;
+
 /// The no-fragment properties that were actually installed on one UDP
 /// socket.  DPLPMTUD treats a missing property as an unsupported capability;
 /// ordinary UDP traffic remains usable and keeps the platform default.

@@ -20,6 +20,8 @@ impl StartAckRetryHarness {
         let (commands, receiver) = mpsc::channel(4);
         client.candidate_offer_tx = commands;
         let (auth_tx, auth_rx) = watch::channel(Some(CriticalControlAuth {
+            wake_device_credential: false,
+            wake_proxy_v1: false,
             accepted_peer_capabilities: PeerCapabilities::current(),
             base_url: base_url.to_string(),
             token: "test-token".to_string(),

@@ -57,13 +57,19 @@ pub fn control_http_client_for_server(
                 .into(),
         ));
     }
-    build_control_http_client(mode, server_url, binding.outbound_interface.as_deref())
+    build_control_http_client(
+        mode,
+        server_url,
+        binding.outbound_interface.as_deref(),
+        false,
+    )
 }
 
 fn build_control_http_client(
     mode: ControlProxyMode,
     server_url: Option<&str>,
     outbound_interface: Option<&str>,
+    restrict_redirects: bool,
 ) -> Result<reqwest::Client> {
     #[cfg(target_env = "ohos")]
     if mode == ControlProxyMode::Direct
@@ -75,7 +81,12 @@ fn build_control_http_client(
         ));
     }
 
-    let builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder();
+    if restrict_redirects {
+        // Wake payloads can contain a private MAC. 307/308 redirects must
+        // never forward them to a different service or a plaintext URL.
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
 
     // `reqwest::ClientBuilder::interface` is unavailable on Windows. Keep
     // the binding code behind the same target gate so a Windows build does
@@ -123,9 +134,12 @@ fn build_control_http_client(
         builder
     };
 
-    let client = match mode {
-        ControlProxyMode::Direct => builder.no_proxy().build(),
-        ControlProxyMode::Environment => builder.build(),
+    let client = if mode == ControlProxyMode::Direct
+        || (restrict_redirects && server_url.is_some_and(control_server_is_local))
+    {
+        builder.no_proxy().build()
+    } else {
+        builder.build()
     };
     client.map_err(|err| {
         DaemonError::ControlPlane(format!(
@@ -166,6 +180,7 @@ struct ControlHttpPoolState {
     pool_id: u64,
     primary: Option<Arc<reqwest::Client>>,
     candidate: Option<Arc<reqwest::Client>>,
+    wake: Option<Arc<reqwest::Client>>,
     unavailable_reason: Option<String>,
 }
 
@@ -214,6 +229,27 @@ impl RouteAwareControlHttpClient {
         })
     }
 
+    pub(super) fn remote_wake_pool(&self) -> Option<(Arc<reqwest::Client>, u64)> {
+        if self.route_aware && self.state_rx.has_changed().is_err() {
+            return None;
+        }
+        let state = self.state_rx.borrow();
+        Some((state.wake.clone()?, state.pool_id))
+    }
+
+    pub(super) fn remote_wake_pool_is_current(&self, pool_id: u64) -> bool {
+        (!self.route_aware || self.state_rx.has_changed().is_ok())
+            && self.state_rx.borrow().pool_id == pool_id
+    }
+
+    pub(super) async fn remote_wake_pool_changed(&self, pool_id: u64) {
+        if !self.route_aware {
+            std::future::pending::<()>().await;
+        }
+        let mut state = self.state_rx.clone();
+        let _ = state.wait_for(|current| current.pool_id != pool_id).await;
+    }
+
     pub(super) fn notify_network_changed(&self) {
         if let Some(clock) = &self.timing {
             clock.invalidate_network();
@@ -230,12 +266,14 @@ fn build_control_http_pools(
     mode: ControlProxyMode,
     server_url: &str,
     binding: ControlRouteBinding,
+    remote_wake_enabled: bool,
 ) -> ControlHttpPoolState {
     if binding.fail_closed {
         return ControlHttpPoolState {
             pool_id: 0,
             primary: None,
             candidate: None,
+            wake: None,
             unavailable_reason: Some(
                 "control HTTP blocked: foreign TUN capture detected but no physical route interface is available"
                     .to_string(),
@@ -247,11 +285,13 @@ fn build_control_http_pools(
         mode,
         Some(server_url),
         binding.outbound_interface.as_deref(),
+        false,
     );
     let candidate = build_control_http_client(
         mode,
         Some(server_url),
         binding.outbound_interface.as_deref(),
+        false,
     );
     match (primary, candidate) {
         (Ok(primary), Ok(candidate)) => ControlHttpPoolState {
@@ -260,6 +300,18 @@ fn build_control_http_pools(
                 .unwrap_or(0),
             primary: Some(Arc::new(primary)),
             candidate: Some(Arc::new(candidate)),
+            wake: remote_wake_enabled
+                .then(|| {
+                    build_control_http_client(
+                        mode,
+                        Some(server_url),
+                        binding.outbound_interface.as_deref(),
+                        true,
+                    )
+                    .ok()
+                    .map(Arc::new)
+                })
+                .flatten(),
             unavailable_reason: None,
         },
         (primary, candidate) => {
@@ -272,6 +324,7 @@ fn build_control_http_pools(
                 pool_id: 0,
                 primary: None,
                 candidate: None,
+                wake: None,
                 unavailable_reason: Some(format!(
                     "control HTTP client construction failed: {error}"
                 )),
@@ -319,9 +372,23 @@ pub(super) fn route_aware_control_http_clients(
     server_url: &str,
     timing: Option<Arc<ServerClockEstimate>>,
 ) -> (RouteAwareControlHttpClient, RouteAwareControlHttpClient) {
+    route_aware_control_http_clients_with_wake(mode, server_url, timing, false)
+}
+
+pub(super) fn route_aware_control_http_clients_with_wake(
+    mode: ControlProxyMode,
+    server_url: &str,
+    timing: Option<Arc<ServerClockEstimate>>,
+    remote_wake_enabled: bool,
+) -> (RouteAwareControlHttpClient, RouteAwareControlHttpClient) {
     let route_aware = mode == ControlProxyMode::Direct && !control_server_is_local(server_url);
     let initial_binding = control_route_binding(mode, Some(server_url));
-    let initial_state = build_control_http_pools(mode, server_url, initial_binding.clone());
+    let initial_state = build_control_http_pools(
+        mode,
+        server_url,
+        initial_binding.clone(),
+        remote_wake_enabled,
+    );
     if let Some(clock) = &timing {
         clock.activate_http_pool(initial_state.pool_id);
     }
@@ -393,7 +460,12 @@ pub(super) fn route_aware_control_http_clients(
                     clock.activate_http_pool(state_tx.borrow().pool_id);
                 }
                 if forced {
-                    let replacement = build_control_http_pools(mode, &server_url, observed.clone());
+                    let replacement = build_control_http_pools(
+                        mode,
+                        &server_url,
+                        observed.clone(),
+                        remote_wake_enabled,
+                    );
                     if let Some(reason) = &replacement.unavailable_reason {
                         warn!("Control-plane HTTP pools forced to rebuild after Android network change; {reason}");
                     } else {
@@ -413,7 +485,12 @@ pub(super) fn route_aware_control_http_clients(
                 let replacement =
                     observe_stable_route_change(&active_binding, &mut pending, observed.clone());
                 if let Some(binding) = replacement {
-                    let replacement = build_control_http_pools(mode, &server_url, binding.clone());
+                    let replacement = build_control_http_pools(
+                        mode,
+                        &server_url,
+                        binding.clone(),
+                        remote_wake_enabled,
+                    );
                     if let Some(reason) = &replacement.unavailable_reason {
                         warn!("Control-plane route changed; {reason}");
                     } else {
@@ -438,7 +515,12 @@ pub(super) fn route_aware_control_http_clients(
                     && !active_binding.fail_closed
                     && state_tx.borrow().primary.is_none()
                 {
-                    let retry = build_control_http_pools(mode, &server_url, active_binding.clone());
+                    let retry = build_control_http_pools(
+                        mode,
+                        &server_url,
+                        active_binding.clone(),
+                        remote_wake_enabled,
+                    );
                     if retry.primary.is_some() {
                         info!("Recovered control-plane HTTP client construction");
                         if let Some(clock) = &timing {
@@ -541,6 +623,7 @@ mod proxy_tests {
                 outbound_interface: None,
                 fail_closed: true,
             },
+            false,
         );
         assert!(state.primary.is_none());
         assert!(state.candidate.is_none());

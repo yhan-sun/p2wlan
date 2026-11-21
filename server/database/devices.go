@@ -163,10 +163,10 @@ func (db *DB) GetDevice(deviceID string) (*Device, error) {
 	var d Device
 	var online int
 	var relayRTTMS sql.NullInt64
-	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, ''), COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2
+	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, ''), COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2, wake_proxy
 		FROM devices WHERE id = ?`, deviceID).
 		Scan(&d.ID, &d.UserID, &d.NetworkID, &d.PublicKey, &d.DeviceName, &d.Platform,
-			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey, &d.RegistrationSeq, &d.RegistrationIncarnation, &d.Capabilities.HH2PairNomination, &d.Capabilities.HH2PlanV2)
+			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey, &d.RegistrationSeq, &d.RegistrationIncarnation, &d.Capabilities.HH2PairNomination, &d.Capabilities.HH2PlanV2, &d.Capabilities.WakeProxyV1)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +183,7 @@ func (db *DB) GetDevice(deviceID string) (*Device, error) {
 type PeerCapabilities struct {
 	HH2PairNomination bool `json:"hh2_pair_nomination"`
 	HH2PlanV2         bool `json:"hh2_plan_v2"`
+	WakeProxyV1       bool `json:"wake_proxy_v1,omitempty"`
 }
 
 // Device represents a registered device/node.
@@ -223,9 +224,10 @@ type Device struct {
 // older CreateDeviceWithOptions API remains available to trusted internal
 // callers and migration tests without changing its historical signature.
 type DeviceRegistrationAttempt struct {
-	Capabilities       PeerCapabilities
-	Incarnation        *int64
-	EnforceIncarnation bool
+	Capabilities                  PeerCapabilities
+	Incarnation                   *int64
+	EnforceIncarnation            bool
+	DeviceCredentialAuthenticated bool
 }
 
 // RegistrationConflictError is returned when an in-flight registration no
@@ -300,6 +302,9 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 		return nil, err
 	}
 	capabilities := attempt.Capabilities
+	if !attempt.DeviceCredentialAuthenticated {
+		capabilities.WakeProxyV1 = false
+	}
 	if !attempt.EnforceIncarnation || attempt.Incarnation == nil || *attempt.Incarnation == 0 {
 		capabilities = PeerCapabilities{}
 	}
@@ -336,10 +341,10 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 	var existing Device
 	var online int
 	var existingRelayRTTMS sql.NullInt64
-	err = tx.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2
+	err = tx.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, ''), COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2, wake_proxy
 		FROM devices WHERE public_key = ? LIMIT 1`, publicKey).
 		Scan(&existing.ID, &existing.UserID, &existing.NetworkID, &existing.PublicKey, &existing.DeviceName, &existing.Platform,
-			&existing.VirtualIP, &existing.NATType, &existing.Endpoint, &existingRelayRTTMS, &existing.LastSeen, &existing.AppVersion, &online, &existing.CreatedAt, &existing.RegistrationSeq, &existing.RegistrationIncarnation, &existing.Capabilities.HH2PairNomination, &existing.Capabilities.HH2PlanV2)
+			&existing.VirtualIP, &existing.NATType, &existing.Endpoint, &existingRelayRTTMS, &existing.LastSeen, &existing.AppVersion, &online, &existing.CreatedAt, &existing.Ed25519PublicKey, &existing.RegistrationSeq, &existing.RegistrationIncarnation, &existing.Capabilities.HH2PairNomination, &existing.Capabilities.HH2PlanV2, &existing.Capabilities.WakeProxyV1)
 	if err == nil {
 		if existing.UserID != userID {
 			return nil, fmt.Errorf("public key is already registered by another user")
@@ -348,6 +353,11 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 			return nil, fmt.Errorf("public key is already registered in another network")
 		}
 		if attempt.EnforceIncarnation {
+			if !attempt.DeviceCredentialAuthenticated {
+				// JWT registration can create an identity. An existing device
+				// keeps its key, or enrolls a first key via signed challenge.
+				ed25519PublicKey = existing.Ed25519PublicKey
+			}
 			if attempt.Incarnation == nil || *attempt.Incarnation == 0 {
 				// A legacy client may perform one migration registration while
 				// this field is still empty. Once an incarnation-aware daemon has
@@ -363,7 +373,12 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 			} else {
 				incoming := *attempt.Incarnation
 				if incoming == existing.RegistrationIncarnation {
-					if existing.Capabilities != capabilities {
+					// Bootstrap may have registered with a user JWT before obtaining
+					// its credential. Only the device credential can activate proxy
+					// service on that same boot. Deactivation requires a new boot.
+					retryCapabilities := capabilities
+					retryCapabilities.WakeProxyV1 = existing.Capabilities.WakeProxyV1
+					if existing.Capabilities != retryCapabilities {
 						return nil, &RegistrationConflictError{
 							CurrentSequence:    existing.RegistrationSeq,
 							CurrentIncarnation: existing.RegistrationIncarnation,
@@ -374,7 +389,8 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 					// facts that this same boot may already have published, but refresh
 					// its online lease.
 					now := time.Now().Unix()
-					if _, err := tx.Exec(`UPDATE devices SET last_seen = ?, online = 1 WHERE id = ?`, now, existing.ID); err != nil {
+					existing.Capabilities.WakeProxyV1 = existing.Capabilities.WakeProxyV1 || capabilities.WakeProxyV1
+					if _, err := tx.Exec(`UPDATE devices SET last_seen = ?, online = 1, wake_proxy = ? WHERE id = ?`, now, existing.Capabilities.WakeProxyV1, existing.ID); err != nil {
 						return nil, err
 					}
 					if err := tx.Commit(); err != nil {
@@ -411,8 +427,8 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 		if attempt.EnforceIncarnation && attempt.Incarnation != nil && *attempt.Incarnation > 0 {
 			registrationIncarnation = *attempt.Incarnation
 		}
-		_, err = tx.Exec(`UPDATE devices SET device_name = ?, platform = ?, virtual_ip = ?, app_version = CASE WHEN ? != '' THEN ? ELSE app_version END, endpoint = '', nat_type = 'unknown', relay_rtt_ms = NULL, last_seen = ?, online = 1, ed25519_public_key = CASE WHEN ? != '' THEN ? ELSE ed25519_public_key END, registration_seq = COALESCE(registration_seq, 1) + 1, registration_incarnation = ?, hh2_pair_nomination = ?, hh2_plan_v2 = ? WHERE id = ?`,
-			deviceName, platform, virtualIP, appVersion, appVersion, now, ed25519PublicKey, ed25519PublicKey, registrationIncarnation, capabilities.HH2PairNomination, capabilities.HH2PlanV2, existing.ID)
+		_, err = tx.Exec(`UPDATE devices SET device_name = ?, platform = ?, virtual_ip = ?, app_version = CASE WHEN ? != '' THEN ? ELSE app_version END, endpoint = '', nat_type = 'unknown', relay_rtt_ms = NULL, last_seen = ?, online = 1, ed25519_public_key = CASE WHEN ? != '' THEN ? ELSE ed25519_public_key END, registration_seq = COALESCE(registration_seq, 1) + 1, registration_incarnation = ?, hh2_pair_nomination = ?, hh2_plan_v2 = ?, wake_proxy = ? WHERE id = ?`,
+			deviceName, platform, virtualIP, appVersion, appVersion, now, ed25519PublicKey, ed25519PublicKey, registrationIncarnation, capabilities.HH2PairNomination, capabilities.HH2PlanV2, capabilities.WakeProxyV1, existing.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -467,9 +483,9 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 	if attempt.EnforceIncarnation && attempt.Incarnation != nil && *attempt.Incarnation > 0 {
 		registrationIncarnation = *attempt.Incarnation
 	}
-	_, err = tx.Exec(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, app_version, last_seen, online, created_at, ed25519_public_key, registration_seq, registration_incarnation, hh2_pair_nomination, hh2_plan_v2)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1, ?, ?, ?)`,
-		id, userID, networkID, publicKey, deviceName, platform, virtualIP, appVersion, now, now, ed25519PublicKey, registrationIncarnation, capabilities.HH2PairNomination, capabilities.HH2PlanV2)
+	_, err = tx.Exec(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, app_version, last_seen, online, created_at, ed25519_public_key, registration_seq, registration_incarnation, hh2_pair_nomination, hh2_plan_v2, wake_proxy)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1, ?, ?, ?, ?)`,
+		id, userID, networkID, publicKey, deviceName, platform, virtualIP, appVersion, now, now, ed25519PublicKey, registrationIncarnation, capabilities.HH2PairNomination, capabilities.HH2PlanV2, capabilities.WakeProxyV1)
 	if err != nil {
 		return nil, err
 	}
@@ -491,10 +507,10 @@ func (db *DB) GetDeviceByPublicKey(networkID, publicKey string) (*Device, error)
 	var d Device
 	var online int
 	var relayRTTMS sql.NullInt64
-	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, ''), COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2
+	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, ''), COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0), hh2_pair_nomination, hh2_plan_v2, wake_proxy
 		FROM devices WHERE network_id = ? AND public_key = ? LIMIT 1`, networkID, publicKey).
 		Scan(&d.ID, &d.UserID, &d.NetworkID, &d.PublicKey, &d.DeviceName, &d.Platform,
-			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey, &d.RegistrationSeq, &d.RegistrationIncarnation, &d.Capabilities.HH2PairNomination, &d.Capabilities.HH2PlanV2)
+			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey, &d.RegistrationSeq, &d.RegistrationIncarnation, &d.Capabilities.HH2PairNomination, &d.Capabilities.HH2PlanV2, &d.Capabilities.WakeProxyV1)
 	if err != nil {
 		return nil, err
 	}

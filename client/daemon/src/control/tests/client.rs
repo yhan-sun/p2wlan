@@ -19,6 +19,8 @@ fn test_signal_registration(
     registration_seq: Option<u64>,
 ) -> watch::Sender<Option<CriticalControlAuth>> {
     watch::channel(Some(CriticalControlAuth {
+        wake_device_credential: false,
+        wake_proxy_v1: false,
         accepted_peer_capabilities: PeerCapabilities::default(),
         base_url: base_url.to_string(),
         token: "test-token".to_string(),

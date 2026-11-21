@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 typedef StartupProcessRunner = Future<ProcessResult> Function(
@@ -318,6 +319,34 @@ String _requireSafePath(String value, String argumentName) {
 
 bool isLoginStartupInvocation(Iterable<String> executableArguments) {
   return executableArguments.contains(loginStartupArgument);
+}
+
+/// The installed machine service owns personal startup. The login entry
+/// still opens the application and tray for the signed-in user.
+Future<bool> personalWindowsServiceInstalled({
+  required String executablePath,
+  StartupProcessRunner processRunner = Process.run,
+}) async {
+  final directory = File(executablePath).parent.path;
+  final cli = '$directory${Platform.pathSeparator}p2wlan.exe';
+  try {
+    final result = await processRunner(cli, const [
+      'service',
+      'status',
+      '--json',
+    ]).timeout(const Duration(seconds: 3));
+    if (result.exitCode != 0 ||
+        result.stdout is! String ||
+        (result.stdout as String).length > 4096) {
+      return false;
+    }
+    final data = jsonDecode(result.stdout as String);
+    return data is Map &&
+        data['installed'] == true &&
+        data['profile'] == 'personal';
+  } catch (_) {
+    return false;
+  }
 }
 
 bool shouldConnectAfterLoginStartup({

@@ -129,12 +129,14 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ed25519PubKey := strings.TrimSpace(req.Ed25519PublicKey)
+	ed25519PubKey := strings.ToLower(strings.TrimSpace(req.Ed25519PublicKey))
 
 	// If Ed25519 challenge is provided, verify it
-	if req.ChallengeID != "" && req.ChallengeSignature != "" && ed25519PubKey != "" {
+	challengeProvided := req.ChallengeID != "" && req.ChallengeSignature != "" && ed25519PubKey != ""
+	if challengeProvided {
 		existingDevice, err := s.db.GetDeviceByPublicKey(networkID, req.PublicKey)
-		if err != nil || existingDevice.UserID != userID {
+		if err != nil || existingDevice.UserID != userID ||
+			(!deviceCredentialAuth && existingDevice.Ed25519PublicKey != "" && !strings.EqualFold(existingDevice.Ed25519PublicKey, ed25519PubKey)) {
 			http.Error(w, `{"error":"challenge verification failed"}`, http.StatusUnauthorized)
 			return
 		}
@@ -181,9 +183,10 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		req.VirtualIP,
 		req.AppVersion,
 		database.DeviceRegistrationAttempt{
-			Incarnation:        req.RegistrationIncarnation,
-			EnforceIncarnation: true,
-			Capabilities:       req.Capabilities,
+			Incarnation:                   req.RegistrationIncarnation,
+			EnforceIncarnation:            true,
+			Capabilities:                  req.Capabilities,
+			DeviceCredentialAuthenticated: deviceCredentialAuth,
 		},
 	)
 	if err != nil {
@@ -221,7 +224,7 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		"registration_seq":           device.RegistrationSeq,
 		"registration_incarnation":   device.RegistrationIncarnation,
 		"relay_servers":              s.relayServers,
-		"capabilities":               []string{"path_telemetry_v1"},
+		"capabilities":               []string{"path_telemetry_v1", "wake_jobs_v1"},
 		"accepted_peer_capabilities": device.Capabilities,
 	}
 
@@ -231,8 +234,12 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Issue device credential if Ed25519 identity was verified
-	if !deviceCredentialAuth && ed25519PubKey != "" && req.ChallengeID != "" && req.ChallengeSignature != "" {
-		cred, token, err := s.db.CreateDeviceCredential(device.ID, 30*24*3600) // 30-day TTL
+	if !deviceCredentialAuth && challengeProvided {
+		cred, token, err := s.db.CreateDeviceCredentialForSigningKey(device.ID, userID, ed25519PubKey, 30*24*3600)
+		if errors.Is(err, database.ErrDeviceSigningKeyMismatch) {
+			http.Error(w, `{"error":"challenge verification failed"}`, http.StatusUnauthorized)
+			return
+		}
 		if err == nil {
 			response["device_credential"] = token
 			response["credential_expires_at"] = cred.ExpiresAt

@@ -6,6 +6,7 @@
 
 - [快速开始](quickstart.md)：安装客户端、配置 Control、登录、加入房间并验证业务连通。
 - [客户端指南](guides/client.md)：CLI、daemon、诊断和支持包。
+- [Windows 远程开机](guides/remote-wake.md)：配置目标机、局域网代理和 Windows 系统服务。
 - [OpenWrt](guides/openwrt.md)：ARM64、x86_64 原生包、procd 和路由器节点。
 - [房间指南](guides/rooms.md)：房间成员、权限、地址和多房间使用。
 - [自托管指南](guides/self-hosting.md)：固定版本服务端包、Control、Relay、TLS 和 Compose。

@@ -500,7 +500,8 @@ impl Daemon {
                 runtime_incarnation,
             )
             .with_room_authorization(self.control.room_authorization().await)
-            .with_resource_capture(self.resource_capture.clone());
+            .with_resource_capture(self.resource_capture.clone())
+            .with_wake_status(self.control.wake_status());
             let shutdown_rx = self.shutdown_rx.clone();
             let (diagnostics_ready_tx, diagnostics_ready_rx) = tokio::sync::oneshot::channel();
             self.task_manager

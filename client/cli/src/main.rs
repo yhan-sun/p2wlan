@@ -16,6 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod formatting;
 use formatting::*;
+#[path = "main/service.rs"]
+mod service;
 
 // A control server is an explicit user setting.  Keep the value empty so a
 // fresh CLI cannot silently contact a project-owned deployment.
@@ -24,10 +26,10 @@ const DEFAULT_NETWORK: &str = "default";
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
 const DEFAULT_UPDATE_REPO: &str = "yhan-sun/p2wlan";
 const DEFAULT_INSTALL_DIR: &str = "/usr/local/bin";
-const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、resource-capture、relay、relay-regions、relay-selection-timeout、relay-policy、prefer-direct、path-policy、relay-startup-timeout、proxy-mode";
+const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、resource-capture、relay、relay-regions、relay-selection-timeout、relay-policy、prefer-direct、path-policy、relay-startup-timeout、proxy-mode、wake-allow-remote、wake-proxy-interface";
 
 #[derive(Parser, Debug)]
-#[command(name = "p2wlan", version, about = "p2wlan Linux command-line client")]
+#[command(name = "p2wlan", version, about = "p2wlan command-line client")]
 struct Cli {
     /// Use a custom daemon configuration file
     #[arg(long, global = true, value_name = "PATH")]
@@ -89,10 +91,20 @@ enum Commands {
         #[command(subcommand)]
         command: RoomCommand,
     },
+    /// Manage Wake-on-LAN
+    Wake {
+        #[command(subcommand)]
+        command: WakeCommand,
+    },
     /// Collect a redacted, server-compatible diagnostic support bundle
     SupportBundle(SupportBundleArgs),
     /// Diagnose local config, daemon status, direct UDP, and relay fallback
     Doctor,
+    /// Manage Windows boot-time service
+    Service {
+        #[command(subcommand)]
+        command: service::ServiceCommand,
+    },
     /// Download and install the latest Linux CLI release
     Update(UpdateArgs),
     /// Internal elevated launcher used by `p2wlan up`
@@ -121,7 +133,7 @@ enum ConfigCommand {
     Path,
     /// Set one supported configuration value
     Set {
-        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, socket-pool, diagnostics, resource-capture, relay, relay-regions, relay-selection-timeout, relay-policy, prefer-direct, path-policy, relay-startup-timeout, or proxy-mode
+        /// Config key such as control, path-policy, wake-allow-remote, or wake-proxy-interface
         key: String,
         value: String,
     },
@@ -219,8 +231,10 @@ async fn run(cli: Cli) -> Result<(), String> {
         Commands::Config { command } => config_command(&config_path, command),
         Commands::Route { command } => route_command(&config_path, command).await,
         Commands::Room { command } => room_command(&config_path, command).await,
+        Commands::Wake { command } => wake_command(&config_path, command).await,
         Commands::SupportBundle(args) => support_bundle(&config_path, args).await,
         Commands::Doctor => doctor(&config_path).await,
+        Commands::Service { command } => service::run(&config_path, command),
         Commands::Update(args) => update(&config_path, args).await,
         Commands::InternalStart(args) => start_daemon_as_root(args).await,
     }
@@ -235,6 +249,8 @@ include!("main/paths.rs");
 include!("main/openwrt.rs");
 include!("main/routes.rs");
 include!("main/rooms.rs");
+include!("main/wake.rs");
+include!("main/wake_control.rs");
 include!("main/support.rs");
 
 #[cfg(test)]

@@ -21,6 +21,8 @@ impl RecoveryWaitHarness {
         .0;
         let (_, pool_id) = http.current_with_pool_id().unwrap();
         let (auth_tx, auth_rx) = watch::channel(Some(CriticalControlAuth {
+            wake_device_credential: false,
+            wake_proxy_v1: false,
             accepted_peer_capabilities: PeerCapabilities::default(),
             base_url: "http://127.0.0.1:9".into(),
             token: "dc-recovery-test".into(),

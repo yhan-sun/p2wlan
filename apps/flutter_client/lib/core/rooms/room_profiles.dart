@@ -58,6 +58,22 @@ File networkConfigFile(File legacy, AppSettings settings) {
 String accountSessionKey(AppSettings settings) =>
     jsonEncode([settings.controlServer, settings.authToken]);
 
+/// A machine's consent to advertise its NIC belongs to the server/account
+/// where it was granted. Session refresh and switching rooms keep that scope.
+String? wakeAccountProfileId(AppSettings settings) {
+  try {
+    return managedNetworkProfileId(settings.copyWith(networkId: ''));
+  } on RoomException {
+    return null;
+  }
+}
+
+bool? wakeAllowRemoteSetting(AppSettings settings) =>
+    settings.wakeAllowRemoteScope != null &&
+        settings.wakeAllowRemoteScope == wakeAccountProfileId(settings)
+    ? settings.wakeAllowRemote
+    : null;
+
 AppSettings selectRoomSettings(AppSettings current, FriendRoom room) {
   if (!isRoomNetwork(room.id) || !validRoomCidr(room.cidr)) {
     throw const RoomException('房间网络信息无效');

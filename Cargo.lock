@@ -2589,6 +2589,7 @@ dependencies = [
  "flate2",
  "hex",
  "libc",
+ "p2pnet-netbind",
  "p2wlan-daemon",
  "reqwest",
  "rpassword",
@@ -2596,6 +2597,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

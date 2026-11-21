@@ -392,6 +392,9 @@ class DaemonController {
     final deviceName = settings.deviceName.trim();
     final udpAdvertise = settings.udpAdvertise.trim();
     final relayServers = settings.relayServers.trim();
+    final allowRemoteWake = Platform.isWindows
+        ? wakeAllowRemoteSetting(settings)
+        : null;
 
     final requiresElevation =
         Platform.isMacOS && !_isRootUser() ||
@@ -549,6 +552,10 @@ class DaemonController {
         settings.socketPool.trim(),
       ],
       if (relayServers.isNotEmpty) ...['--relay', relayServers],
+      if (allowRemoteWake != null) ...[
+        '--wake-allow-remote',
+        allowRemoteWake.toString(),
+      ],
       if (windowsClientSid != null) ...[
         '--diagnostics-client-sid',
         windowsClientSid,

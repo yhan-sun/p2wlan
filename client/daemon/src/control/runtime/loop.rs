@@ -95,7 +95,7 @@ async fn run_control_loop(
                         server_relay_servers,
                         relay_catalog,
                         registration_seq,
-                        accepted_peer_capabilities,
+                        accepted_capabilities,
                     )) => {
                         let registration_seq_changed =
                             config.control.registration_seq != registration_seq;
@@ -106,7 +106,14 @@ async fn run_control_loop(
                             || {
                                 config.control.registration_seq = registration_seq;
                                 let _ = critical_auth_tx.send(Some(CriticalControlAuth {
-                                    accepted_peer_capabilities,
+                                    wake_device_credential: !config
+                                        .control
+                                        .device_credential
+                                        .trim()
+                                        .is_empty()
+                                        && token == config.control.device_credential,
+                                    wake_proxy_v1: accepted_capabilities.wake_proxy_v1,
+                                    accepted_peer_capabilities: accepted_capabilities.peer,
                                     base_url: base_url.clone(),
                                     token: token.clone(),
                                     self_node_id: node_id.clone(),
@@ -279,7 +286,14 @@ async fn run_control_loop(
                             &server_clock,
                             || {
                                 let _ = critical_auth_tx.send(Some(CriticalControlAuth {
-                                    accepted_peer_capabilities,
+                                    wake_device_credential: !config
+                                        .control
+                                        .device_credential
+                                        .trim()
+                                        .is_empty()
+                                        && token == config.control.device_credential,
+                                    wake_proxy_v1: accepted_capabilities.wake_proxy_v1,
+                                    accepted_peer_capabilities: accepted_capabilities.peer,
                                     base_url: base_url.clone(),
                                     token: token.clone(),
                                     self_node_id: node_id.clone(),
