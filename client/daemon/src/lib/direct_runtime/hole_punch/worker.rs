@@ -127,6 +127,18 @@ async fn spawn_hole_punch_task_with_lifecycle(
     {
         return;
     }
+    if !hard_hard_experiment_only
+        && udp
+            .start_negotiated(
+                &peer_id,
+                network_generation,
+                peer_session_generation,
+                invocation_shutdown_rx.clone(),
+            )
+            .await
+    {
+        return;
+    }
     // Give production cold starts the ordinary bounded candidate path first.
     // The existing recovery retry can admit HH after same-epoch ordinary
     // feedback; only the isolated experiment replaces the first punch with HH.

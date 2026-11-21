@@ -60,6 +60,15 @@ async fn build_snapshot(context: DiagnosticsContext, request_id: u64) -> Diagnos
             .with_profile_generation(context.peers.current_local_profile_generation_sync())
     });
     let gateway_mapping = context.gateway_mapping.read().await.clone();
+    let local_nat_profile = p2pnet_nat::engine::PunchProfile::advertisement(
+        nat_profile.as_ref(),
+        gateway_mapping
+            .candidate_endpoint
+            .as_deref()
+            .and_then(|v| v.parse().ok()),
+        !context.config.network.traversal.disable_sym_hole_punching,
+    );
+    let upnp_status = gateway_mapping.upnp.status.clone();
     let traversal_history = context.peers.traversal_history_diagnostics().await;
     let uptime_ms = context.timeline.uptime_ms();
     let peer_snapshot_age_ms = stable_peers
@@ -109,6 +118,8 @@ async fn build_snapshot(context: DiagnosticsContext, request_id: u64) -> Diagnos
         candidate_snapshot_version,
         candidate_snapshot_hash,
         nat_profile,
+        local_nat_profile,
+        upnp_status,
         nat_capabilities,
         gateway_mapping,
         relay_servers: context.config.relay.servers.clone(),

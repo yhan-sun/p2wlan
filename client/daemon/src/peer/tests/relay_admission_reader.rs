@@ -115,7 +115,9 @@ async fn unavailable_or_stale_relay_inputs_cannot_take_the_read_only_admission()
 
 #[tokio::test]
 async fn direct_first_pending_keeps_the_original_epoch_transaction() {
-    let peers = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::DirectFirst;
+    let peers = PeerManager::new(config);
     peers
         .add_peer(&test_peer(PEER, "198.51.100.4:41000".parse().unwrap()))
         .await;

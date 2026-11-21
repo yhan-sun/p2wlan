@@ -1419,6 +1419,7 @@ fn install_signal_forwarder(
             }
             let logged_signal = signal.clone();
             let _ = event_tx.send(ControlEvent::PeerOffer {
+                nat_profile: None,
                 from_node_id: signal.from_node_id,
                 candidates: signal.candidates,
                 session_id: signal.session_id,
@@ -2407,6 +2408,7 @@ async fn inject_candidate_offer(
             signal_seq: Some(signal_seq),
             signal_type: "peer_offer".to_string(),
             event: Box::new(ControlEvent::PeerOffer {
+                nat_profile: None,
                 from_node_id: signal.from_node_id.clone(),
                 candidates: signal.candidates.clone(),
                 session_id,

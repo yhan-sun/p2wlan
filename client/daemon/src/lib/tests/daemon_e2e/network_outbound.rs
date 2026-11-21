@@ -561,6 +561,7 @@ async fn responder_answer_uses_cached_candidates_while_refresh_is_blocked() {
         .control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: vec!["198.51.100.9:44001".to_string()],
             session_id: None,

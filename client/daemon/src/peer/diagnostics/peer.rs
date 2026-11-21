@@ -1,6 +1,20 @@
 /// Serializable peer connection diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerDiagnostics {
+    #[serde(default)]
+    pub remote_nat_profile: Option<p2pnet_nat::engine::PunchProfile>,
+    #[serde(default)]
+    pub punch_mode: Option<u8>,
+    #[serde(flatten, default)]
+    pub punch_metrics: p2pnet_nat::engine::PunchMetrics,
+    #[serde(default)]
+    pub udp_firewall_status: p2pnet_nat::engine::UdpReachability,
+    #[serde(default)]
+    pub active_path_type: Option<String>,
+    #[serde(default)]
+    pub path_cost: Option<u8>,
+    #[serde(default)]
+    pub reason_code: Option<String>,
     pub node_id: String,
     pub device_name: String,
     pub app_version: String,
@@ -408,7 +422,54 @@ impl PeerDiagnostics {
             );
         }
 
+        let negotiated = conn
+            .negotiated_punch
+            .as_ref()
+            .filter(|p| p.current(conn, local_generation));
+        let run = conn
+            .punch_run
+            .as_ref()
+            .filter(|r| r.current_for_diagnostics(conn, local_generation));
+        let udp_firewall_status = run
+            .and_then(|r| r.firewall.lock().ok().map(|v| *v))
+            .unwrap_or_default();
+        let route = match active_path {
+            Some(NetworkPath::Relay) => Some((
+                if conn
+                    .relay_server
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("tls://"))
+                {
+                    "tls_relay"
+                } else {
+                    "relay"
+                },
+                10,
+            )),
+            Some(NetworkPath::Direct) if direct_type == DirectPathType::Lan => Some(("lan", 1)),
+            Some(NetworkPath::Direct) if current_pair_endpoint.is_some_and(|a| a.is_ipv6()) => {
+                Some(("ipv6_direct", 2))
+            }
+            Some(NetworkPath::Direct) => Some(("udp_direct", 3)),
+            None => None,
+        };
         Self {
+            remote_nat_profile: negotiated.map(|p| p.profile.clone()),
+            punch_mode: run.map(|r| r.mode),
+            punch_metrics: run
+                .map(|r| {
+                    r.pacer
+                        .metrics(r.sockets.load(std::sync::atomic::Ordering::Acquire))
+                })
+                .unwrap_or_default(),
+            udp_firewall_status,
+            active_path_type: route.map(|(p, _)| p.to_owned()),
+            path_cost: route.map(|(_, cost)| cost),
+            reason_code: if udp_firewall_status == p2pnet_nat::engine::UdpReachability::Blocked {
+                Some("UDP_BLOCKED".to_owned())
+            } else {
+                current_selection.map(|s| s.reason_code.to_string())
+            },
             node_id: conn.node_id.clone(),
             device_name: conn.device_name.clone(),
             app_version: conn.app_version.clone(),

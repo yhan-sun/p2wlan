@@ -24,7 +24,7 @@ const DEFAULT_NETWORK: &str = "default";
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
 const DEFAULT_UPDATE_REPO: &str = "yhan-sun/p2wlan";
 const DEFAULT_INSTALL_DIR: &str = "/usr/local/bin";
-const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、resource-capture、relay、relay-regions、relay-selection-timeout、relay-policy、prefer-direct、path-policy、relay-startup-timeout、proxy-mode";
+const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、disable-sym-hole-punching、lazy-p2p、max-punch-pps、max-punch-sockets、linear-scan-count、firewall-probe-addresses、diagnostics、resource-capture、relay、relay-regions、relay-selection-timeout、relay-policy、prefer-direct、path-policy、relay-startup-timeout、proxy-mode";
 
 #[derive(Parser, Debug)]
 #[command(name = "p2wlan", version, about = "p2wlan Linux command-line client")]
@@ -121,7 +121,7 @@ enum ConfigCommand {
     Path,
     /// Set one supported configuration value
     Set {
-        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, socket-pool, diagnostics, resource-capture, relay, relay-regions, relay-selection-timeout, relay-policy, prefer-direct, path-policy, relay-startup-timeout, or proxy-mode
+        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, socket-pool, disable-sym-hole-punching, lazy-p2p, max-punch-pps, max-punch-sockets, linear-scan-count, firewall-probe-addresses, diagnostics, resource-capture, relay, relay-regions, relay-selection-timeout, relay-policy, prefer-direct, path-policy, relay-startup-timeout, or proxy-mode
         key: String,
         value: String,
     },

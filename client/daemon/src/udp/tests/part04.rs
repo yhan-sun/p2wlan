@@ -432,10 +432,9 @@ async fn generation_env_with_nat(
     let local_identity = NodeIdentity::generate();
     let peer_identity = NodeIdentity::generate();
 
-    let peers = Arc::new(PeerManager::new(config_for_identity(
-        &local_identity,
-        "peer-a",
-    )));
+    let mut config = config_for_identity(&local_identity, "peer-a");
+    config.relay.path_policy = crate::config::PathPolicy::DirectFirst;
+    let peers = Arc::new(PeerManager::new(config));
     peers
         .add_peer(&peer_with_public_key(
             "peer-b",

@@ -1094,7 +1094,8 @@ impl UdpTransport {
                 .unwrap_or(0);
             (generation, socket_epoch, cleanup_epoch)
         };
-        let requires_legacy_probe = !hh2
+        let requires_legacy_probe = !matches!(purpose, PendingProbePurpose::Negotiated(_))
+            && !hh2
             && match peer_id {
                 Some(peer_id) => self.peers.peer_requires_legacy_probe(peer_id).await,
                 None => true,
@@ -1109,7 +1110,7 @@ impl UdpTransport {
                 self.peers
                     .probe_key_and_session_for_peer(peer_id)
                     .await
-                    .map(|(key, probe_session_id)| {
+                    .and_then(|(key, probe_session_id)| {
                         let key = if hh2 {
                             crate::peer::hard_hard_scoped_probe_key(
                                 &key,
@@ -1118,6 +1119,19 @@ impl UdpTransport {
                         } else {
                             key
                         };
+                        if let PendingProbePurpose::Negotiated(epoch) = purpose {
+                            let id = probe_session_id.as_deref()?;
+                            return self
+                                .compact_request(
+                                    peer_id,
+                                    local_node_id,
+                                    id,
+                                    &key,
+                                    epoch,
+                                    use_candidate,
+                                )
+                                .map(|(bytes, nonce)| (bytes, nonce, probe_session_id));
+                        }
                         let (bytes, nonce) = build_authenticated_punch_packet_with_nomination(
                             local_node_id,
                             peer_id,
@@ -1125,12 +1139,18 @@ impl UdpTransport {
                             use_candidate,
                             &key,
                         );
-                        (bytes, nonce, probe_session_id)
+                        Some((bytes, nonce, probe_session_id))
                     })
             }
             _ => None,
         };
 
+        if matches!(purpose, PendingProbePurpose::Negotiated(_)) && authenticated_probe.is_none() {
+            return Err(ProbeSendFailure::new(
+                ProbeSendFailureKind::SocketRevoked,
+                DaemonError::Network("negotiated probe session expired".into()),
+            ));
+        }
         let (
             bytes,
             nonce,
@@ -1280,6 +1300,7 @@ impl UdpTransport {
                         && matches!(
                             purpose,
                             PendingProbePurpose::ConnectivityCheck
+                                | PendingProbePurpose::Negotiated(_)
                                 | PendingProbePurpose::HardHardNomination
                                 | PendingProbePurpose::HardHardTriggeredCheck
                         )
@@ -1383,6 +1404,31 @@ impl UdpTransport {
                 use_candidate,
             )
             .await
+        } else if let PendingProbePurpose::Negotiated(epoch) = purpose {
+            let sent = self.peers.with_punch_run(
+                peer_id.unwrap_or_default(),
+                peer_addr,
+                u64::from(epoch),
+                |conn, run| {
+                    if !conn.compact_datagram_is_current(
+                        self.local_node_id.as_deref().unwrap_or_default(),
+                        &bytes,
+                    ) {
+                        return Err(std::io::ErrorKind::Interrupted.into());
+                    }
+                    run.pacer.try_send(u64::from(epoch), || {
+                        self.compact_budget
+                            .try_send(0, || socket.try_send_to(&bytes, peer_addr))
+                    })
+                },
+            );
+            sent.unwrap_or_else(|| Err(std::io::ErrorKind::Interrupted.into()))
+                .map_err(|error| {
+                    ProbeSendFailure::new(
+                        ProbeSendFailureKind::SocketRevoked,
+                        DaemonError::Network(error.to_string()),
+                    )
+                })
         } else {
             self.send_probe_datagram(&socket, &bytes, peer_addr)
                 .await

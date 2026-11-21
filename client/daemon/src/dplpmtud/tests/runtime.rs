@@ -211,9 +211,9 @@ async fn assert_relay_activation_revokes_old_direct_budget() {
 }
 
 async fn assert_failed_direct_revokes_budget(business_ready: bool) {
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::DirectFirst;
+    let peers = Arc::new(PeerManager::new(config));
     let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap()

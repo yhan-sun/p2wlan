@@ -212,7 +212,7 @@ impl Daemon {
         let health = tasks::HealthState::new();
         let punch_attempts = PunchAttemptDeduplicator::default();
         let peers = Arc::new(PeerManager::new(config.clone()));
-        let (control, control_rx) = ControlClient::new_with_health(
+        let (control, control_rx) = ControlClient::new_with_peer_manager(
             &config,
             control_enabled,
             config_path,
@@ -220,6 +220,7 @@ impl Daemon {
             timeline.clone(),
             Some(health.clone()),
             Some(peers.telemetry_hub()),
+            Arc::downgrade(&peers),
         );
         let resource_capture =
             crate::dataplane_resources::RuntimeResourceCapture::from_config(&config.diagnostics);

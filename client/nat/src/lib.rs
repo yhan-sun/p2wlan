@@ -15,6 +15,7 @@
 pub mod adaptive;
 pub mod client;
 pub mod detection;
+pub mod engine;
 pub mod error;
 pub mod ice;
 pub mod mapping;

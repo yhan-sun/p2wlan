@@ -2235,6 +2235,7 @@ async fn stale_fresh_signal_never_pollutes_candidate_set_end_to_end() {
         .control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: "node-b".to_string(),
             candidates: candidates.clone(),
             session_id: None,
@@ -2284,6 +2285,7 @@ async fn stale_fresh_signal_never_pollutes_candidate_set_end_to_end() {
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: "node-b".to_string(),
             candidates: vec!["198.51.100.9:44444".to_string()],
             session_id: None,
@@ -2331,6 +2333,7 @@ async fn stale_fresh_signal_never_pollutes_candidate_set_end_to_end() {
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: "node-b".to_string(),
             candidates: vec![
                 "198.51.100.9:44445".to_string(),
@@ -2389,6 +2392,7 @@ async fn stale_fresh_signal_never_pollutes_candidate_set_end_to_end() {
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: "node-b".to_string(),
             candidates: vec!["198.51.100.9:44447".to_string()],
             session_id: None,
@@ -2465,6 +2469,7 @@ async fn fresh_prediction_not_applied_keeps_identity_and_retry_commits() {
         control
             .event_sender()
             .send(ControlEvent::PeerOffer {
+                nat_profile: None,
                 from_node_id: "node-b".to_string(),
                 candidates: fresh_candidates.clone(),
                 session_id: None,
@@ -2611,6 +2616,7 @@ async fn fresh_prediction_for_missing_peer_keeps_identity() {
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: "node-b".to_string(),
             candidates: vec!["203.0.113.10:45393".to_string()],
             session_id: None,

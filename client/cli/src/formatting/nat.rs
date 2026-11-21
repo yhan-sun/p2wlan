@@ -12,6 +12,12 @@ use super::is_clear_value;
 use super::peer::{endpoint_preview, is_public_udp_endpoint};
 
 pub(crate) fn print_nat_diagnostics(snapshot: &Value) {
+    if let Some(profile) = snapshot.get("local_nat_profile").filter(|p| p.is_object()) {
+        println!("local_nat_profile={profile}");
+    }
+    if let Some(status) = snapshot.get("upnp_status").and_then(Value::as_str) {
+        println!("upnp_status={status}");
+    }
     let candidates = local_candidate_strings(snapshot);
     if !candidates.is_empty() {
         println!(

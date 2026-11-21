@@ -910,6 +910,7 @@ impl Daemon {
                         session_id,
                         probe_ephemeral_public_key,
                         candidate_sources,
+                        nat_profile,
                         candidate_generation,
                         candidates_expires_at_ms,
                         handshake_init,
@@ -1044,6 +1045,7 @@ impl Daemon {
                         let candidate_admission = {
                             let mut state = self.pending_handshakes.lock();
                             state.enqueue_candidate_offer_work(PendingPeerOffer {
+                                nat_profile: nat_profile.clone(),
                                 from_node_id: from_node_id.clone(),
                                 candidates: candidates.clone(),
                                 candidate_sources: candidate_sources.clone(),
@@ -1175,6 +1177,7 @@ impl Daemon {
                         let admitted = {
                             let mut state = self.pending_handshakes.lock();
                             state.enqueue_responder_work(PendingPeerOffer {
+                                nat_profile,
                                 from_node_id: from_node_id.clone(),
                                 candidates,
                                 candidate_sources,
@@ -1240,6 +1243,7 @@ impl Daemon {
                         session_id,
                         probe_ephemeral_public_key,
                         candidate_sources,
+                        nat_profile,
                         candidate_generation,
                         candidates_expires_at_ms,
                         handshake_response,
@@ -1443,6 +1447,7 @@ impl Daemon {
                             if let Some(receipt) = answer_delivery_receipt.as_ref() {
                                 receipt.record_phase("waiting_for_resource", "candidate_refresh");
                             }
+                            let profile_owner=(self.peers.current_network_generation_sync(),self.peers.peer_session_generation_sync(&from_node_id));
                             let (_fresh_verdict, candidate_apply_result, fresh_punch) = self
                                 .fresh_prediction_transaction(
                                     &from_node_id,
@@ -1454,6 +1459,10 @@ impl Daemon {
                                     false,
                                 )
                                 .await;
+                            if let Some(profile) = nat_profile {
+                                self.peers.stage_punch_profile(&from_node_id, profile, sender_public_key.as_deref(),
+                                    candidate_generation, candidates_expires_at_ms, profile_owner).await;
+                            }
                             if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
                                 info!(
                                     "Control signal phase=state_committed id={} type={} seq={:?} commit=candidate_refresh result={:?}",

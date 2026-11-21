@@ -225,11 +225,8 @@ fn direct_first_departure_cannot_be_revived_by_a_late_deadline() {
 
 #[test]
 fn direct_first_queue_timeout_does_not_invent_a_relay() {
-    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
-    assert_eq!(
-        config.relay.path_policy,
-        crate::config::PathPolicy::DirectFirst
-    );
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::DirectFirst;
     assert_eq!(
         config.relay.startup_wait_timeout(false),
         Some(Duration::from_secs(5))
@@ -249,7 +246,8 @@ fn direct_first_queue_timeout_does_not_invent_a_relay() {
 
 #[tokio::test]
 async fn relay_ready_timeline_captures_authoritative_direct_first_remaining_window() {
-    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::DirectFirst;
     let manager = PeerManager::new(config);
     let timeline = crate::connection_timeline::ConnectionTimeline::new("node-a", 0);
     manager.set_timeline(timeline.clone());
@@ -285,7 +283,8 @@ async fn relay_ready_timeline_captures_authoritative_direct_first_remaining_wind
 
 #[tokio::test]
 async fn direct_first_manager_blocks_relay_but_admits_one_way_confirmed_direct() {
-    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::DirectFirst;
     let manager = PeerManager::new(config);
     let endpoint = "198.51.100.9:41000".parse().unwrap();
     manager

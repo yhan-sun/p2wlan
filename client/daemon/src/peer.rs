@@ -733,3 +733,6 @@ include!("peer/utils.rs");
 #[cfg(test)]
 #[path = "peer/tests.rs"]
 mod tests;
+
+mod negotiated_punch;
+pub(crate) use negotiated_punch::{NegotiatedPunchProfile, PeerPunchRun};

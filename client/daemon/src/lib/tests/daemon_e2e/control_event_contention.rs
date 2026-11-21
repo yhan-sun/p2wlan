@@ -191,6 +191,7 @@ async fn peer_answer_drives_candidate_target_writer_before_incarnation_commit() 
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: vec!["127.0.0.1:9".to_string()],
             session_id: None,
@@ -250,6 +251,7 @@ async fn peer_answer_drives_candidate_target_writer_before_incarnation_commit() 
             signal_seq: Some(2),
             signal_type: "peer_answer".to_string(),
             event: Box::new(ControlEvent::PeerAnswer {
+                nat_profile: None,
                 from_node_id: peer_id.to_string(),
                 candidates: Vec::new(),
                 session_id: None,
@@ -535,6 +537,7 @@ async fn control_event_loop_processes_peer_answer_while_peer_reflexive_work_wait
     control
         .event_sender()
         .send(ControlEvent::PeerAnswer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: Vec::new(),
             session_id: None,
@@ -615,6 +618,7 @@ async fn control_event_loop_processes_peer_offer_while_peer_reflexive_work_waits
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: vec![offered_candidate.clone()],
             session_id: None,
@@ -702,6 +706,7 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: vec![offered_candidate.clone()],
             session_id: None,
@@ -912,6 +917,7 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: Vec::new(),
             session_id: Some(responder_cache_token.clone()),
@@ -972,6 +978,7 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: vec![fresh_candidate],
             session_id: Some(responder_cache_token),
@@ -1131,6 +1138,7 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
             signal_seq: Some(9),
             signal_type: "peer_answer".to_string(),
             event: Box::new(ControlEvent::PeerAnswer {
+                nat_profile: None,
                 from_node_id: peer_id.to_string(),
                 candidates: Vec::new(),
                 session_id: None,
@@ -1198,6 +1206,7 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: vec![cancelled_candidate.clone()],
             session_id: None,
@@ -1658,6 +1667,7 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
             signal_seq: Some(1),
             signal_type: "peer_offer".to_string(),
             event: Box::new(ControlEvent::PeerOffer {
+                nat_profile: None,
                 from_node_id: peer_id.to_string(),
                 candidates: vec!["198.51.100.80:48000".to_string()],
                 session_id: None,
@@ -1710,6 +1720,7 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
             signal_seq: Some(2),
             signal_type: "peer_offer".to_string(),
             event: Box::new(ControlEvent::PeerOffer {
+                nat_profile: None,
                 from_node_id: peer_id.to_string(),
                 candidates: vec!["198.51.100.80:48000".to_string()],
                 session_id: Some(session_id),

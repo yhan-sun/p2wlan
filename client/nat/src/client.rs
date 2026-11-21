@@ -105,10 +105,13 @@ impl StunClient {
         );
 
         // Send
-        socket
-            .send_to(&encoded, server_addr)
-            .await
-            .map_err(|e| NatError::Network(format!("send_to failed: {e}")))?;
+        // Connected UDP sockets on BSD reject send_to even for their own peer.
+        if socket.peer_addr().ok() == Some(server_addr) {
+            socket.send(&encoded).await
+        } else {
+            socket.send_to(&encoded, server_addr).await
+        }
+        .map_err(|e| NatError::Network(format!("STUN send failed: {e}")))?;
 
         // Receive with one total timeout. A live UDP socket can also carry
         // responses for an earlier STUN transaction (or unrelated tunnel

@@ -15,6 +15,7 @@ async fn run_control_loop(
     telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
     server_clock: Arc<ServerClockEstimate>,
     network_changes: Arc<ControlNetworkChanges>,
+    peers: std::sync::Weak<crate::peer::PeerManager>,
 ) {
     let base_url = normalize_http_base_url(&config.control.server_url);
 
@@ -29,7 +30,7 @@ async fn run_control_loop(
     } else {
         token.clone()
     };
-    let signal_signing_identity = SignalSigningIdentity::from_config(&config);
+    let signal_signing_identity = SignalSigningIdentity::from_config(&config, peers);
     // Bounded cache of recently processed signal IDs: a redelivered batch
     // (lost ACK, expired lease) is deduped by signal id.
     let recent_signal_ids: Arc<tokio::sync::Mutex<SignalDeliveryTracker>> =

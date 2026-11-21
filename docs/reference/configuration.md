@@ -47,17 +47,34 @@ Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemet
 
 ## 客户端路径策略
 
-`relay.path_policy` 缺省值为 `direct-first`。首次在线 peer 生命周期保留 5 秒直连窗口；健康的加密确认 Direct 保持优先。Relay 可提前建立和认证，但窗口到期前不承载本端首个业务包。确认 Direct 失活后立即允许已认证 Relay 兜底，不为已建立连接重跑冷启动等待。
+新生成的配置使用 `relay.path_policy=direct-sticky`。对端确认加密 Relay 后即可承载首包。双方协商紧凑探测时，同一 UDP 地址和本地 socket 须连续返回两个独立挑战，随后由 WireGuard 验证直连。已确认的健康 Direct 保持优先，失活后可回到已确认的 Relay。
+
+旧配置省略 `path_policy` 时仍按 `direct-first` 读取，所有显式保存的策略继续生效。要为首次在线 peer 保留 5 秒直连窗口，可运行以下命令后重启 daemon。
 
     p2wlan config set path-policy direct-first
 
-配置保存后重新启动对应 daemon/profile 生效。旧配置中显式保存的 `auto`、`score`、`direct-sticky`、`relay-only` 不会被悄悄迁移；需要直连优先时显式设置上述值。`auto` 保留旧的立即 Relay 回退策略，`score` 比较已确认路径质量，`direct-sticky` 只保证已确认 Direct 的保持，`relay-only` 明确禁用 Direct 业务路径。`prefer_direct=false` 仍具有 Relay-only 语义。
+`auto` 允许立即 Relay 回退，`score` 比较已确认路径质量，`relay-only` 只使用 Relay 业务路径。`prefer_direct=false` 同样只允许 Relay。
 
 Relay-only 启动时不解析 Direct 专用的 STUN 或 UDP observer 地址，也不启动 Direct 探测和 UDP 连接任务；Control、Relay 与 WireGuard 会话维护仍正常运行。其他路径策略保留 Direct 升级能力。
 
 `relay_startup_timeout_ms` 仍默认为 3000，旧字段 `fallback_timeout_ms` 仍是读取别名。在 Direct-first 下，首次业务 FIFO 的总等待预算包含 5 秒直连窗口，再加配置的 Relay 启动等待；未配置 Relay 时只等待 Direct，不会虚构中继。该预算不会因每个新业务包或候选刷新而无限续期；队列仍受原有包数、字节数和 generation 边界保护。
 
 CLI 的 `--prefer-direct` 与 `relay-policy=direct` 选择 Direct-first；显式 `--prefer-relay` 或 `relay-policy=prefer-relay` 使用兼容 Auto，不等同于 Relay-only。
+
+### 对端协商的 UDP 探测
+
+这些字段位于客户端配置的 `network` 对象中。也可用短横线形式通过 CLI 设置，例如 `p2wlan config set max-punch-pps 80`。两端通过带版本和期限的候选信令交换 NAT 画像，旧客户端继续使用原有候选协议。网关已映射地址优先；随机映射保留最近一次有效观察的端口。每轮 20 秒，整个尝试最长 120 秒；候选、身份或网络失效会提前结束。发包使用协商的具体地址，也可反向确认发布过的 IP 上收到的认证请求来源。
+
+| 配置项 | 默认值 | 作用 |
+| --- | --- | --- |
+| `disable_sym_hole_punching` | `false` | 开启后跳过双方均为对称映射的协商探测。 |
+| `lazy_p2p` | `false` | 等到 peer 有业务流量后才启动协商探测。 |
+| `max_punch_pps` | `200` | 紧凑探测包每秒上限，封顶 200；设为 0 可停用。 |
+| `max_punch_sockets` | `24` | 限制从已有 socket 池参与的数量，封顶 30。主 socket 可单独工作。 |
+| `linear_scan_count` | `50` | 首次按步长排序时最多尝试的已发布候选数。 |
+| `firewall_probe_addresses` | `[]` | 配置具有 STUN Binding 服务的固定 IP 和端口。与已配置的 UDP observer、STUN 服务器合计最多使用 8 个地址。 |
+
+`p2wlan doctor` 显示两端 NAT 画像、队列长度、近期实际发包量及路径成本。UDP 可达性为 `unknown`、`available` 或 `blocked`。一轮内所有已完成的观察点探测都失败时会记录 `UDP_BLOCKED` 并停止当前尝试。没有配置观察点时保留 `unknown`。
 
 ### 网络实验开关
 

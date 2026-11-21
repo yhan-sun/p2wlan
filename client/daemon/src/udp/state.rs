@@ -1614,6 +1614,7 @@ impl PendingProbe {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingProbePurpose {
+    Negotiated(u32),
     ConnectivityCheck,
     HardHardNomination,
     HardHardTriggeredCheck,

@@ -110,6 +110,7 @@ fn rest_signal_response_defaults_to_v1_for_legacy_servers() {
 #[test]
 fn test_peer_reflexive_endpoint_prefers_tagged_candidate() {
     let signal = SignalResponse {
+        nat_profile: None,
         from_node_id: "alice".to_string(),
         to_node_id: None,
         signal_seq: None,
@@ -149,6 +150,7 @@ fn test_peer_reflexive_endpoint_prefers_tagged_candidate() {
 #[test]
 fn test_peer_reflexive_endpoint_falls_back_to_first_candidate() {
     let signal = SignalResponse {
+        nat_profile: None,
         from_node_id: "alice".to_string(),
         to_node_id: None,
         signal_seq: None,

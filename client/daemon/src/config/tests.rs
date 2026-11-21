@@ -15,7 +15,7 @@ mod tests {
         assert_eq!(config.network.mtu, 1420);
         assert!(config.relay.servers.is_empty());
         assert!(config.relay.prefer_direct);
-        assert_eq!(config.relay.path_policy, PathPolicy::DirectFirst);
+        assert_eq!(config.relay.path_policy, PathPolicy::DirectSticky);
         assert!(config.relay.preferred_regions.is_empty());
         assert_eq!(config.relay.selection_timeout_ms, 2000);
         assert!(!config.diagnostics.enabled);
@@ -241,7 +241,7 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         // New fields serialize under their canonical names.
         assert!(json.contains("\"relay_startup_timeout_ms\":"));
-        assert!(json.contains("\"path_policy\":\"direct-first\""));
+        assert!(json.contains("\"path_policy\":\"direct-sticky\""));
         assert!(!json.contains("fallback_timeout_ms"));
         assert!(json.contains("\"proxy_mode\":\"direct\""));
         assert!(json.contains("\"overlay_any_path\":false"));

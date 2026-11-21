@@ -34,6 +34,7 @@ async fn profile_wait_fixture() -> (
         remote_network_generation: 0,
     };
     let offer = PendingPeerOffer {
+        nat_profile: None,
         from_node_id: peer.node_id.clone(),
         candidates: vec!["198.51.100.77:40000".to_string()],
         candidate_sources: HashMap::new(),

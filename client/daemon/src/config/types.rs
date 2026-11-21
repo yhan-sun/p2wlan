@@ -101,6 +101,8 @@ fn default_platform() -> String {
 /// Virtual network configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
+    #[serde(flatten)]
+    pub traversal: p2pnet_nat::engine::PunchSettings,
     /// Network ID to join.
     pub network_id: String,
     /// Whether to run in manual/offline mode.

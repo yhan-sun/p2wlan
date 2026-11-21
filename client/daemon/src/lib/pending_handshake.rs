@@ -41,6 +41,7 @@ enum ResponderHandshakeCacheLookup {
 /// one queued here.
 #[derive(Clone)]
 struct PendingPeerOffer {
+    nat_profile: Option<p2pnet_nat::engine::PunchProfile>,
     from_node_id: String,
     candidates: Vec<String>,
     candidate_sources: HashMap<String, String>,

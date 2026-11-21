@@ -59,6 +59,7 @@ fn delivery(id: &str, seq: u64, lease: &str) -> LeasedSignalDelivery {
         },
         ack_timing: SignalAckTiming::Ordinary,
         prepared: PreparedSignalDelivery::Apply(Box::new(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: "remote-peer".into(),
             candidates: vec![],
             session_id: None,
@@ -442,4 +443,31 @@ fn ack_budgets_keep_original_phase_and_bound_expired_cleanup() {
             reqwest::StatusCode::from_u16(status).unwrap()
         ));
     }
+}
+
+#[test]
+fn negotiated_signal_from_go_and_legacy_signals_share_the_poll_decoder() {
+    let wire: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../contracts/fixtures/negotiated_signal.json"
+    ))
+    .unwrap();
+    let parsed: SignalResponse = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(parsed.candidate_generation, 7);
+    let profile = parsed.nat_profile.unwrap();
+    assert_eq!(
+        profile.nat_type,
+        p2pnet_nat::engine::NatKind::LinearSymmetric
+    );
+    assert_eq!(profile.port_step, -4);
+    assert_eq!(profile.port_hint, 41000);
+    let mut legacy = wire.clone();
+    legacy.as_object_mut().unwrap().remove("nat_profile");
+    let mut future = wire;
+    future["nat_profile"]["nat_type"] = serde_json::json!("Other");
+    let batch: Vec<SignalResponse> =
+        serde_json::from_value(serde_json::json!([legacy, future])).unwrap();
+    assert_eq!(batch.len(), 2);
+    assert!(batch
+        .iter()
+        .all(|message| message.nat_profile.is_none() && message.candidates.len() == 1));
 }

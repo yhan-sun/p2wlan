@@ -119,6 +119,50 @@ impl UdpTransport {
             hosts,
             observations,
         );
+        // Concurrent replies say nothing about allocation order. Recheck three
+        // responsive observers sequentially on this same primary socket during
+        // background refresh; never delay the startup candidate publication.
+        if probe_filtering && report.nat_profile.likely_symmetric == Some(true) {
+            let primary_servers: Vec<SocketAddr> = report
+                .nat_profile
+                .observations
+                .iter()
+                .filter(|sample| sample.error.is_none() && sample.mapped_address.is_some())
+                .filter_map(|sample| sample.server.parse().ok())
+                .take(3)
+                .collect();
+            if primary_servers.len() == 3 {
+                let mut ordered = Vec::new();
+                for server in primary_servers {
+                    ordered.push(
+                        self.query_stun_live_on_socket(
+                            &self.socket,
+                            server,
+                            stun_timeout.min(LIVE_FILTERING_PROBE_TIMEOUT),
+                        )
+                        .await,
+                    );
+                }
+                if ordered
+                    .iter()
+                    .all(|sample| sample.mapped_address.is_some() && sample.error.is_none())
+                {
+                    let measured = candidate_report_from_observations(local_addr, hosts, ordered);
+                    // Keep the full gathered candidate set, including additional
+                    // observers. Only the primary classification uses the ordered sample.
+                    for candidate in measured.candidates {
+                        if !report
+                            .candidates
+                            .iter()
+                            .any(|old| old.endpoint.to_string() == candidate.endpoint.to_string())
+                        {
+                            report.candidates.push(candidate);
+                        }
+                    }
+                    report.nat_profile = measured.nat_profile;
+                }
+            }
+        }
         if let Some(ipv6) = ipv6 {
             self.append_ipv6_candidates(&mut report, ipv6.candidates)
                 .await;

@@ -199,6 +199,7 @@ async fn stale_sender_known_offer_cannot_reset_current_identity_or_apply_candida
         .control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: vec!["203.0.113.99:49999".to_string()],
             session_id: None,
@@ -329,6 +330,7 @@ async fn stale_sender_answer_cannot_reset_or_consume_current_initiator() {
         .control
         .event_sender()
         .send(ControlEvent::PeerAnswer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: vec!["203.0.113.100:50000".to_string()],
             session_id: None,
@@ -440,6 +442,7 @@ async fn stale_sender_deferred_offer_releases_owner_without_mutating_peer() {
         None,
     );
     let offer = PendingPeerOffer {
+        nat_profile: None,
         from_node_id: peer_id.to_string(),
         candidates: vec!["203.0.113.101:50101".to_string()],
         candidate_sources: HashMap::new(),

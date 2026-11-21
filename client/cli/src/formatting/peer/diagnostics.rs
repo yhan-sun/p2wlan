@@ -17,6 +17,9 @@ pub(crate) fn print_peer_diagnostics(snapshot: &Value) {
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(node_id);
+        if let Some(summary) = negotiated_punch_summary(peer) {
+            println!("  {name} {summary}");
+        }
         let virtual_ip = peer
             .get("virtual_ip")
             .and_then(Value::as_str)
@@ -107,4 +110,29 @@ pub(crate) fn print_peer_diagnostics(snapshot: &Value) {
             println!("  relay-reason={reason}");
         }
     }
+}
+
+pub(crate) fn negotiated_punch_summary(peer: &Value) -> Option<String> {
+    const FIELDS: [&str; 12] = [
+        "remote_nat_profile",
+        "punch_mode",
+        "punch_epoch",
+        "queue_a_len",
+        "queue_b_len",
+        "actual_pps",
+        "active_punch_sockets",
+        "udp_firewall_status",
+        "active_path",
+        "active_path_type",
+        "path_cost",
+        "reason_code",
+    ];
+    peer.get("punch_epoch")?;
+    Some(
+        FIELDS
+            .iter()
+            .filter_map(|name| peer.get(*name).map(|value| format!("{name}={value}")))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }

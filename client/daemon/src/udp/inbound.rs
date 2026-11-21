@@ -444,6 +444,22 @@ impl UdpTransport {
                 continue;
             }
 
+            let compact = if data.starts_with(b"P3") {
+                let Some(decoded) = self.decode_compact(data).await else {
+                    self.update_socket_diagnostics(socket_index, |metrics| {
+                        metrics.authenticated_probe_invalid_mac =
+                            metrics.authenticated_probe_invalid_mac.saturating_add(1);
+                    })
+                    .await;
+                    continue;
+                };
+                Some(decoded)
+            } else {
+                None
+            };
+            let data = compact
+                .as_ref()
+                .map_or(data, |ingress| ingress.decoded.as_slice());
             let authenticated_probe = is_authenticated_punch_candidate(data);
             let legacy_punch = decode_punch_packet(data);
             #[cfg(test)]
@@ -810,14 +826,24 @@ impl UdpTransport {
                                     continue;
                                 }
                                 let generation = self.peers.current_network_generation().await;
-                                let ack = build_authenticated_punch_ack(
-                                    packet.nonce,
-                                    local_node_id,
-                                    &identity.source_node_id,
-                                    generation,
-                                    &key,
-                                );
-                                match socket.send_to(&ack, source).await {
+                                let ack = compact
+                                    .as_ref()
+                                    .and_then(|ingress| ingress.reply.clone())
+                                    .unwrap_or_else(|| {
+                                        build_authenticated_punch_ack(
+                                            packet.nonce,
+                                            local_node_id,
+                                            &identity.source_node_id,
+                                            generation,
+                                            &key,
+                                        )
+                                    });
+                                let sent = if let Some(ingress) = &compact {
+                                    self.send_compact_reply(ingress, &socket, &ack, source)
+                                } else {
+                                    socket.send_to(&ack, source).await
+                                };
+                                match sent {
                                     Ok(_) => {
                                         self.update_socket_diagnostics(socket_index, |metrics| {
                                             metrics.probe_acks_sent += 1
@@ -849,15 +875,23 @@ impl UdpTransport {
                         // the return window short, and the sender's nonce is
                         // only pending for this punch session.
                         let generation = self.peers.current_network_generation().await;
-                        let ack = build_authenticated_punch_ack(
-                            packet.nonce,
-                            local_node_id,
-                            &identity.source_node_id,
-                            generation,
-                            &key,
-                        );
-                        let ack_sent = match self
-                            .send_punch_ack_burst(
+                        let ack = compact
+                            .as_ref()
+                            .and_then(|ingress| ingress.reply.clone())
+                            .unwrap_or_else(|| {
+                                build_authenticated_punch_ack(
+                                    packet.nonce,
+                                    local_node_id,
+                                    &identity.source_node_id,
+                                    generation,
+                                    &key,
+                                )
+                            });
+                        let sent = if let Some(ingress) = &compact {
+                            self.send_compact_reply(ingress, &socket, &ack, source)
+                                .map(|_| ())
+                        } else {
+                            self.send_punch_ack_burst(
                                 socket_index,
                                 socket.clone(),
                                 ack,
@@ -865,7 +899,8 @@ impl UdpTransport {
                                 identity.source_node_id.clone(),
                             )
                             .await
-                        {
+                        };
+                        let ack_sent = match sent {
                             Ok(()) => true,
                             Err(err) => {
                                 warn!(
@@ -876,6 +911,18 @@ impl UdpTransport {
                             }
                         };
 
+                        if compact.is_some() {
+                            // Respond on the receiving socket before scheduling a challenge.
+                            // Direct validation starts only after two distinct matched responses.
+                            if ack_sent {
+                                self.peers.enqueue_compact_confirmation(
+                                    &identity.source_node_id,
+                                    source,
+                                    socket_index,
+                                );
+                            }
+                            continue;
+                        }
                         let learned = self
                             .peers
                             .learn_authenticated_endpoint_in_epoch(
@@ -1180,6 +1227,19 @@ impl UdpTransport {
                             let local_endpoint = pending.local_endpoint;
                             let purpose = pending.purpose;
                             let socket_epoch = pending.socket_epoch;
+                            if let PendingProbePurpose::Negotiated(epoch) = purpose {
+                                if compact.is_none()
+                                    || !self.peers.confirm_compact_response(
+                                        &identity.source_node_id,
+                                        source,
+                                        socket_index,
+                                        epoch,
+                                        packet.nonce,
+                                    )
+                                {
+                                    continue;
+                                }
+                            }
                             let hard_hard_winner_promoted =
                                 if let Some(token) = hard_hard_token.as_deref() {
                                     self.promote_hard_hard_winner_in_epoch(

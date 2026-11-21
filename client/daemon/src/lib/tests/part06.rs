@@ -200,6 +200,7 @@ async fn duplicate_offer_has_no_candidate_apply_or_fresh_prediction_side_effect(
         control
             .event_sender()
             .send(ControlEvent::PeerOffer {
+                nat_profile: None,
                 from_node_id: "node-dupe".to_string(),
                 candidates: candidates.clone(),
                 session_id: None,

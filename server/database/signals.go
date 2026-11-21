@@ -23,6 +23,7 @@ type Signal struct {
 	Type                    string            `json:"type"`
 	ProtocolVersion         int64             `json:"protocol_version"`
 	Candidates              []string          `json:"candidates"`
+	NATProfile              *PunchProfile     `json:"nat_profile,omitempty"`
 	CandidateSources        map[string]string `json:"candidate_sources,omitempty"`
 	CandidateGeneration     int64             `json:"candidate_generation,omitempty"`
 	CandidatesExpiresAtMS   int64             `json:"candidates_expires_at_ms,omitempty"`
@@ -145,14 +146,18 @@ func (db *DB) CreateSignalWithTraversalMetadata(fromNodeID, toNodeID, typ string
 // ErrSignalQueueLimit so the API can return 429 instead of silently dropping
 // or unbounded growth.
 func (db *DB) CreateSignalWithTraversalSession(fromNodeID, toNodeID, typ string, protocolVersion int64, candidates []string, candidateSources map[string]string, handshake string, punchAtMS, candidateGeneration, candidatesExpiresAtMS int64, sessionID, probeEphemeralPublicKey, senderPublicKey string) (*Signal, error) {
-	return db.createSignalWithTraversalSession(false, fromNodeID, toNodeID, typ, protocolVersion, candidates, candidateSources, handshake, punchAtMS, candidateGeneration, candidatesExpiresAtMS, sessionID, probeEphemeralPublicKey, senderPublicKey)
+	return db.createSignalWithTraversalSession(nil, false, fromNodeID, toNodeID, typ, protocolVersion, candidates, candidateSources, handshake, punchAtMS, candidateGeneration, candidatesExpiresAtMS, sessionID, probeEphemeralPublicKey, senderPublicKey)
 }
 
 func (db *DB) CreateAuthorizedSignalWithTraversalSession(fromNodeID, toNodeID, typ string, protocolVersion int64, candidates []string, candidateSources map[string]string, handshake string, punchAtMS, candidateGeneration, candidatesExpiresAtMS int64, sessionID, probeEphemeralPublicKey, senderPublicKey string) (*Signal, error) {
-	return db.createSignalWithTraversalSession(true, fromNodeID, toNodeID, typ, protocolVersion, candidates, candidateSources, handshake, punchAtMS, candidateGeneration, candidatesExpiresAtMS, sessionID, probeEphemeralPublicKey, senderPublicKey)
+	return db.createSignalWithTraversalSession(nil, true, fromNodeID, toNodeID, typ, protocolVersion, candidates, candidateSources, handshake, punchAtMS, candidateGeneration, candidatesExpiresAtMS, sessionID, probeEphemeralPublicKey, senderPublicKey)
 }
 
-func (db *DB) createSignalWithTraversalSession(authorize bool, fromNodeID, toNodeID, typ string, protocolVersion int64, candidates []string, candidateSources map[string]string, handshake string, punchAtMS, candidateGeneration, candidatesExpiresAtMS int64, sessionID, probeEphemeralPublicKey, senderPublicKey string) (*Signal, error) {
+func (db *DB) CreateAuthorizedSignalWithProfile(profile *PunchProfile, fromNodeID, toNodeID, typ string, protocolVersion int64, candidates []string, candidateSources map[string]string, handshake string, punchAtMS, candidateGeneration, candidatesExpiresAtMS int64, sessionID, probeEphemeralPublicKey, senderPublicKey string) (*Signal, error) {
+	return db.createSignalWithTraversalSession(profile, true, fromNodeID, toNodeID, typ, protocolVersion, candidates, candidateSources, handshake, punchAtMS, candidateGeneration, candidatesExpiresAtMS, sessionID, probeEphemeralPublicKey, senderPublicKey)
+}
+
+func (db *DB) createSignalWithTraversalSession(profile *PunchProfile, authorize bool, fromNodeID, toNodeID, typ string, protocolVersion int64, candidates []string, candidateSources map[string]string, handshake string, punchAtMS, candidateGeneration, candidatesExpiresAtMS int64, sessionID, probeEphemeralPublicKey, senderPublicKey string) (*Signal, error) {
 	if candidates == nil {
 		candidates = []string{}
 	}
@@ -170,6 +175,18 @@ func (db *DB) createSignalWithTraversalSession(authorize bool, fromNodeID, toNod
 	candidateSourcesJSON, err := json.Marshal(candidateSources)
 	if err != nil {
 		return nil, err
+	}
+
+	if err := profile.Validate(); err != nil {
+		return nil, err
+	}
+	var profileJSON string
+	if profile != nil {
+		bytes, err := json.Marshal(profile)
+		if err != nil {
+			return nil, err
+		}
+		profileJSON = string(bytes)
 	}
 
 	id := fmt.Sprintf("signal-%d-%d", time.Now().UnixNano(), nextSignalID.Add(1))
@@ -194,7 +211,7 @@ func (db *DB) createSignalWithTraversalSession(authorize bool, fromNodeID, toNod
 	}
 
 	// Queue bounds, checked after the TTL cleanup so expired rows never count.
-	if err := enforceSignalQueueBounds(tx, fromNodeID, toNodeID, len(candidatesJSON)+len(candidateSourcesJSON)+len(handshake), now); err != nil {
+	if err := enforceSignalQueueBounds(tx, fromNodeID, toNodeID, len(candidatesJSON)+len(candidateSourcesJSON)+len(handshake)+len(profileJSON), now); err != nil {
 		return nil, err
 	}
 
@@ -211,8 +228,8 @@ func (db *DB) createSignalWithTraversalSession(authorize bool, fromNodeID, toNod
 		return nil, err
 	}
 
-	_, err = tx.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, protocol_version, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, session_id, probe_ephemeral_public_key, handshake, punch_at_ms, sender_public_key, signal_seq, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, fromNodeID, toNodeID, typ, protocolVersion, string(candidatesJSON), string(candidateSourcesJSON), candidateGeneration, candidatesExpiresAtMS, sessionID, probeEphemeralPublicKey, handshake, punchAtMS, senderPublicKey, signalSeq, now)
+	_, err = tx.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, protocol_version, candidates, candidate_sources, nat_profile, candidate_generation, candidates_expires_at_ms, session_id, probe_ephemeral_public_key, handshake, punch_at_ms, sender_public_key, signal_seq, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, fromNodeID, toNodeID, typ, protocolVersion, string(candidatesJSON), string(candidateSourcesJSON), profileJSON, candidateGeneration, candidatesExpiresAtMS, sessionID, probeEphemeralPublicKey, handshake, punchAtMS, senderPublicKey, signalSeq, now)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +246,7 @@ func (db *DB) createSignalWithTraversalSession(authorize bool, fromNodeID, toNod
 
 	return &Signal{
 		ID: id, FromNodeID: fromNodeID, ToNodeID: toNodeID, Type: typ,
-		ProtocolVersion: protocolVersion, Candidates: candidates, CandidateSources: candidateSources, CandidateGeneration: candidateGeneration, CandidatesExpiresAtMS: candidatesExpiresAtMS, SessionID: sessionID, ProbeEphemeralPublicKey: probeEphemeralPublicKey, Handshake: handshake, PunchAtMS: punchAtMS, CreatedAt: now, SenderPublicKey: senderPublicKey, SignalSeq: signalSeq,
+		ProtocolVersion: protocolVersion, Candidates: candidates, CandidateSources: candidateSources, NATProfile: profile, CandidateGeneration: candidateGeneration, CandidatesExpiresAtMS: candidatesExpiresAtMS, SessionID: sessionID, ProbeEphemeralPublicKey: probeEphemeralPublicKey, Handshake: handshake, PunchAtMS: punchAtMS, CreatedAt: now, SenderPublicKey: senderPublicKey, SignalSeq: signalSeq,
 	}, nil
 }
 
@@ -246,7 +263,7 @@ func enforceSignalQueueBounds(tx *sql.Tx, fromNodeID, toNodeID string, payloadBy
 	}
 
 	var pairBytes int64
-	if err := tx.QueryRow(`SELECT COALESCE(SUM(LENGTH(candidates) + LENGTH(candidate_sources) + LENGTH(handshake)), 0) FROM signals WHERE from_node_id = ? AND to_node_id = ?`, fromNodeID, toNodeID).Scan(&pairBytes); err != nil {
+	if err := tx.QueryRow(`SELECT COALESCE(SUM(LENGTH(candidates) + LENGTH(candidate_sources) + LENGTH(handshake) + LENGTH(nat_profile)), 0) FROM signals WHERE from_node_id = ? AND to_node_id = ?`, fromNodeID, toNodeID).Scan(&pairBytes); err != nil {
 		return err
 	}
 	if pairBytes+int64(payloadBytes) > MaxSignalBytesPerPair {
@@ -307,7 +324,7 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 		return nil, err
 	}
 
-	rows, err := tx.Query(`SELECT s.id, s.from_node_id, s.to_node_id, s.type, s.protocol_version, s.candidates, s.candidate_sources, s.candidate_generation, s.candidates_expires_at_ms, s.session_id, s.probe_ephemeral_public_key, s.handshake, s.punch_at_ms, s.sender_public_key, s.signal_seq, s.created_at
+	rows, err := tx.Query(`SELECT s.id, s.from_node_id, s.to_node_id, s.type, s.protocol_version, s.candidates, s.candidate_sources, s.nat_profile, s.candidate_generation, s.candidates_expires_at_ms, s.session_id, s.probe_ephemeral_public_key, s.handshake, s.punch_at_ms, s.sender_public_key, s.signal_seq, s.created_at
 		FROM signals AS s
 		WHERE s.to_node_id = ? AND s.created_at >= ? AND s.lease_expires_at <= ?
 		  AND NOT EXISTS (
@@ -336,8 +353,8 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 	for rows.Next() {
 		var s Signal
 		var candidatesJSON string
-		var candidateSourcesJSON string
-		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &s.ProtocolVersion, &candidatesJSON, &candidateSourcesJSON, &s.CandidateGeneration, &s.CandidatesExpiresAtMS, &s.SessionID, &s.ProbeEphemeralPublicKey, &s.Handshake, &s.PunchAtMS, &s.SenderPublicKey, &s.SignalSeq, &s.CreatedAt); err != nil {
+		var candidateSourcesJSON, profileJSON string
+		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &s.ProtocolVersion, &candidatesJSON, &candidateSourcesJSON, &profileJSON, &s.CandidateGeneration, &s.CandidatesExpiresAtMS, &s.SessionID, &s.ProbeEphemeralPublicKey, &s.Handshake, &s.PunchAtMS, &s.SenderPublicKey, &s.SignalSeq, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		// One malformed row must never block the whole batch: the row is
@@ -355,6 +372,13 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 			appendDeleteID(&malformedIDs, &placeholders, s.ID)
 			continue
 		}
+		if profileJSON != "" {
+			if err := json.Unmarshal([]byte(profileJSON), &s.NATProfile); err != nil || s.NATProfile.Validate() != nil {
+				appendDeleteID(&malformedIDs, &placeholders, s.ID)
+				continue
+			}
+		}
+
 		if s.CandidateSources == nil {
 			s.CandidateSources = map[string]string{}
 		}
@@ -415,7 +439,7 @@ func (db *DB) ListSignalsWithLease(toNodeID string) ([]Signal, int64, error) {
 		return nil, 0, err
 	}
 
-	rows, err := tx.Query(`SELECT s.id, s.from_node_id, s.to_node_id, s.type, s.protocol_version, s.candidates, s.candidate_sources, s.candidate_generation, s.candidates_expires_at_ms, s.session_id, s.probe_ephemeral_public_key, s.handshake, s.punch_at_ms, s.sender_public_key, s.signal_seq, s.created_at
+	rows, err := tx.Query(`SELECT s.id, s.from_node_id, s.to_node_id, s.type, s.protocol_version, s.candidates, s.candidate_sources, s.nat_profile, s.candidate_generation, s.candidates_expires_at_ms, s.session_id, s.probe_ephemeral_public_key, s.handshake, s.punch_at_ms, s.sender_public_key, s.signal_seq, s.created_at
 		FROM signals AS s
 		WHERE s.to_node_id = ? AND s.created_at >= ? AND s.lease_expires_at <= ?
 		  AND NOT EXISTS (
@@ -436,8 +460,8 @@ func (db *DB) ListSignalsWithLease(toNodeID string) ([]Signal, int64, error) {
 	for rows.Next() {
 		var s Signal
 		var candidatesJSON string
-		var candidateSourcesJSON string
-		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &s.ProtocolVersion, &candidatesJSON, &candidateSourcesJSON, &s.CandidateGeneration, &s.CandidatesExpiresAtMS, &s.SessionID, &s.ProbeEphemeralPublicKey, &s.Handshake, &s.PunchAtMS, &s.SenderPublicKey, &s.SignalSeq, &s.CreatedAt); err != nil {
+		var candidateSourcesJSON, profileJSON string
+		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &s.ProtocolVersion, &candidatesJSON, &candidateSourcesJSON, &profileJSON, &s.CandidateGeneration, &s.CandidatesExpiresAtMS, &s.SessionID, &s.ProbeEphemeralPublicKey, &s.Handshake, &s.PunchAtMS, &s.SenderPublicKey, &s.SignalSeq, &s.CreatedAt); err != nil {
 			return nil, 0, err
 		}
 		// One malformed row must never block the batch: it is skipped and
@@ -454,6 +478,13 @@ func (db *DB) ListSignalsWithLease(toNodeID string) ([]Signal, int64, error) {
 			appendID(&malformedIDs, &malformedPlaceholders, s.ID)
 			continue
 		}
+		if profileJSON != "" {
+			if err := json.Unmarshal([]byte(profileJSON), &s.NATProfile); err != nil || s.NATProfile.Validate() != nil {
+				appendID(&malformedIDs, &malformedPlaceholders, s.ID)
+				continue
+			}
+		}
+
 		if s.CandidateSources == nil {
 			s.CandidateSources = map[string]string{}
 		}

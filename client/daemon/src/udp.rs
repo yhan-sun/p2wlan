@@ -36,6 +36,9 @@ use crate::transport::{
     EncryptedPeerPacket, ReceivedEncryptedPacket, ResponderSessionConfirmation, WireGuardTransport,
 };
 
+mod compact;
+mod firewall;
+mod negotiated_worker;
 mod probe_budget;
 pub(crate) use probe_budget::OutboundProbeSweepStop;
 use probe_budget::{
@@ -190,6 +193,10 @@ pub const IPV6_SOCKET_INDEX: usize = 2048;
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
 #[derive(Clone)]
 pub struct UdpTransport {
+    firewall_cache: Arc<StdMutex<firewall::FirewallCache>>,
+    compact_budget: Arc<p2pnet_nat::engine::PunchPacer>,
+    compact_index: Arc<StdMutex<compact::CompactIndex>>,
+    compact_nonce: Arc<std::sync::atomic::AtomicU32>,
     resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
     /// Process-local identity of this concrete UDP publication. Clones keep
     /// the identity; a newly bound/replaced transport gets a new one, so a

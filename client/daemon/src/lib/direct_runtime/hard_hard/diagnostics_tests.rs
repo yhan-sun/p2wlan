@@ -5,6 +5,7 @@ mod hard_hard_production_diagnostics_tests {
 
     fn offer(generation: u64, token: Option<&str>) -> PendingPeerOffer {
         PendingPeerOffer {
+            nat_profile: None,
             from_node_id: "private-peer-identity".to_string(),
             candidates: vec!["198.51.100.77:45678".to_string()],
             candidate_sources: HashMap::new(),
