@@ -38,6 +38,7 @@ use crate::transport::{
 
 mod compact;
 mod firewall;
+mod negotiated_socket;
 mod negotiated_worker;
 mod probe_budget;
 pub(crate) use probe_budget::OutboundProbeSweepStop;
@@ -195,6 +196,7 @@ pub const IPV6_SOCKET_INDEX: usize = 2048;
 pub struct UdpTransport {
     firewall_cache: Arc<StdMutex<firewall::FirewallCache>>,
     compact_budget: Arc<p2pnet_nat::engine::PunchPacer>,
+    negotiated_socket_slots: Arc<tokio::sync::Semaphore>,
     compact_index: Arc<StdMutex<compact::CompactIndex>>,
     compact_nonce: Arc<std::sync::atomic::AtomicU32>,
     resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,

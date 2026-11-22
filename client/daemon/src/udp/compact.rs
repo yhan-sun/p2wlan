@@ -19,9 +19,23 @@ pub(super) struct CompactIndex {
 
 pub(super) struct CompactIngress {
     binding: Arc<Binding>,
-    epoch: u32,
+    frame: CompactFrame,
     pub(super) decoded: Vec<u8>,
     pub(super) reply: Option<Vec<u8>>,
+}
+
+impl CompactIngress {
+    pub(super) fn reply_for(&self, peer: &str) -> Option<&[u8]> {
+        (self.binding.peer == peer)
+            .then_some(self.reply.as_deref())
+            .flatten()
+    }
+
+    pub(super) fn matches_challenge(&self, peer: &str, nonce: [u8; 8]) -> bool {
+        self.binding.peer == peer
+            && self.frame.kind == FrameKind::Response
+            && self.frame.correlation() == nonce
+    }
 }
 
 impl UdpTransport {
@@ -97,6 +111,30 @@ impl UdpTransport {
         Some((binding.wire.encode(frame).to_vec(), frame.correlation()))
     }
 
+    pub(super) fn try_send_compact_challenge(
+        &self,
+        peer: &str,
+        endpoint: SocketAddr,
+        epoch: u32,
+        bytes: &[u8],
+        socket: &UdpSocket,
+    ) -> std::io::Result<usize> {
+        self.peers
+            .with_punch_run(peer, endpoint, u64::from(epoch), |conn, run| {
+                if !conn.compact_datagram_is_current(
+                    self.local_node_id.as_deref().unwrap_or_default(),
+                    bytes,
+                ) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                run.pacer.try_send(u64::from(epoch), || {
+                    self.compact_budget
+                        .try_send(0, || socket.try_send_to(bytes, endpoint))
+                })
+            })
+            .unwrap_or_else(|| Err(std::io::ErrorKind::Interrupted.into()))
+    }
+
     pub(super) fn send_compact_reply(
         &self,
         ingress: &CompactIngress,
@@ -105,7 +143,7 @@ impl UdpTransport {
         source: SocketAddr,
     ) -> std::io::Result<usize> {
         let binding = &ingress.binding;
-        if ingress.epoch != binding.remote_epoch.load(Ordering::Acquire) {
+        if ingress.frame.epoch != binding.remote_epoch.load(Ordering::Acquire) {
             return Err(std::io::ErrorKind::Interrupted.into());
         }
         let local = self
@@ -207,7 +245,7 @@ impl UdpTransport {
         };
         Some(CompactIngress {
             binding,
-            epoch: frame.epoch,
+            frame,
             decoded,
             reply,
         })

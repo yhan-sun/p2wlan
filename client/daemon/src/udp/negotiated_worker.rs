@@ -1,3 +1,4 @@
+use super::negotiated_socket::RoundSocket;
 use super::*;
 use crate::peer::PeerPunchRun;
 use p2pnet_nat::engine::{Lane, PunchTarget};
@@ -67,11 +68,27 @@ impl UdpTransport {
                     return;
                 }
             }
+            if let Some(recheck) = self.blocked_recheck_at(network) {
+                use p2pnet_nat::engine::UdpReachability;
+                *run.0.firewall.lock().unwrap_or_else(|e| e.into_inner()) =
+                    UdpReachability::Blocked;
+                let epoch = run.0.pacer.epoch();
+                tokio::time::sleep_until(recheck).await;
+                let status = self.firewall_verdict(network).await;
+                if self.peers.current_punch_epoch(peer) != Some(epoch) {
+                    return;
+                }
+                *run.0.firewall.lock().unwrap_or_else(|e| e.into_inner()) = status;
+                if status != UdpReachability::Available {
+                    return;
+                }
+            }
             let started = Clock::now();
             let deadline = started + Duration::from_secs(120);
             tokio::time::sleep(Duration::from_millis(200)).await;
             let mut round = started;
             let mut staged = 0;
+            let mut alternate: Option<RoundSocket> = None;
             let mut next_firewall = started + Duration::from_secs(10);
             let mut ticks = tokio::time::interval(run.0.pacer.interval());
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -111,7 +128,7 @@ impl UdpTransport {
                     if run.0.pacer.clear_punch_state().is_none() {
                         break;
                     }
-                    run.0.sockets.store(0, Ordering::Release);
+                    drop(alternate.take());
                     round += Duration::from_secs(20);
                     staged = 0;
                 }
@@ -138,9 +155,24 @@ impl UdpTransport {
                         break;
                     }
                     self.queue_negotiated(&run.0, epoch, &mut candidates, retry);
+                    if retry && run.0.mode == 6 {
+                        if let Some((_, endpoint)) =
+                            candidates.iter().find(|(_, endpoint)| endpoint.is_ipv4())
+                        {
+                            alternate =
+                                RoundSocket::open(self, peer, &run.0, epoch, *endpoint).await;
+                        }
+                    }
                     staged += 1;
                 }
+                if let Some(alternate) = &mut alternate {
+                    alternate.receive(self, peer).await;
+                }
                 for target in run.0.pacer.tick(epoch, now).into_iter().flatten() {
+                    if let Some(socket) = alternate.as_mut().filter(|s| s.owns_probe(target)) {
+                        socket.send_challenge(self, peer).await;
+                        continue;
+                    }
                     let Ok(wire_epoch) = u32::try_from(epoch) else {
                         return;
                     };
@@ -195,15 +227,6 @@ impl UdpTransport {
             (Some(*addr) != run.remote.upnp_mapped_addr, order, *addr)
         };
         addresses.sort_by_key(|(cost, addr)| (*cost, priority(addr)));
-        let count = if run.mode == 6 && addresses.iter().take(max).any(|(_, a)| a.is_ipv4()) {
-            self.socket_count()
-                .min(usize::from(settings.max_punch_sockets.min(30)))
-                .max(1)
-        } else {
-            1
-        };
-        run.sockets
-            .store(count.saturating_sub(1), Ordering::Release);
         for &(_, address) in addresses.iter().take(max) {
             let lane = if !escalate && matches!(run.mode, 2 | 6) && priority(&address).1 != i32::MAX
             {
@@ -213,12 +236,6 @@ impl UdpTransport {
             };
             run.pacer
                 .enqueue(epoch, lane, PunchTarget { address, socket: 0 });
-            for socket in 1..count {
-                if address.is_ipv4() {
-                    run.pacer
-                        .enqueue(epoch, Lane::Predicted, PunchTarget { address, socket });
-                }
-            }
         }
     }
 }

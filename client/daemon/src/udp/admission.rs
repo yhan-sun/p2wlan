@@ -719,6 +719,12 @@ impl UdpTransport {
                 socket,
                 DynamicSocketSendLease::noop(IPV6_SOCKET_INDEX),
             )
+        } else if socket_index >= DYNAMIC_SOCKET_INDEX_BASE
+            && matches!(purpose, PendingProbePurpose::Negotiated(_))
+        {
+            self.resolve_dynamic_socket_index_for_send(peer_id.unwrap_or_default(), socket_index)
+                .await
+                .ok_or_else(|| DaemonError::Network("negotiated socket was retired".into()))?
         } else {
             self.socket_for_index_or_dynamic(socket_index, peer_id)
                 .await
@@ -936,7 +942,8 @@ impl UdpTransport {
             use_candidate,
             purpose,
             hard_hard_session_token,
-            false,
+            matches!(purpose, PendingProbePurpose::Negotiated(_))
+                && socket_index >= DYNAMIC_SOCKET_INDEX_BASE,
             None,
         )
         .await
@@ -1405,30 +1412,19 @@ impl UdpTransport {
             )
             .await
         } else if let PendingProbePurpose::Negotiated(epoch) = purpose {
-            let sent = self.peers.with_punch_run(
+            self.try_send_compact_challenge(
                 peer_id.unwrap_or_default(),
                 peer_addr,
-                u64::from(epoch),
-                |conn, run| {
-                    if !conn.compact_datagram_is_current(
-                        self.local_node_id.as_deref().unwrap_or_default(),
-                        &bytes,
-                    ) {
-                        return Err(std::io::ErrorKind::Interrupted.into());
-                    }
-                    run.pacer.try_send(u64::from(epoch), || {
-                        self.compact_budget
-                            .try_send(0, || socket.try_send_to(&bytes, peer_addr))
-                    })
-                },
-            );
-            sent.unwrap_or_else(|| Err(std::io::ErrorKind::Interrupted.into()))
-                .map_err(|error| {
-                    ProbeSendFailure::new(
-                        ProbeSendFailureKind::SocketRevoked,
-                        DaemonError::Network(error.to_string()),
-                    )
-                })
+                epoch,
+                &bytes,
+                &socket,
+            )
+            .map_err(|error| {
+                ProbeSendFailure::new(
+                    ProbeSendFailureKind::SocketRevoked,
+                    DaemonError::Network(error.to_string()),
+                )
+            })
         } else {
             self.send_probe_datagram(&socket, &bytes, peer_addr)
                 .await

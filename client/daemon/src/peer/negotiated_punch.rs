@@ -161,20 +161,21 @@ impl PeerManager {
 
     pub(crate) fn configured_firewall_targets(&self) -> Vec<String> {
         let network = &self.config.network;
+        let mut seen = std::collections::HashSet::new();
         network
-            .udp_observers
+            .traversal
+            .firewall_probe_addresses
             .iter()
-            .chain(&network.stun_servers)
-            .take(8)
-            .cloned()
+            .map(ToString::to_string)
             .chain(
                 network
-                    .traversal
-                    .firewall_probe_addresses
+                    .udp_observers
                     .iter()
-                    .take(8)
-                    .map(ToString::to_string),
+                    .chain(&network.stun_servers)
+                    .cloned(),
             )
+            .filter(|target| seen.insert(target.clone()))
+            .take(8)
             .collect()
     }
 

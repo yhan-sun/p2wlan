@@ -70,11 +70,15 @@ CLI 的 `--prefer-direct` 与 `relay-policy=direct` 选择 Direct-first；显式
 | `disable_sym_hole_punching` | `false` | 开启后跳过双方均为对称映射的协商探测。 |
 | `lazy_p2p` | `false` | 等到 peer 有业务流量后才启动协商探测。 |
 | `max_punch_pps` | `200` | 紧凑探测包每秒上限，封顶 200；设为 0 可停用。 |
-| `max_punch_sockets` | `24` | 限制从已有 socket 池参与的数量，封顶 30。主 socket 可单独工作。 |
+| `max_punch_sockets` | `24` | 限制同一 UDP 传输上用于协商探测的 socket 总数，主 socket 占一个名额，硬上限为 30。设为 0 或 1 时只使用主 socket。 |
 | `linear_scan_count` | `50` | 首次按步长排序时最多尝试的已发布候选数。 |
 | `firewall_probe_addresses` | `[]` | 配置具有 STUN Binding 服务的固定 IP 和端口。与已配置的 UDP observer、STUN 服务器合计最多使用 8 个地址。 |
 
-`p2wlan doctor` 显示两端 NAT 画像、队列长度、近期实际发包量及路径成本。UDP 可达性为 `unknown`、`available` 或 `blocked`。一轮内所有已完成的观察点探测都失败时会记录 `UDP_BLOCKED` 并停止当前尝试。没有配置观察点时保留 `unknown`。
+双方都是线性对称映射时，首轮发包 5 秒后可用一个临时本地端口重试对端已发布的 IPv4 地址。该端口连续收到两个不同挑战的有效应答后才能交给常规直连验证。轮次切换、取消或超时会关闭尚未晋升的临时端口。
+
+网关授权 PCP 或 NAT-PMP 映射时，客户端以网关返回的租期计算续租时间。同一网关上的 PCP 映射续租会沿用原映射的 nonce，并建议网关继续分配上次返回的公网地址和端口。[PCP MAP 续租规范](https://www.rfc-editor.org/rfc/rfc6887.html#section-11.2.1)
+
+`p2wlan doctor` 显示两端 NAT 画像、队列长度、近期实际发包量及路径成本。UDP 可达性为 `unknown`、`available` 或 `blocked`。同一网络上的对端共享观察结果。观察点探测判为阻断时记录 `UDP_BLOCKED`，业务可继续使用已确认的 TLS Relay。业务唤醒后的下一次检查会先访问配置的 STUN 观察点，收到有效回应后才恢复向对端发送 UDP 探测。没有配置观察点时保留 `unknown`。
 
 ### 网络实验开关
 

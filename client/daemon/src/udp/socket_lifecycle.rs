@@ -300,6 +300,26 @@ impl ProvisionalSocketGuard {
         network_generation: u64,
         punch_generation: u64,
     ) -> CommitOutcome {
+        self.commit_and_pin_if(
+            transport,
+            peer_id,
+            socket_index,
+            network_generation,
+            punch_generation,
+            || true,
+        )
+        .await
+    }
+
+    pub(super) async fn commit_and_pin_if(
+        &self,
+        transport: &UdpTransport,
+        peer_id: &str,
+        socket_index: usize,
+        network_generation: u64,
+        punch_generation: u64,
+        admissible: impl FnOnce() -> bool,
+    ) -> CommitOutcome {
         let refused = CommitOutcome {
             committed: false,
             predecessor: None,
@@ -317,7 +337,8 @@ impl ProvisionalSocketGuard {
         // the generation measured with: a stale generation can never commit a
         // mapping that belongs to an old network.
         let current_network_generation = transport.peers.current_network_generation_sync();
-        if entry.phase != DynamicSocketPhase::Provisional
+        if !admissible()
+            || entry.phase != DynamicSocketPhase::Provisional
             || entry.peer_id != peer_id
             || entry.network_generation != network_generation
             || entry.network_generation != current_network_generation

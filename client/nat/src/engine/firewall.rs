@@ -42,20 +42,20 @@ pub async fn check_udp_reachability(
                 StunClient::with_timeout(budget)
                     .binding_request(&socket, target)
                     .await
-                    .is_ok(),
+                    .is_ok_and(|reply| reply.reflexive_address.is_some()),
             )
         });
     }
-    let mut attempted = false;
     let result = tokio::time::timeout(budget + Duration::from_millis(100), async {
+        let mut all_attempted = true;
         while let Some(outcome) = tasks.join_next().await {
             match outcome {
                 Ok(Some(true)) => return UdpReachability::Available,
-                Ok(Some(false)) => attempted = true,
-                _ => {}
+                Ok(Some(false)) => continue,
+                _ => all_attempted = false,
             }
         }
-        if attempted {
+        if all_attempted {
             UdpReachability::Blocked
         } else {
             UdpReachability::Unknown
