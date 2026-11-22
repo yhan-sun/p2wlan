@@ -1596,7 +1596,7 @@ impl PathStateMachine {
         // strands the cancelled validation owner in Validating.
         next.recovery = PathRecoveryState::Stable;
         next.compatibility_state = match next.active.network_path() {
-            Some(NetworkPath::Direct) => ConnectionState::Direct,
+            Some(NetworkPath::Direct | NetworkPath::TcpDirect) => ConnectionState::Direct,
             Some(NetworkPath::Relay) => ConnectionState::Relay,
             None => {
                 if let Some(from) = previous_active {

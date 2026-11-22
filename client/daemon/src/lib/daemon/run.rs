@@ -315,6 +315,23 @@ impl Daemon {
         let direct_workers_enabled =
             self.config.relay.effective_path_policy(true) != PathPolicy::RelayOnly;
 
+        if direct_workers_enabled && self.config.network.tcp_direct.is_some() {
+            self.task_manager
+                .spawn(
+                    "direct-tcp",
+                    false,
+                    crate::peer::tcp_direct::serve(
+                        self.peers.clone(),
+                        assigned_node_id.clone(),
+                        virtual_ip.clone(),
+                        self.control.room_authorization().await,
+                        network_inbound_tx.clone(),
+                        self.shutdown_rx.clone(),
+                    ),
+                )
+                .await;
+        }
+
         let udp_bind = self.config.network.udp_bind.parse().map_err(|e| {
             DaemonError::Config(format!(
                 "invalid network.udp_bind '{}': {e}",

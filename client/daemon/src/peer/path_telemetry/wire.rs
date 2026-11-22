@@ -89,6 +89,7 @@ pub struct PathTelemetryAckFrame {
 pub fn path_to_wire(path: Option<NetworkPath>) -> String {
     match path {
         Some(NetworkPath::Direct) => "direct".to_string(),
+        Some(NetworkPath::TcpDirect) => "tcp_direct".to_string(),
         Some(NetworkPath::Relay) => "relay".to_string(),
         None => "none".to_string(),
     }
@@ -98,6 +99,7 @@ pub fn path_to_wire(path: Option<NetworkPath>) -> String {
 pub fn opt_path_to_wire(path: Option<NetworkPath>) -> Option<String> {
     path.map(|p| match p {
         NetworkPath::Direct => "direct".to_string(),
+        NetworkPath::TcpDirect => "tcp_direct".to_string(),
         NetworkPath::Relay => "relay".to_string(),
     })
 }

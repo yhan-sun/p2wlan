@@ -99,18 +99,48 @@ impl Gateway {
         index: usize,
         from: SocketAddr,
         lease_owner: SocketAddr,
-    ) -> Option<SocketAddr> {
+    ) -> std::result::Result<SocketAddr, MappingDrop> {
         if index == self.sockets.len() {
-            return self.has_lease().then_some(lease_owner);
+            return self
+                .has_lease()
+                .then_some(lease_owner)
+                .ok_or(MappingDrop::NoMapping);
         }
-        self.mappings.lock().unwrap().iter().enumerate().find_map(
-            |(allocation, &(inside, remote))| {
-                (self.port_index(allocation) == index
-                    && (self.nat == NatKind::Cone || remote == from))
-                    .then_some(inside)
-            },
-        )
+        let mappings = self.mappings.lock().unwrap();
+        let (_, &(inside, remote)) = mappings
+            .iter()
+            .enumerate()
+            .find(|(allocation, _)| self.port_index(*allocation) == index)
+            .ok_or(MappingDrop::NoMapping)?;
+        if self.nat == NatKind::Cone || remote == from {
+            Ok(inside)
+        } else {
+            Err(MappingDrop::SourceMismatch(remote))
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MappingDrop {
+    NoMapping,
+    SourceMismatch(SocketAddr),
+}
+
+#[derive(Default)]
+struct ChallengeTrace {
+    attempted: usize,
+    admitted: usize,
+    no_source_port: usize,
+    no_mapping: usize,
+    source_mismatch: usize,
+    first_mismatch: Option<(SocketAddr, SocketAddr, SocketAddr)>,
+}
+
+struct InFlight {
+    arrives: tokio::time::Instant,
+    source: Arc<UdpSocket>,
+    destination: SocketAddr,
+    bytes: Vec<u8>,
 }
 
 struct LoopbackNetwork {
@@ -120,7 +150,7 @@ struct LoopbackNetwork {
     lose_first_challenge: bool,
     lost: [std::sync::atomic::AtomicBool; 2],
     stop_direct: std::sync::atomic::AtomicBool,
-    requests: std::sync::atomic::AtomicUsize,
+    traces: [std::sync::Mutex<ChallengeTrace>; 2],
 }
 
 impl LoopbackNetwork {
@@ -178,7 +208,28 @@ impl LoopbackNetwork {
                 let net = self.clone();
                 tasks.spawn(async move {
                     let mut packet = [0; 2048];
-                    while let Ok((size, inside_from)) = public.recv_from(&mut packet).await {
+                    let mut flight = std::collections::VecDeque::<InFlight>::new();
+                    loop {
+                        // Propagation delay starts at the socket read. A second
+                        // datagram may already be in flight before the first
+                        // one arrives. Each mapping retains at most 96 packets.
+                        let next = flight.front().map(|d| d.arrives);
+                        let read = tokio::select! {
+                            biased;
+                            () = async {
+                                if let Some(time) = next { tokio::time::sleep_until(time).await }
+                                else { std::future::pending().await }
+                            } => {
+                                let due = flight.pop_front().expect("scheduled datagram");
+                                if !net.stop_direct.load(Ordering::Acquire) {
+                                    due.source.send_to(&due.bytes, due.destination).await.unwrap();
+                                }
+                                continue;
+                            }
+                            read = public.recv_from(&mut packet), if flight.len() < 96 => read,
+                        };
+                        let Ok((size, inside_from)) = read else { break };
+                        let arrives = tokio::time::Instant::now() + net.transit;
                         let sender = 1 - side;
                         if !inside_from.ip().is_loopback() || inside_from == net.inside[side] {
                             continue;
@@ -186,21 +237,39 @@ impl LoopbackNetwork {
                         let challenge = size == p2pnet_nat::engine::FRAME_SIZE
                             && packet[..size].starts_with(b"P3")
                             && packet[2] == 1;
-                        if challenge {
-                            net.requests.fetch_add(1, Ordering::Relaxed);
-                        }
+                        let destination = public.local_addr().unwrap();
                         let Some(source) = net.gateways[sender].outbound(
                             inside_from,
-                            public.local_addr().unwrap(),
+                            destination,
                             net.inside[sender],
                         ) else {
+                            if challenge {
+                                let mut trace = net.traces[sender].lock().unwrap();
+                                trace.attempted += 1;
+                                trace.no_source_port += 1;
+                            }
                             continue;
                         };
-                        let Some(destination) = net.gateways[side].inbound(
-                            index,
-                            source.local_addr().unwrap(),
-                            net.inside[side],
-                        ) else {
+                        let observed = source.local_addr().unwrap();
+                        let decision =
+                            net.gateways[side].inbound(index, observed, net.inside[side]);
+                        if challenge {
+                            let mut trace = net.traces[sender].lock().unwrap();
+                            trace.attempted += 1;
+                            match decision {
+                                Ok(_) => trace.admitted += 1,
+                                Err(MappingDrop::NoMapping) => trace.no_mapping += 1,
+                                Err(MappingDrop::SourceMismatch(expected)) => {
+                                    trace.source_mismatch += 1;
+                                    trace.first_mismatch.get_or_insert((
+                                        destination,
+                                        observed,
+                                        expected,
+                                    ));
+                                }
+                            }
+                        }
+                        let Ok(destination) = decision else {
                             continue;
                         };
                         if net.stop_direct.load(Ordering::Acquire)
@@ -210,8 +279,12 @@ impl LoopbackNetwork {
                         {
                             continue;
                         }
-                        sleep(net.transit).await;
-                        source.send_to(&packet[..size], destination).await.unwrap();
+                        flight.push_back(InFlight {
+                            arrives,
+                            source,
+                            destination,
+                            bytes: packet[..size].to_vec(),
+                        });
                     }
                 });
             }
@@ -292,7 +365,7 @@ async fn matrix_case(
         lose_first_challenge,
         lost: Default::default(),
         stop_direct: Default::default(),
-        requests: Default::default(),
+        traces: Default::default(),
     });
     let stun = network.run(&mut tasks).await;
     let mut signals = Vec::new();
@@ -470,7 +543,23 @@ async fn matrix_case(
             );
         }
     }
-    let packets = network.requests.load(Ordering::Relaxed);
+    let mut packets = 0;
+    for (side, trace) in network.traces.iter().enumerate() {
+        let trace = trace.lock().unwrap();
+        packets += trace.attempted;
+        assert_eq!(
+            trace.attempted,
+            trace.admitted + trace.no_source_port + trace.no_mapping + trace.source_mismatch
+        );
+        if pair.is_none() {
+            eprintln!("NAT filter {:?} x {:?} sender={} attempted={} admitted={} no_source_port={} no_mapping={} source_mismatch={}",
+                kinds[0], kinds[1], PEERS[side], trace.attempted, trace.admitted, trace.no_source_port, trace.no_mapping, trace.source_mismatch);
+            if let Some((target, source, expected)) = trace.first_mismatch {
+                eprintln!("first filtered request sender={} destination={target} observed_source={source} allowed_source={expected} allowed_source_is_observer={}",
+                    PEERS[side], stun.contains(&expected));
+            }
+        }
+    }
     eprintln!(
         "NAT matrix {:?} x {:?} result={} UDP challenges={packets} gateway_pcp={gateway_pcp} elapsed_ms={}",
         kinds[0],

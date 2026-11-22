@@ -23,7 +23,12 @@ impl UdpTransport {
         lifecycle: PeerSessionGeneration,
         shutdown: Option<watch::Receiver<bool>>,
     ) -> bool {
-        if self.peers.negotiated_profile(peer).await.is_none() {
+        if self
+            .peers
+            .negotiated_profile(peer)
+            .await
+            .is_none_or(|p| p.tcp_only())
+        {
             return false;
         }
         if self.register_compact_receiver(peer).await.is_none() {

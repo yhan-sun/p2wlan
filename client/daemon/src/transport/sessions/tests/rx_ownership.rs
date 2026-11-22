@@ -186,3 +186,27 @@ async fn rx_ownership_malformed_and_unknown_receiver_have_no_authenticated_owner
     assert_eq!(s.total.unwrap().live_buffers, 0);
     assert!(!s.observed[ResidencyStage::RxAuthenticatedPlaintext as usize]);
 }
+
+#[tokio::test]
+async fn tcp_reader_peer_is_checked_before_consuming_the_wireguard_counter() {
+    let (transport, _) = WireGuardTransport::new();
+    let (mut remote, local) = pair(73);
+    transport.add_session("session-owner", local).await;
+    let wire = remote
+        .encrypt_to_bytes(b"ordered application payload")
+        .unwrap();
+    let mismatched = transport
+        .decrypt_inbound_for_peer(&wire, Some("other-reader"))
+        .await;
+    assert!(!matches!(mismatched, Ok(Some(_))));
+    let received = transport
+        .decrypt_inbound_for_peer(&wire, Some("session-owner"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.packet.peer_id, "session-owner");
+    assert_eq!(received.packet.packet, b"ordered application payload");
+    assert!(
+        matches!(transport.decrypt_inbound_for_peer(&wire, Some("session-owner")).await, Err(error) if error.is_replay())
+    );
+}

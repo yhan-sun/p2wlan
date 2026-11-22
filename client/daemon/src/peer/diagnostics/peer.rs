@@ -245,7 +245,17 @@ impl PeerDiagnostics {
                 {
                     Some(NetworkPath::Relay)
                 }
-                Some(NetworkPath::Relay) if relay_peer_confirmed => Some(NetworkPath::Relay),
+                Some(NetworkPath::TcpDirect)
+                    if conn
+                        .tcp_path
+                        .as_ref()
+                        .is_some_and(|p| p.current(conn, local_generation)) =>
+                {
+                    Some(NetworkPath::TcpDirect)
+                }
+                Some(NetworkPath::Relay | NetworkPath::TcpDirect) if relay_peer_confirmed => {
+                    Some(NetworkPath::Relay)
+                }
                 _ => None,
             },
             None => match conn.active_path() {
@@ -451,10 +461,11 @@ impl PeerDiagnostics {
                 Some(("ipv6_direct", 2))
             }
             Some(NetworkPath::Direct) => Some(("udp_direct", 3)),
+            Some(NetworkPath::TcpDirect) => Some(("tcp_direct", 4)),
             None => None,
         };
         Self {
-            remote_nat_profile: negotiated.map(|p| p.profile.clone()),
+            remote_nat_profile: negotiated.and_then(|p| p.profile.clone()),
             punch_mode: run.map(|r| r.mode),
             punch_metrics: run
                 .map(|r| {

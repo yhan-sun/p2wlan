@@ -605,18 +605,10 @@ impl Daemon {
         fresh_punch: FreshPunchDecision,
         reservation: &mut CandidateOfferWorkReservation,
     ) -> HardHardOfferHandling {
-        if let Some(profile) = offer.nat_profile.clone() {
-            self.peers
-                .stage_punch_profile(
-                    &offer.from_node_id,
-                    profile,
-                    offer.sender_public_key.as_deref(),
-                    offer.candidate_generation,
-                    offer.candidates_expires_at_ms,
-                    (offer.network_generation, offer.peer_session_generation),
-                )
-                .await;
-        }
+        self.peers.stage_candidate_punch_signal(
+            &offer.from_node_id, (offer.nat_profile.clone(), offer.candidates.is_empty()),
+            offer.sender_public_key.as_deref(), offer.candidate_generation, offer.candidates_expires_at_ms,
+            (offer.network_generation, offer.peer_session_generation)).await;
         let hard_hard_handling =
             if let Some(repeated) = self.handle_hard_hard_repeated_signal(offer).await {
                 repeated
@@ -706,18 +698,10 @@ impl Daemon {
         candidate_apply_result: CandidateSetApplyResult,
         fresh_punch: FreshPunchDecision,
     ) {
-        if let Some(profile) = offer.nat_profile.clone() {
-            self.peers
-                .stage_punch_profile(
-                    &offer.from_node_id,
-                    profile,
-                    offer.sender_public_key.as_deref(),
-                    offer.candidate_generation,
-                    offer.candidates_expires_at_ms,
-                    (offer.network_generation, offer.peer_session_generation),
-                )
-                .await;
-        }
+        self.peers.stage_candidate_punch_signal(
+            &offer.from_node_id, (offer.nat_profile.clone(), offer.candidates.is_empty()),
+            offer.sender_public_key.as_deref(), offer.candidate_generation, offer.candidates_expires_at_ms,
+            (offer.network_generation, offer.peer_session_generation)).await;
         let hard_hard_handling =
             if let Some(repeated) = self.handle_hard_hard_repeated_signal(offer).await {
                 repeated

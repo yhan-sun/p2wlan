@@ -179,6 +179,7 @@ pub struct PeerConnection {
     /// freshness fence; authenticated candidate/path evidence remains the
     /// authority for promotion.
     pub remote_nat_profile: Option<RemoteNatProfile>,
+    pub(crate) tcp_path: Option<Arc<crate::peer::tcp_direct::TcpPath>>,
     pub(crate) punch_run: Option<Arc<crate::peer::PeerPunchRun>>,
     pub(crate) negotiated_punch: Option<crate::peer::NegotiatedPunchProfile>,
     /// Remote profile context captured when the profile was accepted. Age
@@ -629,6 +630,7 @@ impl PeerConnection {
             nat_type: String::new(),
             remote_nat_profile: None,
             negotiated_punch: None,
+            tcp_path: None,
             punch_run: None,
             remote_nat_profile_candidate_epoch: None,
             online: true,

@@ -131,6 +131,7 @@ impl NativeFrameOutcome {
             },
             physical_path: match self.outcome {
                 Outcome::Fresh(receipt) => Some(match receipt.path {
+                    crate::peer::NetworkPath::TcpDirect => "tcp_direct",
                     crate::peer::NetworkPath::Direct => "udp",
                     crate::peer::NetworkPath::Relay => "relay",
                 }),

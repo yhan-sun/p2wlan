@@ -466,6 +466,7 @@ type RelayProbeSnapshotTestGateSlot =
 
 /// Manages all peer connections.
 pub struct PeerManager {
+    tcp_listener: std::sync::Mutex<Option<Arc<tcp_direct::Publication>>>,
     advertised_punch_profile: std::sync::Mutex<Option<negotiated_punch::AdvertisedPunchProfile>>,
     /// Control-plane-resolved local node ID used by deterministic traversal
     /// role selection. Managed registration can replace the persisted short

@@ -86,3 +86,28 @@ func TestNegotiatedProfileRejectsInvalidCandidates(t *testing.T) {
 		}
 	}
 }
+
+func TestNegotiatedTCPOnlyOfferWithEmptyUDPList(t *testing.T) {
+	data, err := os.ReadFile("../../contracts/fixtures/negotiated_tcp_only_signal.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signal Signal
+	if err := json.Unmarshal(data, &signal); err != nil {
+		t.Fatal(err)
+	}
+	profile := signal.NATProfile
+	if profile == nil || profile.Validate() != nil || profile.PortHint != 0 || profile.SupportsSymPunch || len(profile.TCPCandidates) != 1 || len(signal.Candidates) != 0 {
+		t.Fatal("invalid TCP-only offer")
+	}
+	db := openSignalLeaseDB(t)
+	a, b := createLeasePair(t, db)
+	_, err = db.CreateAuthorizedSignalWithProfile(profile, a, b, signal.Type, 0, signal.Candidates, nil, "", 0, signal.CandidateGeneration, time.Now().Add(30*time.Second).UnixMilli(), "paired", "", "sender-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, _, err := db.ListSignalsWithLease(b)
+	if err != nil || len(rows) != 1 || len(rows[0].Candidates) != 0 || !reflect.DeepEqual(rows[0].NATProfile, profile) {
+		t.Fatalf("TCP-only signal delivery: %#v, %v", rows, err)
+	}
+}

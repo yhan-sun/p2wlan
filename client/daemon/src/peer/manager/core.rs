@@ -42,6 +42,7 @@ impl PeerManager {
             tokio::sync::watch::channel(Arc::new(HashMap::<String, String>::new()));
         let (local_mtu_feedback_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
+            tcp_listener: Default::default(),
             advertised_punch_profile: Default::default(),
             local_node_id_for_traversal: std::sync::RwLock::new(config.node.node_id.clone()),
             connections: Arc::new(ConnectionsTable::new(HashMap::new())),

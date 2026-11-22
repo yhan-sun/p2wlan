@@ -111,6 +111,15 @@ impl PunchProfile {
         profile.valid().then_some(profile)
     }
 
+    /// A TCP listener can be offered even when UDP observation failed.
+    pub fn tcp_only(&self) -> bool {
+        self.nat_type == NatKind::None
+            && self.port_hint == 0
+            && !self.supports_sym_punch
+            && self.upnp_mapped_addr.is_none()
+            && !self.tcp_candidates.is_empty()
+    }
+
     pub fn valid(&self) -> bool {
         let endpoint = |a: &SocketAddr| {
             a.port() != 0

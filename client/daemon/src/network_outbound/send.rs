@@ -1210,6 +1210,37 @@ async fn send_encrypted_packet_once_with_origin(
                 }
             };
         }
+        if selection.path == Some(NetworkPath::TcpDirect)
+            && packet.binding().is_none()
+            && packet.is_business
+        {
+            use crate::peer::tcp_direct::WriteFailure;
+            match peers
+                .write_tcp_business(
+                    packet,
+                    generation,
+                    relay_available || relay_expected,
+                    prefer_direct,
+                )
+                .await
+            {
+                Ok(()) => return SendOutcome::Sent,
+                Err(WriteFailure::Partial) => {
+                    return SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
+                        reason: "TCP_DIRECT_PARTIAL_WRITE",
+                        err: "retired a stream after a partial frame".into(),
+                    })
+                }
+                Err(WriteFailure::Unauthorized) => {
+                    return SendOutcome::DirectBudgetStale {
+                        reason: "direct TCP packet authorization changed".into(),
+                    }
+                }
+                // Neither case handed a byte to TCP. The existing confirmed
+                // Relay handoff below can still carry this counter exactly once.
+                Err(WriteFailure::Unavailable | WriteFailure::Busy) => {}
+            }
+        }
         if packet.has_original_echo() && selection.path == Some(NetworkPath::Direct) {
             let result = match (
                 udp.as_ref(),

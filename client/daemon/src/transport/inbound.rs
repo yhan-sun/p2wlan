@@ -161,7 +161,22 @@ impl WireGuardTransport {
                 "encrypted datagram reached the daemon transport decrypt boundary"
             );
             let decrypt_started = Instant::now();
-            match self.decrypt_inbound_with_source(&packet.wire_bytes).await {
+            let tcp_link = physical_ingress.as_ref().and_then(|p| p.tcp_link());
+            let expected_peer = if let Some(link) = tcp_link {
+                let Some(manager) = peers.as_ref() else {
+                    continue;
+                };
+                let Some(peer) = manager.tcp_ingress_peer(link).await else {
+                    continue;
+                };
+                Some(peer)
+            } else {
+                None
+            };
+            match self
+                .decrypt_inbound_for_peer(&packet.wire_bytes, expected_peer)
+                .await
+            {
                 Ok(Some(DecryptedInboundWithSource {
                     packet: owned_inbound,
                     source: original_session_source,
@@ -169,6 +184,14 @@ impl WireGuardTransport {
                     let parts = owned_inbound.into_parts();
                     let plaintext_resources = parts.0;
                     let mut inbound = parts.1;
+                    if let Some(link) = tcp_link {
+                        let Some(owner) = peers.as_ref() else {
+                            continue;
+                        };
+                        if !owner.tcp_ingress_current(&inbound.peer_id, link).await {
+                            continue;
+                        }
+                    }
                     let overlay_source = overlay_origin
                         .map(|origin| origin.authenticated(original_session_source.clone()));
                     #[cfg(test)]
@@ -1257,6 +1280,7 @@ impl WireGuardTransport {
                                             format!("peer:{}:{generation}", inbound.peer_id);
                                         let path_label = match path {
                                             crate::peer::NetworkPath::Relay => "relay",
+                                            crate::peer::NetworkPath::TcpDirect => "tcp_direct",
                                             crate::peer::NetworkPath::Direct => "direct",
                                         };
                                         let first_usable_result = if first_usable_recorded {
@@ -1348,6 +1372,7 @@ impl WireGuardTransport {
                                             },
                                             Some(match path {
                                                 crate::peer::NetworkPath::Relay => "relay",
+                                                crate::peer::NetworkPath::TcpDirect => "tcp_direct",
                                                 crate::peer::NetworkPath::Direct => "direct",
                                             }),
                                             Some(if session_guard_contended {

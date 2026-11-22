@@ -235,10 +235,12 @@ async fn handle_native_overlay_ack(
     stats.received_valid = stats.received_valid.saturating_add(1);
     stats.verified_round_trips = stats.verified_round_trips.saturating_add(1);
     let path = match receipt.path {
+        crate::peer::NetworkPath::TcpDirect => "tcp_direct",
         crate::peer::NetworkPath::Direct => "direct",
         crate::peer::NetworkPath::Relay => "relay",
     };
     let ingress = match receipt.path {
+        crate::peer::NetworkPath::TcpDirect => "tcp_direct".to_string(),
         crate::peer::NetworkPath::Direct => "direct".to_string(),
         crate::peer::NetworkPath::Relay => format!(
             "relay:{}",

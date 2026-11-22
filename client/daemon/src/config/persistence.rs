@@ -66,6 +66,7 @@ impl Config {
                 mtu: default_mtu(),
                 netmask: default_netmask(),
                 interface: default_interface(),
+                tcp_direct: None,
                 udp_bind: default_udp_bind(),
                 udp_advertise: None,
                 stun_servers: Vec::new(),

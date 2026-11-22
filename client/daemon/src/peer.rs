@@ -735,4 +735,5 @@ include!("peer/utils.rs");
 mod tests;
 
 mod negotiated_punch;
+pub(crate) mod tcp_direct;
 pub(crate) use negotiated_punch::{NegotiatedPunchProfile, PeerPunchRun};

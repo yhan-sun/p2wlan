@@ -566,6 +566,16 @@ fn read_windows_option<S: UdpSocketRaw>(socket: &S, level: i32, option: i32) -> 
 /// Loopback destinations deliberately ignore the interface so local control
 /// and test servers remain reachable.
 pub async fn connect_tcp_addr(addr: SocketAddr, interface: Option<&str>) -> io::Result<TcpStream> {
+    connect_tcp_from(addr, None, interface).await
+}
+
+/// Connect from a specific local interface address using an ephemeral source
+/// port. The same VPN socket protection and interface policy apply as for Relay.
+pub async fn connect_tcp_from(
+    addr: SocketAddr,
+    source: Option<IpAddr>,
+    interface: Option<&str>,
+) -> io::Result<TcpStream> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     protect_android_socket(&socket)?;
     if addr.is_ipv6() {
@@ -577,6 +587,9 @@ pub async fn connect_tcp_addr(addr: SocketAddr, interface: Option<&str>) -> io::
         }
     }
     socket.set_nonblocking(true)?;
+    if let Some(ip) = source {
+        socket.bind(&SocketAddr::new(ip, 0).into())?;
+    }
     let stream: std::net::TcpStream = socket.into();
     TcpSocket::from_std_stream(stream).connect(addr).await
 }

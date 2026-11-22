@@ -1459,10 +1459,9 @@ impl Daemon {
                                     false,
                                 )
                                 .await;
-                            if let Some(profile) = nat_profile {
-                                self.peers.stage_punch_profile(&from_node_id, profile, sender_public_key.as_deref(),
-                                    candidate_generation, candidates_expires_at_ms, profile_owner).await;
-                            }
+                            self.peers.stage_candidate_punch_signal(&from_node_id, (nat_profile, candidates.is_empty()), sender_public_key.as_deref(),
+                                candidate_generation, candidates_expires_at_ms, profile_owner).await;
+
                             if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
                                 info!(
                                     "Control signal phase=state_committed id={} type={} seq={:?} commit=candidate_refresh result={:?}",

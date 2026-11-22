@@ -272,25 +272,7 @@ impl PeerManager {
         let same_incarnation = candidate_incarnation.is_some()
             && candidate_incarnation
                 == crate::control::candidate_generation_incarnation(conn.last_candidate_generation);
-        if candidate_generation != 0 {
-            conn.last_candidate_generation = candidate_generation;
-            self.record_remote_candidate_generation_replay_floor(
-                node_id,
-                &conn.public_key,
-                candidate_generation,
-            );
-        }
-        if let Some(incarnation) = candidate_incarnation {
-            conn.remote_candidate_incarnation_high_water = Some(
-                conn.remote_candidate_incarnation_high_water
-                    .map_or(incarnation, |accepted| accepted.max(incarnation)),
-            );
-            self.record_remote_candidate_incarnation_high_water(
-                node_id,
-                &conn.public_key,
-                incarnation,
-            );
-        }
+        self.record_candidate_revision(conn, candidate_generation);
         conn.last_candidates_expires_at_ms = candidates_expires_at_ms;
 
         // `candidate_generation` is a freshness revision, not proof that the
@@ -529,5 +511,32 @@ impl PeerManager {
             }
         }
         CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::Applied)
+    }
+}
+
+impl PeerManager {
+    fn record_candidate_revision(&self, conn: &mut PeerConnection, candidate_generation: u64) {
+        let node_id = conn.node_id.as_str();
+        let candidate_incarnation =
+            crate::control::candidate_generation_incarnation(candidate_generation);
+        if candidate_generation != 0 {
+            conn.last_candidate_generation = candidate_generation;
+            self.record_remote_candidate_generation_replay_floor(
+                node_id,
+                &conn.public_key,
+                candidate_generation,
+            );
+        }
+        if let Some(incarnation) = candidate_incarnation {
+            conn.remote_candidate_incarnation_high_water = Some(
+                conn.remote_candidate_incarnation_high_water
+                    .map_or(incarnation, |accepted| accepted.max(incarnation)),
+            );
+            self.record_remote_candidate_incarnation_high_water(
+                node_id,
+                &conn.public_key,
+                incarnation,
+            );
+        }
     }
 }

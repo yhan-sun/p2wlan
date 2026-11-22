@@ -327,3 +327,18 @@ fn json_contract_shared_with_go_and_legacy_defaults() {
     assert!(!settings.lazy_p2p);
     assert!(settings.firewall_probe_addresses.is_empty());
 }
+
+#[test]
+fn tcp_only_signal_round_trips_without_manufacturing_a_udp_endpoint() {
+    let signal: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../contracts/fixtures/negotiated_tcp_only_signal.json"
+    ))
+    .unwrap();
+    let profile: PunchProfile = serde_json::from_value(signal["nat_profile"].clone()).unwrap();
+    assert!(profile.valid() && profile.tcp_only());
+    assert!(signal["candidates"].as_array().unwrap().is_empty());
+    assert_eq!(
+        serde_json::to_value(profile).unwrap(),
+        signal["nat_profile"]
+    );
+}

@@ -80,6 +80,12 @@ CLI 的 `--prefer-direct` 与 `relay-policy=direct` 选择 Direct-first；显式
 
 `p2wlan doctor` 显示两端 NAT 画像、队列长度、近期实际发包量及路径成本。UDP 可达性为 `unknown`、`available` 或 `blocked`。同一网络上的对端共享观察结果。观察点探测判为阻断时记录 `UDP_BLOCKED`，业务可继续使用已确认的 TLS Relay。业务唤醒后的下一次检查会先访问配置的 STUN 观察点，收到有效回应后才恢复向对端发送 UDP 探测。没有配置观察点时保留 `unknown`。
 
+### 双方配置的 TCP 直连
+
+客户端配置的 `network.tcp_direct` 默认省略。两端各自配置 `listen` 为本机接口地址和 TCP 端口，并在 `peers` 对象中填入对端的节点 ID 与允许连接的完整 TCP 地址。若网关已经为监听器配置端口转发，`advertise` 可填写对应的外部地址。每个客户端最多配置 32 个对端，网络需要允许该 TCP 连接。
+
+监听成功后，节点只向已配置的对端发布地址。节点 ID 字典序较小的一端发起连接。两端核对信令候选、会话身份并完成两轮认证后，路径可承载 WireGuard 业务。诊断字段 `active_path_type` 为 `tcp_direct`，成本为 4。链路关闭、会话更换、候选撤回或过期时，已确认的 Relay 可以接续业务。`relay-only` 禁用 TCP 直连。
+
 ### 网络实验开关
 
 | 配置 | 生效条件 |

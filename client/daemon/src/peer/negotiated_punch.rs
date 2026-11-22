@@ -13,7 +13,7 @@ pub(super) struct AdvertisedPunchProfile {
 /// it requires the candidate owner to have accepted that exact generation.
 #[derive(Debug, Clone)]
 pub(crate) struct NegotiatedPunchProfile {
-    pub(crate) profile: PunchProfile,
+    pub(crate) profile: Option<PunchProfile>,
     network: u64,
     session: PeerSessionGeneration,
     sender: String,
@@ -23,7 +23,8 @@ pub(crate) struct NegotiatedPunchProfile {
 
 impl NegotiatedPunchProfile {
     pub(super) fn current(&self, conn: &PeerConnection, network: u64) -> bool {
-        self.network == network
+        self.profile.is_some()
+            && self.network == network
             && conn.online
             && conn
                 .path_state_machine
@@ -69,6 +70,7 @@ impl PeerManager {
         Some(offer)
     }
 
+    #[cfg(test)]
     pub(crate) async fn stage_punch_profile(
         &self,
         peer: &str,
@@ -78,10 +80,41 @@ impl PeerManager {
         expires_ms: Option<u64>,
         owner: (u64, Option<PeerSessionGeneration>),
     ) {
+        self.stage_candidate_punch_signal(
+            peer,
+            (Some(profile), false),
+            sender,
+            revision,
+            expires_ms,
+            owner,
+        )
+        .await;
+    }
+
+    pub(crate) async fn stage_candidate_punch_signal(
+        &self,
+        peer: &str,
+        (profile, udp_candidates_empty): (Option<PunchProfile>, bool),
+        sender: Option<&str>,
+        revision: u64,
+        expires_ms: Option<u64>,
+        owner: (u64, Option<PeerSessionGeneration>),
+    ) {
         let (network, Some(session)) = owner else {
             return;
         };
-        let mut table = self.connections.write().await;
+        let pinned = self
+            .config
+            .network
+            .tcp_direct
+            .as_ref()
+            .and_then(|cfg| cfg.peers.get(peer));
+        // A normal candidate revision already retires the previous profile.
+        // Legacy signals and unconfigured peers need no extra writer turn.
+        if profile.is_none() && (!udp_candidates_empty || pinned.is_none()) {
+            return;
+        }
+        let (_epoch, mut table) = self.lock_epoch_and_connections_write().await;
         if network != self.current_network_generation_sync()
             || !self.peer_session_is_current_sync(peer, session)
         {
@@ -100,12 +133,46 @@ impl PeerManager {
             || !conn.online
             || conn.public_key.is_empty()
             || sender != Some(&conn.public_key)
-            || revision != conn.last_candidate_generation()
-            || !profile.valid()
+            || revision < conn.last_candidate_generation()
+            || profile.as_ref().is_some_and(|profile| !profile.valid())
             || conn.negotiated_punch.as_ref().is_some_and(|p| {
                 p.network == network && p.session == session && p.candidate_generation >= revision
             })
         {
+            return;
+        }
+        if revision > conn.last_candidate_generation() {
+            // UDP's empty-list rule preserves existing UDP routes. Only a
+            // named TCP peer can advance the shared replay floor without UDP.
+            let permitted = pinned.is_some_and(|pin| {
+                profile
+                    .as_ref()
+                    .is_some_and(|p| p.tcp_only() && p.tcp_candidates.contains(pin))
+            });
+            let withdrawing = pinned.is_some_and(|pin| {
+                conn.negotiated_punch
+                    .as_ref()
+                    .and_then(|p| p.profile.as_ref())
+                    .is_some_and(|p| p.tcp_candidates.contains(pin))
+                    && profile
+                        .as_ref()
+                        .is_none_or(|p| !p.tcp_candidates.contains(pin))
+            });
+            if !udp_candidates_empty
+                || !(permitted || withdrawing)
+                || crate::control::candidate_generation_is_malformed_encoded(revision)
+                || crate::control::candidate_generation_incarnation(revision).is_some_and(
+                    |incoming| {
+                        conn.remote_candidate_incarnation_high_water
+                            .is_some_and(|accepted| incoming < accepted)
+                    },
+                )
+            {
+                return;
+            }
+            self.record_candidate_revision(conn, revision);
+        }
+        if profile.is_none() && conn.negotiated_punch.is_none() {
             return;
         }
         conn.negotiated_punch = Some(NegotiatedPunchProfile {
@@ -125,6 +192,7 @@ impl PeerManager {
         offered
             .current(conn, self.current_network_generation_sync())
             .then(|| offered.profile.clone())
+            .flatten()
     }
 }
 
@@ -156,7 +224,7 @@ impl PeerManager {
             })
             .collect();
         addresses.sort_unstable();
-        Some((offered.profile.clone(), addresses))
+        Some((offered.profile.clone()?, addresses))
     }
 
     pub(crate) fn configured_firewall_targets(&self) -> Vec<String> {
@@ -243,6 +311,9 @@ impl PeerManager {
         lifecycle: PeerSessionGeneration,
     ) -> Option<Arc<PeerPunchRun>> {
         let remote = self.negotiated_profile(peer).await?;
+        if remote.tcp_only() {
+            return None;
+        }
         let settings = self.punch_settings();
         if settings.max_punch_pps == 0 {
             return None;
@@ -279,7 +350,7 @@ impl PeerManager {
             || !conn
                 .negotiated_punch
                 .as_ref()
-                .is_some_and(|p| p.current(conn, network) && p.profile == remote)
+                .is_some_and(|p| p.current(conn, network) && p.profile.as_ref() == Some(&remote))
         {
             return None;
         }

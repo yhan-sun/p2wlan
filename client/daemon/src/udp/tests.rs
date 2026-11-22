@@ -181,3 +181,6 @@ mod negotiated_relay;
 
 #[path = "tests/negotiated_matrix.rs"]
 mod negotiated_matrix;
+
+#[path = "tests/negotiated_tcp.rs"]
+mod negotiated_tcp;
