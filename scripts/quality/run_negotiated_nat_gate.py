@@ -12,7 +12,8 @@ TEST = "udp::tests::negotiated_matrix::negotiated_rootless_nat_matrix"
 KINDS = ("Cone", "LinearSymmetric", "RandomSymmetric")
 ROW = re.compile(
     r"NAT matrix (\w+) x (\w+) result=(bidirectional authenticated UDP|relay) "
-    r"UDP challenges=(\d+) gateway_pcp=false gateway_lease=none\b"
+    r"UDP challenges=(\d+) gateway_pcp=false gateway_lease=none "
+    r"endpoint_receipts=([012])/2 wg_business=([012])/2\b"
 )
 
 
@@ -30,11 +31,14 @@ def main() -> int:
 
     expected = set(itertools.product(KINDS, repeat=2))
     observed = {}
-    for a, b, path, requests in ROW.findall(result.stdout):
+    for a, b, path, requests, receipts, business in ROW.findall(result.stdout):
         if (a, b) not in expected or (a, b) in observed:
             print(f"G4 invalid or duplicate measurement for {a} x {b}", file=sys.stderr)
             return 1
         observed[a, b] = path == "bidirectional authenticated UDP"
+        if observed[a, b] and (receipts, business) != ("2", "2"):
+            print(f"G4 missing bilateral endpoint or business evidence for {a} x {b}", file=sys.stderr)
+            return 1
         if not 1 <= int(requests) <= 96:
             print(f"G4 invalid challenge budget for {a} x {b}", file=sys.stderr)
             return 1

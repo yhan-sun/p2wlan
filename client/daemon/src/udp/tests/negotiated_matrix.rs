@@ -556,10 +556,18 @@ async fn matrix_case(
     }
     drop(setup);
     let started = tokio::time::Instant::now();
+    let mut received_receipts = [None; 2];
     let pair = timeout(Duration::from_secs(125), async {
         loop {
             let left = peers[0].get_connection(PEERS[1]).await.unwrap();
             let right = peers[1].get_connection(PEERS[0]).await.unwrap();
+            for (i, conn) in [&left, &right].into_iter().enumerate() {
+                if let Some(receipt) =
+                    conn.observed_udp_endpoints(peers[i].current_network_generation_sync())
+                {
+                    received_receipts[i] = Some(receipt);
+                }
+            }
             if left.direct_health.success_count > 0 && right.direct_health.success_count > 0 {
                 break Some([left.endpoint.unwrap(), right.endpoint.unwrap()]);
             }
@@ -575,9 +583,28 @@ async fn matrix_case(
     })
     .await
     .expect("each worker must find a pair or stop within the traversal budget");
+    let mut business_directions = 0;
     if let Some(endpoints) = pair {
+        // Read only the clients' authenticated receipts. Neither side learns
+        // an address from the simulated gateway's allocation or filter trace.
+        let evidence = timeout(Duration::from_secs(2), async {
+            loop {
+                let (a, b) = tokio::join!(peers[0].diagnostics(), peers[1].diagnostics());
+                if let (Some(left), Some(right)) =
+                    (a[0].udp_session_endpoints, b[0].udp_session_endpoints)
+                {
+                    break [left, right];
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both clients must receive matching endpoint receipts");
         for i in 0..2 {
             let j = 1 - i;
+            assert_eq!(evidence[i].remote_source, endpoints[i]);
+            assert_eq!(evidence[i].local_as_seen_by_peer, evidence[j].remote_source);
+            received_receipts[i] = Some(evidence[i]);
             let payload = Ipv4Packet::build_icmp_echo_request(
                 VIP[i].parse().unwrap(),
                 VIP[j].parse().unwrap(),
@@ -598,10 +625,12 @@ async fn matrix_case(
                 .unwrap()
                 .unwrap();
             assert_eq!(received.source, Some(endpoints[j]));
+            assert_eq!(received.socket_index, Some(evidence[j].socket_index));
             assert_eq!(
                 wg[j].decrypt_from_bytes(&received.wire_bytes).unwrap(),
                 payload
             );
+            business_directions += 1;
             // Commit the witnessed endpoint only after receiving and decrypting
             // a real WG packet from it, then query the actual path selector.
             peers[j]
@@ -620,6 +649,7 @@ async fn matrix_case(
             );
         }
     }
+    let receipt_sides = received_receipts.iter().flatten().count();
     let mut packets = 0;
     for (side, trace) in network.traces.iter().enumerate() {
         let trace = trace.lock().unwrap();
@@ -638,7 +668,7 @@ async fn matrix_case(
         }
     }
     eprintln!(
-        "NAT matrix {:?} x {:?} result={} UDP challenges={packets} gateway_pcp={} gateway_lease={} elapsed_ms={}",
+        "NAT matrix {:?} x {:?} result={} UDP challenges={packets} gateway_pcp={} gateway_lease={} endpoint_receipts={receipt_sides}/2 wg_business={business_directions}/2 elapsed_ms={}",
         kinds[0],
         kinds[1],
         if pair.is_some() {

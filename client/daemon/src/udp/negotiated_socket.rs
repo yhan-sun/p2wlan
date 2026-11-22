@@ -1,6 +1,6 @@
 use super::*;
 use crate::peer::PeerPunchRun;
-use p2pnet_nat::engine::{Lane, PunchTarget, FRAME_SIZE};
+use p2pnet_nat::engine::{EndpointReceipt, Lane, PunchTarget, ENDPOINT_RECEIPT_SIZE, FRAME_SIZE};
 use tokio::sync::OwnedSemaphorePermit;
 
 /// One alternate source port for the same published destination, after the
@@ -31,12 +31,7 @@ impl RoundSocket {
             .clone()
             .try_acquire_owned()
             .ok()?;
-        if !address.is_ipv4()
-            || transport
-                .peers
-                .with_punch_run(peer, address, epoch, |_, _| ())
-                .is_none()
-        {
+        if !address.is_ipv4() {
             return None;
         }
         let (index, socket) = transport.bind_fresh_punch_socket().await.ok()?;
@@ -47,7 +42,7 @@ impl RoundSocket {
         };
         transport
             .peers
-            .with_punch_run(peer, address, epoch, |_, current| {
+            .with_punch_run(peer, target, epoch, |_, current| {
                 (std::ptr::eq(current, run.as_ref())
                     && run.pacer.enqueue(epoch, Lane::Predicted, target))
                 .then_some(())
@@ -82,13 +77,7 @@ impl RoundSocket {
         else {
             return;
         };
-        match udp.try_send_compact_challenge(
-            peer,
-            self.target.address,
-            self.epoch,
-            &bytes,
-            &self.socket,
-        ) {
+        match udp.try_send_compact_challenge(peer, self.target, self.epoch, &bytes, &self.socket) {
             Ok(_) => {
                 self.pending = Some((nonce, bytes, tokio::time::Instant::now()));
                 self.answered_request = false;
@@ -110,11 +99,21 @@ impl RoundSocket {
             self.pending = None;
             return;
         }
-        let mut bytes = [0u8; FRAME_SIZE + 1];
-        let Ok((FRAME_SIZE, source)) = self.socket.try_recv_from(&mut bytes) else {
+        if self.handoff.is_some() {
+            return;
+        }
+        let mut bytes = [0u8; ENDPOINT_RECEIPT_SIZE + 1];
+        let Ok((size, source)) = self.socket.try_recv_from(&mut bytes) else {
             return;
         };
         if self.target.address != source {
+            return;
+        }
+        if bytes[..size].starts_with(&EndpointReceipt::MAGIC) {
+            udp.receive_endpoint_receipt(&bytes[..size], self.target);
+            return;
+        }
+        if size != FRAME_SIZE {
             return;
         }
         let Some(ingress) = udp.decode_compact(&bytes[..FRAME_SIZE]).await else {
@@ -126,10 +125,16 @@ impl RoundSocket {
             if !self.answered_request {
                 self.answered_request = udp
                     .peers
-                    .with_punch_run(peer, source, u64::from(self.epoch), |_, current| {
+                    .with_punch_run(peer, self.target, u64::from(self.epoch), |_, current| {
                         std::ptr::eq(current, self.run.as_ref())
                             && udp
-                                .send_compact_reply(&ingress, &self.socket, reply, source)
+                                .send_compact_reply(
+                                    &ingress,
+                                    &self.socket,
+                                    reply,
+                                    source,
+                                    Some(self.target.socket),
+                                )
                                 .is_ok()
                     })
                     .unwrap_or(false);
@@ -139,13 +144,10 @@ impl RoundSocket {
         if !ingress.matches_challenge(peer, *nonce) {
             return;
         }
-        let Some((nonce, challenge, _)) = self.pending.take() else {
+        let Some((_, challenge, _)) = self.pending.take() else {
             return;
         };
-        if !udp
-            .peers
-            .confirm_compact_response(peer, source, self.target.socket, self.epoch, nonce)
-        {
+        if !udp.confirm_compact_pair(&ingress, self.target, &self.socket) {
             return;
         }
         let network = udp.peers.current_network_generation_sync();
@@ -169,7 +171,7 @@ impl RoundSocket {
             !udp.peers.is_direct_sync(peer)
                 && udp
                     .peers
-                    .with_punch_run(peer, source, u64::from(self.epoch), |conn, run| {
+                    .with_punch_run(peer, self.target, u64::from(self.epoch), |conn, run| {
                         std::ptr::eq(run, self.run.as_ref())
                             && conn.compact_datagram_is_current(
                                 udp.local_node_id.as_deref().unwrap_or_default(),

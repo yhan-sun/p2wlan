@@ -15,6 +15,7 @@ type PunchProfile struct {
 	UPnPMappedAddr      *netip.AddrPort  `json:"upnp_mapped_addr"`
 	TCPCandidates       []netip.AddrPort `json:"tcp_candidates,omitempty"`
 	TCPSimultaneousOpen bool             `json:"tcp_simultaneous_open,omitempty"`
+	UDPEndpointReceipts bool             `json:"udp_endpoint_receipts,omitempty"`
 	SupportsSymPunch    bool             `json:"supports_sym_punch"`
 }
 

@@ -183,7 +183,7 @@ impl UdpTransport {
                     };
                     if self
                         .peers
-                        .with_punch_run(peer, target.address, epoch, |_, _| ())
+                        .with_punch_run(peer, target, epoch, |_, _| ())
                         .is_none()
                     {
                         continue;

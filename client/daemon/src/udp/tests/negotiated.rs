@@ -7,6 +7,14 @@ async fn negotiated_receiver(
     linear: bool,
     configure: impl FnOnce(&mut Config),
 ) -> (UdpTransport, UdpSocket, CompactSession) {
+    negotiated_receiver_with_receipts(linear, false, configure).await
+}
+
+async fn negotiated_receiver_with_receipts(
+    linear: bool,
+    udp_endpoint_receipts: bool,
+    configure: impl FnOnce(&mut Config),
+) -> (UdpTransport, UdpSocket, CompactSession) {
     let local = NodeIdentity::generate();
     let remote = NodeIdentity::generate();
     let public_key = hex::encode(remote.public_key());
@@ -67,6 +75,7 @@ async fn negotiated_receiver(
         port_step: i32::from(linear),
         port_hint: address.port(),
         supports_sym_punch: true,
+        udp_endpoint_receipts,
         ..PunchProfile::default()
     };
     peers
@@ -123,6 +132,144 @@ async fn read_compact(socket: &UdpSocket, session: &CompactSession) -> CompactFr
 }
 
 #[tokio::test]
+async fn negotiated_endpoint_receipt_requires_a_recent_answer_on_the_same_peer_and_socket() {
+    use p2pnet_nat::engine::{EndpointReceipt, PunchTarget};
+    let (udp, published, wire) = negotiated_receiver_with_receipts(false, true, |_| {}).await;
+    let remote = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    assert_ne!(
+        remote.local_addr().unwrap(),
+        published.local_addr().unwrap()
+    );
+    let peers = &udp.peers;
+    let owner = peers.peer_session_generation_sync("peer-b").unwrap();
+    let network = peers.current_network_generation_sync();
+    let (stop, rx) = watch::channel(false);
+    let (tx, _packets) = mpsc::channel(4);
+    let inbound = tokio::spawn(udp.clone().run_inbound(tx));
+    assert!(
+        udp.start_negotiated("peer-b", network, owner, Some(rx))
+            .await
+    );
+    let target = PunchTarget {
+        address: remote.local_addr().unwrap(),
+        socket: 0,
+    };
+    let request = CompactFrame {
+        kind: FrameKind::Request,
+        nominate: false,
+        epoch: 12,
+        nonce: 51,
+    };
+    remote
+        .send_to(&wire.encode(request), udp.local_addr().unwrap())
+        .await
+        .unwrap();
+    let source = timeout(Duration::from_secs(2), async {
+        let mut bytes = [0; 128];
+        loop {
+            let (n, source) = remote.recv_from(&mut bytes).await.unwrap();
+            if wire.decode(&bytes[..n]).is_some_and(|f| {
+                f.kind == FrameKind::Response && f.correlation() == request.correlation()
+            }) {
+                break source;
+            }
+        }
+    })
+    .await
+    .expect("reporter received the real UDP response");
+    let receipt = EndpointReceipt {
+        challenge: request.correlation(),
+        observed: source,
+    };
+    let bytes = wire.encode_endpoint_receipt(receipt).unwrap();
+    let other = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    assert!(udp
+        .receive_endpoint_receipt(
+            &bytes,
+            PunchTarget {
+                address: other.local_addr().unwrap(),
+                ..target
+            }
+        )
+        .is_none());
+    assert!(udp
+        .receive_endpoint_receipt(
+            &bytes,
+            PunchTarget {
+                socket: 1,
+                ..target
+            }
+        )
+        .is_none());
+    let unrelated = wire
+        .encode_endpoint_receipt(EndpointReceipt {
+            challenge: [0; 8],
+            ..receipt
+        })
+        .unwrap();
+    assert!(udp.receive_endpoint_receipt(&unrelated, target).is_none());
+    let mut altered = bytes;
+    altered[22] ^= 1;
+    assert!(udp.receive_endpoint_receipt(&altered, target).is_none());
+    assert!(peers.diagnostics().await[0].udp_session_endpoints.is_none());
+    remote.send_to(&bytes, source).await.unwrap();
+    let pair = timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(pair) = peers.diagnostics().await[0].udp_session_endpoints {
+                break pair;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer accepted the authenticated on-wire observation");
+    assert_eq!(
+        (
+            pair.remote_source,
+            pair.local_as_seen_by_peer,
+            pair.socket_index
+        ),
+        (target.address, source, 0)
+    );
+    assert!(udp.receive_endpoint_receipt(&bytes, target).is_none());
+    // This reporter answered none of our challenges. A receipt alone cannot
+    // nominate Direct or turn its report of our address into a remote target.
+    let conn = peers.get_connection("peer-b").await.unwrap();
+    assert_eq!(conn.direct_health.success_count, 0);
+    let (_, destinations) = peers.negotiated_candidate_snapshot("peer-b").await.unwrap();
+    assert!(destinations.iter().all(|(_, address)| *address != source));
+    assert!(destinations
+        .iter()
+        .all(|(_, address)| *address != target.address));
+    // The unpublished source may receive a reverse challenge on its witnessed
+    // pair. A different local socket has no such authorization.
+    let epoch = peers.current_punch_epoch("peer-b").unwrap();
+    assert!(peers
+        .with_punch_run(
+            "peer-b",
+            PunchTarget {
+                socket: 1,
+                ..target
+            },
+            epoch,
+            |_, _| ()
+        )
+        .is_none());
+    let reverse = read_compact(&remote, &wire).await;
+    assert_eq!(reverse.kind, FrameKind::Request);
+    assert!(
+        peers
+            .set_probe_session_id("peer-b", Some("replacement".into()))
+            .await
+    );
+    assert!(udp.receive_endpoint_receipt(&bytes, target).is_none());
+    assert!(peers.diagnostics().await[0].udp_session_endpoints.is_none());
+    stop.send_replace(true);
+    inbound.abort();
+    assert!(inbound.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
 async fn negotiated_udp_reader_authenticates_replies_and_requires_two_distinct_challenges() {
     let (udp, remote, wire) = negotiated_receiver(false, |_| {}).await;
     let peers = &udp.peers;
@@ -172,6 +319,17 @@ async fn negotiated_udp_reader_authenticates_replies_and_requires_two_distinct_c
         nominate: false,
         ..challenge
     });
+    // A genuine peer MAC from a different remote port must leave the original
+    // challenge pending on its intended pair.
+    let other = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    other.send_to(&first, dest).await.unwrap();
+    timeout(Duration::from_secs(1), async {
+        while udp.socket_pool_diagnostics().await[0].authenticated_probe_acks_unmatched == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("wrong-source response rejected");
     remote.send_to(&first, dest).await.unwrap();
     let next = read_compact(&remote, &wire).await;
     assert_eq!(next.kind, FrameKind::Request);

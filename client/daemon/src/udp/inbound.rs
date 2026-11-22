@@ -444,6 +444,16 @@ impl UdpTransport {
                 continue;
             }
 
+            if data.starts_with(&p2pnet_nat::engine::EndpointReceipt::MAGIC) {
+                let target = p2pnet_nat::engine::PunchTarget {
+                    address: source,
+                    socket: socket_index,
+                };
+                if self.receive_endpoint_receipt(data, target).is_none() {
+                    trace!(reason = "unmatched_endpoint_receipt", "Ignored UDP endpoint receipt");
+                }
+                continue;
+            }
             let compact = if data.starts_with(b"P3") {
                 let Some(decoded) = self.decode_compact(data).await else {
                     self.update_socket_diagnostics(socket_index, |metrics| {
@@ -839,7 +849,7 @@ impl UdpTransport {
                                         )
                                     });
                                 let sent = if let Some(ingress) = &compact {
-                                    self.send_compact_reply(ingress, &socket, &ack, source)
+                                    self.send_compact_reply(ingress, &socket, &ack, source, None)
                                 } else {
                                     socket.send_to(&ack, source).await
                                 };
@@ -888,7 +898,7 @@ impl UdpTransport {
                                 )
                             });
                         let sent = if let Some(ingress) = &compact {
-                            self.send_compact_reply(ingress, &socket, &ack, source)
+                            self.send_compact_reply(ingress, &socket, &ack, source, Some(socket_index))
                                 .map(|_| ())
                         } else {
                             self.send_punch_ack_burst(
@@ -1079,6 +1089,14 @@ impl UdpTransport {
                                     && pending.cleanup_epoch == cleanup_epoch
                                     && pending.direct_commit_seq == direct_commit_seq
                                     && pending.accepts_authenticated_ack
+                                    && match pending.purpose {
+                                        PendingProbePurpose::Negotiated(_) => {
+                                            pending.endpoint == source && compact.as_ref().is_some_and(|i| {
+                                                i.matches_challenge(&identity.source_node_id, packet.nonce)
+                                            })
+                                        }
+                                        _ => compact.is_none(),
+                                    }
                             };
                             let expired = pending
                                 .as_ref()
@@ -1227,16 +1245,12 @@ impl UdpTransport {
                             let local_endpoint = pending.local_endpoint;
                             let purpose = pending.purpose;
                             let socket_epoch = pending.socket_epoch;
-                            if let PendingProbePurpose::Negotiated(epoch) = purpose {
-                                if compact.is_none()
-                                    || !self.peers.confirm_compact_response(
-                                        &identity.source_node_id,
-                                        source,
-                                        socket_index,
-                                        epoch,
-                                        packet.nonce,
-                                    )
-                                {
+                            if let Some(ingress) = &compact {
+                                let target = p2pnet_nat::engine::PunchTarget {
+                                    address: source,
+                                    socket: socket_index,
+                                };
+                                if !self.confirm_compact_pair(ingress, target, &socket) {
                                     continue;
                                 }
                             }
@@ -1335,11 +1349,13 @@ impl UdpTransport {
                                 )
                                 .await;
                             if accepted {
-                                self.notify_peer_reflexive_observation(
-                                    &identity.source_node_id,
-                                    source,
-                                )
-                                .await;
+                                if !compact.as_ref().is_some_and(|i| i.endpoint_receipts) {
+                                    self.notify_peer_reflexive_observation(
+                                        &identity.source_node_id,
+                                        source,
+                                    )
+                                    .await;
+                                }
                                 // A matched ACK is the most reliable proof that
                                 // the peer's mapping works RIGHT NOW: fire the
                                 // daemon-internal encrypted validation toward

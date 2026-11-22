@@ -17,7 +17,7 @@ func TestNegotiatedSignalContractAndDelivery(t *testing.T) {
 	if err := json.Unmarshal(data, &contract); err != nil {
 		t.Fatal(err)
 	}
-	if contract.NATProfile == nil || contract.NATProfile.Validate() != nil || contract.NATProfile.PortStep != -4 {
+	if contract.NATProfile == nil || contract.NATProfile.Validate() != nil || contract.NATProfile.PortStep != -4 || !contract.NATProfile.UDPEndpointReceipts {
 		t.Fatalf("profile: %#v", contract.NATProfile)
 	}
 	var raw struct {
@@ -68,7 +68,7 @@ func TestNegotiatedSignalContractAndDelivery(t *testing.T) {
 		t.Fatalf("legacy receiver %v %v", old, err)
 	}
 	var partial PunchProfile
-	if err := json.Unmarshal([]byte("{}"), &partial); err != nil || partial.NATType != "None" || partial.Validate() != nil {
+	if err := json.Unmarshal([]byte("{}"), &partial); err != nil || partial.NATType != "None" || partial.UDPEndpointReceipts || partial.Validate() != nil {
 		t.Fatalf("partial %v %v", partial, err)
 	}
 }

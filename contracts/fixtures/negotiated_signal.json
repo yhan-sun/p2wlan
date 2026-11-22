@@ -10,6 +10,7 @@
     "port_hint": 41000,
     "upnp_mapped_addr": "203.0.113.2:41000",
     "tcp_candidates": ["[2001:db8::2]:42000", "192.0.2.2:5000"],
+    "udp_endpoint_receipts": true,
     "supports_sym_punch": true
   }
 }

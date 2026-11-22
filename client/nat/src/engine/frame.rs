@@ -1,6 +1,9 @@
 use ring::hmac;
 use subtle::ConstantTimeEq;
 
+mod receipt;
+pub use receipt::{EndpointReceipt, ENDPOINT_RECEIPT_SIZE};
+
 pub const FRAME_SIZE: usize = 36;
 const MAGIC: [u8; 2] = *b"P3";
 const MAC_START: usize = 20;
@@ -98,21 +101,26 @@ impl CompactSession {
         bytes
     }
 
-    /// Verify that a buffered datagram still belongs to this sender's key.
+    /// Verify a buffered punch request or response under this sender's key.
     pub fn authenticates_outbound(&self, bytes: &[u8]) -> bool {
         if CompactFrame::session_hint(bytes) != Some(self.id) {
             return false;
         }
-        let tag = hmac::sign(&self.outbound, &bytes[..MAC_START]);
-        bool::from(tag.as_ref()[..16].ct_eq(&bytes[MAC_START..]))
+        Self::valid_tag(&self.outbound, bytes)
+    }
+
+    // Called only after checking the exact size and magic of the record.
+    fn valid_tag(key: &hmac::Key, bytes: &[u8]) -> bool {
+        let (message, tag) = bytes.split_at(bytes.len() - 16);
+        let expected = hmac::sign(key, message);
+        bool::from(expected.as_ref()[..16].ct_eq(tag))
     }
 
     pub fn decode(&self, bytes: &[u8]) -> Option<CompactFrame> {
         if CompactFrame::session_hint(bytes)? != self.id {
             return None;
         }
-        let tag = hmac::sign(&self.inbound, &bytes[..MAC_START]);
-        if !bool::from(tag.as_ref()[..16].ct_eq(&bytes[MAC_START..])) {
+        if !Self::valid_tag(&self.inbound, bytes) {
             return None;
         }
         let kind = match bytes[2] {

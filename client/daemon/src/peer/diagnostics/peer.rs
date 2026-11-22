@@ -3,6 +3,8 @@
 pub struct PeerDiagnostics {
     #[serde(default)]
     pub remote_nat_profile: Option<p2pnet_nat::engine::PunchProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_session_endpoints: Option<crate::peer::ObservedUdpEndpoints>,
     #[serde(default)]
     pub punch_mode: Option<u8>,
     #[serde(flatten, default)]
@@ -468,6 +470,7 @@ impl PeerDiagnostics {
         };
         Self {
             remote_nat_profile: negotiated.and_then(|p| p.profile.clone()),
+            udp_session_endpoints: conn.observed_udp_endpoints(local_generation),
             punch_mode: run.map(|r| r.mode),
             punch_metrics: run
                 .map(|r| {

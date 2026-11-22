@@ -31,7 +31,9 @@ impl Default for PunchSettings {
 }
 
 mod frame;
-pub use frame::{CompactFrame, CompactSession, FrameKind, FRAME_SIZE};
+pub use frame::{
+    CompactFrame, CompactSession, EndpointReceipt, FrameKind, ENDPOINT_RECEIPT_SIZE, FRAME_SIZE,
+};
 
 mod pacer;
 pub use pacer::{Lane, PunchMetrics, PunchPacer, PunchTarget};

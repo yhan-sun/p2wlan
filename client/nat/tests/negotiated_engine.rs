@@ -14,6 +14,54 @@ fn addr(port: u16) -> SocketAddr {
     ([127, 0, 0, 1], port).into()
 }
 
+#[test]
+fn endpoint_receipt_authenticates_the_observed_tuple_challenge_and_reporting_direction() {
+    use p2pnet_nat::engine::{EndpointReceipt, ENDPOINT_RECEIPT_SIZE};
+    let a = CompactSession::new(&[3; 32], "live", "a", "b").unwrap();
+    let b = CompactSession::new(&[3; 32], "live", "b", "a").unwrap();
+    let old = CompactSession::new(&[3; 32], "previous", "b", "a").unwrap();
+    let other_peer = CompactSession::new(&[3; 32], "live", "c", "a").unwrap();
+    for endpoint in ["192.0.2.7:51820", "[2001:db8::1]:1234"] {
+        let receipt = EndpointReceipt {
+            challenge: [7; 8],
+            observed: endpoint.parse().unwrap(),
+        };
+        let bytes = a.encode_endpoint_receipt(receipt).unwrap();
+        assert_eq!(bytes.len(), ENDPOINT_RECEIPT_SIZE);
+        assert_eq!(b.decode_endpoint_receipt(&bytes), Some(receipt));
+        assert!(!a.authenticates_outbound(&bytes));
+        assert!(!b.authenticates_outbound(&bytes));
+        assert!(a.decode_endpoint_receipt(&bytes).is_none());
+        assert!(old.decode_endpoint_receipt(&bytes).is_none());
+        assert!(other_peer.decode_endpoint_receipt(&bytes).is_none());
+        assert!(b.decode(&bytes).is_none());
+        assert!(b
+            .decode_endpoint_receipt(&bytes[..bytes.len() - 1])
+            .is_none());
+        for i in 0..bytes.len() {
+            let mut altered = bytes;
+            altered[i] ^= 1;
+            assert!(
+                b.decode_endpoint_receipt(&altered).is_none(),
+                "altered byte {i}"
+            );
+        }
+    }
+    for invalid in [
+        "0.0.0.0:1",
+        "127.0.0.1:0",
+        "[ff02::1]:1234",
+        "255.255.255.255:9",
+    ] {
+        assert!(a
+            .encode_endpoint_receipt(EndpointReceipt {
+                challenge: [1; 8],
+                observed: invalid.parse().unwrap()
+            })
+            .is_none());
+    }
+}
+
 fn observed(ports: &[u16]) -> Vec<StunObservation> {
     ports
         .iter()
@@ -307,6 +355,7 @@ fn json_contract_shared_with_go_and_legacy_defaults() {
     let profile: PunchProfile = serde_json::from_value(signal["nat_profile"].clone()).unwrap();
     assert!(profile.valid());
     assert_eq!(profile.port_step, -4);
+    assert!(profile.udp_endpoint_receipts);
     assert_eq!(profile.tcp_candidates.len(), 2);
     assert_eq!(
         serde_json::to_value(profile).unwrap(),

@@ -23,6 +23,8 @@ pub struct PunchProfile {
     pub tcp_candidates: Vec<SocketAddr>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub tcp_simultaneous_open: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub udp_endpoint_receipts: bool,
     pub supports_sym_punch: bool,
 }
 
@@ -109,6 +111,7 @@ impl PunchProfile {
             })
         })?;
         profile.upnp_mapped_addr = mapped;
+        profile.udp_endpoint_receipts = true;
         profile.supports_sym_punch = supports_sym_punch;
         profile.valid().then_some(profile)
     }

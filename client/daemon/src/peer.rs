@@ -734,6 +734,8 @@ include!("peer/utils.rs");
 #[path = "peer/tests.rs"]
 mod tests;
 
+mod endpoint_exchange;
 mod negotiated_punch;
+pub use endpoint_exchange::ObservedUdpEndpoints;
 pub(crate) mod tcp_direct;
 pub(crate) use negotiated_punch::{NegotiatedPunchProfile, PeerPunchRun};

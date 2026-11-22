@@ -1,5 +1,5 @@
 use super::*;
-use p2pnet_nat::engine::{CompactFrame, CompactSession, FrameKind};
+use p2pnet_nat::engine::{CompactFrame, CompactSession, EndpointReceipt, FrameKind, PunchTarget};
 
 struct Binding {
     peer: String,
@@ -20,8 +20,10 @@ pub(super) struct CompactIndex {
 pub(super) struct CompactIngress {
     binding: Arc<Binding>,
     frame: CompactFrame,
+    packet: [u8; p2pnet_nat::engine::FRAME_SIZE],
     pub(super) decoded: Vec<u8>,
     pub(super) reply: Option<Vec<u8>>,
+    pub(super) endpoint_receipts: bool,
 }
 
 impl CompactIngress {
@@ -114,13 +116,13 @@ impl UdpTransport {
     pub(super) fn try_send_compact_challenge(
         &self,
         peer: &str,
-        endpoint: SocketAddr,
+        target: PunchTarget,
         epoch: u32,
         bytes: &[u8],
         socket: &UdpSocket,
     ) -> std::io::Result<usize> {
         self.peers
-            .with_punch_run(peer, endpoint, u64::from(epoch), |conn, run| {
+            .with_punch_run(peer, target, u64::from(epoch), |conn, run| {
                 if !conn.compact_datagram_is_current(
                     self.local_node_id.as_deref().unwrap_or_default(),
                     bytes,
@@ -129,7 +131,7 @@ impl UdpTransport {
                 }
                 run.pacer.try_send(u64::from(epoch), || {
                     self.compact_budget
-                        .try_send(0, || socket.try_send_to(bytes, endpoint))
+                        .try_send(0, || socket.try_send_to(bytes, target.address))
                 })
             })
             .unwrap_or_else(|| Err(std::io::ErrorKind::Interrupted.into()))
@@ -141,6 +143,7 @@ impl UdpTransport {
         socket: &UdpSocket,
         bytes: &[u8],
         source: SocketAddr,
+        fresh_socket: Option<usize>,
     ) -> std::io::Result<usize> {
         let binding = &ingress.binding;
         if ingress.frame.epoch != binding.remote_epoch.load(Ordering::Acquire) {
@@ -155,11 +158,105 @@ impl UdpTransport {
             local,
             (binding.network, binding.lifecycle),
             bytes,
-            || {
-                self.compact_budget
-                    .try_send(0, || socket.try_send_to(bytes, source))
+            |run| {
+                let sent = self
+                    .compact_budget
+                    .try_send(0, || socket.try_send_to(bytes, source))?;
+                if let (Some(run), Some(socket)) =
+                    (run.filter(|r| r.remote.udp_endpoint_receipts), fresh_socket)
+                {
+                    run.endpoint_exchange
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .answered(
+                            binding.wire.id,
+                            run.pacer.epoch(),
+                            ingress.frame.correlation(),
+                            PunchTarget {
+                                address: source,
+                                socket,
+                            },
+                        );
+                }
+                Ok(sent)
             },
         )
+    }
+
+    /// The caller consumed a pending response on its exact socket and remote tuple.
+    pub(super) fn confirm_compact_pair(
+        &self,
+        ingress: &CompactIngress,
+        target: PunchTarget,
+        socket: &UdpSocket,
+    ) -> bool {
+        let Some(local) = self.local_node_id.as_deref() else {
+            return false;
+        };
+        let challenge = ingress.frame.correlation();
+        let epoch = u64::from(ingress.frame.epoch);
+        self.peers.with_punch_run(&ingress.binding.peer, target, epoch, |conn, run| {
+            let Some(wire) = conn.compact_session(local) else {
+                return false;
+            };
+            if wire.decode(&ingress.packet) != Some(ingress.frame) {
+                return false;
+            }
+            let confirmed = run.confirm_compact_response(target, epoch, challenge);
+            if run.remote.udp_endpoint_receipts {
+                let receipt = EndpointReceipt {
+                    challenge,
+                    observed: target.address,
+                };
+                if let Some(bytes) = wire.encode_endpoint_receipt(receipt) {
+                    let sent = run.pacer.try_send(epoch, || {
+                        self.compact_budget.try_send(0, || socket.try_send_to(&bytes, target.address))
+                    });
+                    if let Err(error) = sent {
+                        trace!(reason = "endpoint_receipt_send_failed", %error, "UDP endpoint receipt send failed");
+                    }
+                }
+            }
+            confirmed
+        }).unwrap_or(false)
+    }
+
+    pub(super) fn receive_endpoint_receipt(&self, bytes: &[u8], target: PunchTarget) -> Option<()> {
+        let id = EndpointReceipt::session_hint(bytes)?;
+        let (binding, used) = self.compact_index.lock().ok()?.sessions.get(&id)?.clone();
+        if used.elapsed() >= Duration::from_secs(120) {
+            return None;
+        }
+        let local = self.local_node_id.as_deref()?;
+        let epoch = self.peers.current_punch_epoch(&binding.peer)?;
+        self.peers
+            .with_active_punch(&binding.peer, epoch, |conn, run| {
+                if !run.remote.udp_endpoint_receipts
+                    || self.peers.current_network_generation_sync() != binding.network
+                    || !self
+                        .peers
+                        .peer_session_is_current_sync(&binding.peer, binding.lifecycle)
+                {
+                    return None;
+                }
+                let receipt = conn
+                    .compact_session(local)?
+                    .decode_endpoint_receipt(bytes)?;
+                let remote_epoch = u32::from_be_bytes(receipt.challenge[..4].try_into().ok()?);
+                if remote_epoch != binding.remote_epoch.load(Ordering::Acquire) {
+                    return None;
+                }
+                let accepted = run
+                    .endpoint_exchange
+                    .lock()
+                    .ok()?
+                    .accept(local, id, epoch, target, receipt);
+                if !accepted {
+                    return None;
+                }
+                run.queue_witnessed_target(conn, epoch, target);
+                Some(())
+            })?
     }
 
     pub(super) async fn decode_compact(&self, packet: &[u8]) -> Option<CompactIngress> {
@@ -179,8 +276,8 @@ impl UdpTransport {
             .peers
             .probe_key_and_session_for_peer(&binding.peer)
             .await?;
+        let profile = self.peers.negotiated_profile(&binding.peer).await?;
         if session.as_deref() != Some(&binding.session)
-            || self.peers.negotiated_profile(&binding.peer).await.is_none()
             || self.peers.current_network_generation_sync() != binding.network
             || !self
                 .peers
@@ -246,8 +343,10 @@ impl UdpTransport {
         Some(CompactIngress {
             binding,
             frame,
+            packet: packet.try_into().ok()?,
             decoded,
             reply,
+            endpoint_receipts: profile.udp_endpoint_receipts,
         })
     }
 }

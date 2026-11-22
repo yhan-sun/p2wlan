@@ -269,6 +269,7 @@ pub(crate) struct PeerPunchRun {
     pub(crate) remote: PunchProfile,
     reversed: std::sync::Mutex<HashMap<(SocketAddr, usize), u64>>,
     confirmations: std::sync::Mutex<HashMap<(SocketAddr, usize), MatchedChallenge>>,
+    pub(crate) endpoint_exchange: std::sync::Mutex<super::endpoint_exchange::EndpointExchange>,
     network: u64,
     lifecycle: PeerSessionGeneration,
     candidates: u64,
@@ -385,6 +386,7 @@ impl PeerManager {
             role: pair.role,
             reversed: Default::default(),
             confirmations: Default::default(),
+            endpoint_exchange: Default::default(),
             remote,
             network,
             lifecycle,
@@ -412,7 +414,7 @@ impl PeerManager {
         .then(|| run.pacer.epoch())
     }
 
-    fn with_active_punch<T>(
+    pub(crate) fn with_active_punch<T>(
         &self,
         peer: &str,
         epoch: u64,
@@ -422,7 +424,9 @@ impl PeerManager {
         let conn = table.get(peer)?;
         let network = self.current_network_generation_sync();
         let run = conn.punch_run.as_ref()?;
-        if !conn.negotiated_punch.as_ref()?.current(conn, network)
+        let offer = conn.negotiated_punch.as_ref()?;
+        if !offer.current(conn, network)
+            || offer.profile.as_ref() != Some(&run.remote)
             || !run.owns(conn, network, self.peer_session_generation_sync(peer)?)
             || run
                 .business_ready
@@ -439,19 +443,16 @@ impl PeerManager {
     pub(crate) fn with_punch_run<T>(
         &self,
         peer: &str,
-        endpoint: SocketAddr,
+        target: p2pnet_nat::engine::PunchTarget,
         epoch: u64,
         f: impl FnOnce(&PeerConnection, &PeerPunchRun) -> T,
     ) -> Option<T> {
         self.with_active_punch(peer, epoch, |conn, run| {
+            let endpoint = target.address;
             let announced = conn.signaled_candidates.contains(&endpoint.to_string())
                 && is_negotiated_source(conn.candidate_source_for_endpoint(endpoint));
-            let witnessed = run
-                .reversed
-                .lock()
-                .ok()?
-                .iter()
-                .any(|((address, _), round)| *address == endpoint && *round == epoch);
+            let witnessed =
+                run.reversed.lock().ok()?.get(&(endpoint, target.socket)) == Some(&epoch);
             (announced || witnessed).then(|| f(conn, run))
         })
         .flatten()
@@ -467,71 +468,79 @@ impl PeerManager {
     ) {
         if let Some(epoch) = self.current_punch_epoch(peer) {
             self.with_active_punch(peer, epoch, |conn, run| {
-                if !conn
-                    .signaled_candidates
-                    .iter()
-                    .filter_map(|s| s.parse::<SocketAddr>().ok())
-                    .any(|announced| {
-                        announced.ip() == address.ip()
-                            && is_negotiated_source(conn.candidate_source_for_endpoint(announced))
-                    })
-                {
-                    return;
-                }
-                let mut reversed = run.reversed.lock().unwrap_or_else(|e| e.into_inner());
-                reversed.retain(|_, round| *round == epoch);
-                if reversed.len() < 4 && reversed.insert((address, socket), epoch).is_none() {
-                    run.pacer.enqueue(
-                        epoch,
-                        p2pnet_nat::engine::Lane::Regular,
-                        p2pnet_nat::engine::PunchTarget { address, socket },
-                    );
-                }
+                run.queue_witnessed_target(
+                    conn,
+                    epoch,
+                    p2pnet_nat::engine::PunchTarget { address, socket },
+                );
             });
         }
     }
+}
 
-    /// Called only after the socket, candidate generation and pending challenge
-    /// match. Two fresh, different responses on one pair can start WG validation.
+impl PeerPunchRun {
+    /// A request and its subsequent receipt share one reverse check. The
+    /// address comes from recv_from and the response goes out on that socket.
+    pub(crate) fn queue_witnessed_target(
+        &self,
+        conn: &PeerConnection,
+        epoch: u64,
+        target: p2pnet_nat::engine::PunchTarget,
+    ) {
+        if !conn
+            .signaled_candidates
+            .iter()
+            .filter_map(|s| s.parse::<SocketAddr>().ok())
+            .any(|announced| {
+                announced.ip() == target.address.ip()
+                    && is_negotiated_source(conn.candidate_source_for_endpoint(announced))
+            })
+        {
+            return;
+        }
+        let mut reversed = self.reversed.lock().unwrap_or_else(|e| e.into_inner());
+        reversed.retain(|_, round| *round == epoch);
+        let pair = (target.address, target.socket);
+        if reversed.len() < 4
+            && !reversed.contains_key(&pair)
+            && self
+                .pacer
+                .enqueue(epoch, p2pnet_nat::engine::Lane::Regular, target)
+        {
+            reversed.insert(pair, epoch);
+        }
+    }
+
+    /// Called under the current peer and key guard, after consuming a pending
+    /// challenge on this exact pair. Two independent responses start WG validation.
     pub(crate) fn confirm_compact_response(
         &self,
-        peer: &str,
-        address: SocketAddr,
-        socket: usize,
-        epoch: u32,
+        target: p2pnet_nat::engine::PunchTarget,
+        epoch: u64,
         nonce: [u8; 8],
     ) -> bool {
-        let epoch = u64::from(epoch);
-        self.with_punch_run(peer, address, epoch, |_, run| {
-            let mut recent = run
-                .confirmations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let now = Instant::now();
-            recent.retain(|_, sample| {
-                sample.epoch == epoch && now.duration_since(sample.at) < Duration::from_secs(3)
-            });
-            if let Some(previous) = recent.get(&(address, socket)) {
-                return previous.nonce != nonce;
-            }
-            if recent.len() < 64 {
-                recent.insert(
-                    (address, socket),
-                    MatchedChallenge {
-                        epoch,
-                        nonce,
-                        at: now,
-                    },
-                );
-                run.pacer.enqueue(
+        let mut recent = self.confirmations.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        recent.retain(|_, sample| {
+            sample.epoch == epoch && now.duration_since(sample.at) < Duration::from_secs(3)
+        });
+        let pair = (target.address, target.socket);
+        if let Some(previous) = recent.get(&pair) {
+            return previous.nonce != nonce;
+        }
+        if recent.len() < 64 {
+            recent.insert(
+                pair,
+                MatchedChallenge {
                     epoch,
-                    p2pnet_nat::engine::Lane::Regular,
-                    p2pnet_nat::engine::PunchTarget { address, socket },
-                );
-            }
-            false
-        })
-        .unwrap_or(false)
+                    nonce,
+                    at: now,
+                },
+            );
+            self.pacer
+                .enqueue(epoch, p2pnet_nat::engine::Lane::Regular, target);
+        }
+        false
     }
 }
 
@@ -548,17 +557,20 @@ fn is_negotiated_source(source: CandidatePairSource) -> bool {
 }
 
 impl PeerConnection {
+    pub(crate) fn compact_session(
+        &self,
+        local: &str,
+    ) -> Option<p2pnet_nat::engine::CompactSession> {
+        p2pnet_nat::engine::CompactSession::new(
+            &effective_probe_mac_key(self)?,
+            self.probe_session_id.as_deref()?,
+            local,
+            &self.node_id,
+        )
+    }
+
     pub(crate) fn compact_datagram_is_current(&self, local: &str, bytes: &[u8]) -> bool {
-        self.probe_session_id
-            .as_deref()
-            .and_then(|session| {
-                p2pnet_nat::engine::CompactSession::new(
-                    &effective_probe_mac_key(self)?,
-                    session,
-                    local,
-                    &self.node_id,
-                )
-            })
+        self.compact_session(local)
             .is_some_and(|wire| wire.authenticates_outbound(bytes))
     }
 }
@@ -572,7 +584,7 @@ impl PeerManager {
         local: &str,
         owner: (u64, PeerSessionGeneration),
         bytes: &[u8],
-        send: impl FnOnce() -> std::io::Result<T>,
+        send: impl FnOnce(Option<&PeerPunchRun>) -> std::io::Result<T>,
     ) -> std::io::Result<T> {
         let table = self
             .connections
@@ -592,9 +604,9 @@ impl PeerManager {
         if let Some(run) = conn.punch_run.as_ref().filter(|r| {
             r.owns(conn, owner.0, owner.1) && !r.ended.load(std::sync::atomic::Ordering::Acquire)
         }) {
-            run.pacer.try_send(run.pacer.epoch(), send)
+            run.pacer.try_send(run.pacer.epoch(), || send(Some(run)))
         } else {
-            send()
+            send(None)
         }
     }
 }
