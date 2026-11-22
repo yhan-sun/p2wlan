@@ -20,7 +20,8 @@ async fn doctor_prints_negotiated_fields_from_authenticated_status() {
     let body=serde_json::json!({"upnp_status":"unavailable","local_nat_profile":profile,
         "peers":[{"node_id":"peer-b","remote_nat_profile":profile,"punch_epoch":41,"punch_mode":9,
         "udp_firewall_status":"blocked","queue_a_len":0,"queue_b_len":0,"actual_pps":3,"active_punch_sockets":0,
-        "active_path":"Relay","active_path_type":"tls_relay","path_cost":10,"reason_code":"UDP_BLOCKED"}]}).to_string();
+        "active_path":"Relay","active_path_type":"tls_relay","path_cost":10,"reason_code":"UDP_BLOCKED"},
+        {"node_id":"peer-c","punch_epoch":42,"active_path_type":"tcp_direct","tcp_open_method":"simultaneous","path_cost":4}]}).to_string();
     let status = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = Vec::new();
@@ -72,6 +73,7 @@ async fn doctor_prints_negotiated_fields_from_authenticated_status() {
         "active_path=",
         "active_path_type=",
         "path_cost=10",
+        "tcp_open_method=\"simultaneous\"",
         "UDP_BLOCKED",
     ] {
         assert!(stdout.contains(marker), "doctor missing {marker}: {stdout}");

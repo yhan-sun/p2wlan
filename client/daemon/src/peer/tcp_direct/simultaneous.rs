@@ -10,6 +10,7 @@ use tokio::time::timeout;
 const ACTIVE_SETUP: Duration = Duration::from_millis(1400);
 const READY: u8 = 1;
 const VERIFIED: u8 = 2;
+const START_LEAD: Duration = Duration::from_millis(40);
 
 pub(super) struct AuthenticatedStream {
     pub stream: TcpStream,
@@ -37,6 +38,41 @@ pub(super) async fn exchange_decision(
         return Err(io::ErrorKind::InvalidData.into());
     }
     Ok(record[0] == 1)
+}
+
+async fn read_marker(stream: &mut TcpStream, expected: &[u8; 32]) -> io::Result<()> {
+    let mut marker = [0; 32];
+    stream.read_exact(&mut marker).await?;
+    if bool::from(marker.ct_eq(expected)) {
+        Ok(())
+    } else {
+        Err(io::ErrorKind::InvalidData.into())
+    }
+}
+
+// A symmetric readiness exchange alone can leave the two calls to connect()
+// almost one transit time apart. Measure one round trip on this coordinator.
+// The initiator allows for the final marker's travel time; both reactors get
+// a scheduling window, including when the endpoints are on the same host.
+async fn align_start(stream: &mut TcpStream, key: &[u8; 32], client: bool) -> io::Result<()> {
+    let ping = hmac(key, b"TCP open timing request");
+    let echo = hmac(key, b"TCP open timing response");
+    let start = hmac(key, b"TCP open start");
+    let delay = if client {
+        let sent = Instant::now();
+        stream.write_all(&ping).await?;
+        read_marker(stream, &echo).await?;
+        let transit = (sent.elapsed() / 2).min(Duration::from_millis(250));
+        stream.write_all(&start).await?;
+        START_LEAD + transit
+    } else {
+        read_marker(stream, &ping).await?;
+        stream.write_all(&echo).await?;
+        read_marker(stream, &start).await?;
+        START_LEAD
+    };
+    tokio::time::sleep(delay).await;
+    Ok(())
 }
 
 pub(super) async fn establish(
@@ -67,6 +103,7 @@ pub(super) async fn establish(
         };
         let ready = exchange_decision(&mut control, &key, client, READY, socket.is_some()).await?;
         if let Some(socket) = socket.filter(|_| ready) {
+            align_start(&mut control, &key, client).await?;
             let active = async {
                 if !peers.tcp_setup_current(peer, grant).await {
                     return Err(io::ErrorKind::PermissionDenied.into());

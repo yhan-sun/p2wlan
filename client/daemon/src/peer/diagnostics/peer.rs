@@ -11,6 +11,8 @@ pub struct PeerDiagnostics {
     pub udp_firewall_status: p2pnet_nat::engine::UdpReachability,
     #[serde(default)]
     pub active_path_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_open_method: Option<String>,
     #[serde(default)]
     pub path_cost: Option<u8>,
     #[serde(default)]
@@ -475,6 +477,9 @@ impl PeerDiagnostics {
                 .unwrap_or_default(),
             udp_firewall_status,
             active_path_type: route.map(|(p, _)| p.to_owned()),
+            tcp_open_method: conn.tcp_path.as_ref()
+                .filter(|path| active_path == Some(NetworkPath::TcpDirect) && path.current(conn, local_generation))
+                .map(|path| path.opening.as_str().to_owned()),
             path_cost: route.map(|(_, cost)| cost),
             reason_code: if udp_firewall_status == p2pnet_nat::engine::UdpReachability::Blocked {
                 Some("UDP_BLOCKED".to_owned())

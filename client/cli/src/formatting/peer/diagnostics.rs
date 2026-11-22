@@ -113,7 +113,7 @@ pub(crate) fn print_peer_diagnostics(snapshot: &Value) {
 }
 
 pub(crate) fn negotiated_punch_summary(peer: &Value) -> Option<String> {
-    const FIELDS: [&str; 12] = [
+    const FIELDS: [&str; 13] = [
         "remote_nat_profile",
         "punch_mode",
         "punch_epoch",
@@ -124,6 +124,7 @@ pub(crate) fn negotiated_punch_summary(peer: &Value) -> Option<String> {
         "udp_firewall_status",
         "active_path",
         "active_path_type",
+        "tcp_open_method",
         "path_cost",
         "reason_code",
     ];

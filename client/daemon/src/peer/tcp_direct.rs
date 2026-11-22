@@ -95,6 +95,15 @@ pub(crate) enum TcpOpening {
     Simultaneous,
 }
 
+impl TcpOpening {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::DialListen => "dial_listen",
+            Self::Simultaneous => "simultaneous",
+        }
+    }
+}
+
 impl std::fmt::Debug for TcpPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TcpPath")

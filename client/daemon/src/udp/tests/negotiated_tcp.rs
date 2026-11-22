@@ -387,6 +387,13 @@ async fn tcp_business(enabled: [bool; 2]) {
         .await
         .unwrap();
     assert_eq!(diagnostics.active_path_type.as_deref(), Some("tcp_direct"));
+    assert_eq!(
+        diagnostics.tcp_open_method.as_deref(),
+        Some(match openings[0] {
+            TcpOpening::DialListen => "dial_listen",
+            TcpOpening::Simultaneous => "simultaneous",
+        })
+    );
     assert_eq!(diagnostics.path_cost, Some(4));
     assert!(
         crate::network_outbound::send_original_slow_for_test(
@@ -431,6 +438,13 @@ async fn tcp_business(enabled: [bool; 2]) {
         cadence.tick().await;
         exchange(&mut nodes, sequence, NetworkPath::Relay).await;
     }
+    let (_, recovered) = nodes[0]
+        .manager
+        .diagnostic_with_path_selection(IDS[1], true, true, Duration::from_secs(1), None)
+        .await
+        .unwrap();
+    assert_eq!(recovered.active_path_type.as_deref(), Some("tls_relay"));
+    assert!(recovered.tcp_open_method.is_none());
     eprintln!("TCP open measurement enabled={simultaneous} left={:?} right={:?} left_socket={}→{} right_socket={}→{} decrypted_per_direction=12", openings[0], openings[1], endpoints[0].0, endpoints[0].1, endpoints[1].0, endpoints[1].1);
     eprintln!("TLS Relay → configured direct TCP → TLS Relay: 12 numbered WireGuard payloads decrypted per direction; first post-disconnect pair on the 20 ms cadence delivered in {} ms", fallback.as_millis());
     tasks.shutdown().await;
