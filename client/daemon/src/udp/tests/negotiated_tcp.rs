@@ -85,6 +85,21 @@ async fn exchange(nodes: &mut [Node], n: u16, path: NetworkPath) {
 
 #[tokio::test]
 async fn negotiated_configured_tcp_carries_wg_then_returns_to_tls_relay() {
+    tcp_business([false, false]).await;
+}
+
+#[tokio::test]
+async fn negotiated_simultaneous_tcp_carries_wg_then_returns_to_tls_relay() {
+    tcp_business([true, true]).await;
+}
+
+#[tokio::test]
+async fn negotiated_tcp_legacy_peer_uses_the_authenticated_ordinary_stream() {
+    tcp_business([true, false]).await;
+}
+
+async fn tcp_business(enabled: [bool; 2]) {
+    let simultaneous = enabled == [true, true];
     let mut tasks = JoinSet::new();
     let server = LocalTlsRelay::start().await;
     let endpoint = server.endpoint();
@@ -115,6 +130,7 @@ async fn negotiated_configured_tcp_carries_wg_then_returns_to_tls_relay() {
         config.network.tcp_direct = Some(TcpDirectConfig {
             listen: addresses[i],
             advertise: None,
+            simultaneous_open: enabled[i],
             peers: BTreeMap::from([(IDS[j].into(), addresses[j])]),
         });
         let manager = Arc::new(PeerManager::new(config));
@@ -257,6 +273,16 @@ async fn negotiated_configured_tcp_carries_wg_then_returns_to_tls_relay() {
         .await
         .unwrap();
         assert_eq!(offer.tcp_candidates, vec![addresses[i]]);
+        assert_eq!(
+            offer.tcp_simultaneous_open,
+            enabled[i]
+                && cfg!(any(
+                    target_vendor = "apple",
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "freebsd"
+                ))
+        );
         assert_eq!(offer.port_hint, 0);
         assert!(!offer.supports_sym_punch);
         assert!(nodes[i]
@@ -330,6 +356,31 @@ async fn negotiated_configured_tcp_carries_wg_then_returns_to_tls_relay() {
         }
         panic!("authorized TCP stream did not become usable");
     }
+    let mut endpoints = Vec::new();
+    let mut openings = Vec::new();
+    for i in 0..2 {
+        let conn = nodes[i].manager.get_connection(IDS[1 - i]).await.unwrap();
+        let path = conn.tcp_path.unwrap();
+        endpoints.push(path.socket_endpoints().unwrap());
+        openings.push(path.opening);
+    }
+    assert_eq!(openings[0], openings[1]);
+    assert_eq!(endpoints[0], (endpoints[1].1, endpoints[1].0));
+    use crate::peer::tcp_direct::TcpOpening;
+    if simultaneous && std::env::var_os("P2WLAN_TEST_REQUIRE_TCP_SIMULTANEOUS").is_some() {
+        assert_eq!(
+            openings[0],
+            TcpOpening::Simultaneous,
+            "both active sockets must carry the business traffic"
+        );
+    }
+    if openings[0] == TcpOpening::Simultaneous {
+        assert!(simultaneous);
+        assert_eq!(endpoints[0], (addresses[0], addresses[1]));
+    } else {
+        assert_ne!(endpoints[0].0, addresses[0]);
+        assert_eq!(endpoints[0].1, addresses[1]);
+    }
     let (_, diagnostics) = nodes[0]
         .manager
         .diagnostic_with_path_selection(IDS[1], true, true, Duration::from_secs(1), None)
@@ -380,6 +431,7 @@ async fn negotiated_configured_tcp_carries_wg_then_returns_to_tls_relay() {
         cadence.tick().await;
         exchange(&mut nodes, sequence, NetworkPath::Relay).await;
     }
+    eprintln!("TCP open measurement enabled={simultaneous} left={:?} right={:?} left_socket={}→{} right_socket={}→{} decrypted_per_direction=12", openings[0], openings[1], endpoints[0].0, endpoints[0].1, endpoints[1].0, endpoints[1].1);
     eprintln!("TLS Relay → configured direct TCP → TLS Relay: 12 numbered WireGuard payloads decrypted per direction; first post-disconnect pair on the 20 ms cadence delivered in {} ms", fallback.as_millis());
     tasks.shutdown().await;
     for node in nodes {
@@ -396,6 +448,7 @@ async fn negotiated_tcp_only_revisions_bind_pin_identity_expiry_and_withdrawal()
     config.network.tcp_direct = Some(TcpDirectConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         advertise: None,
+        simultaneous_open: false,
         peers: BTreeMap::from([(IDS[1].into(), pin)]),
     });
     let manager = PeerManager::new(config);

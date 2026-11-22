@@ -21,6 +21,8 @@ pub struct PunchProfile {
     pub port_hint: u16,
     pub upnp_mapped_addr: Option<SocketAddr>,
     pub tcp_candidates: Vec<SocketAddr>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tcp_simultaneous_open: bool,
     pub supports_sym_punch: bool,
 }
 
@@ -134,6 +136,7 @@ impl PunchProfile {
             _ => self.port_step == 0,
         };
         correct_step
+            && (!self.tcp_simultaneous_open || !self.tcp_candidates.is_empty())
             && self.upnp_mapped_addr.as_ref().is_none_or(endpoint)
             && self.tcp_candidates.len() <= 16
             && self.tcp_candidates.iter().all(endpoint)

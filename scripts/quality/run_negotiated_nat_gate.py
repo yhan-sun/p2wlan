@@ -12,7 +12,7 @@ TEST = "udp::tests::negotiated_matrix::negotiated_rootless_nat_matrix"
 KINDS = ("Cone", "LinearSymmetric", "RandomSymmetric")
 ROW = re.compile(
     r"NAT matrix (\w+) x (\w+) result=(bidirectional authenticated UDP|relay) "
-    r"UDP challenges=(\d+) gateway_pcp=false\b"
+    r"UDP challenges=(\d+) gateway_pcp=false gateway_lease=none\b"
 )
 
 

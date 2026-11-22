@@ -1,3 +1,4 @@
+use super::simultaneous::AuthenticatedStream;
 use super::*;
 use crate::config::TcpDirectConfig;
 use crate::dataplane_resources::EncryptedRxSink;
@@ -5,7 +6,7 @@ use crate::transport::ReceivedEncryptedPacket;
 use std::sync::atomic::Ordering::Acquire;
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncReadExt;
-use tokio::net::{tcp::OwnedReadHalf, TcpListener, TcpStream};
+use tokio::net::{tcp::OwnedReadHalf, TcpListener};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
@@ -63,16 +64,30 @@ pub(crate) async fn serve(
         );
         return;
     }
-    match TcpListener::bind(config.listen).await {
+    let shared = config
+        .simultaneous_open
+        .then(|| p2pnet_netbind::bind_shared_tcp(config.listen).and_then(|s| s.listen(128)));
+    let (listener, simultaneous) = match shared {
+        Some(Ok(listener)) => (Ok(listener), true),
+        fallback => {
+            if let Some(Err(err)) = fallback {
+                debug!(reason_code = "TCP_SHARED_BIND_UNAVAILABLE", %err);
+            }
+            (TcpListener::bind(config.listen).await, false)
+        }
+    };
+    match listener {
         Ok(listener) => {
-            let Some(address) = config.advertise.or_else(|| listener.local_addr().ok()) else {
+            let Ok(bound) = listener.local_addr() else {
                 return;
             };
             let owner = Publication {
                 local,
                 local_vip,
                 room,
-                address,
+                address: config.advertise.unwrap_or(bound),
+                bound,
+                simultaneous,
                 live: AtomicBool::new(true),
             };
             run_listener(peers, Arc::new(owner), rx, stop, listener).await;
@@ -122,15 +137,20 @@ async fn run_listener(
                                 p2pnet_netbind::connect_tcp_from(endpoint, Some(source), None)
                                     .await?;
                             stream.set_nodelay(true)?;
-                            wire::identify(&mut stream, &owner.local).await?;
-                            let key =
-                                grant.handshake_key(&manager.config.network.network_id, &peer);
-                            let key = wire::authenticate(&mut stream, key, true).await?;
-                            io::Result::Ok((stream, key))
+                            wire::identify(&mut stream, &owner.local, grant.simultaneous).await?;
+                            simultaneous::establish(
+                                &manager,
+                                &peer,
+                                &grant,
+                                stream,
+                                true,
+                                grant.simultaneous,
+                            )
+                            .await
                         };
                         match timeout(SETUP, setup).await {
-                            Ok(Ok((stream, key))) => {
-                                run_link(&manager, &peer, &sink, grant, stream, key, true).await
+                            Ok(Ok(stream)) => {
+                                run_link(&manager, &peer, &sink, grant, stream, true).await
                             }
                             Ok(Err(err)) => {
                                 debug!(peer, reason_code = "TCP_DIRECT_SETUP_FAILED", error = %err)
@@ -158,17 +178,16 @@ async fn run_listener(
                 tasks.spawn(async move {
                     let setup = async {
                         stream.set_nodelay(true)?;
-                        let peer = wire::read_identity(&mut stream).await?;
+                        let (peer, requested) = wire::read_identity(&mut stream).await?;
                         let grant = manager.tcp_grant(&peer, &owner).await.ok_or(io::ErrorKind::PermissionDenied)?;
                         if peer >= owner.local || grant.endpoint.ip() != source.ip() { return Err(io::ErrorKind::PermissionDenied.into()); }
-                        let key = grant.handshake_key(&manager.config.network.network_id, &peer);
-                        let key = wire::authenticate(&mut stream, key, false).await?;
-                        io::Result::Ok((peer, grant, key))
+                        let stream = simultaneous::establish(&manager, &peer, &grant, stream, false, requested).await?;
+                        io::Result::Ok((peer, grant, stream))
                     };
                     let result = timeout(SETUP, setup).await;
                     drop(permit);
-                    if let Ok(Ok((peer, grant, key))) = result {
-                        run_link(&manager, &peer, &sink, grant, stream, key, false).await;
+                    if let Ok(Ok((peer, grant, stream))) = result {
+                        run_link(&manager, &peer, &sink, grant, stream, false).await;
                     }
                 });
             }
@@ -198,12 +217,16 @@ async fn run_link(
     peer: &str,
     sink: &EncryptedRxSink,
     grant: Grant,
-    stream: TcpStream,
-    key: [u8; 32],
+    stream: AuthenticatedStream,
     client: bool,
 ) {
+    let AuthenticatedStream {
+        stream,
+        key,
+        opening,
+    } = stream;
     let (reader, writer) = stream.into_split();
-    let Ok(path) = TcpPath::new(grant, writer).map(Arc::new) else {
+    let Ok(path) = TcpPath::new(grant, writer, opening).map(Arc::new) else {
         return;
     };
     let _guard = LinkGuard(path.clone());
@@ -217,6 +240,7 @@ async fn run_link(
     };
     debug!(
         peer,
+        ?opening,
         reason_code = "TCP_DIRECT_CONFIRMED",
         "direct TCP stream authenticated"
     );

@@ -86,6 +86,8 @@ CLI 的 `--prefer-direct` 与 `relay-policy=direct` 选择 Direct-first；显式
 
 监听成功后，节点只向已配置的对端发布地址。节点 ID 字典序较小的一端发起连接。两端核对信令候选、会话身份并完成两轮认证后，路径可承载 WireGuard 业务。诊断字段 `active_path_type` 为 `tcp_direct`，成本为 4。链路关闭、会话更换、候选撤回或过期时，已确认的 Relay 可以接续业务。`relay-only` 禁用 TCP 直连。
 
+双方可在 `network.tcp_direct` 中启用 `simultaneous_open`（默认 `false`）。在支持端口复用的平台，两端通过已认证的 TCP 连接交换就绪状态，各从自己的监听端口连接已配置的对端地址。两端都在新连接完成认证并确认结果后，业务才使用该连接。若系统不支持共享端口，或本次同时打开未成功，业务仍可使用已认证的普通 TCP 连接。这项功能要求双方配置的 TCP 端点可达。[TCP 同时打开规范](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.5)
+
 ### 网络实验开关
 
 | 配置 | 生效条件 |

@@ -8,26 +8,38 @@ pub(super) const PING: u16 = 0;
 pub(super) const PONG: u16 = 1;
 pub(super) const MAX_ID: usize = 128;
 const HEADER: &[u8; 4] = b"PDT1";
+const SIMULTANEOUS_HEADER: &[u8; 4] = b"PDS1";
 
-pub(super) async fn identify(stream: &mut TcpStream, id: &str) -> io::Result<()> {
+pub(super) async fn identify(
+    stream: &mut TcpStream,
+    id: &str,
+    simultaneous: bool,
+) -> io::Result<()> {
     if id.is_empty() || id.len() > MAX_ID {
         return Err(io::ErrorKind::InvalidInput.into());
     }
-    stream.write_all(HEADER).await?;
+    stream
+        .write_all(if simultaneous {
+            SIMULTANEOUS_HEADER
+        } else {
+            HEADER
+        })
+        .await?;
     stream.write_u8(id.len() as u8).await?;
     stream.write_all(id.as_bytes()).await
 }
 
-pub(super) async fn read_identity(stream: &mut TcpStream) -> io::Result<String> {
+pub(super) async fn read_identity(stream: &mut TcpStream) -> io::Result<(String, bool)> {
     let mut header = [0; 4];
     stream.read_exact(&mut header).await?;
     let len = usize::from(stream.read_u8().await?);
-    if &header != HEADER || !(1..=MAX_ID).contains(&len) {
+    if (&header != HEADER && &header != SIMULTANEOUS_HEADER) || !(1..=MAX_ID).contains(&len) {
         return Err(io::ErrorKind::InvalidData.into());
     }
     let mut id = vec![0; len];
     stream.read_exact(&mut id).await?;
-    String::from_utf8(id).map_err(|_| io::ErrorKind::InvalidData.into())
+    let id = String::from_utf8(id).map_err(|_| io::ErrorKind::InvalidData)?;
+    Ok((id, &header == SIMULTANEOUS_HEADER))
 }
 
 // Each role proves possession twice against independently sampled nonces.

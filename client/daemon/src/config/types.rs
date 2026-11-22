@@ -103,6 +103,8 @@ fn default_platform() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcpDirectConfig {
     pub listen: std::net::SocketAddr,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub simultaneous_open: bool,
     #[serde(default)]
     pub advertise: Option<std::net::SocketAddr>,
     pub peers: std::collections::BTreeMap<String, std::net::SocketAddr>,

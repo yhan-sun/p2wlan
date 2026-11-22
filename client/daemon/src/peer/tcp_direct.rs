@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use tokio::net::tcp::OwnedWriteHalf;
 
 mod service;
+mod simultaneous;
 mod wire;
 pub(crate) use service::serve;
 
@@ -20,6 +21,8 @@ pub(super) struct Publication {
     local_vip: String,
     room: Arc<crate::rooms::RoomAuthorization>,
     address: SocketAddr,
+    bound: SocketAddr,
+    simultaneous: bool,
     live: AtomicBool,
 }
 
@@ -31,6 +34,7 @@ struct Grant {
     public_key: String,
     probe_session: String,
     probe_key: ProbeMacKey,
+    simultaneous: bool,
 }
 
 impl Grant {
@@ -45,10 +49,10 @@ impl Grant {
                 .is_some_and(|epoch| epoch.peer_session_generation == self.session)
             && conn.negotiated_punch.as_ref().is_some_and(|offer| {
                 offer.current(conn, network)
-                    && offer
-                        .profile
-                        .as_ref()
-                        .is_some_and(|p| p.tcp_candidates.contains(&self.endpoint))
+                    && offer.profile.as_ref().is_some_and(|p| {
+                        p.tcp_candidates.contains(&self.endpoint)
+                            && (!self.simultaneous || p.tcp_simultaneous_open)
+                    })
             })
             && effective_probe_mac_key(conn) == Some(self.probe_key)
     }
@@ -82,18 +86,26 @@ pub(crate) struct TcpPath {
     id: NonZeroU64,
     writer: Mutex<Option<OwnedWriteHalf>>,
     live: AtomicBool,
+    pub(crate) opening: TcpOpening,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TcpOpening {
+    DialListen,
+    Simultaneous,
 }
 
 impl std::fmt::Debug for TcpPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TcpPath")
             .field("id", &self.id)
+            .field("opening", &self.opening)
             .finish_non_exhaustive()
     }
 }
 
 impl TcpPath {
-    fn new(grant: Grant, writer: OwnedWriteHalf) -> io::Result<Self> {
+    fn new(grant: Grant, writer: OwnedWriteHalf, opening: TcpOpening) -> io::Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let id = NEXT
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
@@ -105,7 +117,15 @@ impl TcpPath {
             grant,
             writer: Mutex::new(Some(writer)),
             live: AtomicBool::new(true),
+            opening,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn socket_endpoints(&self) -> Option<(SocketAddr, SocketAddr)> {
+        let writer = self.writer.lock().ok()?;
+        let stream = writer.as_ref()?;
+        Some((stream.local_addr().ok()?, stream.peer_addr().ok()?))
     }
 
     pub(super) fn current(&self, conn: &PeerConnection, network: u64) -> bool {
@@ -170,12 +190,13 @@ impl PeerManager {
             listener
                 .as_ref()
                 .filter(|p| p.live.load(Ordering::Acquire))
-                .map(|p| p.address)
+                .map(|p| (p.address, p.simultaneous))
         });
         match endpoint {
-            Some(endpoint) => {
+            Some((endpoint, simultaneous)) => {
                 let mut offer = offer.unwrap_or_default();
                 offer.tcp_candidates = vec![endpoint];
+                offer.tcp_simultaneous_open = simultaneous;
                 Some(offer)
             }
             None => offer,
@@ -195,6 +216,12 @@ impl PeerManager {
             return None;
         }
         let grant = Grant {
+            simultaneous: listener.simultaneous
+                && conn
+                    .negotiated_punch
+                    .as_ref()
+                    .and_then(|offer| offer.profile.as_ref())
+                    .is_some_and(|profile| profile.tcp_simultaneous_open),
             listener: listener.clone(),
             endpoint,
             generation: network,
@@ -204,6 +231,13 @@ impl PeerManager {
             probe_key: effective_probe_mac_key(conn)?,
         };
         grant.current(conn, network).then_some(grant)
+    }
+
+    async fn tcp_setup_current(&self, peer: &str, grant: &Grant) -> bool {
+        self.connections.read().await.get(peer).is_some_and(|conn| {
+            self.peer_session_is_current_sync(peer, grant.session)
+                && grant.current(conn, self.current_network_generation_sync())
+        })
     }
 
     async fn install_tcp_path(&self, peer: &str, path: &Arc<TcpPath>) -> bool {

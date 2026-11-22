@@ -79,6 +79,7 @@ func TestNegotiatedProfileRejectsInvalidCandidates(t *testing.T) {
 		`{"nat_type":"LinearSymmetric","port_step":32768,"port_hint":12}`,
 		`{"nat_type":"Cone","port_step":1}`, `{"nat_type":"Cone","upnp_mapped_addr":"0.0.0.0:100"}`,
 		`{"tcp_candidates":["[ff02::1]:443"]}`, `{"tcp_candidates":["127.0.0.1:1","127.0.0.1:1"]}`,
+		`{"tcp_simultaneous_open":true}`,
 	} {
 		var profile PunchProfile
 		if err := json.Unmarshal([]byte(value), &profile); err == nil && profile.Validate() == nil {
@@ -97,7 +98,7 @@ func TestNegotiatedTCPOnlyOfferWithEmptyUDPList(t *testing.T) {
 		t.Fatal(err)
 	}
 	profile := signal.NATProfile
-	if profile == nil || profile.Validate() != nil || profile.PortHint != 0 || profile.SupportsSymPunch || len(profile.TCPCandidates) != 1 || len(signal.Candidates) != 0 {
+	if profile == nil || profile.Validate() != nil || profile.PortHint != 0 || profile.SupportsSymPunch || !profile.TCPSimultaneousOpen || len(profile.TCPCandidates) != 1 || len(signal.Candidates) != 0 {
 		t.Fatal("invalid TCP-only offer")
 	}
 	db := openSignalLeaseDB(t)

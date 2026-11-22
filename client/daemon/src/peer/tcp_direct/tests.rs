@@ -49,3 +49,26 @@ fn stream_frames_require_bounded_wireguard_transport_messages() {
     wire.push(0);
     assert!(super::wire::data_record(&wire).is_none());
 }
+
+#[tokio::test]
+async fn simultaneous_decisions_bind_connection_role_stage_and_peer_vote() {
+    for (other_key, other_role, other_stage, accepted) in [
+        ([1; 32], false, 1, true),
+        ([2; 32], false, 1, false),
+        ([1; 32], true, 1, false),
+        ([1; 32], false, 2, false),
+    ] {
+        let (mut a, mut b) = sockets().await;
+        let (local, remote) = tokio::join!(
+            simultaneous::exchange_decision(&mut a, &[1; 32], true, 1, true),
+            simultaneous::exchange_decision(&mut b, &other_key, other_role, other_stage, false)
+        );
+        if accepted {
+            assert!(!local.unwrap());
+            assert!(remote.unwrap());
+        } else {
+            assert_eq!(local.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(remote.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+    }
+}

@@ -12,6 +12,23 @@ const PORTS: usize = 16;
 // spend their traversal windows concurrently without racing port reservations.
 static MATRIX_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GatewayLease {
+    None,
+    Pcp,
+    NatPmp,
+}
+
+impl GatewayLease {
+    fn source(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pcp => "pcp",
+            Self::NatPmp => "nat_pmp",
+        }
+    }
+}
+
 struct Gateway {
     nat: NatKind,
     sockets: Vec<Arc<UdpSocket>>,
@@ -68,6 +85,13 @@ impl Gateway {
             .lock()
             .unwrap()
             .is_some_and(|expiry| tokio::time::Instant::now() < expiry)
+    }
+
+    fn grant(&self, requested: u32) -> u32 {
+        let seconds = requested.min(30);
+        *self.lease_until.lock().unwrap() =
+            Some(tokio::time::Instant::now() + Duration::from_secs(seconds.into()));
+        seconds
     }
 
     fn outbound(
@@ -172,10 +196,8 @@ impl LoopbackNetwork {
                 {
                     continue;
                 }
-                let granted = u32::from_be_bytes(request[4..8].try_into().unwrap()).min(30);
                 let gateway = &net.gateways[0];
-                *gateway.lease_until.lock().unwrap() =
-                    Some(tokio::time::Instant::now() + Duration::from_secs(granted.into()));
+                let granted = gateway.grant(u32::from_be_bytes(request[4..8].try_into().unwrap()));
                 let mut response = [0u8; 60];
                 response[0..2].copy_from_slice(&[2, 0x81]);
                 response[4..8].copy_from_slice(&granted.to_be_bytes());
@@ -190,6 +212,47 @@ impl LoopbackNetwork {
                 );
                 response[54..60].copy_from_slice(&[255, 255, 127, 0, 0, 1]);
                 socket.send_to(&response, from).await.unwrap();
+            }
+        });
+        address
+    }
+
+    async fn start_nat_pmp(self: &Arc<Self>, tasks: &mut JoinSet<()>) -> SocketAddr {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let net = self.clone();
+        tasks.spawn(async move {
+            let mut request = [0; 64];
+            while let Ok((n, from)) = socket.recv_from(&mut request).await {
+                if from.ip() != net.inside[0].ip() {
+                    continue;
+                }
+                if request[..n] == [0, 0] {
+                    let mut response = [0u8; 12];
+                    response[1] = 128;
+                    response[8..12].copy_from_slice(&Ipv4Addr::LOCALHOST.octets());
+                    socket.send_to(&response, from).await.unwrap();
+                } else if n == 12
+                    && request[..4] == [0, 1, 0, 0]
+                    && request[4..6] == net.inside[0].port().to_be_bytes()
+                {
+                    let gateway = &net.gateways[0];
+                    let seconds =
+                        gateway.grant(u32::from_be_bytes(request[8..12].try_into().unwrap()));
+                    let mut response = [0u8; 16];
+                    response[1] = 129;
+                    response[8..10].copy_from_slice(&request[4..6]);
+                    response[10..12].copy_from_slice(
+                        &gateway
+                            .mapped_socket
+                            .local_addr()
+                            .unwrap()
+                            .port()
+                            .to_be_bytes(),
+                    );
+                    response[12..16].copy_from_slice(&seconds.to_be_bytes());
+                    socket.send_to(&response, from).await.unwrap();
+                }
             }
         });
         address
@@ -322,7 +385,7 @@ async fn matrix_case(
     kinds: [NatKind; 2],
     transit: Duration,
     lose_first_challenge: bool,
-    gateway_pcp: bool,
+    lease: GatewayLease,
 ) -> bool {
     let setup = MATRIX_SETUP.lock().await;
     let keys = [NodeIdentity::generate(), NodeIdentity::generate()];
@@ -387,22 +450,33 @@ async fn matrix_case(
             .iter()
             .map(|s| (s.clone(), "stun_observed".into()))
             .collect();
-        if i == 0 && gateway_pcp {
+        if i == 0 && lease != GatewayLease::None {
             assert!(!network.gateways[i].has_lease());
-            let server = network.start_pcp(&mut tasks).await;
-            let (endpoint, granted) = crate::candidate_refresh::request_pcp_udp_mapping(
-                Ipv4Addr::LOCALHOST,
-                network.inside[i].port(),
-                server,
-                (rand::random(), None),
-            )
-            .await
+            let port = network.inside[i].port();
+            let (endpoint, granted) = if lease == GatewayLease::Pcp {
+                let server = network.start_pcp(&mut tasks).await;
+                crate::candidate_refresh::request_pcp_udp_mapping(
+                    Ipv4Addr::LOCALHOST,
+                    port,
+                    server,
+                    (rand::random(), None),
+                )
+                .await
+            } else {
+                let server = network.start_nat_pmp(&mut tasks).await;
+                crate::candidate_refresh::request_nat_pmp_udp_mapping(
+                    Ipv4Addr::LOCALHOST,
+                    port,
+                    server,
+                )
+                .await
+            }
             .unwrap();
             assert_eq!(granted, 30);
             assert!(network.gateways[i].has_lease());
             crate::candidate_refresh::prefer_gateway_candidate(
                 &endpoint.to_string(),
-                "pcp",
+                lease.source(),
                 &mut candidates,
                 &mut sources,
             );
@@ -411,7 +485,10 @@ async fn matrix_case(
             .punch_profile_for_signal(&candidates, &sources)
             .unwrap();
         assert_eq!(offer.nat_type, kinds[i]);
-        assert_eq!(offer.upnp_mapped_addr.is_some(), i == 0 && gateway_pcp);
+        assert_eq!(
+            offer.upnp_mapped_addr.is_some(),
+            i == 0 && lease != GatewayLease::None
+        );
         let wire = serde_json::to_vec(&(offer, candidates, sources)).unwrap();
         signals.push(wire);
     }
@@ -561,16 +638,16 @@ async fn matrix_case(
         }
     }
     eprintln!(
-        "NAT matrix {:?} x {:?} result={} UDP challenges={packets} gateway_pcp={gateway_pcp} elapsed_ms={}",
+        "NAT matrix {:?} x {:?} result={} UDP challenges={packets} gateway_pcp={} gateway_lease={} elapsed_ms={}",
         kinds[0],
         kinds[1],
         if pair.is_some() {
             "bidirectional authenticated UDP"
         } else {
             "relay"
-        }, started.elapsed().as_millis()
+        }, lease == GatewayLease::Pcp, lease.source(), started.elapsed().as_millis()
     );
-    if gateway_pcp || kinds.contains(&NatKind::Cone) {
+    if lease != GatewayLease::None || kinds.contains(&NatKind::Cone) {
         if pair.is_none() {
             for (i, manager) in peers.iter().enumerate() {
                 let connection = manager.get_connection(PEERS[1 - i]).await.unwrap();
@@ -629,7 +706,12 @@ async fn negotiated_rootless_nat_matrix() {
             NatKind::LinearSymmetric,
             NatKind::RandomSymmetric,
         ] {
-            cases.spawn(matrix_case([a, b], Duration::from_millis(3), false, false));
+            cases.spawn(matrix_case(
+                [a, b],
+                Duration::from_millis(3),
+                false,
+                GatewayLease::None,
+            ));
         }
     }
     let mut direct = 0;
@@ -644,11 +726,26 @@ async fn negotiated_rootless_nat_matrix() {
 
 #[tokio::test]
 async fn negotiated_delayed_udp_retries_after_first_challenge_is_lost_in_each_direction() {
-    matrix_case([NatKind::Cone; 2], Duration::from_millis(120), true, false).await;
+    matrix_case(
+        [NatKind::Cone; 2],
+        Duration::from_millis(120),
+        true,
+        GatewayLease::None,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn negotiated_nat_matrix_with_one_authorized_pcp_gateway() {
+    leased_matrix(GatewayLease::Pcp).await;
+}
+
+#[tokio::test]
+async fn negotiated_nat_matrix_without_pcp_with_one_nat_pmp_gateway() {
+    leased_matrix(GatewayLease::NatPmp).await;
+}
+
+async fn leased_matrix(lease: GatewayLease) {
     let kinds = [
         NatKind::Cone,
         NatKind::LinearSymmetric,
@@ -658,7 +755,7 @@ async fn negotiated_nat_matrix_with_one_authorized_pcp_gateway() {
     for local in kinds {
         for remote in kinds {
             direct += usize::from(
-                matrix_case([local, remote], Duration::from_millis(3), false, true).await,
+                matrix_case([local, remote], Duration::from_millis(3), false, lease).await,
             );
         }
     }

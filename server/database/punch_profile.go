@@ -9,12 +9,13 @@ import (
 // PunchProfile is an optional capability in a generation-bound peer offer or
 // answer. Old devices omit the whole object and continue using candidate_sources.
 type PunchProfile struct {
-	NATType          string           `json:"nat_type"`
-	PortStep         int32            `json:"port_step"`
-	PortHint         uint16           `json:"port_hint"`
-	UPnPMappedAddr   *netip.AddrPort  `json:"upnp_mapped_addr"`
-	TCPCandidates    []netip.AddrPort `json:"tcp_candidates,omitempty"`
-	SupportsSymPunch bool             `json:"supports_sym_punch"`
+	NATType             string           `json:"nat_type"`
+	PortStep            int32            `json:"port_step"`
+	PortHint            uint16           `json:"port_hint"`
+	UPnPMappedAddr      *netip.AddrPort  `json:"upnp_mapped_addr"`
+	TCPCandidates       []netip.AddrPort `json:"tcp_candidates,omitempty"`
+	TCPSimultaneousOpen bool             `json:"tcp_simultaneous_open,omitempty"`
+	SupportsSymPunch    bool             `json:"supports_sym_punch"`
 }
 
 // UnmarshalJSON supplies the same old-client defaults as the Rust receiver.
@@ -46,6 +47,9 @@ func (p *PunchProfile) Validate() error {
 	}
 	if len(p.TCPCandidates) > 16 {
 		return errors.New("too many TCP candidates")
+	}
+	if p.TCPSimultaneousOpen && len(p.TCPCandidates) == 0 {
+		return errors.New("TCP simultaneous open requires a TCP candidate")
 	}
 	valid := func(a netip.AddrPort) bool {
 		return a.IsValid() && a.Port() != 0 && !a.Addr().IsUnspecified() && !a.Addr().IsMulticast() && a.Addr().Zone() == ""

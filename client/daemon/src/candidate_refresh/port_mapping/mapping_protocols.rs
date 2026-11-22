@@ -31,6 +31,21 @@ async fn discover_nat_pmp_udp_candidate(
     gateway: Ipv4Addr,
 ) -> std::result::Result<PortMappingCandidate, String> {
     let gateway_addr = SocketAddr::new(IpAddr::V4(gateway), NAT_MAPPING_CONTROL_PORT);
+    let (endpoint, lease_seconds) = request_nat_pmp_udp_mapping(local_ip, local_port, gateway_addr).await?;
+    is_public_udp_candidate(endpoint)
+        .then_some(PortMappingCandidate {
+            endpoint: endpoint.to_string(),
+            source: "nat_pmp",
+            lease_seconds,
+        })
+        .ok_or_else(|| format!("gateway returned non-public endpoint {endpoint}"))
+}
+
+pub(crate) async fn request_nat_pmp_udp_mapping(
+    local_ip: Ipv4Addr,
+    local_port: u16,
+    gateway_addr: SocketAddr,
+) -> std::result::Result<(SocketAddr, u32), String> {
     let bind_addr = SocketAddr::new(IpAddr::V4(local_ip), 0);
     let socket = match p2pnet_netbind::bind_udp(bind_addr, None).await {
         Ok(socket) => socket,
@@ -101,13 +116,7 @@ async fn discover_nat_pmp_udp_candidate(
         return Err("NAT-PMP gateway returned an expired lease".into());
     }
     let endpoint = SocketAddr::new(IpAddr::V4(external_ip), external_port);
-    is_public_udp_candidate(endpoint)
-        .then_some(PortMappingCandidate {
-            endpoint: endpoint.to_string(),
-            source: "nat_pmp",
-            lease_seconds,
-        })
-        .ok_or_else(|| format!("gateway returned non-public endpoint {endpoint}"))
+    Ok((endpoint, lease_seconds))
 }
 
 async fn discover_pcp_udp_candidate(
