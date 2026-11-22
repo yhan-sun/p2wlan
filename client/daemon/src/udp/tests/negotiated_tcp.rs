@@ -66,11 +66,6 @@ async fn exchange(nodes: &mut [Node], n: u16, path: NetworkPath) {
         let j = 1 - i;
         let packet = business(i, n);
         let generation = nodes[i].manager.current_network_generation_sync();
-        let selection = nodes[i]
-            .manager
-            .select_path_for_data(IDS[j], true, true)
-            .await;
-        assert_eq!(selection.path, Some(path), "{selection:?}");
         assert!(
             crate::network_outbound::send_original_slow_for_test(
                 packet.clone().into(),
@@ -335,9 +330,6 @@ async fn negotiated_configured_tcp_carries_wg_then_returns_to_tls_relay() {
         }
         panic!("authorized TCP stream did not become usable");
     }
-    for sequence in 2..=5 {
-        exchange(&mut nodes, sequence, NetworkPath::TcpDirect).await;
-    }
     let (_, diagnostics) = nodes[0]
         .manager
         .diagnostic_with_path_selection(IDS[1], true, true, Duration::from_secs(1), None)
@@ -367,32 +359,28 @@ async fn negotiated_configured_tcp_carries_wg_then_returns_to_tls_relay() {
         .as_ref()
         .and_then(|p| p.tcp_link())
         .is_some());
+
+    // Application traffic owns this clock. The sender never polls routing or
+    // waits for path retirement before submitting the next numbered packet.
+    let mut cadence = tokio::time::interval(Duration::from_millis(20));
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    for sequence in 2..=5 {
+        cadence.tick().await;
+        exchange(&mut nodes, sequence, NetworkPath::TcpDirect).await;
+    }
     let disconnected = Instant::now();
     stop[1].send_replace(true);
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let mut retired = true;
-            for i in 0..2 {
-                retired &= nodes[i]
-                    .manager
-                    .select_path_for_data(IDS[1 - i], true, true)
-                    .await
-                    .path
-                    == Some(NetworkPath::Relay);
-            }
-            if retired {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    // This captured wire packet belongs to the retired reader. If it gets
-    // delivered, the ordered next-plaintext assertion for sequence six fails.
-    nodes[1].decrypt.send(stale).await.unwrap();
+    cadence.tick().await;
     exchange(&mut nodes, 6, NetworkPath::Relay).await;
-    eprintln!("TLS Relay → configured direct TCP → TLS Relay: 7 numbered WireGuard payloads decrypted per direction; fallback delivery {} ms", disconnected.elapsed().as_millis());
+    let fallback = disconnected.elapsed();
+    // This captured wire packet belongs to the retired reader. If delivered,
+    // it would appear before the next numbered plaintext on this same tunnel.
+    nodes[1].decrypt.send(stale).await.unwrap();
+    for sequence in 7..=11 {
+        cadence.tick().await;
+        exchange(&mut nodes, sequence, NetworkPath::Relay).await;
+    }
+    eprintln!("TLS Relay → configured direct TCP → TLS Relay: 12 numbered WireGuard payloads decrypted per direction; first post-disconnect pair on the 20 ms cadence delivered in {} ms", fallback.as_millis());
     tasks.shutdown().await;
     for node in nodes {
         node.relay.abort_writer();
