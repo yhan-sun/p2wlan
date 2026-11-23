@@ -6,6 +6,7 @@ build. The checked-out repository supplies only this acceptance harness.
 It deliberately refuses to run on developer machines or self-hosted runners.
 """
 import argparse
+import base64
 import datetime
 import hashlib
 import json
@@ -15,6 +16,7 @@ import platform
 import pty
 import pwd
 import re
+import secrets
 import selectors
 import signal
 import socket
@@ -23,6 +25,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import termios
 import time
 import urllib.error
 import urllib.request
@@ -30,6 +33,7 @@ import urllib.request
 
 MAX_COMMAND_OUTPUT = 4 * 1024 * 1024
 MAX_HTTP_RESPONSE = 32 * 1024
+WIZARD_ADMIN_USER = 'release-smoke-admin'
 
 
 class SmokeFailure(Exception):
@@ -121,6 +125,7 @@ class PublishedServerSmoke:
     def __init__(self, args):
         self.args = args
         self.secrets = set()
+        self.wizard_password = None
         self.attempted_install = False
         self.bootstrap_digest = None
         self.image = None
@@ -443,6 +448,13 @@ class PublishedServerSmoke:
                         output.extend(chunk)
                         require(len(output) <= MAX_COMMAND_OUTPUT, 'public_wizard_output_limit')
                         text = output.decode(errors='replace')
+                        if not steps and self.wizard_password is None and '管理员账号 [admin]: ' in text[cursor:]:
+                            self.wizard_password = secrets.token_urlsafe(24)
+                            self.secrets.add(self.wizard_password.encode())
+                            steps.extend([('管理员账号 [admin]: ', WIZARD_ADMIN_USER),
+                                          ('输入隐藏）: ', self.wizard_password),
+                                          ('确认管理员密码: ', self.wizard_password)])
+                            total_steps += len(steps)
                         while steps:
                             needle, reply = steps[0]
                             found = text.find(needle, cursor)
@@ -456,6 +468,12 @@ class PublishedServerSmoke:
                                 self.evidence['checks']['default_release_matches_requested'] = True
                             if needle == '确认部署':
                                 self.before_confirmation()
+                            if self.wizard_password is not None and reply == self.wizard_password:
+                                # Bash may print its prompt just before disabling PTY echo.
+                                echo_deadline = time.monotonic() + 3
+                                while termios.tcgetattr(terminal)[3] & termios.ECHO:
+                                    require(time.monotonic() < echo_deadline, 'public_password_prompt_echo_enabled')
+                                    time.sleep(0.01)
                             os.write(terminal, (reply + '\n').encode())
                             cursor = found + len(needle)
                             steps.pop(0)
@@ -539,10 +557,12 @@ class PublishedServerSmoke:
                 if len(line) >= 32 and not line.startswith(b'-----'):
                     self.secrets.add(line)
 
-    def http(self, path, *, body=None, token=None):
+    def http(self, path, *, body=None, token=None, basic_auth=None):
         data = None if body is None else json.dumps(body).encode()
         headers = {'Content-Type': 'application/json'}
-        if token:
+        if basic_auth:
+            headers['Authorization'] = 'Basic ' + base64.b64encode(basic_auth.encode()).decode('ascii')
+        elif token:
             headers['Authorization'] = 'Bearer ' + token
         request = urllib.request.Request('http://127.0.0.1:18080' + path, data=data, headers=headers)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
@@ -634,6 +654,28 @@ class PublishedServerSmoke:
     def verify(self):
         self.verify_native() if self.args.method == 'native' else self.verify_docker()
         self.http('/admin/api/v1/overview', token=self.admin_token)
+        if self.wizard_password is None:
+            # Older releases only offer token login. A capable package must
+            # have asked for the administrator on this fresh installation.
+            if self.args.method == 'native':
+                help_text = self.command('config_help', [str(self.program / 'current/p2wlan-config'), '--help'])
+            else:
+                help_text = self.compose(['exec', '-T', 'control', '/usr/local/bin/p2wlan-config', '--help'], 'config_help')
+            require(b'-admin-user ' not in help_text, 'public_wizard_missing_admin_prompt')
+            return
+        summary = self.first_bootstrap_output.decode(errors='replace').partition('健康检查通过，访问地址')[2]
+        for label, address in [('服务端地址', 'http://127.0.0.1:18080'),
+                               ('管理后台地址', 'http://127.0.0.1:18080/admin/'),
+                               ('Relay 地址', 'tls://localhost:18081')]:
+            require(any(line.startswith(label) and line.endswith('：' + address) for line in summary.splitlines()),
+                    'public_wizard_access_address_missing')
+        login = json.loads(self.http('/admin/api/v1/session', body={},
+                                     basic_auth=WIZARD_ADMIN_USER + ':' + self.wizard_password))
+        session = login.get('access_token')
+        require(isinstance(session, str) and session and session != self.admin_token, 'admin_password_session_missing')
+        self.secrets.add(session.encode())
+        self.http('/admin/api/v1/overview', token=session)
+        self.evidence['checks'].update(wizard_admin_password_login=True, wizard_access_addresses=True)
 
     def stop(self):
         if self.args.method == 'native':
@@ -662,7 +704,6 @@ class PublishedServerSmoke:
         original = self.credential_fingerprint()
         self.verify()
         self.evidence['checks']['real_initial_deployment'] = True
-        import secrets
         account = dict(email='release-smoke-' + secrets.token_hex(8) + '@example.test', password=secrets.token_hex(24))
         self.secrets.add(account['password'].encode())
         registration = json.loads(self.http('/api/v1/register', body=account))
