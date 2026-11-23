@@ -328,6 +328,21 @@ def certificate_email(value):
         fail('请输入有效的 ACME 账户邮箱')
     return value
 
+def port_without_bind_privilege(port):
+    # The caller can use a rootful daemon without permission to bind privileged
+    # ports itself. The kernel still exposes its TCP listening sockets.
+    if shutil.which('ss'):
+        return not run(['ss', '-H', '-ltn', f'sport = :{port}'])
+    tables = [path for path in (Path('/proc/net/tcp'), Path('/proc/net/tcp6')) if path.is_file()]
+    if not tables:
+        fail(f'无法检查主机 TCP {port}，请安装 ss 或使用 sudo 运行安装器。')
+    for table in tables:
+        for line in table.read_text().splitlines()[1:]:
+            fields = line.split()
+            if fields[3] == '0A' and int(fields[1].rsplit(':', 1)[1], 16) == port:
+                return False
+    return True
+
 def port_available(port):
     for family, host in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
         try:
@@ -339,6 +354,8 @@ def port_available(port):
         except OSError as error:
             if error.errno == errno.EADDRINUSE:
                 return False
+            if error.errno in (errno.EACCES, errno.EPERM):
+                return port_without_bind_privilege(port)
             if error.errno not in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.EADDRNOTAVAIL):
                 raise
     return True

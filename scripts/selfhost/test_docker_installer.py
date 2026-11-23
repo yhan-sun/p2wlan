@@ -413,6 +413,30 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(owner.exists())
 
+    def test_user_without_privileged_bind_permission_can_check_kernel_listeners(self):
+        self.existing_web_conflict().unlink()
+        marker = self.path / 'listener-active'
+        marker.touch()
+        self.env.update(PYTHONPATH=str(self.path), FIXTURE_LISTENER=str(marker))
+        (self.path / 'sitecustomize.py').write_text("""
+import errno, socket
+original = socket.socket.bind
+def bind(sock, addr):
+    if addr[1] in (80, 443):
+        raise PermissionError(errno.EACCES, 'privileged port')
+    return original(sock, addr)
+socket.socket.bind = bind
+""")
+        self.executable(self.bin / 'ss', '''#!/bin/sh
+if [ "$3" = 'sport = :443' ] && [ -f "$FIXTURE_LISTENER" ]; then echo 'LISTEN *:443'; fi
+''')
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('TCP 443 已被占用', result.stderr)
+        marker.unlink()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
     def test_stale_confirmed_owner_and_auto_remove_containers_are_not_stopped(self):
         owner = self.existing_web_conflict()
@@ -452,7 +476,11 @@ def read(path, *args, **kwargs):
 socket.socket.bind = bind
 pathlib.Path.read_text = read
 """)
-        self.executable(self.bin / 'ss', '#!/bin/sh\necho \'LISTEN 0 128 *:80 *:* users:(("nginx",pid=123456,fd=3))\'\n')
+        self.executable(self.bin / 'ss', '''#!/bin/sh
+if [ "$3" = 'sport = :80' ] && [ -f "$FIXTURE_LISTENER" ]; then
+    echo 'LISTEN 0 128 *:80 *:* users:(("nginx",pid=123456,fd=3))'
+fi
+''')
         self.executable(self.bin / 'systemctl', """#!/bin/sh
 case "$1" in
     show) echo 1234567890abcdef1234567890abcdef ;;
