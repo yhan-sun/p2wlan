@@ -19,6 +19,7 @@ if os.name == 'posix':
 
 
 ROOT = Path(__file__).resolve().parents[2]
+ACCOUNT_INPUT = [('管理员账号', 'operator'), ('管理员密码（', 'sample pass for test'), ('确认管理员密码', 'sample pass for test')]
 IMAGE = 'registry.example.test/p2wlan-server@sha256:' + 'a' * 64
 IMAGE_ID = 'sha256:' + 'b' * 64
 COMMIT = 'c' * 40
@@ -73,6 +74,9 @@ elif args[:1] == ['run']:
         print('--mode --output --relay-endpoint --tls-cert --tls-key --dev-localhost')
         sys.exit(0)
     if '--output' not in args: sys.exit(0)
+    if '--admin-user' in args:
+        assert '--interactive' in args and args[args.index('--admin-user') + 1] == 'operator'
+        assert sys.stdin.readline().rstrip('\n') == 'sample pass for test'
     if os.environ.get('FAIL_DOCKER_GENERATE'): sys.exit(1)
     mounts = []
     for index, arg in enumerate(args):
@@ -260,6 +264,28 @@ else:
         digest = hashlib.sha256(path.read_bytes()).hexdigest() if checksum else '0' * 64
         (self.path / 'SERVER-IMAGE.json.sha256').write_text(f'{digest}  SERVER-IMAGE.json\n')
 
+    def test_busy_acme_port_reports_planned_addresses_before_any_build(self):
+        import socket
+        self.certbot_stub('relay.example.test')
+        with socket.socket() as busy:
+            busy.bind(('127.0.0.1', 0))
+            busy.listen()
+            # Exercise a real bind collision without reserving privileged host port 80.
+            (self.path / 'sitecustomize.py').write_text(
+                'import socket\noriginal = socket.socket.bind\n'
+                'def bind(sock, addr):\n'
+                f'    if addr == ("0.0.0.0", 80): addr = ("127.0.0.1", {busy.getsockname()[1]})\n'
+                '    return original(sock, addr)\nsocket.socket.bind = bind\n')
+            self.env['PYTHONPATH'] = str(self.path)
+            result = self.run_installer('--tls-mode', 'auto', '--tls-domain', 'relay.example.test',
+                                        '--relay-endpoint', 'tls://relay.example.test:18081', '--no-start')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('TCP 80 已被占用', result.stderr)
+        self.assertIn('本次部署未完成', result.stderr)
+        self.assertIn('管理后台地址：https://relay.example.test/admin/', result.stderr)
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.calls(), [])
+
     def test_dry_run_does_not_contact_docker_or_create_the_deployment(self):
         result = self.run_installer('--dev-localhost', '--dry-run')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -335,7 +361,7 @@ urllib.request.urlopen = fixture_urlopen
     def test_interactive_mode_uses_dev_tty_while_python_source_occupies_stdin(self):
         code, output = self.run_interactive([
             ('Relay主机', ''), ('Relay端口', ''), ('Control端口', ''),
-            ('metrics端口', ''), ('Relay绑定IP', ''), ('确认部署', '1'),
+            ('metrics端口', ''), ('Relay绑定IP', ''), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], '--dev-localhost', '--no-start', before_reply=lambda *_: self.assert_not_deployed())
         self.assertEqual(code, 0, output)
         self.assertTrue((self.target / 'config/control.env').exists())
@@ -346,7 +372,7 @@ urllib.request.urlopen = fixture_urlopen
         code, output = self.run_interactive([
             ('部署目录', str(self.target)), ('部署模式', '2'), ('Relay主机', ''),
             ('Relay端口', ''), ('Control端口', ''), ('metrics端口', ''),
-            ('Relay绑定IP', ''), ('启动方式', '2'), ('确认部署', '1'),
+            ('Relay绑定IP', ''), ('启动方式', '2'), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], include_dir=False, before_reply=lambda *_: self.assert_not_deployed())
         self.assertEqual(code, 0, output)
         self.assertIn('/opt/p2wlan-docker', output)
@@ -364,7 +390,7 @@ urllib.request.urlopen = fixture_urlopen
             ('部署模式', '1'), ('Relay主机', 'relay.example.test'), ('Relay端口', '28081'),
             ('证书来源', '3'), ('证书链路径', str(certificate)), ('私钥路径', str(key)),
             ('Control端口', '28080'), ('metrics端口', '28082'),
-            ('Relay绑定IP', '0.0.0.0'), ('启动方式', '1'), ('确认部署', '1'),
+            ('Relay绑定IP', '0.0.0.0'), ('启动方式', '1'), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], before_reply=lambda *_: self.assert_not_deployed())
         self.assertEqual(code, 0, output)
         settings = (self.target / '.env').read_text()
@@ -375,6 +401,10 @@ urllib.request.urlopen = fixture_urlopen
         self.assertEqual(generator[generator.index('--relay-endpoint') + 1], 'tls://relay.example.test:28081')
         self.assertTrue(any('up' in call['args'] and '--help' not in call['args'] for call in self.calls()))
         self.assertNotIn('fixture-private-key', output)
+        self.assertNotIn('sample pass for test', output + self.log.read_text())
+        self.assertIn('健康检查通过，访问地址', output)
+        self.assertIn('服务端地址（Control）：https://relay.example.test', output)
+        self.assertIn('管理后台地址：https://relay.example.test/admin/', output)
 
     @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
     def test_wizard_retries_invalid_choices_ports_addresses_and_directory(self):
@@ -387,7 +417,7 @@ urllib.request.urlopen = fixture_urlopen
             ('metrics端口', '28080'), ('metrics端口', '28082'),
             ('Relay绑定IP', '0.0.0.0'), ('Relay绑定IP', '127.0.0.2'),
             ('启动方式', '99'), ('启动方式', '2'),
-            ('确认部署', '99'), ('确认部署', '1'),
+            ('确认部署', '99'), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], include_dir=False, before_reply=lambda *_: self.assert_not_deployed())
         self.assertEqual(code, 0, output)
         settings = (self.target / '.env').read_text()
@@ -572,7 +602,7 @@ esac
             ('确认部署', '2'), ('部署目录', str(self.target)), ('部署模式', '2'),
             ('Relay主机', 'localhost'), ('Relay端口', '38081'),
             ('Control端口', '38080'), ('metrics端口', '38082'),
-            ('Relay绑定IP', '127.0.0.1'), ('启动方式', '2'), ('确认部署', '1'),
+            ('Relay绑定IP', '127.0.0.1'), ('启动方式', '2'), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], '--dev-localhost', '--relay-endpoint', 'tls://localhost:28081',
             '--control-port', '28080', '--metrics-port', '28082',
             '--publish-host', '127.0.0.1', '--no-start',
@@ -592,7 +622,7 @@ esac
             ('确认部署', '2'), ('部署目录', str(self.target)), ('部署模式', '2'),
             ('Relay主机', 'localhost'), ('Relay端口', '38081'),
             ('Control端口', '38080'), ('metrics端口', '38082'),
-            ('Relay绑定IP', ''), ('启动方式', '2'), ('确认部署', '1'),
+            ('Relay绑定IP', ''), ('启动方式', '2'), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], '--relay-endpoint', 'tls://relay.example.test:28081',
             '--tls-cert', str(certificate), '--tls-key', str(key),
             '--control-port', '28080', '--metrics-port', '28082',

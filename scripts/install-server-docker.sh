@@ -8,6 +8,7 @@ import argparse
 import contextlib
 import fcntl
 import errno
+import getpass
 import hashlib
 import ipaddress
 import io
@@ -25,6 +26,7 @@ import sys
 import tempfile
 import urllib.request
 import urllib.parse
+import warnings
 
 os.umask(0o077)
 script_dir = Path(sys.argv[1])
@@ -67,12 +69,13 @@ class InstallError(Exception):
 def fail(message):
     raise InstallError(message)
 
-def run(arguments, *, timeout=30, capture=True, env=None):
+def run(arguments, *, timeout=30, capture=True, env=None, input_text=None):
     try:
-        result = subprocess.run(arguments, stdin=subprocess.DEVNULL,
+        result = subprocess.run(arguments, stdin=subprocess.DEVNULL if input_text is None else None, input=input_text,
                                 stdout=subprocess.PIPE if capture else None,
                                 stderr=subprocess.PIPE if capture else None,
-                                text=True, timeout=timeout, env=env, check=False)
+                                text=True, encoding='utf-8' if input_text is not None else None,
+                                timeout=timeout, env=env, check=False)
     except subprocess.TimeoutExpired:
         fail('command timed out: ' + ' '.join(arguments[:3]))
     except OSError:
@@ -160,6 +163,49 @@ def choice(terminal, label, default, choices):
             fail('请选择 ' + '/'.join(choices))
         return value
     return ask(terminal, label, default, validate)
+
+def admin_account(terminal):
+    def username(value):
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', value):
+            fail('账号须以字母或数字开头，可含点、下划线和短横线，最多 64 个字符')
+        return value
+    def secret(label):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('error', getpass.GetPassWarning)
+                value = getpass.getpass(label, stream=terminal)
+        except (getpass.GetPassWarning, EOFError, KeyboardInterrupt):
+            fail('无法从终端安全读取密码，安装已取消')
+        if value.lower() in CANCEL_REPLIES:
+            fail('installation cancelled')
+        return value
+    name = ask(terminal, '管理员账号', 'admin', username)
+    while True:
+        password = secret('管理员密码（12–72 个 UTF-8 字节，输入隐藏）: ')
+        if 12 <= len(password.encode()) <= 72 and '\x00' not in password:
+            check = secret('确认管理员密码: ')
+            if password == check:
+                return name, password
+        terminal.write('密码长度不符或两次输入不一致，请重新输入。\n')
+
+def access_addresses(control, endpoint, panel):
+    local = 'http://127.0.0.1:' + str(control)
+    host = '[' + panel.strip('[]') + ']' if panel and ':' in panel else panel
+    base = 'https://' + host if host else local
+    return f'服务端地址（Control）：{base}\n管理后台地址：{base}/admin/\nRelay 地址：{endpoint}'
+
+@contextlib.contextmanager
+def show_failed_addresses(addresses):
+    try:
+        yield
+    except Exception:
+        print('本次部署未完成。以下为计划地址，可用性尚未确认。\n' + addresses, file=sys.stderr, flush=True)
+        raise
+
+def require_edge_port(port):
+    if not port_available(port):
+        fail(f'主机 TCP {port} 已被占用。请用 sudo ss -ltnp 查看监听进程。'
+             '内置 HTTPS 入口启动需要独占 80 和 443；如需保留现有 Web 服务，可使用原生安装配合现有反向代理。')
 
 def deployment_directory(raw):
     if (not raw.startswith('/') or not re.fullmatch(r'/[A-Za-z0-9_./-]+', raw)
@@ -447,9 +493,8 @@ def ensure_certbot():
         fail('installing certbot failed; install it with apt-get, or use --tls-mode files')
 
 def request_certificate(domain, contact, hooks):
+    require_edge_port(80)
     ensure_certbot()
-    if not port_available(80):
-        fail('HTTP-01 standalone needs TCP 80 free on this host; stop that service or use --tls-mode selfsigned')
     print('[TLS] Requesting a certificate for ' + domain)
     contact_arguments = (['-m', contact, '--no-eff-email'] if contact
                          else ['--register-unsafely-without-email'])
@@ -630,7 +675,7 @@ def saved_deployment(directory):
 def configure_new(terminal, plan, edit=False):
     previous_dev = plan['dev']
     supplied_tls = bool(args.relay_endpoint and args.tls_cert and args.tls_key)
-    terminal.write('\n[2/7] 部署模式\n  1) 公网部署（需要已有可信证书和 HTTPS/WSS 反向代理）\n  2) 本机测试（24 小时测试证书，仅 loopback）\n')
+    terminal.write('\n[2/7] 部署模式\n  1) 公网部署（内置 HTTPS/WSS 入口，使用主机 TCP 80 和 443）\n  2) 本机测试（24 小时测试证书，仅 loopback）\n')
     if edit or not (args.dev_localhost or supplied_tls):
         mode = choice(terminal, '部署模式', '2' if plan['dev'] else '1', ('2',) if args.local_image else ('1', '2'))
         plan['dev'] = mode == '2'
@@ -1069,16 +1114,16 @@ def install(resources):
                 ('证书来源', '本机测试证书' if plan['dev'] else
                  {'auto': '自动申请（自动续期）', 'selfsigned': '自签名（本地 CA）',
                   'files': '已有证书文件'}[plan['tls_mode']]),
-                ('证书链路径', plan['tls_cert'] or '自动生成本机测试证书'),
-                ('私钥路径', plan['tls_key'] or '自动生成本机测试私钥'),
                 ('启动方式', '只准备' if plan['no_start'] else '安装并启动'),
             ):
                 terminal.write(f'  {label}：{value}\n')
+            if plan['tls_cert'] and plan['tls_key']:
+                terminal.write(f'  证书链路径：{plan["tls_cert"]}\n  私钥路径：{plan["tls_key"]}\n')
             if plan['dev']:
                 terminal.write('Control 仅监听 loopback；本机测试不配置公网 HTTPS。\n')
-            else:
-                terminal.write('将启动内置 HTTPS 入口：https://'
-                               + (plan['tls_domain'] or endpoint_parts(plan['endpoint'], False)[0]) + '\n')
+            elif not existing or settings.get('COMPOSE_PROFILES') == 'edge':
+                panel = plan['tls_domain'] or endpoint_parts(plan['endpoint'], False)[0]
+                terminal.write('计划访问地址\n' + access_addresses(plan['control_port'], plan['endpoint'], panel) + '\n')
             terminal.write('  1) 确认部署  2) 重新填写' + ('启动方式' if existing else '配置') + '  0/q) 取消\n')
             action = choice(terminal, '确认部署', '1', ('1', '2', '0'))
             if action == '0':
@@ -1131,12 +1176,17 @@ def install(resources):
     args.dev_localhost, args.relay_endpoint = plan['dev'], plan['endpoint']
     args.tls_mode, args.tls_domain, args.tls_email = plan['tls_mode'], plan['tls_domain'], plan['tls_email']
     edge_enabled = (not args.dev_localhost) and (not existing or settings.get('COMPOSE_PROFILES') == 'edge')
+    panel = (plan['tls_domain'] or endpoint_parts(plan['endpoint'], False)[0]) if edge_enabled else None
+    addresses = access_addresses(plan['control_port'], plan['endpoint'], panel)
+    resources.enter_context(show_failed_addresses(addresses))
     if edge_enabled:
         check_edge_ports(plan['control_port'], plan['relay_port'])
-        if not existing and not plan['no_start']:
-            for port in (80, 443):
-                if not port_available(port):
-                    fail(f'HTTPS edge host port {port} is already in use')
+        if not existing:
+            if not plan['no_start'] or args.tls_mode == 'auto':
+                require_edge_port(80)
+            if not plan['no_start']:
+                require_edge_port(443)
+    account = admin_account(terminal) if terminal and not existing else None
     args.tls_cert, args.tls_key = plan['tls_cert'], plan['tls_key']
     args.control_port, args.metrics_port = plan['control_port'], plan['metrics_port']
     args.publish_host, args.no_start = plan['publish_host'], plan['no_start']
@@ -1283,9 +1333,12 @@ def install(resources):
                             os.chown(stage / destination, uid, gid)
                     generator += ['--tls-cert', '/output/input.crt', '--tls-key', '/output/input.key']
                 print('[2/3] Generating private matching configuration')
+                if account:
+                    generator += ['--admin-user', account[0]]
                 try:
-                    run(common + ['--user', f'{uid}:{gid}', '--mount', f'type=bind,src={stage},dst=/output',
-                                  '--entrypoint', '/usr/local/bin/p2wlan-config', image] + generator, timeout=60)
+                    run(common + (['--interactive'] if account else []) + ['--user', f'{uid}:{gid}', '--mount',
+                        f'type=bind,src={stage},dst=/output', '--entrypoint', '/usr/local/bin/p2wlan-config', image]
+                        + generator, timeout=60, input_text=account[1] + '\n' if account else None)
                 except InstallError:
                     fail('configuration generation failed; verify Relay endpoint, matching TLS chain/key and certificate hostname/validity')
                 if not args.dev_localhost:
@@ -1359,23 +1412,13 @@ def install(resources):
             print(f'Manage: cd {directory} && docker compose ps')
             print(f'Logs: cd {directory} && docker compose logs --tail 100 control relay')
             print(f'Restart: cd {directory} && docker compose restart')
-            label = 'Configured Control (services not started)' if args.no_start else 'Local Control'
-            print(f'{label}: http://127.0.0.1:{settings["CONTROL_PORT"]}')
-            print(f'Admin path: http://127.0.0.1:{settings["CONTROL_PORT"]}/admin/')
-            if edge_enabled:
-                panel = settings['P2WLAN_TLS_DOMAIN']
-                if ':' in panel:
-                    panel = '[' + panel.strip('[]') + ']'
-                print('Panel: https://' + panel + '/')
-                print('Admin path: https://' + panel + '/admin/')
-            print('Relay endpoint: ' + plan['endpoint'])
-            print('Admin credential: CONTROL_ADMIN_TOKEN in config/control.env (not printed).')
-            if args.dev_localhost:
-                print('Control stays on loopback; Relay uses a local test certificate.')
-            else:
-                print('Panel serves trusted HTTPS/WSS; Relay uses the same certificate files.')
             if args.dev_localhost:
                 print('Local test only: the generated certificate expires in 24 hours and is not publicly trusted.')
+            if account:
+                print('管理员账号：' + account[0])
+            print('管理令牌保存在 ' + str(config / 'control.env') + ' 的 CONTROL_ADMIN_TOKEN 字段。')
+            print('配置已就绪，本次未启动服务。计划访问地址' if args.no_start else '健康检查通过，访问地址')
+            print(addresses)
     if terminal:
         terminal.close()
 

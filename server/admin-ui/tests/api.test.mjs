@@ -1,6 +1,24 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { adminApi, api, clearAdminToken, getAdminToken, setAdminToken, verifyAdminToken } from '../src/api.ts'
+import { adminApi, api, clearAdminToken, getAdminToken, openAdminSession, setAdminToken, supportsPasswordLogin, verifyAdminToken } from '../src/api.ts'
+
+test('account login sends UTF-8 credentials only to the session endpoint and returns a separate bearer', async t => {
+  setup(t)
+  const signal = new AbortController().signal
+  globalThis.fetch = async (url, init) => {
+    assert.equal(init.signal, signal)
+    assert.equal(init.cache, 'no-store')
+    if (url.endsWith('/login-methods')) return Response.json({password: true})
+    assert.equal(url, '/admin/api/v1/session')
+    assert.equal(init.method, 'POST')
+    assert.equal(init.redirect, 'error')
+    assert.equal(Buffer.from(init.headers.Authorization.slice(6), 'base64').toString(), 'ops:  示例 password  ')
+    return Response.json({access_token: 'scoped-session'})
+  }
+  assert.equal(await supportsPasswordLogin(signal), true)
+  assert.equal(await openAdminSession('ops', '  示例 password  ', signal), 'scoped-session')
+  assert.equal(getAdminToken(), '')
+})
 
 function setup(t) {
   const originals = new Map(['window', 'sessionStorage', 'fetch'].map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))

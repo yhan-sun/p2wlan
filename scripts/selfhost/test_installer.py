@@ -18,6 +18,7 @@ if os.name == 'posix':
 
 
 ROOT = Path(__file__).resolve().parents[2]
+ACCOUNT_INPUT = [('管理员账号', 'operator'), ('管理员密码（', 'sample pass for test'), ('确认管理员密码', 'sample pass for test')]
 VERSION = 'server-v9.9.9'
 COMMIT = 'a' * 40
 
@@ -85,11 +86,12 @@ if [ "$1" = check ] && [ "${FAIL_HEALTH:-0}" = 1 ]; then exit 1; fi
 '''
         self.members['p2wlan-config'] = b'''#!/bin/bash
 set -eu
-if [ "$1" = --help ]; then echo '-config-dir -data-dir'; exit 0; fi
+if [ "$1" = --help ]; then echo '-config-dir -data-dir -admin-user'; exit 0; fi
 if [ "${FAIL_CONFIG:-0}" = 1 ]; then exit 1; fi
 output= config= data= endpoint=tls://localhost:18081 control=18080 metrics=18082
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --admin-user) [ "$2" = operator ]; IFS= read -r input; [ "$input" = "sample pass for test" ]; shift 2;;
     --output) output=$2; shift 2;;
     --config-dir) config=$2; shift 2;;
     --data-dir) data=$2; shift 2;;
@@ -415,7 +417,7 @@ esac
             ('程序目录', ''), ('配置目录', ''), ('数据目录', ''),
             ('部署模式', '1'), ('Relay主机', 'relay.example.com'), ('Relay端口', ''),
             ('证书链路径', str(certificate)), ('私钥路径', str(private_key)),
-            ('Control端口', ''), ('metrics端口', ''), ('启动方式', '2'), ('确认部署', '1'),
+            ('Control端口', ''), ('metrics端口', ''), ('启动方式', '2'), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], no_arguments=True, env=env, before_reply=lambda *_: self.assert_no_mutation())
         self.assertEqual(code, 0, output)
         self.assertTrue((self.config / 'control.env').exists())
@@ -430,12 +432,14 @@ esac
         code, output = self.run_interactive([
             ('部署模式', '2'), ('Relay主机', 'localhost'), ('Relay端口', '28081'),
             ('Control端口', '28080'), ('metrics端口', '28082'),
-            ('启动方式', '1'), ('确认部署', '1'),
+            ('启动方式', '1'), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], before_reply=lambda *_: self.assert_no_mutation())
         self.assertEqual(code, 0, output)
         self.assertIn('PORT=28080', (self.config / 'control.env').read_text())
         self.assertIn('RELAY_BIND=:28081', (self.config / 'relay.env').read_text())
         self.assertIn('RELAY_METRICS_BIND=127.0.0.1:28082', (self.config / 'relay.env').read_text())
+        self.assertIn('管理后台地址（本机）：http://127.0.0.1:28080/admin/', output)
+        self.assertNotIn('sample pass for test', output)
         calls = self.calls.read_text().splitlines()
         self.assertTrue(any(call.startswith('manager start ') for call in calls))
         self.assertTrue(any(call.startswith('manager check ') for call in calls))
@@ -468,7 +472,7 @@ esac
             ('确认部署', '2'), ('程序目录', str(program)), ('配置目录', str(config)), ('数据目录', str(data)),
             ('部署模式', '2'), ('Relay主机', 'localhost'), ('Relay端口', '38081'),
             ('Control端口', '38080'), ('metrics端口', '38082'),
-            ('启动方式', '2'), ('确认部署', '1'),
+            ('启动方式', '2'), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], '--dev-localhost', '--relay-endpoint', 'tls://localhost:28081',
             '--control-port', '28080', '--metrics-port', '28082', '--no-start',
             before_reply=nothing_published)
@@ -488,7 +492,7 @@ esac
             ('Relay端口', '65536'), ('Relay端口', '28081'),
             ('Control端口', 'invalid'), ('Control端口', '28080'),
             ('metrics端口', '28080'), ('metrics端口', '28082'),
-            ('启动方式', '99'), ('启动方式', '2'), ('确认部署', '1'),
+            ('启动方式', '99'), ('启动方式', '2'), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], include_paths=False, before_reply=lambda *_: self.assert_no_mutation())
         self.assertEqual(code, 0, output)
         self.assertIn('PORT=28080', (self.config / 'control.env').read_text())

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
@@ -14,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/url"
@@ -23,12 +25,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yhan-sun/p2wlan/server/internal/admincredential"
 	"github.com/yhan-sun/p2wlan/server/internal/privatefile"
 )
 
 type options struct {
 	output, mode, endpoint, cert, key string
 	configDir, dataDir                string
+	adminUser                         string
+	passwordInput                     io.Reader
 	dev                               bool
 	controlPort, metricsPort          int
 }
@@ -43,6 +48,8 @@ func main() {
 	flag.StringVar(&o.cert, "tls-cert", "", "Existing TLS certificate chain PEM")
 	flag.StringVar(&o.key, "tls-key", "", "Matching TLS private key PEM")
 	flag.BoolVar(&o.dev, "dev-localhost", false, "Generate a loopback-only test certificate; not trusted by deployed clients")
+	flag.StringVar(&o.adminUser, "admin-user", "", "Configure an administrator username and read its password from stdin")
+	o.passwordInput = os.Stdin
 	flag.IntVar(&o.controlPort, "control-port", 18080, "Control port")
 	flag.IntVar(&o.metricsPort, "metrics-port", 18082, "Loopback relay readiness port")
 	flag.Parse()
@@ -62,6 +69,25 @@ func secret() (string, error) {
 }
 
 func generate(o options) (err error) {
+	var adminAccount string
+	if o.adminUser != "" {
+		if !admincredential.ValidUsername(o.adminUser) || o.passwordInput == nil {
+			return errors.New("administrator username must be 1–64 ASCII letters, digits, dots, underscores or hyphens and start with a letter or digit")
+		}
+		line, err := io.ReadAll(io.LimitReader(o.passwordInput, 75))
+		if err != nil {
+			return errors.New("unable to read administrator password")
+		}
+		password := bytes.TrimSuffix(bytes.TrimSuffix(line, []byte("\n")), []byte("\r"))
+		if bytes.ContainsAny(password, "\r\n\x00") {
+			return errors.New("administrator password must be a single line")
+		}
+		hash, err := admincredential.EncodePassword(password)
+		if err != nil {
+			return err
+		}
+		adminAccount = "CONTROL_ADMIN_USERNAME=" + o.adminUser + "\nCONTROL_ADMIN_PASSWORD_HASH=" + hash + "\n"
+	}
 	if o.output == "" {
 		return errors.New("--output is required")
 	}
@@ -209,7 +235,7 @@ func generate(o options) (err error) {
 		gid = 10001
 	}
 	compose := fmt.Sprintf("P2WLAN_UID=%d\nP2WLAN_GID=%d\nCONTROL_PORT=%d\nRELAY_PORT=%d\nMETRICS_PORT=%d\nRELAY_PUBLISH_HOST=%s\n", uid, gid, o.controlPort, n, o.metricsPort, publishHost)
-	for name, data := range map[string][]byte{"control.env": []byte(control), "relay.env": []byte(relay), "compose.env": []byte(compose), "tls.crt": certPEM, "tls.key": keyPEM} {
+	for name, data := range map[string][]byte{"control.env": []byte(control + adminAccount), "relay.env": []byte(relay), "compose.env": []byte(compose), "tls.crt": certPEM, "tls.key": keyPEM} {
 		if err = privatefile.WriteNew(filepath.Join(out, name), data); err != nil {
 			return err
 		}
