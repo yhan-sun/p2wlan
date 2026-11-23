@@ -81,16 +81,24 @@ valid_path() {
   case "$1" in /*) ;; *) die "installation paths must be absolute" ;; esac
   case "$1" in /|*//*|*[!A-Za-z0-9_./-]*|*/../*|*/./*|*/..|*/.) die "unsafe installation path: $1" ;; esac
 }
-read_admin_secret() (
-  local state secret
-  state=$(stty -g <&3) || exit 1
-  trap 'stty "$state" <&3; printf "\n" >&3' EXIT
-  trap 'exit 1' HUP INT TERM
-  stty -echo <&3 || exit 1
-  printf '%s: ' "$1" >&3
-  IFS= read -r secret <&3 || exit 1
-  printf '%s' "$secret"
-)
+read_admin_secret() {
+  python3 - "$1" <<'PY_PASSWORD'
+import getpass, signal, sys, warnings
+
+def cancel(*_):
+    raise KeyboardInterrupt
+
+for event in (signal.SIGHUP, signal.SIGTERM):
+    signal.signal(event, cancel)
+warnings.simplefilter('error', getpass.GetPassWarning)
+try:
+    with open('/dev/tty', 'w', encoding='utf-8') as terminal:
+        password = getpass.getpass(sys.argv[1] + ': ', stream=terminal)
+except (EOFError, OSError, KeyboardInterrupt, getpass.GetPassWarning):
+    sys.exit(1)
+sys.stdout.buffer.write(password.encode('utf-8'))
+PY_PASSWORD
+}
 ask_admin_account() {
   local LC_ALL=C confirmation
   while true; do
