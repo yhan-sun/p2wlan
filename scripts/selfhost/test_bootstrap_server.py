@@ -558,13 +558,14 @@ FIXTURE
         result = self.run_bootstrap('--relay-endpoint', 'tls://relay.example.test:18081',
                                     '--tls-cert', str(certificate), '--tls-key', str(key),
                                     '--control-port', '28080', '--metrics-port', '28082',
-                                    '--wait-timeout', '120', '--no-start')
+                                    '--wait-timeout', '120', '--http-port', '8080', '--https-port', '8443', '--no-start')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         arguments = json.loads(self.installer_log.read_text())
         for option, value in (('--dir', str(self.target)), ('--relay-endpoint', 'tls://relay.example.test:18081'),
                               ('--tls-cert', str(certificate)), ('--tls-key', str(key)), ('--wait-timeout', '120')):
             self.assertEqual(arguments[arguments.index(option) + 1], value)
-        for option, value in (('--control-port', '28080'), ('--metrics-port', '28082')):
+        for option, value in (('--control-port', '28080'), ('--metrics-port', '28082'),
+                              ('--http-port', '8080'), ('--https-port', '8443')):
             self.assertEqual(arguments[arguments.index(option) + 1], value)
         self.assertNotIn('fixture-private-key', result.stdout + result.stderr)
 

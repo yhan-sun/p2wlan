@@ -186,6 +186,36 @@ jobs:
           sudo curl --noproxy '*' --fail --silent --show-error --max-time 10 --output /dev/null \
             --resolve relay.example.test:443:127.0.0.1 --cacert "$deployment/config/relay-ca.crt" \
             https://relay.example.test/health
+      - name: Recover a web port conflict without interrupting the existing site
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/edge-source"
+          deployment="$RUNNER_TEMP/selfhost-edge"
+          installer=(sudo bash "$bundle/scripts/install-server-docker.sh" --source "$bundle"
+            --dir "$deployment" --non-interactive --wait-timeout 120)
+          compose=(sudo docker compose --env-file "$deployment/.env" -f "$deployment/compose.yml")
+          "${compose[@]}" stop edge
+          owner=$(sudo docker run --detach --rm -p 80:8080 -p 443:8080 nginxinc/nginx-unprivileged:1.27-alpine)
+          trap 'sudo docker stop "$owner" >/dev/null' EXIT
+          sudo sha256sum "$deployment/.env" "$deployment/config/control.env" > "$RUNNER_TEMP/before-port-conflict.sha256"
+          if "${installer[@]}" > "$RUNNER_TEMP/edge-conflict.log" 2>&1; then exit 1; fi
+          grep -Fq 'TCP 80 已被占用' "$RUNNER_TEMP/edge-conflict.log"
+          sudo sha256sum --check --status "$RUNNER_TEMP/before-port-conflict.sha256"
+          curl -fsS --noproxy '*' --max-time 5 -o /dev/null http://127.0.0.1:28080/health
+          "${installer[@]}" --http-port 8080 --https-port 8443
+          "${installer[@]}"
+          test "$(sudo docker inspect --format '{{.State.Running}}' "$owner")" = true
+          curl -fsS --noproxy '*' --max-time 5 -o /dev/null http://127.0.0.1:80/
+          test "$(curl -sS --noproxy '*' --max-time 5 -o /dev/null --write-out '%{redirect_url}' \
+            --resolve relay.example.test:8080:127.0.0.1 http://relay.example.test:8080/admin/)" = \
+            'https://relay.example.test:8443/admin/'
+          sudo curl -fsS --noproxy '*' --max-time 10 -o /dev/null \
+            --resolve relay.example.test:8443:127.0.0.1 --cacert "$deployment/config/relay-ca.crt" \
+            https://relay.example.test:8443/admin/
+          sudo sed -n 's/^CONTROL_ADMIN_TOKEN=/Authorization: Bearer /p' "$deployment/config/control.env" | \
+            sudo curl -fsS --noproxy '*' --max-time 10 -o /dev/null --header @- \
+              --resolve relay.example.test:8443:127.0.0.1 --cacert "$deployment/config/relay-ca.crt" \
+              https://relay.example.test:8443/admin/api/v1/overview
       - name: Verify static ELF and Ubuntu 20.04 server loader compatibility
         working-directory: server
         run: |

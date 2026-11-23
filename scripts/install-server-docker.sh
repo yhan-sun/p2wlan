@@ -50,6 +50,8 @@ parser.add_argument('--tls-mode', choices=('auto', 'selfsigned', 'files'),
 parser.add_argument('--tls-domain', help='certificate domain for --tls-mode auto; must equal the Relay host')
 parser.add_argument('--tls-email', help='ACME account email for --tls-mode auto')
 parser.add_argument('--control-port', type=int, help='internal Control port (default: 18080)')
+parser.add_argument('--http-port', type=int, help='public HTTP redirect port (default: 80)')
+parser.add_argument('--https-port', type=int, help='public HTTPS panel port (default: 443)')
 parser.add_argument('--metrics-port', type=int, help='internal Relay readiness port (default: 18082)')
 parser.add_argument('--publish-host', help='Relay host bind IP; public 0.0.0.0, test 127.0.0.1')
 parser.add_argument('--dev-localhost', action='store_true')
@@ -93,7 +95,8 @@ def read_env(path, content=None):
                'P2WLAN_VERSION', 'P2WLAN_COMMIT', 'P2WLAN_DEV_LOCALHOST',
                'P2WLAN_INSTALL_MODE', 'P2WLAN_SOURCE_DIR', 'P2WLAN_BUILD_IMAGE',
                'P2WLAN_BUILD_MANIFEST', 'P2WLAN_BUILD_PLATFORM',
-               'P2WLAN_TLS_MODE', 'P2WLAN_TLS_DOMAIN', 'COMPOSE_PROFILES'}
+               'P2WLAN_TLS_MODE', 'P2WLAN_TLS_DOMAIN', 'COMPOSE_PROFILES',
+               'P2WLAN_HTTP_PORT', 'P2WLAN_HTTPS_PORT', 'P2WLAN_EDGE_CONF'}
     for line in (path.read_text() if content is None else content.decode()).splitlines():
         if not line or line.startswith('#'):
             continue
@@ -188,10 +191,10 @@ def admin_account(terminal):
                 return name, password
         terminal.write('密码长度不符或两次输入不一致，请重新输入。\n')
 
-def access_addresses(control, endpoint, panel):
+def access_addresses(control, endpoint, panel, https_port=443):
     local = 'http://127.0.0.1:' + str(control)
     host = '[' + panel.strip('[]') + ']' if panel and ':' in panel else panel
-    base = 'https://' + host if host else local
+    base = 'https://' + host + (f':{https_port}' if https_port != 443 else '') if host else local
     return f'服务端地址（Control）：{base}\n管理后台地址：{base}/admin/\nRelay 地址：{endpoint}'
 
 @contextlib.contextmanager
@@ -199,13 +202,13 @@ def show_failed_addresses(addresses):
     try:
         yield
     except Exception:
-        print('本次部署未完成。以下为计划地址，可用性尚未确认。\n' + addresses, file=sys.stderr, flush=True)
+        print('本次部署未完成。以下为计划地址，可用性尚未确认。\n' + addresses(), file=sys.stderr, flush=True)
         raise
 
 def require_edge_port(port):
     if not port_available(port):
         fail(f'主机 TCP {port} 已被占用。请用 sudo ss -ltnp 查看监听进程。'
-             '内置 HTTPS 入口启动需要独占 80 和 443；如需保留现有 Web 服务，可使用原生安装配合现有反向代理。')
+             'Certbot standalone 签发证书时需要公网 TCP 80。')
 
 def deployment_directory(raw):
     if (not raw.startswith('/') or not re.fullmatch(r'/[A-Za-z0-9_./-]+', raw)
@@ -226,7 +229,7 @@ def port_number(value, used=()):
         fail('端口必须是 1-65535 的整数')
     number = int(value)
     if number in used:
-        fail('Control、Relay 和 metrics 端口不能重复')
+        fail('该端口已用于此部署，请另选端口')
     return number
 
 def relay_host(value, dev=False):
@@ -283,7 +286,7 @@ server {
         return 200 'ok';
     }
     location / {
-        return 301 https://$host$request_uri;
+        return 301 https://$host__HTTPS_SUFFIX__$request_uri;
     }
 }
 server {
@@ -299,7 +302,8 @@ server {
     location / {
         proxy_pass http://control:__CONTROL_PORT__;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Port __HTTPS_PORT__;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
@@ -335,23 +339,157 @@ def port_available(port):
         except OSError as error:
             if error.errno == errno.EADDRINUSE:
                 return False
+            if error.errno not in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.EADDRNOTAVAIL):
+                raise
     return True
 
-def check_edge_ports(control, relay):
-    if control in (80, 443) or relay in (80, 443):
-        fail('the HTTPS edge reserves host TCP 80/443; select another Control or Relay port')
+def check_edge_ports(control, relay, http=80, https=443):
+    if len({http, https, control, relay}) != 4:
+        fail(f'网页 HTTP/HTTPS 端口 {http}/{https}、Control 和 Relay 的主机端口必须各不相同')
 
-def check_panel(host, config, mode):
+def docker_port_bindings(ports, project):
+    # Published ports can exist only in Docker's NAT rules, without a listening PID.
+    bindings = {port: [] for port in ports}
+    fields = ('{{.Id}}\t{{.Name}}\t{{json .HostConfig.AutoRemove}}\t{{json (index .Config.Labels "com.docker.compose.project")}}\t'
+              '{{json (index .Config.Labels "com.docker.compose.service")}}\t{{json .NetworkSettings.Ports}}')
+    def inspect_running():
+        ids = run(['docker', 'ps', '--quiet', '--no-trunc']).splitlines()
+        return '\n'.join(run(['docker', 'container', 'inspect', '--format', fields] + ids[start:start + 32])
+                         for start in range(0, len(ids), 32))
+    try:
+        rows = inspect_running()
+    except InstallError:
+        # An unrelated, short-lived container may have disappeared after docker ps.
+        rows = inspect_running()
+    for row in rows.splitlines():
+        identity, name, removable, owner, service, mapping = row.split('\t', 5)
+        own = json.loads(owner) == project and json.loads(service) == 'edge'
+        for target, entries in (json.loads(mapping) or {}).items():
+            if not target.endswith('/tcp'):
+                continue
+            for entry in entries or []:
+                port = int(entry['HostPort'])
+                if port in bindings:
+                    bindings[port].append((identity, name.lstrip('/'), own, entry['HostIp'], json.loads(removable)))
+    return bindings
+
+def web_port_conflicts(ports, project):
+    conflicts = {}
+    for port, bindings in docker_port_bindings(ports, project).items():
+        foreign = {(identity, name, removable) for identity, name, own, _, removable in bindings if not own}
+        own_wildcard = any(own and address in ('', '0.0.0.0', '::') for _, _, own, address, _ in bindings)
+        if foreign or (not own_wildcard and not port_available(port)):
+            conflicts[port] = foreign
+    return conflicts
+
+def listener_owner(port, containers):
+    if containers:
+        targets = sorted(containers)
+        names = ', '.join(name + ('（停止即删除）' if removable else '') for _, name, removable in targets)
+        target = ('docker', targets[0][1], targets[0][0]) if len(targets) == 1 and not targets[0][2] else None
+        return 'Docker ' + names, target
+    if not shutil.which('ss'):
+        return '请在主机上查看监听服务', None
+    try:
+        listeners = run(['ss', '-H', '-ltnp', f'sport = :{port}'])
+    except InstallError:
+        return '请用 sudo ss -ltnp 查看监听服务', None
+    pids = set(re.findall(r'pid=(\d+)', listeners))
+    units = set()
+    for pid in pids:
+        try:
+            groups = Path('/proc', pid, 'cgroup').read_text()
+        except OSError:
+            return listeners, None
+        match = re.search(r'/((?:nginx|apache2|httpd|caddy|haproxy)\.service)(?:/|$)', groups, re.MULTILINE)
+        if not match:
+            return listeners, None
+        units.add(match[1])
+    if len(units) == 1 and shutil.which('systemctl'):
+        unit = units.pop()
+        try:
+            invocation = run(['systemctl', 'show', '--property=InvocationID', '--value', unit])
+        except InstallError:
+            return unit, None
+        if re.fullmatch(r'[a-f0-9]{32}', invocation):
+            return unit, ('systemd', unit, invocation)
+    return listeners or '请用 sudo ss -ltnp 查看监听服务', None
+
+def edit_web_ports(terminal, plan, busy):
+    used = (plan['control_port'], plan['relay_port'])
+    for field, label, alternate in [('http_port', '网页 HTTP 端口', 8080), ('https_port', '网页 HTTPS 端口', 8443)]:
+        default = plan[field]
+        if default in busy or default in used:
+            default = alternate
+            while default in busy or default in used:
+                default += 1
+        plan[field] = ask(terminal, label, default, lambda value: port_number(value, used))
+        used += (plan[field],)
+
+def resolve_web_ports(terminal, plan, project, *, issue_certificate=False):
+    while True:
+        http, https = plan['http_port'], plan['https_port']
+        check_edge_ports(plan['control_port'], plan['relay_port'], http, https)
+        required = [] if plan['no_start'] else [http, https]
+        acme = plan['tls_mode'] == 'auto' and issue_certificate
+        if acme and 80 not in required:
+            required.append(80)
+        conflicts = web_port_conflicts(required, project) if required else {}
+        if not conflicts:
+            return
+        port = next(iter(conflicts))
+        message = f'主机 TCP {port} 已被占用。'
+        if not terminal:
+            fail(message + '可用 --http-port 和 --https-port 修改网页端口。' +
+                 ('HTTP-01 签发时需要公网 TCP 80。' if acme and port == 80 else ''))
+        description, target = listener_owner(port, conflicts[port])
+        terminal.write(message + '\n占用者：' + description + '\n'
+                       '  1) 给 P2WLAN 更换网页端口\n  2) 手动处理后重新检测\n')
+        if target:
+            terminal.write('  3) 正常停止占用服务 ' + target[1] + '（该服务会中断）\n')
+        terminal.write('  q) 取消并退出\n')
+        action = choice(terminal, '处理端口冲突', '1', ('1', '2', '3') if target else ('1', '2'))
+        if action == '1':
+            if acme and 80 in conflicts:
+                terminal.write('独立 HTTP-01 仍需公网 TCP 80。可改用已有证书，或选择客户端需信任的自签名证书。\n'
+                               '  1) 已有证书文件  2) 自签名证书  3) 返回端口冲突菜单\n')
+                certificate = choice(terminal, '更换证书方式', '', ('1', '2', '3'))
+                if certificate == '3':
+                    continue
+                plan['tls_mode'] = 'files' if certificate == '1' else 'selfsigned'
+                plan['tls_domain'] = endpoint_parts(plan['endpoint'], False)[0]
+                if certificate == '1':
+                    plan['tls_cert'] = ask(terminal, '证书链路径', '', tls_path)
+                    plan['tls_key'] = ask(terminal, '私钥路径', '', tls_path)
+            edit_web_ports(terminal, plan, conflicts)
+        elif action == '3':
+            if prompt(terminal, '确认停止请完整输入 ' + target[1] + '，回车返回') != target[1]:
+                continue
+            current = web_port_conflicts([port], project)
+            if port not in current or listener_owner(port, current[port])[1] != target:
+                terminal.write('占用者已变化，重新检测。\n')
+                continue
+            command = ['docker', 'stop', '--timeout', '30', target[2]] if target[0] == 'docker' else ['systemctl', 'stop', target[1]]
+            try:
+                run(command, timeout=120)
+            except InstallError:
+                terminal.write('未能停止 ' + target[1] + '。重新检测后可更换网页端口或退出。\n')
+                continue
+            restart = 'docker start ' + target[2][:12] if target[0] == 'docker' else 'systemctl start ' + target[1]
+            terminal.write(f'已停止 {target[1]}。如需恢复该服务，可执行 sudo {restart}。\n')
+
+def check_panel(host, config, mode, port=443):
     authority = '[' + host.strip('[]') + ']' if ':' in host else host
     command = ['curl', '--silent', '--show-error', '--fail', '--noproxy', '*',
                '--connect-timeout', '3', '--max-time', '10', '--connect-to',
-               f'{authority}:443:127.0.0.1:443', '--output', os.devnull, '--write-out', '%{http_code}']
+               f'{authority}:{port}:127.0.0.1:{port}', '--output', os.devnull, '--write-out', '%{http_code}']
     if mode == 'selfsigned':
         command += ['--cacert', str(config / 'relay-ca.crt')]
     elif mode == 'files':
         command += ['--cacert', str(config / 'tls.crt')]
     try:
-        if run(command + ['https://' + authority + '/health']) == '200':
+        url = 'https://' + authority + (f':{port}' if port != 443 else '') + '/health'
+        if run(command + [url]) == '200':
             return
     except InstallError:
         pass
@@ -443,7 +581,7 @@ def activate_compose(directory, stage, settings, previous_env, no_start, wait):
             stopped = sorted(set(present) - set(running))
             if (set(running) | set(present)) - {'control', 'relay', 'edge'}:
                 fail('unexpected service in the deployment')
-            if old['P2WLAN_IMAGE'] != settings['P2WLAN_IMAGE']:
+            if old['P2WLAN_IMAGE'] != settings['P2WLAN_IMAGE'] and not recovery_pending:
                 database = database_path(config)
                 snapshot, schema = snapshot_database(database, directory)
                 atomic_write(blocked, f'Activation in progress. Snapshot: {snapshot or "no prior database"}\n'.encode())
@@ -454,13 +592,15 @@ def activate_compose(directory, stage, settings, previous_env, no_start, wait):
     try:
         run(command + starting, timeout=wait + 60, capture=False, env=environment)
         if settings.get('COMPOSE_PROFILES') == 'edge':
-            check_panel(settings['P2WLAN_TLS_DOMAIN'], config, settings['P2WLAN_TLS_MODE'])
+            check_panel(settings['P2WLAN_TLS_DOMAIN'], config, settings['P2WLAN_TLS_MODE'], int(settings.get('P2WLAN_HTTPS_PORT', 443)))
     except InstallError as error:
         if snapshot:
             print(f'Pre-upgrade SQLite snapshot: {snapshot}', file=sys.stderr)
         run(command + ['stop'], timeout=120, env=environment)
         if previous:
-            if recovery_pending or (database and not same_schema(database, schema)):
+            if recovery_pending:
+                fail(f'{error}; services stopped. Prior upgrade recovery record and snapshot preserved: {blocked}')
+            if database and not same_schema(database, schema):
                 fail(f'{error}; services stopped after database schema changed. Snapshot: {snapshot or "no prior database"}')
             run(command + ['rm', '--force'], env=environment)
             atomic_write(compose_file, previous[1].encode())
@@ -471,7 +611,7 @@ def activate_compose(directory, stage, settings, previous_env, no_start, wait):
             if running:
                 run(command + starting + ['--no-deps'] + running, timeout=wait + 60, env=old_environment)
                 if 'edge' in running:
-                    check_panel(old['P2WLAN_TLS_DOMAIN'], config, old['P2WLAN_TLS_MODE'])
+                    check_panel(old['P2WLAN_TLS_DOMAIN'], config, old['P2WLAN_TLS_MODE'], int(old.get('P2WLAN_HTTPS_PORT', 443)))
             blocked.unlink(missing_ok=True)
             print('Restored the prior deployment files and previously running services.', file=sys.stderr)
         raise
@@ -547,12 +687,24 @@ def self_signed_certificate(work, host):
         path.unlink()
     return str(cert), str(key), str(ca_crt)
 
-def write_edge_config(config, domain, control_port):
+def write_edge_config(config, domain, control_port, https_port):
     edge = config / 'edge'
     edge.mkdir(mode=0o700, exist_ok=True)
-    target = edge / 'nginx.conf'
-    target.write_text(EDGE_NGINX.replace('__DOMAIN__', domain).replace('__CONTROL_PORT__', str(control_port)))
-    target.chmod(0o644)
+    if protected(edge, directory=True).st_uid != os.geteuid():
+        fail('unexpected owner of the managed HTTPS configuration directory')
+    name = 'nginx.conf' if https_port == 443 else f'nginx-{https_port}.conf'
+    target = edge / name
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        content = EDGE_NGINX.replace('__DOMAIN__', domain).replace('__CONTROL_PORT__', str(control_port))
+        suffix = f':{https_port}' if https_port != 443 else ''
+        content = content.replace('__HTTPS_SUFFIX__', suffix).replace('__HTTPS_PORT__', str(https_port))
+        atomic_write(target, content.encode(), 0o644)
+    else:
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o022:
+            fail('unsafe managed HTTPS configuration file')
+    return name
 
 def install_renewal_hooks(directory, domain, uid, gid, publish, relay_port):
     # Certbot runs these commands as root. Keep all executables and state in its
@@ -574,6 +726,12 @@ def install_renewal_hooks(directory, domain, uid, gid, publish, relay_port):
               + 'relay=' + shlex.quote(relay) + '\n'
               + f'uid={int(uid)}\ngid={int(gid)}\n'
               + """[ -f "$directory/.env" ] && [ -f "$directory/compose.yml" ] || exit 0
+http_port=$(sed -n 's/^P2WLAN_HTTP_PORT=//p' "$directory/.env")
+https_port=$(sed -n 's/^P2WLAN_HTTPS_PORT=//p' "$directory/.env")
+http_port=${http_port:-80}
+https_port=${https_port:-443}
+case "$http_port:$https_port" in *[!0-9:]*) exit 1 ;; esac
+https="127.0.0.1:$https_port"
 compose() { docker compose --env-file "$directory/.env" -f "$directory/compose.yml" "$@"; }
 recreate() { compose up -d --no-deps --force-recreate --no-build --pull never --wait --wait-timeout 90 "$1"; }
 verify() {
@@ -585,14 +743,14 @@ verify() {
 """)
     scripts = {
         'pre': """running=$(compose ps --status running --services)
-if echo "$running" | grep -Fxq edge; then
+if [ "$http_port" = 80 ] && echo "$running" | grep -Fxq edge; then
     : > "$marker"
     compose stop edge
 fi
 """,
         'post': """[ -f "$marker" ] || exit 0
 recreate edge
-verify 127.0.0.1:443
+verify "$https"
 rm -f "$marker"
 """,
         'deploy': """[ "${RENEWED_LINEAGE:-}" = "$live" ] || exit 0
@@ -609,7 +767,7 @@ for name in ('tls.crt', 'tls.key'):
     (source / name).replace(destination / name)
 REPLACE
 if echo "$running" | grep -Fxq relay; then recreate relay; verify "$relay"; fi
-if echo "$running" | grep -Fxq edge; then recreate edge; verify 127.0.0.1:443; fi
+if echo "$running" | grep -Fxq edge; then recreate edge; verify "$https"; fi
 """,
     }
     for kind, script in scripts.items():
@@ -675,7 +833,7 @@ def saved_deployment(directory):
 def configure_new(terminal, plan, edit=False):
     previous_dev = plan['dev']
     supplied_tls = bool(args.relay_endpoint and args.tls_cert and args.tls_key)
-    terminal.write('\n[2/7] 部署模式\n  1) 公网部署（内置 HTTPS/WSS 入口，使用主机 TCP 80 和 443）\n  2) 本机测试（24 小时测试证书，仅 loopback）\n')
+    terminal.write('\n[2/7] 部署模式\n  1) 公网部署（内置 HTTPS/WSS，网页端口默认 80 和 443）\n  2) 本机测试（24 小时测试证书，仅 loopback）\n')
     if edit or not (args.dev_localhost or supplied_tls):
         mode = choice(terminal, '部署模式', '2' if plan['dev'] else '1', ('2',) if args.local_image else ('1', '2'))
         plan['dev'] = mode == '2'
@@ -976,6 +1134,14 @@ def install(resources):
             fail('existing publication is preserved; edit .env explicitly to change it')
     else:
         settings = {}
+    def initial_web_ports(saved):
+        http = port_number(args.http_port if args.http_port is not None else saved.get('P2WLAN_HTTP_PORT', 80))
+        https = port_number(args.https_port if args.https_port is not None else saved.get('P2WLAN_HTTPS_PORT', 443), (http,))
+        return {'http_port': http, 'https_port': https}
+    web = initial_web_ports(settings)
+    if (args.http_port is not None or args.https_port is not None) and (
+            args.dev_localhost or (existing and settings.get('COMPOSE_PROFILES') != 'edge')):
+        fail('网页端口只适用于启用公网 HTTPS 入口的 Docker 部署')
     selection = bool(args.source or args.version or args.image or args.local_image or args.manifest)
     source_bundle = None
     expected = None
@@ -1007,16 +1173,19 @@ def install(resources):
             control_port = port_number(args.control_port if args.control_port is not None else 18080)
             metrics_port = port_number(args.metrics_port if args.metrics_port is not None else 18082, (control_port,))
             endpoint = args.relay_endpoint or ('tls://localhost:18081' if args.dev_localhost else '')
-            if endpoint:
-                relay_port = endpoint_parts(endpoint, args.dev_localhost)[1]
-                port_number(control_port, (relay_port,))
-                port_number(metrics_port, (relay_port, control_port))
-                if not args.dev_localhost:
-                    check_edge_ports(control_port, relay_port)
+            relay_port = endpoint_parts(endpoint, args.dev_localhost)[1] if endpoint else 18081
+            port_number(control_port, (relay_port,))
+            port_number(metrics_port, (relay_port, control_port))
+            if not args.dev_localhost:
+                check_edge_ports(control_port, relay_port, web['http_port'], web['https_port'])
+        elif settings.get('COMPOSE_PROFILES') == 'edge':
+            check_edge_ports(int(settings['CONTROL_PORT']), int(settings['RELAY_PORT']), web['http_port'], web['https_port'])
         if source_bundle is not None:
             print('Would build source ' + expected['version'] + ' commit=' + expected['source_sha'] + ' with Docker Compose')
         else:
             print('Would deploy ' + (args.image or args.local_image or args.version or settings.get('P2WLAN_IMAGE', 'a fixed server release')))
+        if not args.dev_localhost and (not existing or settings.get('COMPOSE_PROFILES') == 'edge'):
+            print(f"网页端口：HTTP {web['http_port']} / HTTPS {web['https_port']}")
         print(f'Directory: {directory}; start={not args.no_start}; health timeout={args.wait_timeout}s')
         return
     adjacent = script_dir / 'SERVER-IMAGE.json'
@@ -1071,7 +1240,7 @@ def install(resources):
                     except (InstallError, ValueError, TypeError, AttributeError, KeyError, IndexError):
                         pass
                     break
-            return dict(dev=saved['P2WLAN_DEV_LOCALHOST'] == 'true', endpoint=endpoint,
+            return dict(**initial_web_ports(saved), dev=saved['P2WLAN_DEV_LOCALHOST'] == 'true', endpoint=endpoint,
                         tls_cert=str(directory / 'config/tls.crt'), tls_key=str(directory / 'config/tls.key'),
                         tls_mode=saved.get('P2WLAN_TLS_MODE', 'files'),
                         tls_domain=saved.get('P2WLAN_TLS_DOMAIN') or '',
@@ -1080,7 +1249,7 @@ def install(resources):
                         metrics_port=port_number(saved.get('METRICS_PORT', '')),
                         relay_port=port_number(saved.get('RELAY_PORT', '')),
                         publish_host=saved.get('RELAY_PUBLISH_HOST', ''), no_start=args.no_start)
-        return dict(dev=args.dev_localhost, endpoint=args.relay_endpoint or '',
+        return dict(**initial_web_ports(saved), dev=args.dev_localhost, endpoint=args.relay_endpoint or '',
                     tls_cert=args.tls_cert, tls_key=args.tls_key,
                     tls_mode=args.tls_mode or ('files' if args.tls_cert and args.tls_key else None),
                     tls_domain=args.tls_domain, tls_email=args.tls_email,
@@ -1093,7 +1262,7 @@ def install(resources):
     if terminal:
         while True:
             if existing:
-                terminal.write('\n[2-5/7] 检测到已有部署，将升级/重装选定版本并保留配置、证书、数据库与端口。\n')
+                terminal.write('\n[2-5/7] 检测到已有部署，将升级/重装选定版本并沿用凭据、证书和数据库。\n')
                 terminal.write('当前版本：' + settings.get('P2WLAN_VERSION', '未知') + '\n')
             else:
                 plan = configure_new(terminal, plan, edit)
@@ -1123,9 +1292,17 @@ def install(resources):
                 terminal.write('Control 仅监听 loopback；本机测试不配置公网 HTTPS。\n')
             elif not existing or settings.get('COMPOSE_PROFILES') == 'edge':
                 panel = plan['tls_domain'] or endpoint_parts(plan['endpoint'], False)[0]
-                terminal.write('计划访问地址\n' + access_addresses(plan['control_port'], plan['endpoint'], panel) + '\n')
+                terminal.write(f"网页端口：HTTP {plan['http_port']} / HTTPS {plan['https_port']}\n")
+                terminal.write('计划访问地址\n' + access_addresses(plan['control_port'], plan['endpoint'], panel, plan['https_port']) + '\n')
             terminal.write('  1) 确认部署  2) 重新填写' + ('启动方式' if existing else '配置') + '  0/q) 取消\n')
-            action = choice(terminal, '确认部署', '1', ('1', '2', '0'))
+            public_edge = not plan['dev'] and (not existing or settings.get('COMPOSE_PROFILES') == 'edge')
+            if public_edge:
+                terminal.write('  3) 更改网页 HTTP/HTTPS 端口\n')
+            action = choice(terminal, '确认部署', '1', ('1', '2', '3', '0') if public_edge else ('1', '2', '0'))
+            while action == '3':
+                edit_web_ports(terminal, plan, {})
+                terminal.write('计划访问地址\n' + access_addresses(plan['control_port'], plan['endpoint'], panel, plan['https_port']) + '\n')
+                action = choice(terminal, '确认部署', '1', ('1', '2', '3', '0'))
             if action == '0':
                 fail('installation cancelled')
             if action == '1':
@@ -1174,20 +1351,17 @@ def install(resources):
         elif plan['tls_mode'] == 'selfsigned':
             plan['tls_cert'] = plan['tls_key'] = None
     args.dev_localhost, args.relay_endpoint = plan['dev'], plan['endpoint']
-    args.tls_mode, args.tls_domain, args.tls_email = plan['tls_mode'], plan['tls_domain'], plan['tls_email']
     edge_enabled = (not args.dev_localhost) and (not existing or settings.get('COMPOSE_PROFILES') == 'edge')
     panel = (plan['tls_domain'] or endpoint_parts(plan['endpoint'], False)[0]) if edge_enabled else None
-    addresses = access_addresses(plan['control_port'], plan['endpoint'], panel)
+    def addresses():
+        return access_addresses(plan['control_port'], plan['endpoint'], panel, plan['https_port'])
     resources.enter_context(show_failed_addresses(addresses))
     if edge_enabled:
-        check_edge_ports(plan['control_port'], plan['relay_port'])
-        if not existing:
-            if not plan['no_start'] or args.tls_mode == 'auto':
-                require_edge_port(80)
-            if not plan['no_start']:
-                require_edge_port(443)
-    account = admin_account(terminal) if terminal and not existing else None
-    args.tls_cert, args.tls_key = plan['tls_cert'], plan['tls_key']
+        check_edge_ports(plan['control_port'], plan['relay_port'], plan['http_port'], plan['https_port'])
+        if not existing and not terminal and plan['tls_mode'] == 'auto':
+            require_edge_port(80)
+    elif args.http_port is not None or args.https_port is not None:
+        fail('网页端口只适用于启用公网 HTTPS 入口的 Docker 部署')
     args.control_port, args.metrics_port = plan['control_port'], plan['metrics_port']
     args.publish_host, args.no_start = plan['publish_host'], plan['no_start']
     if args.local_image and not args.dev_localhost:
@@ -1206,6 +1380,19 @@ def install(resources):
     help_text = run(['docker', 'compose', 'up', '--help'])
     if '--wait' not in help_text or '--wait-timeout' not in help_text:
         fail('upgrade Docker Compose: up --wait and --wait-timeout are required')
+    project = 'p2wlan-' + hashlib.sha256(str(directory).encode()).hexdigest()[:12]
+    if edge_enabled:
+        previous_ports = plan['http_port'], plan['https_port']
+        resolve_web_ports(terminal, plan, project, issue_certificate=not existing)
+        if terminal and previous_ports != (plan['http_port'], plan['https_port']):
+            terminal.write(f"将使用 HTTP {plan['http_port']} / HTTPS {plan['https_port']}\n" + addresses() + '\n')
+            if choice(terminal, '确认使用这些网页端口（1 继续，0 退出）', '1', ('1', '0')) == '0':
+                fail('installation cancelled')
+        if existing and plan['tls_mode'] == 'auto' and plan['http_port'] != 80 and web_port_conflicts([80], project):
+            print('现有证书将继续使用。Certbot HTTP-01 自动续期时仍须释放公网 TCP 80。', file=sys.stderr)
+    args.tls_mode, args.tls_domain, args.tls_email = plan['tls_mode'], plan['tls_domain'], plan['tls_email']
+    args.tls_cert, args.tls_key = plan['tls_cert'], plan['tls_key']
+    account = admin_account(terminal) if terminal and not existing else None
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     owner = protected(directory, directory=True)
     if owner.st_uid != os.geteuid():
@@ -1229,7 +1416,6 @@ def install(resources):
             metadata = None
             if source_bundle:
                 saved_source = persist_source(directory, source_bundle, resources)
-                project = 'p2wlan-' + hashlib.sha256(str(directory).encode()).hexdigest()[:12]
                 build_image = source_image(directory, expected['source_sha'])
                 build_env = dict(os.environ, P2WLAN_BUILD_CONTEXT=str(saved_source / 'server'),
                                  P2WLAN_BUILD_IMAGE=build_image, P2WLAN_VERSION=expected['version'],
@@ -1341,9 +1527,6 @@ def install(resources):
                         + generator, timeout=60, input_text=account[1] + '\n' if account else None)
                 except InstallError:
                     fail('configuration generation failed; verify Relay endpoint, matching TLS chain/key and certificate hostname/validity')
-                if not args.dev_localhost:
-                    write_edge_config(stage / 'config',
-                                      args.tls_domain or endpoint_parts(endpoint, False)[0], args.control_port)
                 if self_signed_ca is not None:
                     shutil.copyfile(self_signed_ca, stage / 'config/relay-ca.crt')
                     (stage / 'config/relay-ca.crt').chmod(0o644)
@@ -1363,7 +1546,6 @@ def install(resources):
             publish = ipaddress.ip_address(settings.get('RELAY_PUBLISH_HOST', ''))
             if args.dev_localhost and not publish.is_loopback:
                 fail('development publication must stay loopback-only')
-            project = 'p2wlan-' + hashlib.sha256(str(directory).encode()).hexdigest()[:12]
             settings.update(P2WLAN_IMAGE=image, P2WLAN_CONFIG_DIR=str(config), COMPOSE_PROJECT_NAME=project,
                             P2WLAN_VERSION=version, P2WLAN_COMMIT=commit,
                             P2WLAN_DEV_LOCALHOST='true' if args.dev_localhost else 'false',
@@ -1371,6 +1553,9 @@ def install(resources):
             if not args.dev_localhost and not existing:
                 settings.update(COMPOSE_PROFILES='edge', P2WLAN_TLS_MODE=args.tls_mode or 'files',
                                 P2WLAN_TLS_DOMAIN=args.tls_domain or endpoint_parts(args.relay_endpoint, False)[0])
+            if edge_enabled:
+                settings.update(P2WLAN_HTTP_PORT=str(plan['http_port']), P2WLAN_HTTPS_PORT=str(plan['https_port']),
+                                P2WLAN_EDGE_CONF=write_edge_config(candidate, panel, args.control_port, plan['https_port']))
             if source_bundle:
                 settings.update(P2WLAN_SOURCE_DIR=str(saved_source), P2WLAN_BUILD_IMAGE=build_image,
                                 P2WLAN_BUILD_MANIFEST=source_bundle['metadata_hash'], P2WLAN_BUILD_PLATFORM=platform)
@@ -1398,6 +1583,8 @@ def install(resources):
                                                   settings['P2WLAN_GID'], settings['RELAY_PUBLISH_HOST'],
                                                   settings['RELAY_PORT'])
                 bind_renewal_hooks(directory, args.tls_domain, hooks)
+            if edge_enabled and not args.no_start:
+                resolve_web_ports(None, plan, project)
             if not existing:
                 (candidate / 'compose.env').unlink()
                 candidate.rename(config)
@@ -1418,7 +1605,7 @@ def install(resources):
                 print('管理员账号：' + account[0])
             print('管理令牌保存在 ' + str(config / 'control.env') + ' 的 CONTROL_ADMIN_TOKEN 字段。')
             print('配置已就绪，本次未启动服务。计划访问地址' if args.no_start else '健康检查通过，访问地址')
-            print(addresses)
+            print(addresses())
     if terminal:
         terminal.close()
 

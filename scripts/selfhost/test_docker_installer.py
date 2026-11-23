@@ -56,6 +56,17 @@ elif args[:2] == ['compose', 'version']:
     print('2.39.4')
 elif args[:2] == ['compose', 'up'] and '--help' in args:
     print('' if os.environ.get('DOCKER_FIXTURE_NO_WAIT') else '--wait --wait-timeout')
+elif args[:1] == ['ps']:
+    if os.environ.get('FIXTURE_WEB_CONTAINER') and pathlib.Path(os.environ['FIXTURE_WEB_CONTAINER']).exists():
+        print('f' * 64)
+elif args[:2] == ['container', 'inspect']:
+    entry = json.loads(pathlib.Path(os.environ['FIXTURE_WEB_CONTAINER']).read_text())
+    print('\t'.join(['f' * 64, '/' + entry['name'], json.dumps(entry.get('removable', False)), json.dumps(entry.get('project', '')),
+                    json.dumps(entry.get('service', '')), json.dumps(entry['ports'])]))
+elif args[:1] == ['stop']:
+    assert args[-1] == 'f' * 64
+    if os.environ.get('FAIL_FIXTURE_STOP'): sys.exit(1)
+    pathlib.Path(os.environ['FIXTURE_WEB_CONTAINER']).unlink()
 elif args[:2] == ['image', 'inspect']:
     print(json.dumps({'Id': os.environ['DOCKER_FIXTURE_ID'], 'RepoDigests': [os.environ['DOCKER_FIXTURE_IMAGE']],
           'Os': 'linux', 'Architecture': 'amd64',
@@ -291,6 +302,170 @@ else:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(self.target.exists())
         self.assertEqual(self.calls(), [])
+
+    def existing_web_conflict(self):
+        cert, key = self.path / 'cert.pem', self.path / 'key.pem'
+        cert.write_text('fixture-certificate')
+        key.write_text('fixture-private-key')
+        result = self.run_installer('--relay-endpoint', 'tls://relay.example.test:18081',
+                                    '--tls-cert', str(cert), '--tls-key', str(key), '--no-start')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Older deployments persisted neither of the host web port fields.
+        settings = self.target / '.env'
+        settings.write_text(''.join(line for line in settings.read_text().splitlines(keepends=True)
+                                    if not line.startswith(('P2WLAN_HTTP_PORT=', 'P2WLAN_HTTPS_PORT=', 'P2WLAN_EDGE_CONF='))))
+        container = self.path / 'published-ports.json'
+        container.write_text(json.dumps({'name': 'existing-site', 'ports': {
+            '8080/tcp': [{'HostPort': '80', 'HostIp': '0.0.0.0'}],
+            '8443/tcp': [{'HostPort': '443', 'HostIp': '0.0.0.0'}]}}))
+        self.env['FIXTURE_WEB_CONTAINER'] = str(container)
+        self.log.unlink()
+        return container
+
+    def test_unattended_conflict_preserves_previous_deployment_and_recovery_record(self):
+        owner = self.existing_web_conflict()
+        marker = self.target / '.recovery-required'
+        marker.write_text('Keep the original pre-migration snapshot')
+        original = (self.target / '.env').read_bytes()
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('TCP 80 已被占用', result.stderr)
+        self.assertEqual(original, (self.target / '.env').read_bytes())
+        self.assertEqual(marker.read_text(), 'Keep the original pre-migration snapshot')
+        self.assertTrue(owner.exists())
+        self.assertFalse(any(call['args'][0] in ('stop', 'pull', 'run') or 'build' in call['args']
+                             or 'up' in call['args'] and '--help' not in call['args'] for call in self.calls()))
+
+    @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
+    def test_conflicting_upgrade_can_keep_the_site_and_select_new_web_ports(self):
+        owner = self.existing_web_conflict()
+        private = (self.target / 'config/control.env').read_bytes()
+        snapshot = self.target / '.upgrade-example' / 'database.sqlite'
+        snapshot.parent.mkdir()
+        snapshot.write_bytes(b'original pre-migration snapshot')
+        recovery = self.target / '.recovery-required'
+        recovery.write_text(f'Activation in progress. Snapshot: {snapshot}\n')
+        code, output = self.run_interactive([
+            ('启动方式', '1'), ('确认部署', '1'), ('处理端口冲突', '1'),
+            ('网页 HTTP 端口', '38000'), ('网页 HTTPS 端口', '38443'), ('确认使用这些网页端口', '1')])
+        self.assertEqual(code, 0, output)
+        self.assertIn('Docker existing-site', output)
+        self.assertIn('管理后台地址：https://relay.example.test:38443/admin/', output)
+        self.assertTrue(owner.exists())
+        self.assertFalse(recovery.exists())
+        self.assertEqual(snapshot.read_bytes(), b'original pre-migration snapshot')
+        self.assertEqual(private, (self.target / 'config/control.env').read_bytes())
+        settings = (self.target / '.env').read_text()
+        self.assertIn('P2WLAN_HTTP_PORT=38000', settings)
+        self.assertIn('P2WLAN_HTTPS_PORT=38443', settings)
+        self.assertIn('https://$host:38443$request_uri', (self.target / 'config/edge/nginx-38443.conf').read_text())
+        self.assertIn('https://$host$request_uri', (self.target / 'config/edge/nginx.conf').read_text())
+        self.assertFalse(any(call['args'][0] == 'stop' for call in self.calls()))
+
+    @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
+    def test_stopping_a_named_container_requires_confirmation_and_rechecks_the_owner(self):
+        owner = self.existing_web_conflict()
+        code, output = self.run_interactive([
+            ('启动方式', '1'), ('确认部署', '1'), ('处理端口冲突', '3'),
+            ('确认停止请完整输入', 'wrong-site'), ('处理端口冲突', '3'),
+            ('确认停止请完整输入', 'existing-site')])
+        self.assertEqual(code, 0, output)
+        self.assertFalse(owner.exists())
+        stops = [call['args'] for call in self.calls() if call['args'][0] == 'stop']
+        self.assertEqual(stops, [['stop', '--timeout', '30', 'f' * 64]])
+
+    @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
+    def test_stop_failure_returns_to_port_selection(self):
+        owner = self.existing_web_conflict()
+        self.env['FAIL_FIXTURE_STOP'] = '1'
+        code, output = self.run_interactive([
+            ('启动方式', '1'), ('确认部署', '1'), ('处理端口冲突', '3'),
+            ('确认停止请完整输入', 'existing-site'), ('处理端口冲突', '1'),
+            ('网页 HTTP 端口', '38000'), ('网页 HTTPS 端口', '38443'), ('确认使用这些网页端口', '1')])
+        self.assertEqual(code, 0, output)
+        self.assertIn('未能停止 existing-site', output)
+        self.assertTrue(owner.exists())
+
+    @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
+    def test_occupied_acme_port_allows_an_explicit_change_of_certificate_method(self):
+        owner = self.path / 'published-ports.json'
+        owner.write_text(json.dumps({'name': 'site', 'ports': {
+            '8080/tcp': [{'HostPort': '80', 'HostIp': '0.0.0.0'}]}}))
+        self.env['FIXTURE_WEB_CONTAINER'] = str(owner)
+        self.executable(self.bin / 'certbot', '#!/bin/sh\nexit 94\n')
+        code, output = self.run_interactive([
+            ('部署模式', '1'), ('证书域名', ''), ('ACME 邮箱', ''), ('Control端口', ''),
+            ('metrics端口', ''), ('Relay绑定IP', ''), ('确认部署', '1'), ('处理端口冲突', '1'),
+            ('更换证书方式', '2'), ('网页 HTTP 端口', '38000'), ('网页 HTTPS 端口', '38443'),
+            ('确认使用这些网页端口', '1'), *ACCOUNT_INPUT],
+            '--relay-endpoint', 'tls://relay.example.test:18081', '--tls-mode', 'auto', '--no-start')
+        self.assertEqual(code, 0, output)
+        self.assertIn('P2WLAN_TLS_MODE=selfsigned', (self.target / '.env').read_text())
+        self.assertTrue((self.target / 'config/relay-ca.crt').is_file())
+        self.assertTrue(owner.exists())
+
+    def test_own_active_edge_bindings_are_reused_during_upgrade(self):
+        owner = self.existing_web_conflict()
+        project = 'p2wlan-' + hashlib.sha256(str(self.target.resolve()).encode()).hexdigest()[:12]
+        data = json.loads(owner.read_text())
+        owner.write_text(json.dumps(dict(data, project=project, service='edge')))
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(owner.exists())
+
+    @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
+    def test_stale_confirmed_owner_and_auto_remove_containers_are_not_stopped(self):
+        owner = self.existing_web_conflict()
+        def replace_owner(needle, _output):
+            if needle == '确认停止请完整输入':
+                data = json.loads(owner.read_text())
+                owner.write_text(json.dumps(dict(data, name='new-site', removable=True)))
+        code, output = self.run_interactive([
+            ('启动方式', '1'), ('确认部署', '1'), ('处理端口冲突', '3'),
+            ('确认停止请完整输入', 'existing-site'), ('处理端口冲突', 'q')],
+            before_reply=replace_owner)
+        self.assertNotEqual(code, 0)
+        self.assertIn('占用者已变化', output)
+        self.assertIn('停止即删除', output)
+        self.assertTrue(owner.exists())
+        self.assertFalse(any(call['args'][0] == 'stop' for call in self.calls()))
+
+    @unittest.skipUnless(os.name == 'posix', 'interactive terminal requires POSIX')
+    def test_wizard_can_stop_a_confirmed_systemd_web_service(self):
+        owner = self.existing_web_conflict()
+        owner.unlink()
+        occupied = self.path / 'listener-active'
+        occupied.touch()
+        self.env.update(PYTHONPATH=str(self.path), FIXTURE_LISTENER=str(occupied))
+        (self.path / 'sitecustomize.py').write_text("""
+import errno, os, pathlib, socket
+original_bind = socket.socket.bind
+original_read = pathlib.Path.read_text
+def bind(sock, addr):
+    if addr == ('0.0.0.0', 80) and os.path.exists(os.environ['FIXTURE_LISTENER']):
+        raise OSError(errno.EADDRINUSE, 'fixture listener')
+    return original_bind(sock, addr)
+def read(path, *args, **kwargs):
+    if str(path) == '/proc/123456/cgroup':
+        return '0::/system.slice/nginx.service'
+    return original_read(path, *args, **kwargs)
+socket.socket.bind = bind
+pathlib.Path.read_text = read
+""")
+        self.executable(self.bin / 'ss', '#!/bin/sh\necho \'LISTEN 0 128 *:80 *:* users:(("nginx",pid=123456,fd=3))\'\n')
+        self.executable(self.bin / 'systemctl', """#!/bin/sh
+case "$1" in
+    show) echo 1234567890abcdef1234567890abcdef ;;
+    stop) [ "$2" = nginx.service ] && rm "$FIXTURE_LISTENER" ;;
+    *) exit 1 ;;
+esac
+""")
+        code, output = self.run_interactive([
+            ('启动方式', '1'), ('确认部署', '1'), ('处理端口冲突', '3'),
+            ('确认停止请完整输入', 'nginx.service')])
+        self.assertEqual(code, 0, output)
+        self.assertIn('sudo systemctl start nginx.service', output)
+        self.assertFalse(occupied.exists())
 
     def test_complete_release_bundle_selects_its_adjacent_image_manifest_by_default(self):
         self.manifest()
@@ -682,6 +857,17 @@ esac
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn('80/443', result.stderr)
                     self.assert_not_deployed()
+
+    def test_public_web_port_flags_are_validated_in_dry_run(self):
+        for arguments in (('--http-port', '0'), ('--https-port', '65536'),
+                          ('--http-port', '8080', '--https-port', '8080'),
+                          ('--http-port', '18080'), ('--https-port', '18081'),
+                          ('--dev-localhost', '--http-port', '8080')):
+            with self.subTest(arguments=arguments):
+                result = self.run_installer('--dry-run', *arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.target.exists())
+                self.assertEqual(self.calls(), [])
 
     def test_invalid_publish_hosts_are_rejected_before_docker(self):
         for host in ('relay.example.com', '0.0.0.0\nOTHER=value', '127.0.0.1:18081'):
