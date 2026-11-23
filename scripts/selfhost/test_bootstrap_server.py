@@ -20,6 +20,7 @@ if os.name == 'posix':
 
 
 ROOT = Path(__file__).resolve().parents[2]
+ACCOUNT_INPUT = [('管理员账号', 'operator'), ('管理员密码（', 'sample pass for test'), ('确认管理员密码', 'sample pass for test')]
 VERSION = 'server-v9.9.9'
 COMMIT = 'c' * 40
 IMAGE = 'registry.example.test/p2wlan-server@sha256:' + 'a' * 64
@@ -695,7 +696,7 @@ FIXTURE
             ('请选择版本编号', '1'), ('部署目录', str(self.target)), ('部署模式', '2'),
             ('Relay主机', ''), ('Relay端口', ''),
             ('Control端口', ''), ('metrics端口', ''), ('Relay绑定IP', ''),
-            ('启动方式', '1'), ('确认部署', '1'),
+            ('启动方式', '1'), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], before_reply=not_deployed)
         self.assertEqual(code, 0, output)
         self.assertTrue((self.target / 'config/control.env').is_file())
@@ -961,7 +962,7 @@ FIXTURE
             ('请选择版本编号', '1'), ('程序目录', str(program)), ('配置目录', str(config)), ('数据目录', str(data)),
             ('部署模式', '2'), ('Relay主机', 'localhost'), ('Relay端口', ''),
             ('Control端口', '28080'), ('metrics端口', '28082'),
-            ('启动方式', '1'), ('确认部署', '1'),
+            ('启动方式', '1'), ('确认部署', '1'), *ACCOUNT_INPUT,
         ], before_reply=nothing_published)
         self.assertEqual(code, 0, output)
         self.assertIn(f'DB_PATH={data}/p2pnet.db', (config / 'control.env').read_text())

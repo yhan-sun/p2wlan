@@ -26,6 +26,7 @@ CONFIG_SET=0
 DATA_SET=0
 CONTROL_PORT_SET=0
 METRICS_PORT_SET=0
+ADMIN_USER=
 
 die() { echo "install-server: $*" >&2; exit 1; }
 usage() {
@@ -79,6 +80,26 @@ prompt() {
 valid_path() {
   case "$1" in /*) ;; *) die "installation paths must be absolute" ;; esac
   case "$1" in /|*//*|*[!A-Za-z0-9_./-]*|*/../*|*/./*|*/..|*/.) die "unsafe installation path: $1" ;; esac
+}
+ask_admin_account() {
+  local LC_ALL=C confirmation
+  while true; do
+    prompt ADMIN_USER '管理员账号' admin
+    [[ "$ADMIN_USER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] && break
+    printf '账号须以字母或数字开头，可含点、下划线和短横线，最多 64 个字符。\n' >&3
+  done
+  while true; do
+    IFS= read -rs -p '管理员密码（12–72 个 UTF-8 字节，输入隐藏）: ' installer_admin_password <&3 2>&3 || die 'installation cancelled'
+    printf '\n' >&3
+    case "$installer_admin_password" in q|Q|quit|exit|取消) die 'installation cancelled' ;; esac
+    if (( ${#installer_admin_password} >= 12 && ${#installer_admin_password} <= 72 )); then
+      IFS= read -rs -p '确认管理员密码: ' confirmation <&3 2>&3 || die 'installation cancelled'
+      printf '\n' >&3
+      case "$confirmation" in q|Q|quit|exit|取消) die 'installation cancelled' ;; esac
+      [ "$installer_admin_password" != "$confirmation" ] || return 0
+    fi
+    printf '密码长度不符或两次输入不一致，请重新输入。\n' >&3
+  done
 }
 valid_version() {
   case "$1" in server-v?*) ;; *) die "version must look like server-vX.Y.Z (latest is not supported)" ;; esac
@@ -178,9 +199,8 @@ try:
             if name in ('', '0.0.0.0'): name = '127.0.0.1'
             if name == '::': name = '::1'
             base = 'http://' + authority(host(name, False), port(number))
-            label = 'Local Control' if extra[1] == '1' else 'Configured Control (services not started)'
-            print(label + ': ' + base)
-            print('Admin path: ' + base + '/admin/')
+            print('服务端地址（本机 Control）：' + base)
+            print('管理后台地址（本机）：' + base + '/admin/')
         relay = extra[0]
         if fields.get('RELAY_CATALOG_JSON'):
             catalog = json.loads(fields['RELAY_CATALOG_JSON'])
@@ -188,7 +208,7 @@ try:
                 relay = catalog[0].get('endpoint', '')
         if relay:
             name, number = endpoint(relay)
-            print('Relay endpoint: tls://' + authority(name, number))
+            print('Relay 地址：tls://' + authority(name, number))
     else:
         raise ValueError()
 except (ValueError, OSError, RuntimeError, IndexError, OverflowError, TypeError):
@@ -525,7 +545,18 @@ if [ "$configured" -eq 0 ] && { [ -n "$ENDPOINT$TLS_CERT$TLS_KEY" ] || [ "$DEV_L
     generator_args+=(--tls-cert "$TLS_CERT" --tls-key "$TLS_KEY")
   fi
   generator_args+=(--relay-endpoint "$ENDPOINT")
-  "$stage/p2wlan-config" "${generator_args[@]}"
+  if [ "$INTERACTIVE" -eq 1 ]; then
+    [[ "$generator_help" == *-admin-user* ]] || die '该版本不支持管理员账号设置。请选择支持账号登录的服务端版本。'
+    installer_shell_flags=$-
+    set +x
+    unset installer_admin_password
+    ask_admin_account
+    "$stage/p2wlan-config" "${generator_args[@]}" --admin-user "$ADMIN_USER" <<<"$installer_admin_password"
+    unset installer_admin_password
+    case "$installer_shell_flags" in *x*) set -x ;; esac
+  else
+    "$stage/p2wlan-config" "${generator_args[@]}"
+  fi
   configured=2
 fi
 [ "$START" -eq 0 ] || [ "$configured" -ne 0 ] || die "--start requires complete configuration; use --interactive or supply TLS configuration"
@@ -569,6 +600,8 @@ if [ "$START" -eq 1 ]; then
   done
   if [ "$healthy" -ne 1 ]; then
     cat "$tmp_dir/health" >&2
+    echo '本次部署未通过健康检查。以下为计划地址。' >&2
+    check_input public-info "$CONFIG_DIR" "$ENDPOINT" "$START" >&2 || true
     die "service readiness failed; inspect sudo p2wlan-server status --service $ROLE and journalctl -u p2wlan-control -u p2wlan-relay"
   fi
   echo "P2WLAN server installed and local health checks passed."
@@ -576,8 +609,6 @@ else
   echo "P2WLAN server installed; services were not started or restarted."
 fi
 echo "Configuration: $CONFIG_DIR; data: $DATA_DIR"
-echo "Admin console credential: CONTROL_ADMIN_TOKEN in $CONFIG_DIR/control.env (kept private)."
-check_input public-info "$CONFIG_DIR" "$ENDPOINT" "$START" || true
 echo "Status: sudo env P2WLAN_SERVER_ROOT=$INSTALL_ROOT P2WLAN_SERVER_CONFIG=$CONFIG_DIR P2WLAN_SERVER_DATA=$DATA_DIR p2wlan-server status --service $ROLE"
 echo "Restart: sudo env P2WLAN_SERVER_ROOT=$INSTALL_ROOT P2WLAN_SERVER_CONFIG=$CONFIG_DIR P2WLAN_SERVER_DATA=$DATA_DIR p2wlan-server restart --service $ROLE"
 echo 'Logs: sudo journalctl -u p2wlan-control.service -u p2wlan-relay.service -f'
@@ -585,3 +616,7 @@ echo 'Public Control access requires trusted HTTPS/WSS; Relay requires a client-
 if [ "$DEV_LOCALHOST" -eq 1 ]; then
   echo 'Local test only: the generated certificate expires in 24 hours and is not trusted by public clients.'
 fi
+if [ -n "$ADMIN_USER" ]; then printf '管理员账号：%s\n' "$ADMIN_USER"; fi
+if [ -f "$CONFIG_DIR/control.env" ]; then printf '管理令牌保存在 %s/control.env 的 CONTROL_ADMIN_TOKEN 字段。\n' "$CONFIG_DIR"; fi
+if [ "$START" -eq 1 ]; then echo '健康检查通过，访问地址'; else echo '本次未启动服务。计划访问地址'; fi
+check_input public-info "$CONFIG_DIR" "$ENDPOINT" "$START" || echo "请检查 $CONFIG_DIR/control.env 中的访问地址。" >&2

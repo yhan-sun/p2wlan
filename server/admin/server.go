@@ -46,6 +46,8 @@ type Store interface {
 
 type Config struct {
 	Token        string
+	Username     string
+	PasswordHash string
 	BuildVersion string
 	BuildCommit  string
 	StartedAt    time.Time
@@ -54,6 +56,7 @@ type Config struct {
 type Server struct {
 	store        Store
 	tokenHash    [sha256.Size]byte
+	password     *passwordLogin
 	enabled      bool
 	buildVersion string
 	buildCommit  string
@@ -69,6 +72,14 @@ func New(store Store, config Config) (*Server, error) {
 	if token != "" && store == nil {
 		return nil, errors.New("admin store is required when the console is enabled")
 	}
+	var password *passwordLogin
+	if token != "" {
+		var err error
+		password, err = newPasswordLogin(config.Username, config.PasswordHash)
+		if err != nil {
+			return nil, err
+		}
+	}
 	webRoot, err := fs.Sub(embeddedWeb, "web")
 	if err != nil {
 		return nil, fmt.Errorf("prepare embedded admin console: %w", err)
@@ -80,6 +91,7 @@ func New(store Store, config Config) (*Server, error) {
 	return &Server{
 		store:        store,
 		tokenHash:    sha256.Sum256([]byte(token)),
+		password:     password,
 		enabled:      token != "",
 		buildVersion: strings.TrimSpace(config.BuildVersion),
 		buildCommit:  strings.TrimSpace(config.BuildCommit),
@@ -104,6 +116,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 		return
 	}
 	mux.HandleFunc("GET /admin", s.redirectConsole)
+	mux.HandleFunc("GET /admin/api/v1/login-methods", s.loginMethods)
 	mux.HandleFunc("GET /admin/api/v1/overview", s.requireAdmin(s.overview))
 	mux.HandleFunc("GET /admin/api/v1/accounts", s.requireAdmin(s.accounts))
 	mux.HandleFunc("GET /admin/api/v1/accounts/cursor", s.requireAdmin(s.accountsCursor))
@@ -192,8 +205,9 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 			s.writeUnauthorized(w)
 			return
 		}
-		candidateHash := sha256.Sum256([]byte(strings.TrimSpace(strings.TrimPrefix(header, prefix))))
-		if subtle.ConstantTimeCompare(candidateHash[:], s.tokenHash[:]) != 1 {
+		token := strings.TrimSpace(strings.TrimPrefix(header, prefix))
+		candidateHash := sha256.Sum256([]byte(token))
+		if subtle.ConstantTimeCompare(candidateHash[:], s.tokenHash[:]) != 1 && !s.password.accepts(token) {
 			s.writeUnauthorized(w)
 			return
 		}

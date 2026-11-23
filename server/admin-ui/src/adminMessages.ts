@@ -1,4 +1,12 @@
 export const adminMessages: Record<string, string> = {
+  '管理员账号': 'Administrator username',
+  '管理员密码': 'Administrator password',
+  '管理员账号或密码不正确。': 'Incorrect administrator username or password.',
+  '登录尝试过于频繁，请稍后重试。': 'Too many sign-in attempts. Try again later.',
+  '登录响应无效。': 'Invalid sign-in response.',
+  '使用管理令牌登录': 'Sign in with an administrator token',
+  '使用账号密码登录': 'Sign in with username and password',
+  '显示输入': 'Show credential', '隐藏输入': 'Hide credential',
   "条记录": "records",
   "在线 / 总数": "Online / total",
   "详情": "Details",

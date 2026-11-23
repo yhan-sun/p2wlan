@@ -11,7 +11,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yhan-sun/p2wlan/server/internal/admincredential"
 	"github.com/yhan-sun/p2wlan/server/internal/privatefile"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func envFile(t *testing.T, path string) map[string]string {
@@ -30,6 +32,36 @@ func envFile(t *testing.T, path string) map[string]string {
 	}
 	return out
 }
+func TestOperatorPasswordFromStdin(t *testing.T) {
+	const password = "  端口测试 login  "
+	for _, mode := range []string{"native", "docker"} {
+		out := filepath.Join(t.TempDir(), "config")
+		o := options{mode: mode, output: out, dev: true, endpoint: "tls://localhost:18081", controlPort: 18080, metricsPort: 18082, adminUser: "ops", passwordInput: strings.NewReader(password + "\n")}
+		if err := generate(o); err != nil {
+			t.Fatal(err)
+		}
+		config := envFile(t, filepath.Join(out, "control.env"))
+		hash, err := admincredential.DecodeHash(config["CONTROL_ADMIN_PASSWORD_HASH"])
+		if err != nil || config["CONTROL_ADMIN_USERNAME"] != "ops" || bcrypt.CompareHashAndPassword(hash, []byte(password)) != nil {
+			t.Fatal("operator credentials were not preserved")
+		}
+		raw, err := os.ReadFile(filepath.Join(out, "control.env"))
+		if err != nil || strings.Contains(string(raw), password) {
+			t.Fatal("invalid on-disk credential")
+		}
+		for _, invalid := range []string{"short", "two\nlines-long-password", strings.Repeat("x", 73)} {
+			o.output = filepath.Join(t.TempDir(), "invalid")
+			o.passwordInput = strings.NewReader(invalid)
+			if generate(o) == nil {
+				t.Fatal("invalid password accepted")
+			}
+			if _, err := os.Stat(o.output); !os.IsNotExist(err) {
+				t.Fatal("published invalid configuration")
+			}
+		}
+	}
+}
+
 func TestGenerateMatchingSecureConfiguration(t *testing.T) {
 	for _, mode := range []string{"native", "docker"} {
 		t.Run(mode, func(t *testing.T) {

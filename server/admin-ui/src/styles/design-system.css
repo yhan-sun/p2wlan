@@ -288,6 +288,9 @@ h2, h3, p { overflow-wrap: anywhere; }
 .login-card-v2 h1 { margin: 0; font-size: 26px; line-height: 1.35; font-weight: 600; letter-spacing: -.025em; }
 .login-card-v2 > p { margin: 10px 0 28px; color: var(--text-3); font-size: 14px; }
 .login-card-v2 label { margin-bottom: 8px; color: var(--text-2); font-size: 13px; font-weight: 550; }
+.login-card-v2 h1 + label { margin-top: 24px; }
+.login-card-v2 .input-with-icon + label { margin-top: 16px; }
+.login-card-v2 .login-button + button { margin-top: 8px; width: 100%; }
 .login-card-v2 .input-with-icon { height: 44px; }
 .login-card-v2 .login-token-help { margin: 10px 0 0; color: var(--text-3); font-size: 12px; }
 .login-token-help code { font-size: 11px; }

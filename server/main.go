@@ -87,6 +87,8 @@ func main() {
 	// uses an independent bearer token rather than extending user JWT privileges.
 	adminServer, err := admin.New(db, admin.Config{
 		Token:        getEnv("CONTROL_ADMIN_TOKEN", ""),
+		Username:     os.Getenv("CONTROL_ADMIN_USERNAME"),
+		PasswordHash: os.Getenv("CONTROL_ADMIN_PASSWORD_HASH"),
 		BuildVersion: buildVersion,
 		BuildCommit:  buildCommit,
 		StartedAt:    startedAt,
@@ -98,6 +100,9 @@ func main() {
 	// HTTP mux
 	mux := http.NewServeMux()
 	adminServer.RegisterRoutes(mux)
+	if adminServer.PasswordLoginEnabled() {
+		mux.HandleFunc("POST /admin/api/v1/session", rateLimit(adminServer.Login, 10, time.Minute))
+	}
 	apiServer.RegisterRoomRoutes(mux)
 	if adminServer.Enabled() {
 		log.Println("Admin console enabled at /admin/ (read-only)")

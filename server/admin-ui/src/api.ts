@@ -71,6 +71,24 @@ export async function verifyAdminToken(token: string, signal?: AbortSignal): Pro
   if (!response.ok) throw new ApiError(response.status, await parseError(response))
 }
 
+export async function supportsPasswordLogin(signal: AbortSignal): Promise<boolean> {
+  const response = await fetch('/admin/api/v1/login-methods', { cache: 'no-store', signal })
+  return response.ok && (await response.json()).password === true
+}
+
+export async function openAdminSession(username: string, password: string, signal: AbortSignal): Promise<string> {
+  const bytes = new TextEncoder().encode(username + ':' + password)
+  const credentials = btoa(String.fromCharCode(...bytes))
+  const response = await fetch('/admin/api/v1/session', {
+    method: 'POST', headers: { Authorization: 'Basic ' + credentials, Accept: 'application/json' },
+    cache: 'no-store', credentials: 'omit', redirect: 'error', signal,
+  })
+  if (!response.ok) throw new ApiError(response.status, await parseError(response))
+  const { access_token } = await response.json()
+  if (typeof access_token !== 'string' || !access_token) throw new Error('登录响应无效。')
+  return access_token
+}
+
 export async function api<T>(path: string, signal?: AbortSignal): Promise<T> {
   const token = getAdminToken()
   const revision = sessionRevision

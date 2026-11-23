@@ -8,6 +8,8 @@
 | DB_PATH | SQLite 文件路径，不是目录；相对路径相对于服务工作目录。 |
 | JWT_SECRET | 每个部署独立随机值，持续保存；改变会使现有账号会话失效。 |
 | CONTROL_ADMIN_TOKEN | 管理控制台凭据；`p2wlan-config` 默认生成独立 256-bit 随机值。为空时 `/admin` 与 `/admin/*` 返回 404；手工配置时至少 32 个字符，只用于 `/admin/api/v1/*` 的 Bearer 认证，不能复用 JWT_SECRET 或 Relay 凭据。 |
+| CONTROL_ADMIN_USERNAME | 可选的管理台登录名，1–64 个 ASCII 字母、数字、点、下划线或短横线，首字符为字母或数字。与密码哈希成对配置。 |
+| CONTROL_ADMIN_PASSWORD_HASH | `p2wlan-config --admin-user` 从标准输入读取密码后写入的 bcrypt 哈希，使用无填充 Base64URL 编码。管理台启用时生效。 |
 | LOG_UPLOAD_DIR | 支持日志保存目录。托管部署显式配置为服务账户可写的绝对持久路径；默认受管理目录为数据目录下的 `log-uploads`，权限 `0700`。升级保留非空自定义值。 |
 | RELAY_CATALOG_JSON | 每项包含唯一 region、audience 和客户端可访问的 tls:// endpoint。 |
 | RELAY_TICKET_SIGNER_KEY_FILE / RELAY_TICKET_SIGNER_KID | 签票私钥和 key id，必须成对配置。 |
