@@ -32,7 +32,12 @@ impl PeerManagerStats {
             total_peers: peers.len(),
             direct_connections: peers
                 .iter()
-                .filter(|peer| peer.active_path == Some(NetworkPath::Direct))
+                .filter(|peer| {
+                    matches!(
+                        peer.active_path,
+                        Some(NetworkPath::Direct | NetworkPath::TcpDirect)
+                    )
+                })
                 .count(),
             relay_connections: peers
                 .iter()

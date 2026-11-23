@@ -153,6 +153,7 @@ fn new_generation_replaces_stale_pending_initiator_before_retry() {
 fn deferred_unknown_peer_offer_is_newest_wins_and_owner_scoped() {
     fn offer(peer_id: &str, endpoint: &str) -> PendingPeerOffer {
         PendingPeerOffer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: vec![endpoint.to_string()],
             candidate_sources: HashMap::from([(endpoint.to_string(), "stun".to_string())]),
@@ -206,6 +207,7 @@ fn deferred_unknown_peer_offer_is_newest_wins_and_owner_scoped() {
 fn retired_active_sender_cannot_overwrite_queued_replacement_identity_offer() {
     fn offer(sender: &str, endpoint: &str) -> PendingPeerOffer {
         PendingPeerOffer {
+            nat_profile: None,
             from_node_id: "peer-identity-coalescing".to_string(),
             candidates: vec![endpoint.to_string()],
             candidate_sources: HashMap::new(),
@@ -262,6 +264,7 @@ fn retired_active_sender_cannot_overwrite_queued_replacement_identity_offer() {
 fn cancelled_responder_owner_cannot_consume_a_new_offer() {
     fn offer(endpoint: &str) -> PendingPeerOffer {
         PendingPeerOffer {
+            nat_profile: None,
             from_node_id: "peer-cancelled-responder".to_string(),
             candidates: vec![endpoint.to_string()],
             candidate_sources: HashMap::new(),
@@ -303,6 +306,7 @@ fn cancelled_responder_owner_cannot_consume_a_new_offer() {
 fn candidate_offer_work_is_newest_wins_owner_scoped_and_capacity_bounded() {
     fn offer(peer_id: &str, generation: u64) -> PendingPeerOffer {
         PendingPeerOffer {
+            nat_profile: None,
             from_node_id: peer_id.to_string(),
             candidates: vec![format!("198.51.100.10:{}", 41_000 + generation)],
             candidate_sources: HashMap::new(),
@@ -414,6 +418,7 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
     let peer_id = "peer-deferred-replay";
     let candidate = "198.51.100.77:47000";
     let offer = PendingPeerOffer {
+        nat_profile: None,
         from_node_id: peer_id.to_string(),
         candidates: vec![candidate.to_string()],
         candidate_sources: HashMap::from([(candidate.to_string(), "stun".to_string())]),

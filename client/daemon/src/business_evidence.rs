@@ -198,6 +198,7 @@ impl WgEvidenceOwnerId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObservedIngress {
     DirectUdpObserved,
+    DirectTcpObserved,
     RelayObserved,
     Unknown,
 }
@@ -295,6 +296,29 @@ impl PhysicalIngressContext {
             relay_connection_id: None,
             relay_endpoint_slot: None,
         }
+    }
+
+    pub(crate) fn direct_tcp(network: u64, link: NonZeroU64) -> Self {
+        Self {
+            ingress: ObservedIngress::DirectTcpObserved,
+            network_generation: Some(network),
+            runtime_instance: Some(link),
+            socket_index: None,
+            socket_owner: SocketOwner::Unknown,
+            publication: PublicationObservation::Unknown,
+            source: None,
+            local_endpoint: None,
+            received_at: None,
+            enqueued_at: None,
+            relay_connection_id: None,
+            relay_endpoint_slot: None,
+        }
+    }
+
+    pub(crate) fn tcp_link(&self) -> Option<NonZeroU64> {
+        (self.ingress == ObservedIngress::DirectTcpObserved)
+            .then_some(self.runtime_instance)
+            .flatten()
     }
 
     pub(crate) fn runtime_instance(self) -> Option<NonZeroU64> {

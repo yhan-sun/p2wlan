@@ -1,0 +1,16 @@
+{
+  "type": "peer_offer",
+  "from_node_id": "peer-a",
+  "to_node_id": "peer-b",
+  "candidate_generation": 8,
+  "candidates": [],
+  "nat_profile": {
+    "nat_type": "None",
+    "port_step": 0,
+    "port_hint": 0,
+    "upnp_mapped_addr": null,
+    "tcp_candidates": ["192.0.2.1:42000"],
+    "tcp_simultaneous_open": true,
+    "supports_sym_punch": false
+  }
+}

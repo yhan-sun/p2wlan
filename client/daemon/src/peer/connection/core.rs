@@ -179,6 +179,9 @@ pub struct PeerConnection {
     /// freshness fence; authenticated candidate/path evidence remains the
     /// authority for promotion.
     pub remote_nat_profile: Option<RemoteNatProfile>,
+    pub(crate) tcp_path: Option<Arc<crate::peer::tcp_direct::TcpPath>>,
+    pub(crate) punch_run: Option<Arc<crate::peer::PeerPunchRun>>,
+    pub(crate) negotiated_punch: Option<crate::peer::NegotiatedPunchProfile>,
     /// Remote profile context captured when the profile was accepted. Age
     /// and profile generation alone cannot authorize Hard↔Hard after a newer
     /// candidate set has been published.
@@ -626,6 +629,9 @@ impl PeerConnection {
             signaled_endpoint: None,
             nat_type: String::new(),
             remote_nat_profile: None,
+            negotiated_punch: None,
+            tcp_path: None,
+            punch_run: None,
             remote_nat_profile_candidate_epoch: None,
             online: true,
             last_seen: LastSeen::new(0),
@@ -981,11 +987,17 @@ impl PeerConnection {
     /// Record bytes sent.
     pub fn record_sent(&self, n: u64) {
         self.bytes_sent.add(n);
+        if let Some(run) = &self.punch_run {
+            run.observe_business(n);
+        }
     }
 
     /// Record bytes received.
     pub fn record_received(&self, n: u64) {
         self.bytes_received.add(n);
+        if let Some(run) = &self.punch_run {
+            run.observe_business(n);
+        }
     }
 
     /// Record the first usable production ingress for this peer + generation.

@@ -86,6 +86,40 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
         "birthday-probing" => {
             config.network.birthday_probing_enabled = parse_bool_config(value, "birthday-probing")?;
         }
+        "disable-sym-hole-punching" => {
+            config.network.traversal.disable_sym_hole_punching = parse_bool_config(value, key)?
+        }
+        "lazy-p2p" => config.network.traversal.lazy_p2p = parse_bool_config(value, key)?,
+        "max-punch-pps" => {
+            config.network.traversal.max_punch_pps = parse_punch_limit(value, key, 200)?
+        }
+        "max-punch-sockets" => {
+            config.network.traversal.max_punch_sockets = parse_punch_limit(value, key, 30)? as u8
+        }
+        "linear-scan-count" => {
+            config.network.traversal.linear_scan_count = parse_punch_limit(value, key, 256)?
+        }
+        "firewall-probe-addresses" => {
+            let mut addresses = Vec::new();
+            if !is_clear_value(value) {
+                for item in value.split(',') {
+                    let address = parse_socket_addr(item.trim(), key)?;
+                    if address.port() == 0
+                        || address.ip().is_multicast()
+                        || address.ip().is_unspecified()
+                    {
+                        return Err(format!("{key} 需要有效的单播地址和非零端口"));
+                    }
+                    if !addresses.contains(&address) {
+                        addresses.push(address);
+                    }
+                    if addresses.len() > 8 {
+                        return Err(format!("{key} 最多支持 8 个地址"));
+                    }
+                }
+            }
+            config.network.traversal.firewall_probe_addresses = addresses;
+        }
         "socket-pool" => {
             if is_clear_value(value)
                 || matches!(
@@ -218,4 +252,13 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
         }
     }
     Ok(())
+}
+
+fn parse_punch_limit(value: &str, key: &str, max: u16) -> Result<u16, String> {
+    value
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|v| *v <= max)
+        .ok_or_else(|| format!("{key} 必须是 0 到 {max} 的整数"))
 }

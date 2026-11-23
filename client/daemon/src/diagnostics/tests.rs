@@ -191,6 +191,7 @@ mod tests {
         let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
         config.node.node_id = "node-a".to_string();
         config.network.virtual_ip = "10.20.0.1".to_string();
+        config.relay.path_policy = crate::config::PathPolicy::DirectFirst;
         let config = Arc::new(config);
         let peers = Arc::new(PeerManager::new((*config).clone()));
         peers

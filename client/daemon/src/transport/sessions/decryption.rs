@@ -22,6 +22,17 @@ impl WireGuardTransport {
         &self,
         wire_bytes: &[u8],
     ) -> std::result::Result<Option<DecryptedInboundWithSource>, InboundDecryptError> {
+        self.decrypt_inbound_for_peer(wire_bytes, None).await
+    }
+
+    pub(in crate::transport) async fn decrypt_inbound_for_peer(
+        &self,
+        wire_bytes: &[u8],
+        expected_peer: Option<&str>,
+    ) -> std::result::Result<Option<DecryptedInboundWithSource>, InboundDecryptError> {
+        let permitted = |(peer_id, _): &(&String, &mut PeerTransportSessions)| {
+            expected_peer.is_none_or(|expected| expected == peer_id.as_str())
+        };
         let msg = MessageTransport::from_bytes(wire_bytes).map_err(InboundDecryptError::Parse)?;
         if let Some(capture) = self.resource_capture() {
             capture.observe_vec(
@@ -57,7 +68,7 @@ impl WireGuardTransport {
         // collision occurs. Successfully receiving the new key confirms the
         // peer has completed the rekey, so the prior key can be retired early.
         let mut confirmed_active = None;
-        for (peer_id, peer_sessions) in sessions.iter_mut() {
+        for (peer_id, peer_sessions) in sessions.iter_mut().filter(permitted) {
             let Some(active) = peer_sessions.active.as_mut() else {
                 continue;
             };
@@ -132,7 +143,7 @@ impl WireGuardTransport {
         // The first authenticated packet under that key is the peer's commit
         // acknowledgement and atomically promotes it for outbound traffic.
         let mut promoted = None;
-        'pending_sessions: for (peer_id, peer_sessions) in sessions.iter_mut() {
+        'pending_sessions: for (peer_id, peer_sessions) in sessions.iter_mut().filter(permitted) {
             for (pending_token, pending) in &mut peer_sessions.pending {
                 if pending.slot.session.our_index() != receiver_index {
                     continue;
@@ -244,7 +255,7 @@ impl WireGuardTransport {
             }));
         }
 
-        for (peer_id, peer_sessions) in sessions.iter_mut() {
+        for (peer_id, peer_sessions) in sessions.iter_mut().filter(permitted) {
             let Some(previous) = peer_sessions.previous.as_mut() else {
                 continue;
             };

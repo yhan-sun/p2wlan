@@ -86,7 +86,21 @@ impl UdpTransport {
             ipv6_socket,
             ipv6_socket_diagnostics,
             outbound_interface: outbound_interface.map(Arc::<str>::from),
+            firewall_cache: Default::default(),
+            compact_budget: Arc::new(p2pnet_nat::engine::PunchPacer::new(
+                0,
+                peers.punch_settings().max_punch_pps,
+            )),
+            negotiated_socket_slots: Arc::new(tokio::sync::Semaphore::new(usize::from(
+                peers
+                    .punch_settings()
+                    .max_punch_sockets
+                    .min(30)
+                    .saturating_sub(1),
+            ))),
             peers,
+            compact_index: Default::default(),
+            compact_nonce: Arc::new(std::sync::atomic::AtomicU32::new(rand::random())),
             pending_probes: Arc::new(Mutex::new(HashMap::new())),
             hard_hard_probe_bindings: Arc::new(Mutex::new(HashMap::new())),
             hard_hard_measurement_gate: Arc::new(tokio::sync::Semaphore::new(1)),

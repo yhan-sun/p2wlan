@@ -102,19 +102,20 @@ func verifyProbeEphemeralSignature(sender *database.Device, signalType, fromNode
 // CreateSignal handles POST /api/v1/signals.
 func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		FromNodeID              string            `json:"from_node_id"`
-		ToNodeID                string            `json:"to_node_id"`
-		Type                    string            `json:"type"`
-		ProtocolVersion         int64             `json:"protocol_version"`
-		Candidates              []string          `json:"candidates"`
-		CandidateSources        map[string]string `json:"candidate_sources"`
-		CandidateGeneration     int64             `json:"candidate_generation"`
-		CandidatesExpiresAtMS   int64             `json:"candidates_expires_at_ms"`
-		SessionID               string            `json:"session_id"`
-		ProbeEphemeralPublicKey string            `json:"probe_ephemeral_public_key"`
-		ProbeEphemeralSignature string            `json:"probe_ephemeral_signature"`
-		Handshake               string            `json:"handshake"`
-		PunchAtMS               int64             `json:"punch_at_ms"`
+		FromNodeID              string                 `json:"from_node_id"`
+		ToNodeID                string                 `json:"to_node_id"`
+		Type                    string                 `json:"type"`
+		ProtocolVersion         int64                  `json:"protocol_version"`
+		Candidates              []string               `json:"candidates"`
+		NATProfile              *database.PunchProfile `json:"nat_profile"`
+		CandidateSources        map[string]string      `json:"candidate_sources"`
+		CandidateGeneration     int64                  `json:"candidate_generation"`
+		CandidatesExpiresAtMS   int64                  `json:"candidates_expires_at_ms"`
+		SessionID               string                 `json:"session_id"`
+		ProbeEphemeralPublicKey string                 `json:"probe_ephemeral_public_key"`
+		ProbeEphemeralSignature string                 `json:"probe_ephemeral_signature"`
+		Handshake               string                 `json:"handshake"`
+		PunchAtMS               int64                  `json:"punch_at_ms"`
 		// PunchAtServerMS echoes an already normalized server deadline from
 		// an offer. It lets the answer join the same synchronized punch window
 		// instead of scheduling a second one after the round trip.
@@ -168,6 +169,10 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		candidateSet[c] = struct{}{}
+	}
+	if err := req.NATProfile.Validate(); err != nil {
+		http.Error(w, `{"error":"invalid NAT profile"}`, http.StatusBadRequest)
+		return
 	}
 	if len(req.CandidateSources) > len(req.Candidates) {
 		http.Error(w, `{"error":"too many candidate sources"}`, http.StatusBadRequest)
@@ -350,7 +355,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signal, err := s.db.CreateAuthorizedSignalWithTraversalSession(fromNodeID, req.ToNodeID, req.Type, protocolVersion, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, candidatesExpiresAtMS, req.SessionID, req.ProbeEphemeralPublicKey, senderIdentityFingerprint(senderDevice))
+	signal, err := s.db.CreateAuthorizedSignalWithProfile(req.NATProfile, fromNodeID, req.ToNodeID, req.Type, protocolVersion, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, candidatesExpiresAtMS, req.SessionID, req.ProbeEphemeralPublicKey, senderIdentityFingerprint(senderDevice))
 	if err != nil {
 		if errors.Is(err, database.ErrRoomAccess) {
 			roomError(w, err)

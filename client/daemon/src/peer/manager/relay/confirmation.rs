@@ -828,6 +828,7 @@ impl PeerManager {
             self.emit_timeline(
                 "first_usable_rejected",
                 Some(match path {
+                    NetworkPath::TcpDirect => "tcp_direct",
                     NetworkPath::Direct => "direct",
                     NetworkPath::Relay => "relay",
                 }),
@@ -851,6 +852,7 @@ impl PeerManager {
                 node_id,
                 generation,
                 match path {
+                    NetworkPath::TcpDirect => "tcp_direct",
                     NetworkPath::Direct => "direct",
                     NetworkPath::Relay => "relay",
                 },

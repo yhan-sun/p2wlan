@@ -528,9 +528,9 @@ async fn remote_candidate_refresh_cancels_direct_validation_owner() {
 
 #[tokio::test]
 async fn lost_validation_restarts_after_candidate_handover_with_relay_active() {
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::DirectFirst;
+    let peers = Arc::new(PeerManager::new(config));
     peers.add_peer(&peer("peer-b", "10.20.0.2", None)).await;
     peers
         .record_relay_success("peer-b", "relay.test:443", true)

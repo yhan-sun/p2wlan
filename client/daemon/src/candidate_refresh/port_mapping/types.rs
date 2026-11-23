@@ -2,4 +2,5 @@
 struct PortMappingCandidate {
     endpoint: String,
     source: &'static str,
+    lease_seconds: u32,
 }

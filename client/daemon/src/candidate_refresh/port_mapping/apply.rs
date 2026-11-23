@@ -14,6 +14,19 @@ fn gateway_mapping_identity_is_current(
 
 const GATEWAY_MAPPING_COMMIT_TIMEOUT: Duration = Duration::from_millis(100);
 
+pub(crate) fn prefer_gateway_candidate(
+    endpoint: &str,
+    source: &str,
+    candidates: &mut Vec<String>,
+    sources: &mut HashMap<String, String>,
+) {
+    // Gateway-created mappings must survive the signaling cap even when an
+    // earlier STUN observation already published the same address.
+    candidates.retain(|candidate| candidate != endpoint);
+    candidates.insert(0, endpoint.to_owned());
+    sources.insert(endpoint.to_owned(), source.to_owned());
+}
+
 /// The single gateway cache and its diagnostic snapshot commit together.
 /// No discovery I/O is allowed while these guards are held.
 struct GatewayMappingCommit<'a> {
@@ -98,7 +111,7 @@ pub(super) async fn maybe_add_port_mapping_udp_candidate(
     identity.local_endpoint = local_addr;
     identity.gateway = gateway;
 
-    {
+    let pcp_request = {
         let Some(GatewayMappingCommit {
             mut runtime,
             mut diagnostics,
@@ -116,10 +129,7 @@ pub(super) async fn maybe_add_port_mapping_udp_candidate(
                 runtime.candidate_endpoint.as_ref(),
                 runtime.candidate_source,
             ) {
-                if !candidates.contains(endpoint) {
-                    candidates.insert(0, endpoint.clone());
-                    candidate_sources.insert(endpoint.clone(), source.to_string());
-                }
+                prefer_gateway_candidate(endpoint, source, candidates, candidate_sources);
                 *diagnostics = runtime.snapshot(true, PORT_MAPPING_LEASE_SECS, diagnostics.clone());
                 return;
             }
@@ -128,9 +138,13 @@ pub(super) async fn maybe_add_port_mapping_udp_candidate(
             *diagnostics = runtime.snapshot(true, PORT_MAPPING_LEASE_SECS, diagnostics.clone());
             return;
         }
-    }
+        let Some(request) = runtime.pcp_request() else {
+            return;
+        };
+        request
+    };
 
-    let discovered = discover_port_mapping_udp_candidate(local_addr).await;
+    let discovered = discover_port_mapping_udp_candidate(local_addr, gateway, pcp_request).await;
     let Some(GatewayMappingCommit {
         mut runtime,
         mut diagnostics,
@@ -167,15 +181,18 @@ pub(super) async fn maybe_add_port_mapping_udp_candidate(
                 "{} mapped UDP {local_addr} as {}",
                 candidate.source, candidate.endpoint
             );
-            // Gateway-created mappings must survive the signaling cap.
-            candidates.insert(0, candidate.endpoint.clone());
         }
-        candidate_sources.insert(candidate.endpoint.clone(), candidate.source.to_string());
+        prefer_gateway_candidate(
+            &candidate.endpoint,
+            candidate.source,
+            candidates,
+            candidate_sources,
+        );
         runtime.record_success(
             identity,
             candidate.endpoint,
             candidate.source,
-            Duration::from_secs(PORT_MAPPING_LEASE_SECS.into()),
+            Duration::from_secs(candidate.lease_seconds.into()),
         );
     } else {
         runtime.record_failure(identity, PORT_MAPPING_FAILURE_RETRY);

@@ -5,28 +5,39 @@ struct GatewayMappingDiscovery {
     nat_pmp: Option<std::result::Result<(), String>>,
 }
 
-async fn discover_port_mapping_udp_candidate(local_addr: SocketAddr) -> GatewayMappingDiscovery {
-    match discover_upnp_udp_candidate(local_addr).await {
-        Ok(candidate) => GatewayMappingDiscovery {
-            candidate: Some(candidate),
-            upnp: Ok(()),
-            pcp: None,
-            nat_pmp: None,
-        },
-        Err(upnp) => {
-            let (pcp, nat_pmp) = discover_pcp_or_nat_pmp_udp_candidate(local_addr).await;
-            let candidate = pcp
-                .as_ref()
-                .ok()
-                .cloned()
-                .or_else(|| nat_pmp.as_ref().ok().cloned());
-            GatewayMappingDiscovery {
-                candidate,
-                upnp: Err(upnp),
-                pcp: Some(pcp.map(|_| ())),
-                nat_pmp: Some(nat_pmp.map(|_| ())),
-            }
-        }
+async fn discover_port_mapping_udp_candidate(
+    local_addr: SocketAddr,
+    gateway: Option<Ipv4Addr>,
+    pcp_request: ([u8; 12], Option<SocketAddr>),
+) -> GatewayMappingDiscovery {
+    let (upnp, gateway) = tokio::join!(
+        tokio::time::timeout(
+            UPNP_DISCOVERY_TIMEOUT + NAT_MAPPING_DISCOVERY_TIMEOUT,
+            discover_upnp_udp_candidate(local_addr)
+        ),
+        tokio::time::timeout(
+            NAT_MAPPING_DISCOVERY_TIMEOUT * 3,
+            discover_pcp_or_nat_pmp_udp_candidate(local_addr, gateway, pcp_request)
+        ),
+    );
+    let (pcp, nat_pmp) = gateway.unwrap_or_else(|_| {
+        (
+            Err("PCP discovery deadline elapsed".into()),
+            Err("NAT-PMP discovery deadline elapsed".into()),
+        )
+    });
+    let upnp = upnp.unwrap_or_else(|_| Err("UPnP mapping deadline elapsed".into()));
+    let candidate = upnp
+        .as_ref()
+        .ok()
+        .or_else(|| pcp.as_ref().ok())
+        .or_else(|| nat_pmp.as_ref().ok())
+        .cloned();
+    GatewayMappingDiscovery {
+        candidate,
+        upnp: upnp.map(|_| ()),
+        pcp: Some(pcp.map(|_| ())),
+        nat_pmp: Some(nat_pmp.map(|_| ())),
     }
 }
 
@@ -72,6 +83,7 @@ async fn discover_upnp_udp_candidate(
         return Ok(PortMappingCandidate {
             endpoint: SocketAddr::new(external_ip, local_addr.port()).to_string(),
             source: "upnp",
+            lease_seconds: PORT_MAPPING_LEASE_SECS,
         });
     }
 
@@ -87,6 +99,7 @@ async fn discover_upnp_udp_candidate(
         Ok(endpoint) if is_public_udp_candidate(endpoint) => Ok(PortMappingCandidate {
             endpoint: endpoint.to_string(),
             source: "upnp",
+            lease_seconds: PORT_MAPPING_LEASE_SECS,
         }),
         Ok(endpoint) => {
             debug!("UPnP IGD mapped to non-public endpoint {endpoint}; skipping candidate");

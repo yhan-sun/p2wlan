@@ -566,6 +566,24 @@ fn read_windows_option<S: UdpSocketRaw>(socket: &S, level: i32, option: i32) -> 
 /// Loopback destinations deliberately ignore the interface so local control
 /// and test servers remain reachable.
 pub async fn connect_tcp_addr(addr: SocketAddr, interface: Option<&str>) -> io::Result<TcpStream> {
+    connect_tcp_from(addr, None, interface).await
+}
+
+/// Connect from a specific local interface address using an ephemeral source
+/// port. The same VPN socket protection and interface policy apply as for Relay.
+pub async fn connect_tcp_from(
+    addr: SocketAddr,
+    source: Option<IpAddr>,
+    interface: Option<&str>,
+) -> io::Result<TcpStream> {
+    let socket = new_tcp_socket(addr, interface)?;
+    if let Some(ip) = source {
+        socket.bind(SocketAddr::new(ip, 0))?;
+    }
+    socket.connect(addr).await
+}
+
+fn new_tcp_socket(addr: SocketAddr, interface: Option<&str>) -> io::Result<TcpSocket> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     protect_android_socket(&socket)?;
     if addr.is_ipv6() {
@@ -578,7 +596,35 @@ pub async fn connect_tcp_addr(addr: SocketAddr, interface: Option<&str>) -> io::
     }
     socket.set_nonblocking(true)?;
     let stream: std::net::TcpStream = socket.into();
-    TcpSocket::from_std_stream(stream).connect(addr).await
+    Ok(TcpSocket::from_std_stream(stream))
+}
+
+/// Reserve a concrete local TCP endpoint shared by a listener and connected
+/// sockets with distinct four-tuples. Windows uses the ordinary listener.
+pub fn bind_shared_tcp(local: SocketAddr) -> io::Result<TcpSocket> {
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    ))]
+    {
+        let socket = new_tcp_socket(local, None)?;
+        socket.set_reuseaddr(true)?;
+        socket.set_reuseport(true)?;
+        socket.bind(local)?;
+        Ok(socket)
+    }
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    )))]
+    {
+        let _ = local;
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 #[cfg(target_os = "android")]

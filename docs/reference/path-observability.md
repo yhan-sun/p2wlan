@@ -1,5 +1,7 @@
 # 路径可观测性参考
 
+双方通过 `udp_endpoint_receipts` 协商端点交换后，本地状态中的 `peers[].udp_session_endpoints` 可显示最近三秒内同一 UDP 会话的两个观测值。`remote_source` 是本机收到该对端报文时的源地址，`local_as_seen_by_peer` 是对端收到本机应答时回报的源地址。`socket_index` 标识收发该挑战的本地 socket。回执由会话密钥认证，按挑战和收包端点匹配。两个独立挑战以及 WireGuard 的加密验证仍负责确认 Direct。
+
 路径观测只读取已提交的 Direct/Relay 状态，不做路径决策、不写 socket、不阻塞数据面。唯一的状态转换入口是 commit_path_transition；每个 peer 最多保留 32 条转换记录，动态标签不包含 peer id、endpoint、IP、session id 或任意错误文本。
 
 `peers[].traversal_plan` 是当前资料下的尝试建议，不表示运行时已取得探测许可或 Direct 已建立。生日扫描建议遵守 `birthday_probing_enabled`，可预测的 Hard↔Hard 计划不受该生日开关影响；IPv6 依据本地 NAT 能力中的端点及远端当前候选，诊断显示的本地 socket 地址仍用于候选对展示。

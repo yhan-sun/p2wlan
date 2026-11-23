@@ -108,6 +108,7 @@ impl ControlClient {
                 ..
             } => {
                 let _ = self.event_tx.send(ControlEvent::PeerOffer {
+                    nat_profile: None,
                     from_node_id,
                     candidates,
                     session_id,
@@ -135,6 +136,7 @@ impl ControlClient {
                 ..
             } => {
                 let _ = self.event_tx.send(ControlEvent::PeerAnswer {
+                    nat_profile: None,
                     from_node_id,
                     candidates,
                     session_id,

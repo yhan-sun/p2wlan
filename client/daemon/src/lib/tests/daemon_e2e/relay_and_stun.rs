@@ -798,6 +798,7 @@ async fn responder_offer_from_previous_network_generation_cannot_stage_session()
     let daemon = Daemon::new(config);
     let peer_id = "peer-old-network-generation-offer";
     let offer = PendingPeerOffer {
+        nat_profile: None,
         from_node_id: peer_id.to_string(),
         candidates: Vec::new(),
         candidate_sources: HashMap::new(),

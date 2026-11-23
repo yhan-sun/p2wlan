@@ -334,7 +334,7 @@ impl PathObservabilitySnapshot {
                 self.selected_path_mtu = Some(RELAY_SAFE_PATH_MTU);
                 self.selected_udp_datagram_size = None;
             }
-            None => {
+            Some(NetworkPath::TcpDirect) | None => {
                 self.selected_path_mtu = None;
                 self.selected_udp_datagram_size = None;
             }

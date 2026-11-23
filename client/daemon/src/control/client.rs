@@ -367,6 +367,29 @@ impl ControlClient {
         health: Option<Arc<crate::tasks::HealthState>>,
         telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
     ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
+        Self::new_with_peer_manager(
+            config,
+            enabled,
+            config_path,
+            relay_selection,
+            timeline,
+            health,
+            telemetry_hub,
+            std::sync::Weak::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_peer_manager(
+        config: &Config,
+        enabled: bool,
+        config_path: Option<PathBuf>,
+        relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
+        timeline: Arc<ConnectionTimeline>,
+        health: Option<Arc<crate::tasks::HealthState>>,
+        telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
+        peers: std::sync::Weak<crate::peer::PeerManager>,
+    ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let (critical_offer_tx, critical_offer_rx) = mpsc::channel(CRITICAL_OFFER_QUEUE_CAPACITY);
@@ -491,6 +514,7 @@ impl ControlClient {
                     telemetry_hub,
                     server_clock,
                     network_changes,
+                    peers,
                 )
                 .await;
             };

@@ -98,8 +98,19 @@ pub struct GatewayMappingRuntime {
     pub local_endpoint: Option<SocketAddr>,
     pub candidate_endpoint: Option<String>,
     pub candidate_source: Option<&'static str>,
+    granted_lease_seconds: Option<u32>,
+    pcp_nonce: Option<PcpMappingNonce>,
     pub renew_at: Option<Instant>,
     pub retry_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+struct PcpMappingNonce([u8; 12]);
+
+impl std::fmt::Debug for PcpMappingNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PcpMappingNonce(redacted)")
+    }
 }
 
 impl GatewayMappingRuntime {
@@ -108,9 +119,20 @@ impl GatewayMappingRuntime {
             *self = Self {
                 identity: Some(identity),
                 local_endpoint: Some(identity.local_endpoint),
+                pcp_nonce: Some(PcpMappingNonce(rand::random())),
                 ..Self::default()
             };
         }
+    }
+
+    /// Renewals and retries on the same gateway reuse its mapping nonce.
+    pub(crate) fn pcp_request(&self) -> Option<([u8; 12], Option<SocketAddr>)> {
+        let suggested = self
+            .candidate_endpoint
+            .as_deref()
+            .filter(|_| self.candidate_source == Some("pcp"))
+            .and_then(|address| address.parse().ok());
+        Some((self.pcp_nonce?.0, suggested))
     }
 
     pub(crate) fn matches_identity(&self, identity: GatewayMappingIdentity) -> bool {
@@ -143,7 +165,8 @@ impl GatewayMappingRuntime {
         self.local_endpoint = Some(identity.local_endpoint);
         self.candidate_endpoint = Some(candidate_endpoint);
         self.candidate_source = Some(candidate_source);
-        // Renew at half the requested lease.  This provides a retry window
+        self.granted_lease_seconds = Some(lease.as_secs().min(u64::from(u32::MAX)) as u32);
+        // Renew at half the granted lease.  This provides a retry window
         // without issuing a full discovery on every candidate refresh.
         self.renew_at = Instant::now().checked_add(lease / 2);
         self.retry_at = None;
@@ -162,6 +185,7 @@ impl GatewayMappingRuntime {
         self.candidate_endpoint = None;
         self.candidate_source = None;
         self.renew_at = None;
+        self.granted_lease_seconds = None;
         self.retry_at = Instant::now().checked_add(retry_after);
         true
     }
@@ -174,7 +198,7 @@ impl GatewayMappingRuntime {
     ) -> GatewayMappingDiagnostics {
         let now = Instant::now();
         diagnostics.enabled = enabled;
-        diagnostics.lease_seconds = lease_seconds;
+        diagnostics.lease_seconds = self.granted_lease_seconds.unwrap_or(lease_seconds);
         diagnostics.local_endpoint = self.local_endpoint.map(|endpoint| endpoint.to_string());
         diagnostics.candidate_endpoint = self.candidate_endpoint.clone();
         diagnostics.candidate_source = self.candidate_source.map(str::to_string);

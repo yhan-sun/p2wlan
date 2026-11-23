@@ -69,6 +69,16 @@ message EndpointUpdate {
   string nat_type = 3;
 }
 
+// Optional capability attached to a single candidate generation.
+message PunchProfile {
+  string nat_type = 1;
+  sint32 port_step = 2;
+  uint32 port_hint = 3;
+  optional string upnp_mapped_addr = 4;
+  repeated string tcp_candidates = 5;
+  bool supports_sym_punch = 6;
+}
+
 /// Offer to establish a P2P connection with a peer.
 message PeerOffer {
   string from_node_id = 1;
@@ -83,6 +93,7 @@ message PeerOffer {
   uint64 candidate_generation = 6;
   // Sender wall-clock deadline for this candidate set (Unix milliseconds).
   uint64 candidates_expires_at_ms = 7;
+  PunchProfile nat_profile = 8;
 }
 
 /// Answer to a peer offer.
@@ -94,6 +105,7 @@ message PeerAnswer {
   map<string, string> candidate_sources = 5;
   uint64 candidate_generation = 6;
   uint64 candidates_expires_at_ms = 7;
+  PunchProfile nat_profile = 8;
 }
 
 /// Reject a peer connection.

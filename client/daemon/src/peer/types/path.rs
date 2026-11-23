@@ -45,6 +45,8 @@ impl std::fmt::Display for ConnectionState {
 pub enum NetworkPath {
     /// Direct UDP path.
     Direct,
+    /// Authenticated stream between explicitly configured TCP endpoints.
+    TcpDirect,
     /// Relay fallback path.
     Relay,
 }
@@ -89,6 +91,7 @@ impl std::fmt::Display for NetworkPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Direct => write!(f, "direct"),
+            Self::TcpDirect => write!(f, "tcp_direct"),
             Self::Relay => write!(f, "relay"),
         }
     }
@@ -134,6 +137,16 @@ impl PathSelection {
             relay_hedged: false,
             direct_score: None,
             relay_score: None,
+        }
+    }
+
+    pub(super) fn tcp_direct() -> Self {
+        Self {
+            path: Some(NetworkPath::TcpDirect),
+            ..Self::unavailable(
+                "TCP_DIRECT_CONFIRMED",
+                "peer authenticated two challenges on the configured TCP stream",
+            )
         }
     }
 

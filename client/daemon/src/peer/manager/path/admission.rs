@@ -107,6 +107,17 @@ impl PeerManager {
                     return false;
                 }
                 conn.advance_direct_first_deadline(generation);
+                if self
+                    .tcp_data_path(
+                        conn,
+                        generation,
+                        relay_available,
+                        self.config.relay.effective_path_policy(true),
+                    )
+                    .is_some()
+                {
+                    return true;
+                }
                 if conn.has_current_authoritative_direct(generation) {
                     return true;
                 }

@@ -79,7 +79,13 @@ pub(crate) fn prepare_signal_payload(
         candidate_generation,
         candidates_expires_at_ms,
     );
+    let nat_profile = signing_identity
+        .and_then(|identity| identity.peers.upgrade())
+        .and_then(|peers| {
+            peers.punch_profile_for_peer_signal(to_node_id, &candidates, &candidate_sources)
+        });
     Ok(serde_json::json!({
+        "nat_profile": nat_profile,
         "from_node_id": from_node_id,
         "to_node_id": to_node_id,
         "type": signal_type,
@@ -432,6 +438,7 @@ pub(super) async fn poll_signals(
                     session_id: signal.session_id,
                     probe_ephemeral_public_key: signal.probe_ephemeral_public_key,
                     candidate_sources: signal.candidate_sources,
+                    nat_profile: signal.nat_profile,
                     candidate_generation: signal.candidate_generation,
                     candidates_expires_at_ms,
                     handshake_init: handshake,
@@ -447,6 +454,7 @@ pub(super) async fn poll_signals(
                     session_id: signal.session_id,
                     probe_ephemeral_public_key: signal.probe_ephemeral_public_key,
                     candidate_sources: signal.candidate_sources,
+                    nat_profile: signal.nat_profile,
                     candidate_generation: signal.candidate_generation,
                     candidates_expires_at_ms,
                     handshake_response: handshake,
@@ -1026,14 +1034,19 @@ fn unix_time_millis() -> u64 {
 #[derive(Clone)]
 pub(crate) struct SignalSigningIdentity {
     keypair: Ed25519KeyPair,
+    peers: std::sync::Weak<crate::peer::PeerManager>,
 }
 
 impl SignalSigningIdentity {
-    pub(super) fn from_config(config: &Config) -> Option<Self> {
+    pub(super) fn from_config(
+        config: &Config,
+        peers: std::sync::Weak<crate::peer::PeerManager>,
+    ) -> Option<Self> {
         let private_key = hex::decode(config.node.ed25519_private_key.trim()).ok()?;
         let private_key: [u8; 32] = private_key.as_slice().try_into().ok()?;
         Some(Self {
             keypair: Ed25519KeyPair::from_private_key(&private_key),
+            peers,
         })
     }
 }

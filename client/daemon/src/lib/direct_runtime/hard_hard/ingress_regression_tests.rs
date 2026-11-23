@@ -23,6 +23,7 @@ async fn startup_offer(
         "predicted".to_string()
     };
     PendingPeerOffer {
+        nat_profile: None,
         from_node_id: record.peer_id.clone(),
         candidate_sources: candidates
             .iter()

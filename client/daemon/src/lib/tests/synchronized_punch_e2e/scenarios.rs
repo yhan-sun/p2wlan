@@ -647,6 +647,7 @@ async fn hard_hard_responder_without_stun_worker_falls_back_to_admitted_fresh_pu
     };
     let punch_at_ms = hard_hard_now_for_test().saturating_add(3_500);
     let offer = PendingPeerOffer {
+        nat_profile: None,
         from_node_id: HARD_HARD_B.to_string(),
         candidates: vec![remote_prediction.to_string()],
         candidate_sources: HashMap::new(),

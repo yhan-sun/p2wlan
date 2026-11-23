@@ -27,6 +27,9 @@ impl PeerConnection {
         path: NetworkPath,
         relay_endpoint: Option<&str>,
     ) -> std::result::Result<Option<&'static str>, &'static str> {
+        if path == NetworkPath::TcpDirect {
+            return Err("original_udp_or_relay_receipt_required");
+        }
         if !self.online || self.state == ConnectionState::Closed {
             return Err("peer_offline_or_closed");
         }

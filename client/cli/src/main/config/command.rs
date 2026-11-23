@@ -70,6 +70,24 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
                     "off".to_string()
                 }
             );
+            let traversal = &config.network.traversal;
+            println!(
+                "disable-sym-hole-punching = {}",
+                traversal.disable_sym_hole_punching
+            );
+            println!("lazy-p2p = {}", traversal.lazy_p2p);
+            println!("max-punch-pps = {}", traversal.max_punch_pps);
+            println!("max-punch-sockets = {}", traversal.max_punch_sockets);
+            println!("linear-scan-count = {}", traversal.linear_scan_count);
+            println!(
+                "firewall-probe-addresses = {}",
+                traversal
+                    .firewall_probe_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
             println!("relay = {}", config.relay.servers.join(","));
             println!(
                 "relay-regions = {}",

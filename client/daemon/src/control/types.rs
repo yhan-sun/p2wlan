@@ -411,6 +411,7 @@ pub enum ControlEvent {
         session_id: Option<String>,
         probe_ephemeral_public_key: Option<String>,
         candidate_sources: HashMap<String, String>,
+        nat_profile: Option<p2pnet_nat::engine::PunchProfile>,
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
         handshake_init: Vec<u8>,
@@ -430,6 +431,7 @@ pub enum ControlEvent {
         session_id: Option<String>,
         probe_ephemeral_public_key: Option<String>,
         candidate_sources: HashMap<String, String>,
+        nat_profile: Option<p2pnet_nat::engine::PunchProfile>,
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
         handshake_response: Vec<u8>,
@@ -655,6 +657,8 @@ struct SignalResponse {
     session_id: Option<String>,
     #[serde(default)]
     probe_ephemeral_public_key: Option<String>,
+    #[serde(default, deserialize_with = "read_punch_profile")]
+    nat_profile: Option<p2pnet_nat::engine::PunchProfile>,
     #[serde(default)]
     candidate_sources: HashMap<String, String>,
     #[serde(default)]
@@ -669,6 +673,15 @@ struct SignalResponse {
     sender_public_key: Option<String>,
     #[serde(default)]
     delivery_token: Option<String>,
+}
+
+fn read_punch_profile<'de, D: serde::Deserializer<'de>>(
+    input: D,
+) -> std::result::Result<Option<p2pnet_nat::engine::PunchProfile>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(input)?;
+    Ok(value
+        .and_then(|value| serde_json::from_value::<p2pnet_nat::engine::PunchProfile>(value).ok())
+        .filter(|profile| profile.valid()))
 }
 
 /// Control plane client.

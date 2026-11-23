@@ -1468,6 +1468,7 @@ async fn stale_sender_identity_fresh_signal_never_enters_new_high_water() {
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: "node-b".to_string(),
             candidates: candidates.clone(),
             session_id: None,
@@ -1508,6 +1509,7 @@ async fn stale_sender_identity_fresh_signal_never_enters_new_high_water() {
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: "node-b".to_string(),
             candidates: candidates.clone(),
             session_id: None,
@@ -1579,6 +1581,7 @@ async fn offline_peer_first_offer_deferred_and_not_rejected_as_stale_identity() 
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
+            nat_profile: None,
             from_node_id: "node-offline".to_string(),
             candidates: vec!["203.0.113.20:51820".to_string()],
             session_id: None,

@@ -172,3 +172,15 @@ mod rx_ownership;
 
 #[path = "tests/hard_hard_rejection_cost.rs"]
 mod hard_hard_rejection_cost;
+
+#[path = "tests/negotiated.rs"]
+mod negotiated;
+
+#[path = "tests/negotiated_relay.rs"]
+mod negotiated_relay;
+
+#[path = "tests/negotiated_matrix.rs"]
+mod negotiated_matrix;
+
+#[path = "tests/negotiated_tcp.rs"]
+mod negotiated_tcp;

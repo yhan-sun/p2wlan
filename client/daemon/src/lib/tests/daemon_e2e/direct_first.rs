@@ -158,7 +158,8 @@ async fn run_direct_first_queued_business_case(establish_direct: bool, remote_bi
     let relay_endpoint = server.addr.to_string();
     let sink = tokio::net::UdpSocket::bind(remote_bind_addr).await.unwrap();
     let endpoint = sink.local_addr().unwrap();
-    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::DirectFirst;
     let startup = RelayStartupWait {
         relay_expected: true,
         timeout: config.relay.startup_wait_timeout(true),

@@ -49,17 +49,46 @@ Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemet
 
 ## 客户端路径策略
 
-`relay.path_policy` 缺省值为 `direct-first`。首次在线 peer 生命周期保留 5 秒直连窗口；健康的加密确认 Direct 保持优先。Relay 可提前建立和认证，但窗口到期前不承载本端首个业务包。确认 Direct 失活后立即允许已认证 Relay 兜底，不为已建立连接重跑冷启动等待。
+新生成的配置使用 `relay.path_policy=direct-sticky`。对端确认加密 Relay 后即可承载首包。双方协商紧凑探测时，同一 UDP 地址和本地 socket 须连续返回两个独立挑战，随后由 WireGuard 验证直连。已确认的健康 Direct 保持优先，失活后可回到已确认的 Relay。
+
+旧配置省略 `path_policy` 时仍按 `direct-first` 读取，所有显式保存的策略继续生效。要为首次在线 peer 保留 5 秒直连窗口，可运行以下命令后重启 daemon。
 
     p2wlan config set path-policy direct-first
 
-配置保存后重新启动对应 daemon/profile 生效。旧配置中显式保存的 `auto`、`score`、`direct-sticky`、`relay-only` 不会被悄悄迁移；需要直连优先时显式设置上述值。`auto` 保留旧的立即 Relay 回退策略，`score` 比较已确认路径质量，`direct-sticky` 只保证已确认 Direct 的保持，`relay-only` 明确禁用 Direct 业务路径。`prefer_direct=false` 仍具有 Relay-only 语义。
+`auto` 允许立即 Relay 回退，`score` 比较已确认路径质量，`relay-only` 只使用 Relay 业务路径。`prefer_direct=false` 同样只允许 Relay。
 
 Relay-only 启动时不解析 Direct 专用的 STUN 或 UDP observer 地址，也不启动 Direct 探测和 UDP 连接任务；Control、Relay 与 WireGuard 会话维护仍正常运行。其他路径策略保留 Direct 升级能力。
 
 `relay_startup_timeout_ms` 仍默认为 3000，旧字段 `fallback_timeout_ms` 仍是读取别名。在 Direct-first 下，首次业务 FIFO 的总等待预算包含 5 秒直连窗口，再加配置的 Relay 启动等待；未配置 Relay 时只等待 Direct，不会虚构中继。该预算不会因每个新业务包或候选刷新而无限续期；队列仍受原有包数、字节数和 generation 边界保护。
 
 CLI 的 `--prefer-direct` 与 `relay-policy=direct` 选择 Direct-first；显式 `--prefer-relay` 或 `relay-policy=prefer-relay` 使用兼容 Auto，不等同于 Relay-only。
+
+### 对端协商的 UDP 探测
+
+这些字段位于客户端配置的 `network` 对象中。也可用短横线形式通过 CLI 设置，例如 `p2wlan config set max-punch-pps 80`。两端通过带版本和期限的候选信令交换 NAT 画像，旧客户端继续使用原有候选协议。网关已映射地址优先；随机映射保留最近一次有效观察的端口。每轮 20 秒，整个尝试最长 120 秒；候选、身份或网络失效会提前结束。发包使用协商的具体地址，也可反向确认发布过的 IP 上收到的认证请求来源。
+
+| 配置项 | 默认值 | 作用 |
+| --- | --- | --- |
+| `disable_sym_hole_punching` | `false` | 开启后跳过双方均为对称映射的协商探测。 |
+| `lazy_p2p` | `false` | 等到 peer 有业务流量后才启动协商探测。 |
+| `max_punch_pps` | `200` | 紧凑探测包每秒上限，封顶 200；设为 0 可停用。 |
+| `max_punch_sockets` | `24` | 限制同一 UDP 传输上用于协商探测的 socket 总数，主 socket 占一个名额，硬上限为 30。设为 0 或 1 时只使用主 socket。 |
+| `linear_scan_count` | `50` | 首次按步长排序时最多尝试的已发布候选数。 |
+| `firewall_probe_addresses` | `[]` | 配置具有 STUN Binding 服务的固定 IP 和端口。与已配置的 UDP observer、STUN 服务器合计最多使用 8 个地址。 |
+
+双方都是线性对称映射时，首轮发包 5 秒后可用一个临时本地端口重试对端已发布的 IPv4 地址。该端口连续收到两个不同挑战的有效应答后才能交给常规直连验证。轮次切换、取消或超时会关闭尚未晋升的临时端口。
+
+网关授权 PCP 或 NAT-PMP 映射时，客户端以网关返回的租期计算续租时间。同一网关上的 PCP 映射续租会沿用原映射的 nonce，并建议网关继续分配上次返回的公网地址和端口。[PCP MAP 续租规范](https://www.rfc-editor.org/rfc/rfc6887.html#section-11.2.1)
+
+`p2wlan doctor` 显示两端 NAT 画像、队列长度、近期实际发包量及路径成本。UDP 可达性为 `unknown`、`available` 或 `blocked`。同一网络上的对端共享观察结果。观察点探测判为阻断时记录 `UDP_BLOCKED`，业务可继续使用已确认的 TLS Relay。业务唤醒后的下一次检查会先访问配置的 STUN 观察点，收到有效回应后才恢复向对端发送 UDP 探测。没有配置观察点时保留 `unknown`。
+
+### 双方配置的 TCP 直连
+
+客户端配置的 `network.tcp_direct` 默认省略。两端各自配置 `listen` 为本机接口地址和 TCP 端口，并在 `peers` 对象中填入对端的节点 ID 与允许连接的完整 TCP 地址。若网关已经为监听器配置端口转发，`advertise` 可填写对应的外部地址。每个客户端最多配置 32 个对端，网络需要允许该 TCP 连接。
+
+监听成功后，节点只向已配置的对端发布地址。节点 ID 字典序较小的一端发起连接。两端核对信令候选、会话身份并完成两轮认证后，路径可承载 WireGuard 业务。诊断字段 `active_path_type` 为 `tcp_direct`，成本为 4。链路关闭、会话更换、候选撤回或过期时，已确认的 Relay 可以接续业务。`relay-only` 禁用 TCP 直连。
+
+双方可在 `network.tcp_direct` 中启用 `simultaneous_open`（默认 `false`）。在支持端口复用的平台，两端通过已认证的 TCP 连接交换就绪状态、测量往返时间，再各从自己的监听端口连接已配置的对端地址。两端都在新连接完成认证并确认结果后，业务才使用该连接。若系统不支持共享端口，或本次同时打开未成功，业务仍可使用已认证的普通 TCP 连接。这项功能要求双方配置的 TCP 端点可达。TCP 承载业务期间，`p2wlan doctor` 的 `tcp_open_method` 显示实际建连方式，取值为 `simultaneous` 或 `dial_listen`。[TCP 同时打开规范](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.5)
 
 ### 网络实验开关
 

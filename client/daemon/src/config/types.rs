@@ -98,9 +98,23 @@ fn default_platform() -> String {
     std::env::consts::OS.to_string()
 }
 
+/// Operator-authorized direct TCP listeners. Both peers pin the other's
+/// advertised endpoint before exchanging any WireGuard traffic on a stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TcpDirectConfig {
+    pub listen: std::net::SocketAddr,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub simultaneous_open: bool,
+    #[serde(default)]
+    pub advertise: Option<std::net::SocketAddr>,
+    pub peers: std::collections::BTreeMap<String, std::net::SocketAddr>,
+}
+
 /// Virtual network configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
+    #[serde(flatten)]
+    pub traversal: p2pnet_nat::engine::PunchSettings,
     /// Network ID to join.
     pub network_id: String,
     /// Whether to run in manual/offline mode.
@@ -122,6 +136,9 @@ pub struct NetworkConfig {
     /// TUN interface name.
     #[serde(default = "default_interface")]
     pub interface: String,
+    /// A direct TCP listener and per-peer endpoint pins. Disabled by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_direct: Option<TcpDirectConfig>,
     /// Local UDP bind address for direct peer transport.
     #[serde(default = "default_udp_bind")]
     pub udp_bind: String,

@@ -14,3 +14,9 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 rand = { workspace = true }
 if-addrs = "0.15"
+ring = "0.17.14"
+subtle = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

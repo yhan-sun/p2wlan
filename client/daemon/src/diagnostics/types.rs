@@ -151,6 +151,10 @@ pub struct DiagnosticsSnapshot {
     pub candidate_snapshot_version: Option<u64>,
     pub candidate_snapshot_hash: Option<u64>,
     pub nat_profile: Option<NatProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_nat_profile: Option<p2pnet_nat::engine::PunchProfile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub upnp_status: String,
     /// Normalized NAT truth used by the traversal planner. This is additive
     /// to the historical profile so older clients can continue to ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
