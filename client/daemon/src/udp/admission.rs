@@ -1414,7 +1414,10 @@ impl UdpTransport {
         } else if let PendingProbePurpose::Negotiated(epoch) = purpose {
             self.try_send_compact_challenge(
                 peer_id.unwrap_or_default(),
-                p2pnet_nat::engine::PunchTarget { address: peer_addr, socket: socket_index },
+                p2pnet_nat::engine::PunchTarget {
+                    address: peer_addr,
+                    socket: socket_index,
+                },
                 epoch,
                 &bytes,
                 &socket,

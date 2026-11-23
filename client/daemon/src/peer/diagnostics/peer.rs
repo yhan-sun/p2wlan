@@ -480,8 +480,13 @@ impl PeerDiagnostics {
                 .unwrap_or_default(),
             udp_firewall_status,
             active_path_type: route.map(|(p, _)| p.to_owned()),
-            tcp_open_method: conn.tcp_path.as_ref()
-                .filter(|path| active_path == Some(NetworkPath::TcpDirect) && path.current(conn, local_generation))
+            tcp_open_method: conn
+                .tcp_path
+                .as_ref()
+                .filter(|path| {
+                    active_path == Some(NetworkPath::TcpDirect)
+                        && path.current(conn, local_generation)
+                })
                 .map(|path| path.opening.as_str().to_owned()),
             path_cost: route.map(|(_, cost)| cost),
             reason_code: if udp_firewall_status == p2pnet_nat::engine::UdpReachability::Blocked {

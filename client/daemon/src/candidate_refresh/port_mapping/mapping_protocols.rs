@@ -31,7 +31,8 @@ async fn discover_nat_pmp_udp_candidate(
     gateway: Ipv4Addr,
 ) -> std::result::Result<PortMappingCandidate, String> {
     let gateway_addr = SocketAddr::new(IpAddr::V4(gateway), NAT_MAPPING_CONTROL_PORT);
-    let (endpoint, lease_seconds) = request_nat_pmp_udp_mapping(local_ip, local_port, gateway_addr).await?;
+    let (endpoint, lease_seconds) =
+        request_nat_pmp_udp_mapping(local_ip, local_port, gateway_addr).await?;
     is_public_udp_candidate(endpoint)
         .then_some(PortMappingCandidate {
             endpoint: endpoint.to_string(),

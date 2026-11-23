@@ -150,10 +150,7 @@ impl PunchPacer {
         q.seen.clear();
         q.issued = 0;
         // Keep the sliding window across rounds; a restart cannot buy more packets.
-        self.punch_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
-            .ok()
-            .map(|v| v + 1)
+        super::reserve_sequence(&self.punch_epoch, 1, u64::MAX).map(|previous| previous + 1)
     }
 
     pub fn metrics(&self, active_punch_sockets: usize) -> PunchMetrics {

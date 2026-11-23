@@ -143,7 +143,10 @@ impl PathSelection {
     pub(super) fn tcp_direct() -> Self {
         Self {
             path: Some(NetworkPath::TcpDirect),
-            ..Self::unavailable("TCP_DIRECT_CONFIRMED", "peer authenticated two challenges on the configured TCP stream")
+            ..Self::unavailable(
+                "TCP_DIRECT_CONFIRMED",
+                "peer authenticated two challenges on the configured TCP stream",
+            )
         }
     }
 

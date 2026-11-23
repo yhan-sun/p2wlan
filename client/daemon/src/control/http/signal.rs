@@ -81,7 +81,9 @@ pub(crate) fn prepare_signal_payload(
     );
     let nat_profile = signing_identity
         .and_then(|identity| identity.peers.upgrade())
-        .and_then(|peers| peers.punch_profile_for_peer_signal(to_node_id, &candidates, &candidate_sources));
+        .and_then(|peers| {
+            peers.punch_profile_for_peer_signal(to_node_id, &candidates, &candidate_sources)
+        });
     Ok(serde_json::json!({
         "nat_profile": nat_profile,
         "from_node_id": from_node_id,

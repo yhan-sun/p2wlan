@@ -1,5 +1,5 @@
 use super::*;
-use p2pnet_nat::engine::PunchProfile;
+use p2pnet_nat::engine::{reserve_sequence, PunchProfile};
 
 #[derive(Clone, Debug)]
 pub(super) struct AdvertisedPunchProfile {
@@ -373,13 +373,7 @@ impl PeerManager {
             old.pacer.clear_punch_state();
         }
         static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let epoch = EPOCH
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |v| v.checked_add(8).filter(|n| *n <= u64::from(u32::MAX)),
-            )
-            .ok()?;
+        let epoch = reserve_sequence(&EPOCH, 8, u64::from(u32::MAX))?;
         let run = Arc::new(PeerPunchRun {
             pacer: PunchPacer::new(epoch, settings.max_punch_pps),
             mode: pair.mode,

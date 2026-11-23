@@ -4,7 +4,7 @@
 use super::*;
 use crate::config::PathPolicy;
 use crate::transport::EncryptedPeerPacket;
-use p2pnet_nat::engine::PunchProfile;
+use p2pnet_nat::engine::{reserve_sequence, PunchProfile};
 use std::io;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -116,9 +116,7 @@ impl std::fmt::Debug for TcpPath {
 impl TcpPath {
     fn new(grant: Grant, writer: OwnedWriteHalf, opening: TcpOpening) -> io::Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .ok()
+        let id = reserve_sequence(&NEXT, 1, u64::MAX)
             .and_then(NonZeroU64::new)
             .ok_or(io::ErrorKind::Other)?;
         Ok(Self {

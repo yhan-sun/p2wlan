@@ -450,7 +450,10 @@ impl UdpTransport {
                     socket: socket_index,
                 };
                 if self.receive_endpoint_receipt(data, target).is_none() {
-                    trace!(reason = "unmatched_endpoint_receipt", "Ignored UDP endpoint receipt");
+                    trace!(
+                        reason = "unmatched_endpoint_receipt",
+                        "Ignored UDP endpoint receipt"
+                    );
                 }
                 continue;
             }
@@ -898,8 +901,14 @@ impl UdpTransport {
                                 )
                             });
                         let sent = if let Some(ingress) = &compact {
-                            self.send_compact_reply(ingress, &socket, &ack, source, Some(socket_index))
-                                .map(|_| ())
+                            self.send_compact_reply(
+                                ingress,
+                                &socket,
+                                &ack,
+                                source,
+                                Some(socket_index),
+                            )
+                            .map(|_| ())
                         } else {
                             self.send_punch_ack_burst(
                                 socket_index,
@@ -1091,9 +1100,13 @@ impl UdpTransport {
                                     && pending.accepts_authenticated_ack
                                     && match pending.purpose {
                                         PendingProbePurpose::Negotiated(_) => {
-                                            pending.endpoint == source && compact.as_ref().is_some_and(|i| {
-                                                i.matches_challenge(&identity.source_node_id, packet.nonce)
-                                            })
+                                            pending.endpoint == source
+                                                && compact.as_ref().is_some_and(|i| {
+                                                    i.matches_challenge(
+                                                        &identity.source_node_id,
+                                                        packet.nonce,
+                                                    )
+                                                })
                                         }
                                         _ => compact.is_none(),
                                     }
