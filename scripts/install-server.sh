@@ -81,6 +81,24 @@ valid_path() {
   case "$1" in /*) ;; *) die "installation paths must be absolute" ;; esac
   case "$1" in /|*//*|*[!A-Za-z0-9_./-]*|*/../*|*/./*|*/..|*/.) die "unsafe installation path: $1" ;; esac
 }
+read_admin_secret() {
+  python3 - "$1" <<'PY_PASSWORD'
+import getpass, signal, sys, warnings
+
+def cancel(*_):
+    raise KeyboardInterrupt
+
+for event in (signal.SIGHUP, signal.SIGTERM):
+    signal.signal(event, cancel)
+warnings.simplefilter('error', getpass.GetPassWarning)
+try:
+    with open('/dev/tty', 'w', encoding='utf-8') as terminal:
+        password = getpass.getpass(sys.argv[1] + ': ', stream=terminal)
+except (EOFError, OSError, KeyboardInterrupt, getpass.GetPassWarning):
+    sys.exit(1)
+sys.stdout.buffer.write(password.encode('utf-8'))
+PY_PASSWORD
+}
 ask_admin_account() {
   local LC_ALL=C confirmation
   while true; do
@@ -89,12 +107,10 @@ ask_admin_account() {
     printf '账号须以字母或数字开头，可含点、下划线和短横线，最多 64 个字符。\n' >&3
   done
   while true; do
-    IFS= read -rs -p '管理员密码（12–72 个 UTF-8 字节，输入隐藏）: ' installer_admin_password <&3 2>&3 || die 'installation cancelled'
-    printf '\n' >&3
+    installer_admin_password=$(read_admin_secret '管理员密码（12–72 个 UTF-8 字节，输入隐藏）') || die 'installation cancelled'
     case "$installer_admin_password" in q|Q|quit|exit|取消) die 'installation cancelled' ;; esac
     if (( ${#installer_admin_password} >= 12 && ${#installer_admin_password} <= 72 )); then
-      IFS= read -rs -p '确认管理员密码: ' confirmation <&3 2>&3 || die 'installation cancelled'
-      printf '\n' >&3
+      confirmation=$(read_admin_secret '确认管理员密码') || die 'installation cancelled'
       case "$confirmation" in q|Q|quit|exit|取消) die 'installation cancelled' ;; esac
       [ "$installer_admin_password" != "$confirmation" ] || return 0
     fi

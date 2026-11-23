@@ -45,6 +45,8 @@ Options:
   --tls-domain DOMAIN         Docker: certificate domain (must equal the Relay host)
   --tls-email EMAIL           Docker: ACME account email
   --publish-host IP          Docker Relay host bind address (Docker only)
+  --http-port PORT           Docker public HTTP redirect port (default: 80)
+  --https-port PORT          Docker public HTTPS panel port (default: 443)
   --control-port PORT        internal Control port (default: 18080)
   --metrics-port PORT        loopback Relay readiness port (default: 18082)
   --no-start                 prepare deployment without starting/restarting services
@@ -84,7 +86,7 @@ HELP
       --non-interactive) BOOT_INTERACTIVE=0; shift ;;
       --install-deps) BOOT_INSTALL_DEPS=1; shift ;;
       --dry-run) BOOT_DRY_RUN=1; shift ;;
-      --dir|--publish-host|--wait-timeout|--tls-mode|--tls-domain|--tls-email)
+      --dir|--publish-host|--wait-timeout|--tls-mode|--tls-domain|--tls-email|--http-port|--https-port)
         value "$@"; BOOT_FORWARD+=("$1" "$2"); BOOT_DOCKER_OPTIONS=1; shift 2 ;;
       --root|--config-dir|--data-dir)
         value "$@"; BOOT_FORWARD+=("$1" "$2"); BOOT_NATIVE_OPTIONS=1; shift 2 ;;

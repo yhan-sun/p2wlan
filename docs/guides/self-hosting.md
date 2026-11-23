@@ -88,12 +88,14 @@ Docker 默认使用 `p2wlan-server-source.tar.gz` 和同名 `.sha256`。包内�
 4. **确认持久路径。** 原生分支分别确认程序、配置与数据目录；Docker 分支确认一个持久部署目录，默认值见上表。已有部署进入保留配置和凭据的升级流程。
 5. **选择部署模式。** 新部署选择公网服务或本机测试。公网服务使用真实证书；本机测试生成短期 loopback 测试证书，不面向公网客户端。
 6. **填写 Relay 和 TLS。** 公网模式先选证书来源：`1` 自动申请 Let's Encrypt 证书（HTTP-01，需要域名和 80 端口，签发后自动续期，ACME 邮箱可留空跳过）、`2` 自签名证书（Relay 是 IP 或主机名时可用，无需域名和邮箱，生成 `config/relay-ca.crt` 供客户端信任）、`3` 使用已有证书文件。自动申请要求证书域名与 Relay 主机名一致；使用已有证书时依次填写完整证书链和匹配私钥的 PEM 路径。Docker 公网部署会同时启动内置 HTTPS 入口，面板与 Relay 共用同一份证书。
-7. **确认内部端口。** Control 内部 HTTP 默认 `18080`、Relay 健康检查默认 `18082`，Relay 端口默认 `18081`。Docker 还确认 Relay 发布绑定 IP，公网默认 `0.0.0.0`。Docker 公网部署由内置 edge 容器发布 80/443 并反向代理到 loopback Control；原生部署的 Control 仍只监听 loopback。
+7. **确认内部端口。** Control 内部 HTTP 默认 `18080`、Relay 健康检查默认 `18082`，Relay 端口默认 `18081`。Docker 还确认 Relay 发布绑定 IP，公网默认 `0.0.0.0`。Docker 的网页入口默认使用 TCP 80 和 443，可以在公网部署摘要选 `3` 更改。原生部署的 Control 监听 loopback。
 8. **选择执行方式并确认摘要。** 启动方式选 `1` 安装并启动、`2` 只准备，默认 `1`。摘要列出固定版本、目录、Relay、端口、TLS 文件和执行方式，Docker 还列出源码身份或显式选择的镜像身份，不显示秘密；最后选 `1` 确认、`2` 重填、`0`／`q` 取消。已有部署保留配置，重填只调整允许的执行选项。
 9. **设置管理员账号。** 支持账号登录的服务端版本在首次交互部署确认后询问管理员账号（默认 `admin`）并要求两次隐藏输入密码。密码为 12–72 个 UTF-8 字节，配置文件保存加盐哈希。升级沿用已有凭据。无人值守安装默认使用独立管理令牌。
 10. **自动执行并交付入口。** 原生分支安装已校验的二进制和 systemd unit；默认 Docker 分支运行独立 Compose builder，先构建管理台再构建 Go 服务，核验本地镜像 ID、标签和二进制版本；显式镜像模式才拉取固定摘要。新部署生成匹配的 Control/Relay 配置。立即启动会等待健康检查，失败时报告排查入口；只准备不会声称服务已经健康。完成后显示本机 Control、Relay、管理台、凭据文件位置和对应方式的管理命令。
 
-Docker 公网安装在构建前检查内置入口所需的端口。若报告 TCP 80 或 443 已被占用，可用 `sudo ss -ltnp` 查找监听服务。需要保留现有 Web 服务时，可选择原生安装，使用已有证书并让现有反向代理转发 Control。Docker 向导在失败时标注计划地址，健康检查通过后显示可访问的服务端、`/admin/` 后台和 TLS Relay 地址。
+Docker 在初装和升级时检查主机监听和 Docker 已发布的端口，并识别本部署正在运行的网页入口。遇到冲突时，选 `1` 可以保留原网站并给 P2WLAN 换端口。例如选 HTTP `8080` 和 HTTPS `8443` 后，后台地址为 `https://你的域名:8443/admin/`。公网访问需要在防火墙和云安全组放行选定的端口。无人值守部署可传 `--http-port 8080 --https-port 8443`。
+
+也可以手动释放端口后选 `2` 重新检测。如果向导能核实占用端口的容器或 systemd Web 服务，会提供选项 `3`。输入显示的完整名称后，向导会再次核对占用者并停止该服务。无人值守模式遇到冲突会在激活部署前退出。Certbot standalone 首次签发和续期仍需要公网 TCP 80。如果 80 要长期留给其他网站，新部署可选择已有证书或自签名证书。使用自签名证书的客户端需要信任生成的 CA。
 
 已有部署不会重新询问并生成一套新 JWT、管理台或 Relay 凭据；向导展示已保存的配置，让部署者确认升级和启动方式。更换 TLS 或调整既有参数应按下文的配置与证书维护步骤显式进行。
 
@@ -195,19 +197,19 @@ Control 保持 loopback HTTP 监听。公网部署还需准备可信 HTTPS/WSS �
 
 ## 网络边界
 
-Docker 公网部署的 Control HTTP 监听仍只在 loopback，公网经内置 edge 容器的 80/443 暴露，并保留 WebSocket Upgrade；原生部署由外部可信 HTTPS 反向代理暴露。Relay 使用独立的 TLS 入口；Relay 的 loopback metrics 和 readyz 不对公网开放。
+Docker 公网部署的 Control HTTP 只发布到 loopback。内置 edge 容器通过选定的网页端口提供 HTTPS 和 WebSocket，原生部署通过外部 HTTPS 反向代理提供访问。Relay 使用独立的 TLS 入口，Relay 的 metrics 和 readyz 监听 loopback。
 
 推荐的最小公网入口：
 
 | 入口 | 用途 | 公开 |
 | --- | --- | --- |
-| HTTP 80 | 跳转到 HTTPS；ACME HTTP-01 续期时短暂占用 | 是 |
-| HTTPS 443 | Control API、WebSocket、可选 `/admin/` | 是 |
+| HTTP 网页端口（默认 80） | 跳转至配置的 HTTPS 地址 | 是 |
+| HTTPS 网页端口（默认 443） | Control API、WebSocket、可选 `/admin/` | 是 |
 | TLS 18081 | Relay 数据连接 | 是 |
 | HTTP 18080 | Control 内部监听 | 否 |
 | HTTP 18082 | Relay metrics、readyz | 否 |
 
-Docker 新部署由内置 edge 容器占用 80/443；原生部署由外部反向代理占用 443，80 是否开放取决于你的 ACME 或跳转策略。Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。JWT、设备凭据、Relay ticket、票据签名密钥和 TLS 私钥不是同一种凭据。
+原生部署由外部反向代理提供 HTTPS，80 是否开放取决于 ACME 或跳转策略。Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。JWT、设备凭据、Relay ticket、票据签名密钥和 TLS 私钥各有独立用途。
 
 ## 配置
 

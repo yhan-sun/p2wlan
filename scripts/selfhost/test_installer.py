@@ -15,6 +15,7 @@ import unittest
 
 if os.name == 'posix':
     import pty
+    import termios
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -194,6 +195,9 @@ printf fixture-key > "$output/tls.key"
                         found = output.find(needle, cursor)
                         if found < 0:
                             break
+                        if needle in ('管理员密码（', '确认管理员密码'):
+                            self.assertFalse(termios.tcgetattr(terminal)[3] & termios.ECHO,
+                                             'visible password prompt must have terminal echo disabled')
                         if before_reply:
                             before_reply(needle, output)
                         os.write(terminal, (reply + '\n').encode())
