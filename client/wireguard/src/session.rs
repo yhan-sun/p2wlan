@@ -5,7 +5,9 @@
 
 use std::time::{Duration, Instant};
 
-use p2pnet_crypto::aead::{decrypt_with_counter, encrypt_with_counter};
+use p2pnet_crypto::aead::{
+    decrypt_in_place_with_counter, decrypt_with_counter, encrypt_with_counter,
+};
 use p2pnet_crypto::{
     Hash, REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME, REKEY_AFTER_MESSAGES, REKEY_AFTER_TIME,
 };
@@ -17,8 +19,8 @@ use crate::types::MessageTransport;
 mod prepared;
 pub use prepared::PreparedTransportBuffer;
 
-/// Sliding window size for replay protection (64 packets).
-const REPLAY_WINDOW_SIZE: u64 = 64;
+/// Includes the highest authenticated counter and 127 older counters.
+const REPLAY_WINDOW_SIZE: u64 = u128::BITS as u64;
 
 /// An established transport session for a single peer.
 ///
@@ -38,7 +40,7 @@ pub struct TransportSession {
     /// Highest received counter (for replay protection).
     recv_highest: u64,
     /// Bitmap for the replay window (tracks which counters have been seen).
-    replay_bitmap: u64,
+    replay_bitmap: u128,
     /// Whether we've received at least one packet.
     replay_initialized: bool,
     /// When this session was created (for time-based rekey / reject).
@@ -153,8 +155,7 @@ impl TransportSession {
 
     /// Encrypt a packet and serialize to wire format in one call.
     pub fn encrypt_to_bytes(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
-        let msg = self.encrypt(packet)?;
-        Ok(msg.to_bytes())
+        self.encrypt_into_prepared(packet, PreparedTransportBuffer::new(packet.len())?)
     }
 
     /// Decrypt a WireGuard transport message into an IP packet.
@@ -167,39 +168,44 @@ impl TransportSession {
     ///
     /// The decrypted IP packet, or an error if decryption fails or replay is detected.
     pub fn decrypt(&mut self, msg: &MessageTransport) -> Result<Vec<u8>> {
+        self.authorize_receive(msg.receiver_index, msg.counter)?;
+        let plaintext =
+            decrypt_with_counter(&self.recv_key, msg.counter, b"", &msg.encrypted_payload)
+                .map_err(|_| WireGuardError::DecryptionFailed)?;
+        self.update_replay(msg.counter);
+        Ok(plaintext)
+    }
+
+    fn authorize_receive(&self, receiver_index: u32, counter: u64) -> Result<()> {
         if self.is_expired() {
             return Err(WireGuardError::InvalidPacket(
                 "session expired; rekey required".into(),
             ));
         }
         // Verify the message is addressed to us
-        if msg.receiver_index != self.our_index {
+        if receiver_index != self.our_index {
             return Err(WireGuardError::InvalidPacket(format!(
                 "receiver_index mismatch: got {}, expected {}",
-                msg.receiver_index, self.our_index
+                receiver_index, self.our_index
             )));
         }
 
         // Replay protection
-        if !self.check_replay(msg.counter) {
-            return Err(WireGuardError::ReplayDetected(msg.counter));
+        if !self.check_replay(counter) {
+            return Err(WireGuardError::ReplayDetected(counter));
         }
-
-        // Decrypt
-        let plaintext =
-            decrypt_with_counter(&self.recv_key, msg.counter, b"", &msg.encrypted_payload)
-                .map_err(|_| WireGuardError::DecryptionFailed)?;
-
-        // Mark this counter as received
-        self.update_replay(msg.counter);
-
-        Ok(plaintext)
+        Ok(())
     }
 
     /// Decrypt from raw wire-format bytes.
     pub fn decrypt_from_bytes(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let msg = MessageTransport::from_bytes(data)?;
-        self.decrypt(&msg)
+        let (index, counter, tag) = prepared::frame_header(data)?;
+        self.authorize_receive(index, counter)?;
+        let mut plaintext = data[16..data.len() - tag.len()].to_vec();
+        decrypt_in_place_with_counter(&self.recv_key, counter, b"", &mut plaintext, &tag)
+            .map_err(|_| WireGuardError::DecryptionFailed)?;
+        self.update_replay(counter);
+        Ok(plaintext)
     }
 
     /// Check if a counter is within the replay window (not a replay).
@@ -216,18 +222,8 @@ impl TransportSession {
             return true;
         }
 
-        // Counter is below the window → replay
-        if counter + REPLAY_WINDOW_SIZE <= self.recv_highest {
-            return false;
-        }
-
-        // Counter is within the window → check bitmap
         let offset = self.recv_highest - counter;
-        if offset >= 64 {
-            return false;
-        }
-        let bit = 1u64 << offset;
-        (self.replay_bitmap & bit) == 0
+        offset < REPLAY_WINDOW_SIZE && (self.replay_bitmap & (1u128 << offset)) == 0
     }
 
     /// Update the replay window after receiving a valid packet.
@@ -242,7 +238,7 @@ impl TransportSession {
         if counter > self.recv_highest {
             // Shift bitmap: old bits move up, new bit 0 for new highest
             let shift = counter - self.recv_highest;
-            if shift >= 64 {
+            if shift >= REPLAY_WINDOW_SIZE {
                 self.replay_bitmap = 1; // All old counters are out of window
             } else {
                 self.replay_bitmap = (self.replay_bitmap << shift) | 1;
@@ -251,8 +247,8 @@ impl TransportSession {
         } else if counter < self.recv_highest {
             // Mark this counter as seen within the window
             let offset = self.recv_highest - counter;
-            if offset < 64 {
-                self.replay_bitmap |= 1u64 << offset;
+            if offset < REPLAY_WINDOW_SIZE {
+                self.replay_bitmap |= 1u128 << offset;
             }
         } else {
             // counter == recv_highest: mark bit 0

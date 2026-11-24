@@ -1637,14 +1637,24 @@ fn path_identity_rejects_mixed_local_and_remote_ip_families() {
 
 #[tokio::test(start_paused = true)]
 async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak() {
-    const BLACKHOLE_THRESHOLD: usize = 1397;
+    run_encrypted_udp_blackhole(1397, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn outer_1340_byte_blackhole_keeps_encrypted_business_moving() {
+    run_encrypted_udp_blackhole(1340 - 28, true).await;
+}
+
+async fn run_encrypted_udp_blackhole(blackhole_udp_limit: usize, exercise_business: bool) {
     const DOWNWARD_BLACKHOLE_THRESHOLD: usize = 1280;
-    let peers_a = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
-    let peers_b = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    if exercise_business {
+        config.transport.fec_mode = crate::config::FecMode::Off;
+        config.transport.compression = crate::config::CompressionMode::Off;
+    }
+    let peers_a = Arc::new(PeerManager::new(config.clone()));
+    let peers_b = Arc::new(PeerManager::new(config));
+    let business_pool = p2pnet_crypto::packet_buf::BufPool::default();
     let udp_a = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_a.clone())
         .await
         .unwrap();
@@ -1688,13 +1698,17 @@ async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak()
     let _ = wireguard_b.add_session("peer-a", session_b).await;
 
     let (a_encrypted_tx, a_encrypted_rx) = mpsc::channel(64);
-    let (b_encrypted_tx, b_encrypted_rx) = mpsc::channel(64);
+    let (b_encrypted_tx, b_encrypted_rx) = if exercise_business {
+        crate::dataplane_resources::EncryptedRxSink::channel_with_pool(64, None)
+    } else {
+        crate::dataplane_resources::EncryptedRxSink::channel(64, None)
+    };
     let a_reader_tx = a_encrypted_tx.clone();
     let b_reader_tx = b_encrypted_tx.clone();
     let udp_a = udp_a
         .with_dplpmtud_local_virtual_ip(Ipv4Addr::new(10, 20, 0, 1))
         .with_inbound_channel(a_encrypted_tx);
-    let udp_b = udp_b.with_inbound_channel(b_encrypted_tx);
+    let udp_b = udp_b.with_inbound_sink(b_encrypted_tx);
     // The live daemon uses a publication watch, rather than a static
     // transport option.  Keep the same owner check in this E2E test so a
     // queued datagram from a withdrawn UDP publication cannot become
@@ -1704,7 +1718,8 @@ async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak()
     let (udp_a_watch_tx, udp_a_watch_rx) = watch::channel(Some(udp_a.clone()));
     let (udp_b_watch_tx, udp_b_watch_rx) = watch::channel(Some(udp_b.clone()));
     let (a_overlay_tx, mut a_overlay_rx) = mpsc::channel(8);
-    let (b_overlay_tx, mut b_overlay_rx) = mpsc::channel(8);
+    let (b_overlay_tx, mut b_overlay_rx) =
+        crate::dataplane_resources::PlaintextRxSink::channel_with_pool(8, None);
 
     let a_reader = tokio::spawn({
         let udp = udp_a.clone();
@@ -1712,7 +1727,7 @@ async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak()
     });
     let b_reader = tokio::spawn({
         let udp = udp_b.clone();
-        async move { udp.run_inbound(b_reader_tx).await }
+        async move { udp.run_inbound_with_sink(b_reader_tx).await }
     });
     let a_transport = tokio::spawn({
         let wireguard = wireguard_a.clone();
@@ -1733,18 +1748,19 @@ async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak()
         let peers = peers_b.clone();
         async move {
             wireguard
-                .run_inbound_with_peers_live_udp(
+                .run_inbound_with_peers_live_udp_and_relay(
                     b_encrypted_rx,
                     b_overlay_tx,
                     Some(peers),
                     udp_b_watch_rx,
+                    None,
                 )
                 .await
         }
     });
 
     let dropped_probe_count = Arc::new(AtomicUsize::new(0));
-    let blackhole_threshold = Arc::new(AtomicUsize::new(BLACKHOLE_THRESHOLD));
+    let blackhole_threshold = Arc::new(AtomicUsize::new(blackhole_udp_limit));
     let router_task = tokio::spawn({
         let dropped_probe_count = dropped_probe_count.clone();
         let blackhole_threshold = blackhole_threshold.clone();
@@ -1807,7 +1823,7 @@ async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak()
         }
         let candidate = outstanding.candidate_udp_datagram_size as usize;
         observed_probe_sizes.push(candidate);
-        if candidate <= BLACKHOLE_THRESHOLD {
+        if candidate <= blackhole_udp_limit {
             last_success_token = runtime.current_probe_token("peer-b", &identity);
             let expected_successes = observed_successes + 1;
             yield_until(
@@ -1850,14 +1866,14 @@ async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak()
     let confirmed = result
         .confirmed_udp_datagram_size
         .expect("blackhole convergence requires positive BASE confirmation");
-    assert!(confirmed as usize <= BLACKHOLE_THRESHOLD);
-    assert!(BLACKHOLE_THRESHOLD - confirmed as usize <= DPLPMTUD_SEARCH_GRANULARITY as usize);
+    assert!(confirmed as usize <= blackhole_udp_limit);
+    assert!(blackhole_udp_limit - confirmed as usize <= DPLPMTUD_SEARCH_GRANULARITY as usize);
     assert!(observed_probe_sizes
         .iter()
-        .any(|size| *size <= BLACKHOLE_THRESHOLD));
+        .any(|size| *size <= blackhole_udp_limit));
     assert!(observed_probe_sizes
         .iter()
-        .any(|size| *size > BLACKHOLE_THRESHOLD));
+        .any(|size| *size > blackhole_udp_limit));
     let connection = peers_a.get_connection("peer-b").await.unwrap();
     assert_eq!(
         connection.active_path(),
@@ -1866,8 +1882,26 @@ async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak()
     assert_eq!(connection.direct_health.failure_count, 0);
     assert_eq!(connection.relay_health.failure_count, 0);
     assert!(a_overlay_rx.try_recv().is_err());
-    assert!(b_overlay_rx.try_recv().is_err());
+    assert!(futures_util::FutureExt::now_or_never(b_overlay_rx.recv(None)).is_none());
     let initial_result = result.clone();
+    if exercise_business {
+        let config = result
+            .confirmed_outer_ip_packet_size
+            .expect("positive outer IPv4 budget");
+        assert!(config <= 1340);
+        for sequence in 0..128 {
+            assert_encrypted_business(
+                &wireguard_a,
+                &peers_a,
+                &udp_a,
+                &mut b_overlay_rx,
+                &business_pool,
+                sequence,
+            )
+            .await;
+        }
+        eprintln!("1340B IPv4 blackhole converged at {config}B outer, delivered 128 × 1200B authenticated IP packets");
+    }
 
     // Keep the exact committed path and socket identity, lower only the
     // controllable forwarding threshold, and let the SearchComplete
@@ -1948,6 +1982,35 @@ async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak()
             downward_timeouts += 1;
         }
     }
+    if exercise_business {
+        for sequence in 128..256 {
+            assert_encrypted_business(
+                &wireguard_a,
+                &peers_a,
+                &udp_a,
+                &mut b_overlay_rx,
+                &business_pool,
+                sequence,
+            )
+            .await;
+        }
+    }
+    if exercise_business {
+        assert_eq!(
+            peers_a
+                .tuning()
+                .pooled_tx_packets
+                .load(AtomicOrdering::Relaxed),
+            256
+        );
+        assert!(
+            peers_b
+                .tuning()
+                .pooled_rx_packets
+                .load(AtomicOrdering::Relaxed)
+                >= 256
+        );
+    }
     let downward_result = runtime.snapshots().remove("peer-b").unwrap();
     let downward_confirmed = downward_result
         .confirmed_udp_datagram_size
@@ -1981,7 +2044,8 @@ async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak()
     assert_eq!(downward_connection.direct_health.failure_count, 0);
     assert_eq!(downward_connection.relay_health.failure_count, 0);
     println!(
-            "DPLPMTUD_DOWNWARD_E2E before=1392 after={} endpoint_preserved=true generation_preserved=true candidate_epoch_preserved=true socket_identity_preserved=true direct_active=true direct_health_failure_count={} relay_fallback_count=0 old_ack_contamination=false task_leak=false",
+            "DPLPMTUD_DOWNWARD_E2E before={} after={} endpoint_preserved=true generation_preserved=true candidate_epoch_preserved=true socket_identity_preserved=true direct_active=true direct_health_failure_count={} relay_fallback_count=0 old_ack_contamination=false task_leak=false",
+            confirmed,
             downward_confirmed,
             downward_connection.direct_health.failure_count,
         );
@@ -2148,7 +2212,7 @@ async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak()
     let _ = router_task.await;
     println!(
             "DPLPMTUD_BLACKHOLE threshold={} confirmed={} upper={} probe_count={} timeout_count={} success_count={} dropped_probe_count={} direct_active=true direct_health_failure_count={} relay_fallback_count=0 generation_switch_stale_ack=true peer_left_cancelled=true stale_ack_count={} duplicate_ack_count={} task_leak={}",
-            BLACKHOLE_THRESHOLD,
+            blackhole_udp_limit,
             initial_result.confirmed_udp_datagram_size.unwrap_or(0),
             initial_result.search_upper_udp_datagram_size,
             initial_result.probe_count,
@@ -2160,6 +2224,61 @@ async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak()
             result.duplicate_ack_count,
             runtime.active_worker_count() != 0,
         );
+}
+
+async fn assert_encrypted_business(
+    wireguard: &WireGuardTransport,
+    peers: &PeerManager,
+    udp: &UdpTransport,
+    delivered: &mut crate::dataplane_resources::PlaintextRxReceiver,
+    pool: &p2pnet_crypto::packet_buf::BufPool,
+    sequence: usize,
+) {
+    let mut ip = vec![sequence as u8; 1200];
+    ip[..28].fill(0);
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&1200u16.to_be_bytes());
+    ip[8] = 64;
+    ip[9] = 17;
+    ip[12..20].copy_from_slice(&[10, 20, 0, 1, 10, 20, 0, 2]);
+    ip[20..24].copy_from_slice(&[0x7e, 1, 0x7e, 2]);
+    ip[24..26].copy_from_slice(&1180u16.to_be_bytes());
+    let mut slab = pool.acquire(ip.len()).unwrap();
+    slab.read_space().copy_from_slice(&ip);
+    assert!(slab.set_read_len(ip.len()));
+    let socket = tokio::sync::RwLock::new(Some(udp.clone()));
+    let relay = tokio::sync::RwLock::new(None);
+    assert!(
+        crate::network_outbound::send_original_managed_for_test(
+            crate::request_carriage::RawRequestDelivery::pooled(
+                OutboundPacket {
+                    room_authorization: None,
+                    peer_id: "peer-b".into(),
+                    dst_ip: "10.20.0.2".into(),
+                    packet: Vec::new(),
+                    trace: None,
+                },
+                slab
+            ),
+            wireguard,
+            peers,
+            &socket,
+            &relay,
+        )
+        .await
+    );
+    let mut received = None;
+    yield_until(
+        || {
+            received = futures_util::FutureExt::now_or_never(delivered.recv(None)).flatten();
+            received.is_some()
+        },
+        "business traffic crossed the exact Direct UDP path",
+    )
+    .await;
+    let received = received.unwrap();
+    assert_eq!(received.bytes(), ip);
+    assert!(received.into_parts_with_pool().2.is_some());
 }
 
 #[tokio::test]

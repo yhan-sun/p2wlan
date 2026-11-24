@@ -77,6 +77,6 @@ func TestQueuedForwardRechecksTicketExpiryAtWriterBoundary(t *testing.T) {
 		if h.currentForward(frame.source, destination) {
 			t.Fatal("queued frame borrowed authorization beyond its ticket expiry")
 		}
-		destination.releaseFrame(frame.data)
+		destination.releaseQueued(frame)
 	})
 }

@@ -314,7 +314,9 @@ async fn actual_relay_writer_wait_retains_only_retry_and_serialized_local_owners
                 // Preserve the actual premature result; never poll a completed
                 // send future again. The outer catch still joins held owners.
                 let reason = match outcome {
-                    EncryptSendOutcome::Sent => "Sent".to_string(),
+                    EncryptSendOutcome::Sent | EncryptSendOutcome::SentWithTuning(_) => {
+                        "Sent".to_string()
+                    }
                     EncryptSendOutcome::BudgetPending { reason, .. }
                     | EncryptSendOutcome::Retryable { reason, .. }
                     | EncryptSendOutcome::RetryableLocalBackpressure { reason, .. }

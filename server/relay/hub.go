@@ -40,6 +40,7 @@ type peer struct {
 type queuedFrame struct {
 	data   []byte
 	source *peer // nil only for relay-generated control frames
+	store  *frameStorage
 }
 
 type hub struct {
@@ -132,12 +133,9 @@ func (h *hub) forward(src *peer, dstID string, data []byte, maxFramePayload int)
 	if !h.currentForward(src, dst) {
 		return errIdentityMismatch, "source session is no longer current"
 	}
-	if 1+len(src.id)+len(data) > maxFramePayload {
+	payloadSize := 1 + len(src.id) + len(data)
+	if len(src.id) > 255 || payloadSize > min(65535, maxFramePayload) {
 		return 4006, "forwarded frame too large"
-	}
-	frame, err := receivedFrame(src.id, data)
-	if err != nil {
-		return 4000, "malformed received frame"
 	}
 	if h.forwardDelay > 0 {
 		timer := time.NewTimer(h.forwardDelay)
@@ -154,7 +152,10 @@ func (h *hub) forward(src *peer, dstID string, data []byte, maxFramePayload int)
 	if !h.currentForward(src, dst) {
 		return errIdentityMismatch, "forward session is no longer current"
 	}
-	if !dst.enqueueFrame(queuedFrame{data: frame, source: src}) {
+	frame := acquireFrame(frameHeader + payloadSize)
+	putReceivedFrame(frame.bytes, src.id, data)
+	if !dst.enqueueFrame(queuedFrame{data: frame.bytes, source: src, store: frame}) {
+		frame.release()
 		return 4008, "peer backpressure: " + dstID
 	}
 	if h.debugFrames {

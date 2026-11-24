@@ -81,9 +81,10 @@ impl RawOutboundSink {
         &self,
         packet: impl Into<RawRequestDelivery>,
     ) -> Result<(), Box<mpsc::error::TrySendError<RawRequestDelivery>>> {
-        let packet = packet.into();
+        let mut packet = packet.into();
         match self {
             Self::Legacy(tx) => {
+                packet.materialize();
                 if packet.binding().is_some() {
                     return Err(Box::new(mpsc::error::TrySendError::Closed(packet)));
                 }
@@ -113,9 +114,10 @@ impl RawOutboundSink {
         &self,
         packet: impl Into<RawRequestDelivery>,
     ) -> Result<(), Box<mpsc::error::SendError<RawRequestDelivery>>> {
-        let packet = packet.into();
+        let mut packet = packet.into();
         match self {
             Self::Legacy(tx) => {
+                packet.materialize();
                 // Matching private constructors never send a tracked delivery
                 // to this compatibility sink. A miswire cannot strip identity.
                 if packet.binding().is_some() {
@@ -181,6 +183,7 @@ impl RawOutboundPermit<'_> {
     ) -> Result<(), Box<RawRequestDelivery>> {
         match self {
             Self::Legacy(slot) => {
+                packet.materialize();
                 if packet.binding().is_some() {
                     return Err(Box::new(packet));
                 }

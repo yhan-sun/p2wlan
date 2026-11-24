@@ -16,6 +16,9 @@ pub struct Config {
     pub control: ControlConfig,
     /// Relay configuration.
     pub relay: RelayConfig,
+    /// Data-plane settings. Older configuration files use these defaults.
+    #[serde(default)]
+    pub transport: TransportConfig,
     /// Local diagnostics endpoint configuration.
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,

@@ -327,7 +327,7 @@ async fn b14_c06_original_stopping_owner_discards_real_tracked_fifo_without_keep
     append_ingress(delivery.clone(), &mut pending, &ctx, &mut kick, &kick_tx);
     append_ingress(delivery.clone(), &mut pending, &ctx, &mut kick, &kick_tx);
     assert_eq!(pending.get(&peer).unwrap().queue.len(), 2);
-    for packet in &pending.get(&peer).unwrap().queue {
+    for packet in pending.get(&peer).unwrap().queue.iter() {
         b14_network_same_a(packet, &record);
     }
     drop(record);

@@ -270,7 +270,10 @@ pub(crate) struct RawRequestDelivery {
 
 impl Clone for RawRequestDelivery {
     fn clone(&self) -> Self {
-        let raw = self.raw.clone();
+        let mut raw = self.raw.clone();
+        if let DeliveryMetadata::Pooled(pooled) = &self.metadata {
+            raw.packet = pooled.bytes().to_vec();
+        }
         let metadata = self.metadata.clone_for(&raw.packet);
         Self { raw, metadata }
     }
@@ -302,9 +305,80 @@ impl RawRequestDelivery {
         }
     }
 
+    pub(crate) fn pooled(
+        raw: OutboundPacket,
+        buffer: p2pnet_crypto::packet_buf::PacketBuf,
+    ) -> Self {
+        debug_assert!(raw.packet.is_empty());
+        Self {
+            raw,
+            metadata: DeliveryMetadata::Pooled(buffer),
+        }
+    }
+
+    pub(crate) fn payload(&self) -> &[u8] {
+        match &self.metadata {
+            DeliveryMetadata::Pooled(buffer) => buffer.bytes(),
+            _ => &self.raw.packet,
+        }
+    }
+
+    pub(crate) fn allocated_payload_capacity(&self) -> usize {
+        match &self.metadata {
+            DeliveryMetadata::Pooled(buffer) => buffer.storage_capacity(),
+            _ => self.raw.packet.capacity(),
+        }
+    }
+
+    pub(crate) fn take_pool(&mut self) -> Option<p2pnet_crypto::packet_buf::PacketBuf> {
+        if !matches!(self.metadata, DeliveryMetadata::Pooled(_)) {
+            return None;
+        }
+        match std::mem::replace(&mut self.metadata, DeliveryMetadata::Tun) {
+            DeliveryMetadata::Pooled(buffer) => Some(buffer),
+            _ => unreachable!("pool ownership checked above"),
+        }
+    }
+
+    pub(crate) fn put_pool(&mut self, buffer: p2pnet_crypto::packet_buf::PacketBuf) {
+        debug_assert!(self.raw.packet.is_empty() && matches!(self.metadata, DeliveryMetadata::Tun));
+        self.metadata = DeliveryMetadata::Pooled(buffer);
+    }
+
+    pub(crate) fn materialize(&mut self) {
+        if let Some(buffer) = self.take_pool() {
+            self.raw.packet = buffer.into_vec();
+        }
+    }
+
     #[allow(dead_code)] // Historical carriage accessor, no send/credit authority.
     pub(crate) fn binding(&self) -> Option<&RequestBinding> {
         self.metadata.binding()
+    }
+
+    pub(crate) fn mark_tun_read(mut self) -> Self {
+        if matches!(self.metadata, DeliveryMetadata::Empty) {
+            self.metadata = DeliveryMetadata::Tun;
+        }
+        self
+    }
+
+    pub(crate) fn tuning_record(raw: OutboundPacket, deadline: tokio::time::Instant) -> Self {
+        Self {
+            raw,
+            metadata: DeliveryMetadata::Tuning(deadline),
+        }
+    }
+
+    pub(crate) fn tuning_expired(&self) -> bool {
+        matches!(self.metadata, DeliveryMetadata::Tuning(deadline) if tokio::time::Instant::now() >= deadline)
+    }
+
+    pub(crate) fn tunes_transport(&self) -> bool {
+        matches!(
+            self.metadata,
+            DeliveryMetadata::Tun | DeliveryMetadata::Pooled(_)
+        ) && !crate::transport_tuning::is_internal(self.payload())
     }
 
     pub(crate) fn original_echo(&self) -> Option<&Arc<crate::overlay_requests::OriginalEchoInput>> {
@@ -317,6 +391,7 @@ impl RawRequestDelivery {
         stage: ResidencyStage,
     ) {
         if let Some(capture) = capture {
+            self.materialize();
             self.metadata.observe(capture, stage, &self.raw.packet);
         } else {
             self.metadata.relocate(stage, &self.raw.packet);

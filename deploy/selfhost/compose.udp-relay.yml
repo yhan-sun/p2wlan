@@ -1,0 +1,8 @@
+# Load with a self-hosting Compose file after setting RELAY_UDP_BIND in relay.env.
+services:
+  relay:
+    ports:
+      - target: ${RELAY_PORT:-18081}
+        published: "${RELAY_PORT:-18081}"
+        host_ip: "${RELAY_PUBLISH_HOST:-127.0.0.1}"
+        protocol: udp

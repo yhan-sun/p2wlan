@@ -5,9 +5,12 @@ go 1.26.11
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/gorilla/websocket v1.5.3
+	github.com/quic-go/quic-go v0.66.0
 	golang.org/x/crypto v0.57.0
 	modernc.org/sqlite v1.61.1
 )
+
+require golang.org/x/net v0.58.0 // indirect
 
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect

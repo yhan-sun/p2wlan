@@ -256,7 +256,7 @@ async fn workflow(
             assert_eq!(pending["peer-a"].wait_generation, Some(generation));
             assert_eq!(pending["peer-a"].bytes, 4);
             assert_eq!(pending["peer-a"].queue.len(), 1);
-            assert!(pending["peer-a"].queue[0].raw_packet() == [1; 4]);
+            assert!(pending["peer-a"].queue.front().unwrap().raw_packet() == [1; 4]);
             schedule_peer_work(&mut pending, &mut children.0, &mut active, &ctx);
             gate.wait_entered().await;
             let task = gate.task();
@@ -271,7 +271,7 @@ async fn workflow(
             append_ingress(newer, &mut pending, &ctx, &mut probe_kick, &probe_tx);
             assert_eq!(pending["peer-a"].queue.len(), 1);
             assert_eq!(pending["peer-a"].bytes, 4);
-            assert!(pending["peer-a"].queue[0].raw_packet() == [2; 4]);
+            assert!(pending["peer-a"].queue.front().unwrap().raw_packet() == [2; 4]);
             assert_eq!(pending["peer-a"].wait_deadline, original_deadline);
             let held = position(&resources);
             let unjoined;
@@ -292,7 +292,7 @@ async fn workflow(
                 active.remove("peer-a");
                 unjoined = None;
                 assert_eq!(pending["peer-a"].queue.len(), 1);
-                assert!(pending["peer-a"].queue[0].raw_packet() == [2; 4]);
+                assert!(pending["peer-a"].queue.front().unwrap().raw_packet() == [2; 4]);
                 assert_eq!(pending["peer-a"].wait_deadline, original_deadline);
             } else {
                 gate.release();
@@ -320,7 +320,7 @@ async fn workflow(
                 assert_eq!(peer_id, "peer-a");
                 assert_eq!(completed.queue.len(), 1);
                 assert_eq!(completed.bytes, 4);
-                assert!(completed.queue[0].raw_packet() == [1; 4]);
+                assert!(completed.queue.front().unwrap().raw_packet() == [1; 4]);
                 assert_eq!(completed.wait_deadline, original_deadline);
                 assert_eq!(completed.wait_generation, Some(generation));
                 active.remove(&peer_id);
@@ -328,8 +328,8 @@ async fn workflow(
                 let merged = &pending["peer-a"];
                 assert_eq!(merged.queue.len(), 2);
                 assert_eq!(merged.bytes, 8);
-                assert!(merged.queue[0].raw_packet() == [1; 4]);
-                assert!(merged.queue[1].raw_packet() == [2; 4]);
+                assert!(merged.queue.front().unwrap().raw_packet() == [1; 4]);
+                assert!(merged.queue.iter().nth(1).unwrap().raw_packet() == [2; 4]);
                 assert_eq!(merged.wait_deadline, original_deadline);
                 assert_eq!(merged.wait_generation, Some(generation));
             }

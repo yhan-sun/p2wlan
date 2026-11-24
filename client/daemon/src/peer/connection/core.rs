@@ -138,6 +138,14 @@ impl CommittedBusinessPathSnapshot {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TransportPathLoss {
+    path: ActiveBusinessPath,
+    loss_bp: u16,
+    high_samples: u8,
+    received: tokio::time::Instant,
+}
+
 /// Information about a connection to a specific peer.
 #[derive(Debug, Clone)]
 pub struct PeerConnection {
@@ -235,6 +243,7 @@ pub struct PeerConnection {
     pub candidate_sources: HashMap<String, CandidatePairSource>,
     /// Direct UDP path health.
     pub direct_health: PathHealth,
+    transport_loss: Option<TransportPathLoss>,
     /// Relay path health.
     pub relay_health: PathHealth,
     /// Local network generation in which the direct path was last confirmed.
@@ -652,6 +661,7 @@ impl PeerConnection {
             last_candidates_expires_at_ms: None,
             candidate_sources: HashMap::new(),
             direct_health: PathHealth::default(),
+            transport_loss: None,
             relay_health: PathHealth::default(),
             direct_generation: 0,
             direct_commit_seq: 0,
@@ -985,6 +995,22 @@ impl PeerConnection {
     }
 
     /// Record bytes sent.
+    pub(super) fn record_transport_loss(&mut self, path: ActiveBusinessPath, loss_bp: u16) {
+        if path != self.path_state_machine.snapshot().state.active {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        let high_samples = self.transport_loss.as_ref()
+            .filter(|sample| sample.path == path && now.duration_since(sample.received) <= Duration::from_secs(6))
+            .map_or(0, |sample| sample.high_samples);
+        self.transport_loss = Some(TransportPathLoss {
+            path,
+            loss_bp,
+            high_samples: if loss_bp >= 800 { high_samples.saturating_add(1) } else if loss_bp < 300 { 0 } else { high_samples },
+            received: now,
+        });
+    }
+
     pub fn record_sent(&self, n: u64) {
         self.bytes_sent.add(n);
         if let Some(run) = &self.punch_run {

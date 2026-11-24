@@ -18,6 +18,13 @@ func (p *peer) enqueue(frame []byte) bool {
 	return p.enqueueFrame(queuedFrame{data: frame})
 }
 
+func (queued queuedFrame) sourceID() (string, bool) {
+	if queued.source != nil {
+		return queued.source.id, true
+	}
+	return forwardedSource(queued.data)
+}
+
 func (p *peer) enqueueFrame(queued queuedFrame) bool {
 	frame := queued.data
 	p.queueMu.Lock()
@@ -25,7 +32,7 @@ func (p *peer) enqueueFrame(queued queuedFrame) bool {
 	if p.revoked.Load() || len(frame) > maxPeerQueuedBytes-p.queuedBytes {
 		return false
 	}
-	source, business := forwardedSource(frame)
+	source, business := queued.sourceID()
 	if business {
 		reserve := min(16, cap(p.send)/4)
 		if len(frame) > maxPeerQueuedBytes-relayControlByteReserve-p.queuedBytes ||
@@ -54,14 +61,39 @@ func (p *peer) enqueueFrame(queued queuedFrame) bool {
 }
 
 func (p *peer) releaseFrame(frame []byte) {
+	p.releaseQueued(queuedFrame{data: frame})
+}
+
+func (p *peer) releaseQueued(queued queuedFrame) {
 	p.queueMu.Lock()
 	defer p.queueMu.Unlock()
-	p.queuedBytes = max(0, p.queuedBytes-len(frame))
-	if source, business := forwardedSource(frame); business {
+	p.queuedBytes = max(0, p.queuedBytes-len(queued.data))
+	if source, business := queued.sourceID(); business {
 		if p.queuedBySource[source] <= 1 {
 			delete(p.queuedBySource, source)
 		} else {
 			p.queuedBySource[source]--
+		}
+	}
+	queued.store.release()
+}
+
+func (p *peer) closeQueue() {
+	p.queueMu.Lock()
+	defer p.queueMu.Unlock()
+	close(p.done)
+}
+
+func (p *peer) drainQueue() {
+	for {
+		select {
+		case frame, open := <-p.send:
+			if !open {
+				return
+			}
+			p.releaseQueued(frame)
+		default:
+			return
 		}
 	}
 }

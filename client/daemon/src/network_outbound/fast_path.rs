@@ -61,12 +61,38 @@ pub(super) fn try_lan_direct_fast_path(
     ineligible: &mut HashMap<String, FastPathEligibilityToken>,
 ) -> FastPathAttempt {
     let packet = packet.into();
+    // The managed Direct sender can carry the TUN slab through the syscall.
+    if packet.packet.is_empty() && !packet.payload().is_empty() {
+        return FastPathAttempt::Fallback(packet);
+    }
     // A sourced echo needs the original receive fence at the final syscall.
     // The general sender owns that boundary; the cache carries no RX source.
     if packet.original_echo().is_some() {
         return FastPathAttempt::Fallback(packet);
     }
     let peer_id = packet.peer_id.as_str();
+    if crate::transport_tuning::is_internal(&packet.packet) {
+        return FastPathAttempt::Fallback(packet);
+    }
+    if packet.tunes_transport() && transport.resource_capture().is_none() {
+        let needs_tuning = transport
+            .try_session_status(peer_id)
+            .and_then(|status| status.active_session_instance)
+            .is_none_or(|instance| {
+                peers.tuning().needs_tuning(
+                    peer_id,
+                    crate::transport_tuning::SessionKey {
+                        generation: peers.current_network_generation_sync(),
+                        instance,
+                    },
+                    packet.packet.len(),
+                    peers.transport_config(),
+                )
+            });
+        if needs_tuning {
+            return FastPathAttempt::Fallback(packet);
+        }
+    }
     let profiler = global_dataplane_profiler();
     // The legacy LAN specialization predates business-budget tokens. A
     // capability-managed peer must use the tokenized slow path until the fast
@@ -551,6 +577,18 @@ pub(super) fn try_lan_direct_fast_path(
 
     let outcome = match send_result {
         Ok(_) => {
+            if plaintext.tunes_transport() && transport.resource_capture().is_none() {
+                if let Some(counter) = crate::transport::wire_counter(&encrypted.wire_bytes) {
+                    let key = crate::transport_tuning::SessionKey {
+                        generation: entry.path.generation,
+                        instance: entry.session_instance,
+                    };
+                    let path = peers
+                        .committed_business_path_snapshot_sync(peer_id)
+                        .map(|path| path.active);
+                    peers.tuning().sent_unmodified(peer_id, key, path, counter);
+                }
+            }
             profiler.record_fast_path_hit();
             FastPathAttempt::Sent
         }

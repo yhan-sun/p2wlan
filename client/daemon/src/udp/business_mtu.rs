@@ -342,17 +342,28 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         origin: Option<&mut UdpSendCapture>,
     ) -> std::result::Result<usize, DirectBusinessUdpSendError> {
-        if packet.wire_bytes.len() > prepared.token.max_udp_datagram_size.0 as usize {
+        self.try_send_direct_business_wire(
+            prepared,
+            packet.room_authorization.as_ref(),
+            &packet.wire_bytes,
+            origin.map(|origin| (packet, origin)),
+        )
+    }
+
+    pub(crate) fn try_send_direct_business_wire(
+        &self,
+        prepared: &PreparedDirectBusinessSend,
+        permission: Option<&crate::rooms::RoomSendPermit>,
+        wire: &[u8],
+        origin: Option<(&EncryptedPeerPacket, &mut UdpSendCapture)>,
+    ) -> std::result::Result<usize, DirectBusinessUdpSendError> {
+        if wire.len() > prepared.token.max_udp_datagram_size.0 as usize {
             return Err(DirectBusinessUdpSendError::CiphertextTooLarge);
         }
         let attempted = self
             .dplpmtud
             .with_current_direct_business_token(&prepared.token, || {
-                if packet
-                    .room_authorization
-                    .as_ref()
-                    .is_some_and(|permit| !permit.is_valid())
-                {
+                if permission.is_some_and(|permit| !permit.is_valid()) {
                     return Err(DirectBusinessUdpSendError::Io(
                         "room send authorization expired or revoked".into(),
                     ));
@@ -381,7 +392,7 @@ impl UdpTransport {
                 let syscall_started = origin.as_ref().map(|_| Instant::now());
                 let result = prepared
                     .socket
-                    .try_send_to(&packet.wire_bytes, prepared.endpoint)
+                    .try_send_to(wire, prepared.endpoint)
                     .map_err(|error| {
                         if is_local_packet_too_large(&error) {
                             DirectBusinessUdpSendError::LocalPacketTooLarge
@@ -391,7 +402,8 @@ impl UdpTransport {
                             DirectBusinessUdpSendError::Io(error.to_string())
                         }
                     });
-                if let (Ok(sent), Some(started), Some(capture)) = (&result, syscall_started, origin)
+                if let (Ok(sent), Some(started), Some((packet, capture))) =
+                    (&result, syscall_started, origin)
                 {
                     capture.record_full_success(
                         self,
@@ -409,10 +421,10 @@ impl UdpTransport {
                 result
             });
         let sent = attempted.ok_or(DirectBusinessUdpSendError::StaleToken)??;
-        if sent != packet.wire_bytes.len() {
+        if sent != wire.len() {
             return Err(DirectBusinessUdpSendError::Short {
                 sent,
-                expected: packet.wire_bytes.len(),
+                expected: wire.len(),
             });
         }
         self.update_socket_diagnostics_try(prepared.socket_index, |metrics| {

@@ -27,6 +27,7 @@ pub struct PathHealth {
     pub latency_ms: Option<u64>,
     /// Smoothed RTT estimate for this path.
     pub rtt_ewma_ms: Option<u64>,
+    pub min_rtt_ms: Option<u64>,
     /// Smoothed absolute RTT variation for this path.
     pub jitter_ms: Option<u64>,
     /// Number of authoritative encrypted data-plane RTT samples in the
@@ -57,6 +58,7 @@ impl PathHealth {
         self.record_success();
         let latency_ms = duration_millis(latency);
         self.latency_ms = Some(latency_ms);
+        self.min_rtt_ms = Some(self.min_rtt_ms.map_or(latency_ms, |minimum| minimum.min(latency_ms)));
         update_latency_ewma(&mut self.rtt_ewma_ms, &mut self.jitter_ms, latency_ms);
     }
 
@@ -68,11 +70,13 @@ impl PathHealth {
     pub(super) fn record_success_with_authoritative_latency(&mut self, latency: Duration) {
         if self.authoritative_sample_count == 0 {
             self.rtt_ewma_ms = None;
+            self.min_rtt_ms = None;
             self.jitter_ms = None;
         }
         self.record_success();
         let latency_ms = duration_millis(latency);
         self.latency_ms = Some(latency_ms);
+        self.min_rtt_ms = Some(self.min_rtt_ms.map_or(latency_ms, |minimum| minimum.min(latency_ms)));
         update_latency_ewma(&mut self.rtt_ewma_ms, &mut self.jitter_ms, latency_ms);
         self.authoritative_sample_count = self.authoritative_sample_count.saturating_add(1);
     }

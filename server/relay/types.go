@@ -2,17 +2,20 @@ package main
 
 import (
 	"crypto/ed25519"
-	"github.com/golang-jwt/jwt/v5"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/quic-go/quic-go"
 )
 
 const authFailureSourceSnapshotLimit = 10
 
 type RelayConfig struct {
 	Bind                     string
+	UDPBind                  string
 	UDPObserverAlternateBind string
 	UDPObserverBind          string
 	SendQueueCapacity        int
@@ -57,6 +60,7 @@ type RelayConfig struct {
 type RelayServer struct {
 	config               *RelayConfig
 	listener             net.Listener
+	datagramListener     *quic.Listener
 	udpObserverAlternate *net.UDPConn
 	udpObserverConn      *net.UDPConn
 	hub                  *hub
@@ -100,6 +104,7 @@ type relayStats struct {
 	frameErrorsTotal                uint64
 	udpObserverRequestsTotal        uint64
 	udpObserverErrorsTotal          uint64
+	udpDatagramDropsTotal           uint64
 	authFailuresTotal               uint64
 	authRateLimitedTotal            uint64
 	legacyRegistrationsTotal        uint64
@@ -118,6 +123,7 @@ type RelayStatsSnapshot struct {
 	FrameErrorsTotal                uint64 `json:"frame_errors_total"`
 	UDPObserverRequestsTotal        uint64 `json:"udp_observer_requests_total"`
 	UDPObserverErrorsTotal          uint64 `json:"udp_observer_errors_total"`
+	UDPDatagramDropsTotal           uint64 `json:"udp_datagram_drops_total"`
 	AuthFailuresTotal               uint64 `json:"auth_failures_total"`
 	AuthRateLimitedTotal            uint64 `json:"auth_rate_limited_total"`
 	LegacyRegistrationsTotal        uint64 `json:"legacy_registrations_total"`

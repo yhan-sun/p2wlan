@@ -96,10 +96,12 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
     println!("网络：{}", config.network.network_id);
     println!(
         "虚拟网卡：{} MTU {}",
-        config.network.interface, config.network.mtu
+        config.network.interface, config.tun_mtu()
     );
-    println!("MTU profile：{}", mtu_profile(config.network.mtu));
-    suggestions.extend(mtu_config_suggestions(config.network.mtu));
+    println!("MTU profile：{}", mtu_profile(config.tun_mtu()));
+    let transport = serde_json::to_string(&config.transport).map_err(|e| e.to_string())?;
+    println!("传输配置 {transport}");
+    suggestions.extend(mtu_config_suggestions(config.tun_mtu()));
     println!("UDP bind：{}", config.network.udp_bind);
     println!(
         "UDP advertise：{}",
@@ -202,12 +204,15 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
             );
             print_path_observability(stats);
             suggestions.extend(protocol_boundary_suggestions(&snapshot));
-            suggestions.extend(mtu_snapshot_suggestions(config.network.mtu, &snapshot));
+            suggestions.extend(mtu_snapshot_suggestions(config.tun_mtu(), &snapshot));
             let mtu_diagnostics = mtu_diagnostic_suggestions(&snapshot);
             if mtu_diagnostics.is_empty() {
-                suggestions.extend(mtu_runtime_suggestions(config.network.mtu, stats));
+                suggestions.extend(mtu_runtime_suggestions(config.tun_mtu(), stats));
             } else {
                 suggestions.extend(mtu_diagnostics);
+            }
+            if let Some(transport) = snapshot.get("transport").filter(|value| value.is_object()) {
+                println!("传输状态 {transport}");
             }
             print_relay_diagnostics(&snapshot);
             print_peer_diagnostics(&snapshot);

@@ -41,9 +41,10 @@ async fn runtime_resource_default_disabled_and_unexposed_configs_create_no_captu
     let daemon = Daemon::new(config);
     assert!(daemon.resource_capture.is_none());
     assert!(daemon.transport.resource_capture().is_none());
+    assert!(!daemon.transport.accepts_request_carriage());
     assert!(matches!(
         daemon.outbound_rx,
-        Some(crate::request_carriage::RawOutboundReceiver::Legacy(_))
+        Some(crate::request_carriage::RawOutboundReceiver::Tracked(_))
     ));
 
     let mut unexposed = runtime_config(true);
@@ -88,13 +89,10 @@ async fn runtime_resource_actual_daemon_dataplane_channel_preserves_bytes_capaci
         );
         assert_eq!(inbound.max_capacity(), 1024);
         assert_eq!(plane.resource_capture().is_some(), observe);
-        assert_eq!(
-            matches!(
-                &receiver,
-                crate::request_carriage::RawOutboundReceiver::Tracked(_)
-            ),
-            observe
-        );
+        assert!(matches!(
+            &receiver,
+            crate::request_carriage::RawOutboundReceiver::Tracked(_)
+        ));
         let original = Ipv4Packet::build_icmp_echo_request(
             "10.20.0.1".parse().unwrap(),
             "10.20.0.2".parse().unwrap(),
@@ -111,7 +109,8 @@ async fn runtime_resource_actual_daemon_dataplane_channel_preserves_bytes_capaci
         .unwrap();
         let queued = daemon.resource_capture.as_ref().map(|run| run.readout());
         let packet = receiver.try_recv().unwrap();
-        assert_eq!(packet.packet, original);
+        assert_eq!(packet.payload(), original);
+        assert_eq!(packet.packet.is_empty(), !observe);
         assert!(
             packet.binding().is_none(),
             "observation must not mint original-request authority"

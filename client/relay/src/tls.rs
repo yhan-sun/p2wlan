@@ -151,6 +151,14 @@ impl ParsedEndpoint {
 /// Build a `TlsConnector` configured for TLS 1.3 only with system root CAs
 /// and optional additional CA certificate bundle.
 pub fn build_tls_connector(ca_cert_path: Option<&PathBuf>) -> Result<TlsConnector, RelayError> {
+    Ok(TlsConnector::from(Arc::new(build_client_tls(
+        ca_cert_path,
+    )?)))
+}
+
+pub(crate) fn build_client_tls(
+    ca_cert_path: Option<&PathBuf>,
+) -> Result<rustls::ClientConfig, RelayError> {
     let mut root_store = rustls::RootCertStore::empty();
 
     // Load system root certificates
@@ -199,11 +207,11 @@ pub fn build_tls_connector(ca_cert_path: Option<&PathBuf>) -> Result<TlsConnecto
     // Configure TLS 1.3 only. Do not rely on rustls defaults here: dev/test
     // feature unification can make TLS 1.2 available, but relay A2 requires
     // TLS 1.3-only transport semantics.
-    let config = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    Ok(TlsConnector::from(Arc::new(config)))
+    Ok(
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    )
 }
 
 /// Perform a TLS handshake on an already-connected TCP stream.

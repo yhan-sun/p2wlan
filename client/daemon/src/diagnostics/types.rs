@@ -32,7 +32,7 @@ impl ProtocolDiagnostics {
             aead: "ChaCha20-Poly1305".to_string(),
             hash_kdf: "BLAKE2s/HKDF-BLAKE2s".to_string(),
             device_identity: "Ed25519 challenge-response".to_string(),
-            relay_transport: "DERP-like TCP/TLS ciphertext forwarding".to_string(),
+            relay_transport: "authenticated QUIC datagrams or DERP-like TCP/TLS".to_string(),
             wireguard_interop: false,
             turn_compatible: false,
             security_audit: "not_completed".to_string(),
@@ -53,6 +53,36 @@ pub struct MtuDiagnostics {
     pub relay_path_observed: bool,
     pub suggested_safe_mtu: Option<u32>,
     pub risks: Vec<MtuRiskDiagnostics>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransportDiagnostics {
+    pub mss_clamped_count: u64,
+    pub pooled_tx_packets: u64,
+    pub pooled_rx_packets: u64,
+    pub qos_queue_drops: u64,
+    pub relay_mode: Option<String>,
+    pub fec_recovered: u64,
+    pub fec_parity_queued: u64,
+    pub compression_saved_bytes: u64,
+    /// Wire plaintext divided by original plaintext for compressed packets.
+    pub compressed_ratio: Option<f64>,
+    pub replay_rejected: u64,
+    pub peers: Vec<TransportPeerDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportPeerDiagnostics {
+    pub peer_id: String,
+    pub effective_mtu: u32,
+    pub rtt_ms: Option<u64>,
+    pub min_rtt_ms: Option<u64>,
+    pub jitter_ms: Option<u64>,
+    pub loss_rate: f64,
+    pub fec_state: String,
+    pub tx_bps: u64,
+    pub rx_bps: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +167,8 @@ pub struct DiagnosticsSnapshot {
     pub ready_phase: String,
     pub protocol: ProtocolDiagnostics,
     pub mtu: MtuDiagnostics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<TransportDiagnostics>,
     pub udp_local_addr: Option<String>,
     /// Number of live direct UDP sockets (one unless the bounded experiment is enabled).
     pub udp_socket_count: usize,

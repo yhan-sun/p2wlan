@@ -26,7 +26,8 @@ Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemet
 
 | 变量 | 规则 |
 | --- | --- |
-| RELAY_BIND | Relay TLS 数据入口。 |
+| RELAY_BIND | Relay TCP/TLS 数据入口。 |
+| RELAY_UDP_BIND | 可选的 QUIC DATAGRAM 监听地址。留空时只监听 TCP/TLS。启用时需要 TLS、票据认证和关闭匿名注册。 |
 | RELAY_TLS_CERT / RELAY_TLS_KEY | 匹配的完整证书链和私钥。 |
 | RELAY_TICKET_KEYRING_JSON | key id 到 32 字节公钥的映射。 |
 | RELAY_AUDIENCE / RELAY_REGION | 必须与 Control catalog 的一项完全匹配。 |
@@ -38,6 +39,22 @@ Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemet
 | RELAY_ALLOW_INSECURE_PLAINTEXT | 生产禁止。 |
 
 配置生成器会检查目录、证书、签票关系和随机秘密。正式启动还必须拒绝占位符、弱默认值和缺失证书。
+
+## 客户端传输配置
+
+配置文件的 `transport` 段可省略，旧配置按以下默认值读取。通过 `p2wlan config set` 修改后重启对应客户端。
+
+| 字段 | 默认值 | CLI 键 | 说明 |
+| --- | --- | --- | --- |
+| `mtu_mode` | `"auto"` | `mtu-mode` | `auto` 沿用 `network.mtu` 作为 TUN 上限。整数 576–65503 指定 TUN 上限。实际 Direct UDP 尺寸仍受已确认的路径 MTU 限制。 |
+| `enable_mss_clamping` | `true` | `mss-clamping` | 读取 TUN 后钳制合格 TCP SYN 和 SYN-ACK 的 MSS。 |
+| `fec_mode` | `"auto"` | `fec-mode` | `auto` 按丢包估计选择冗余，`light` 和 `strong` 固定发送档位，`off` 关闭冗余。需对端支持。 |
+| `compression` | `"auto"` | `compression` | 只对协商成功且收益足够的报文使用 LZ4。`off` 关闭本端发送压缩。 |
+| `enable_qos` | `true` | `qos` | 控制、交互和吞吐流量使用有界加权队列。 |
+| `max_tx_mbps` | 未设置 | `max-tx-mbps` | 使用正整数限制数据面发送速率，或用 `off` 清除。 |
+| `relay_transport` | `"auto_udp_first"` | `relay-transport` | Relay 候选优先尝试认证 UDP。选择 `tls_only` 时只使用 TLS。 |
+
+`p2wlan doctor` 显示已加载的配置和运行指标。`p2wlan status --json` 的 `transport` 对象包含 MSS 钳制、FEC 恢复、压缩节省、QoS 丢弃、防重放拒绝和当前 Relay 模式。其 `peers` 列表包含当前路径 MTU、RTT、最小 RTT、抖动、接收丢包估计、发送 FEC 档位和采样吞吐。首次读取吞吐需要建立采样基线，RTT 和 Relay 模式在未获得证据时为空。
 
 ## 客户端资源观测
 

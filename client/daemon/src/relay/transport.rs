@@ -122,6 +122,8 @@ impl RelayTransport {
         let mut config = RelayClientConfig {
             idle_timeout: RELAY_INBOUND_IDLE_TIMEOUT,
             keepalive_interval: RELAY_INBOUND_IDLE_TIMEOUT / 2,
+            prefer_datagrams: peers.transport_config().relay_transport
+                == crate::config::RelayTransportMode::AutoUdpFirst,
             allow_insecure_plaintext,
             relay_ticket,
             ..Default::default()
@@ -140,7 +142,7 @@ impl RelayTransport {
         if let Some(interface) = config.outbound_interface.as_deref() {
             debug!(
                 interface,
-                relay_endpoint, "Binding relay TCP connection to the physical interface"
+                relay_endpoint, "Binding relay connection to the physical interface"
             );
         }
 
@@ -160,6 +162,7 @@ impl RelayTransport {
             relay_connection_id,
             relay_endpoint = %relay_endpoint,
             relay_region = %relay_region,
+            relay_mode = if client.is_udp() { "udp" } else { "tls" },
             connect_latency_ms = duration_millis(started.elapsed()),
             "relay transport connected and registered locally; peer delivery still requires encrypted confirmation"
         );
@@ -285,6 +288,10 @@ impl RelayTransport {
     /// TCP connect plus relay registration latency.
     pub fn connect_latency_ms(&self) -> u64 {
         self.connect_latency_ms
+    }
+
+    pub fn is_udp(&self) -> bool {
+        self.client.is_udp()
     }
 
     /// Route signature captured immediately before this TCP connection was

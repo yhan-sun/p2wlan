@@ -48,7 +48,8 @@ func TestSecurityBooleanEnvironmentFailsClosed(t *testing.T) {
 	}
 }
 
-func TestTLSOverloadDoesNotHandshakeOnAcceptLoop(t *testing.T) {
+func relayTestCertificate(t *testing.T, config *RelayConfig) *x509.CertPool {
+	t.Helper()
 	private, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -63,8 +64,6 @@ func TestTLSOverloadDoesNotHandshakeOnAcceptLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	config := testConfig()
-	config.MaxConnections = 1
 	config.TLSCertChainPath, config.TLSPrivateKeyPath = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
 	if err := os.WriteFile(config.TLSCertChainPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600); err != nil {
 		t.Fatal(err)
@@ -74,6 +73,13 @@ func TestTLSOverloadDoesNotHandshakeOnAcceptLoop(t *testing.T) {
 	}
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	return roots
+}
+
+func TestTLSOverloadDoesNotHandshakeOnAcceptLoop(t *testing.T) {
+	config := testConfig()
+	config.MaxConnections = 1
+	roots := relayTestCertificate(t, config)
 	server, addr, cleanup := startTestServerWithInstance(t, config)
 	defer cleanup()
 	dial := func() *tls.Conn {
@@ -157,7 +163,7 @@ func TestRelayBackpressurePreservesOtherSourcesAndControl(t *testing.T) {
 		t.Fatal(err)
 	}
 	for len(destination.send) > 0 {
-		destination.releaseFrame((<-destination.send).data)
+		destination.releaseQueued(<-destination.send)
 	}
 	if destination.queuedBytes != 0 || len(destination.queuedBySource) != 0 {
 		t.Fatal("queue credits leaked")
@@ -171,7 +177,9 @@ func TestRelayBackpressurePreservesOtherSourcesAndControl(t *testing.T) {
 
 func TestRelayQueueByteBudgetAndInFlightAccounting(t *testing.T) {
 	p := &peer{send: make(chan queuedFrame, 1024), done: make(chan struct{})}
-	frame, _ := receivedFrame("source", make([]byte, 60000))
+	body := make([]byte, 60000)
+	frame := make([]byte, frameHeader+1+len("source")+len(body))
+	putReceivedFrame(frame, "source", body)
 	accepted := 0
 	for p.enqueue(frame) {
 		accepted++

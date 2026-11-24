@@ -1,10 +1,13 @@
 use super::*;
 use crate::connection_timeline::HotPathObservation;
 use crate::transport::wire::wire_receiver_index;
+use crate::transport_tuning::{self, Compression, IngressKey, Message};
 
 mod overlay_ingress;
+mod tuning;
 use overlay_ingress::EncryptedOverlayOrigin;
 pub(crate) use overlay_ingress::{OriginalOverlayIngressSource, OverlayIngressDelivery};
+use tuning::TuningIngress;
 
 #[cfg(test)]
 mod original_ack_observer;
@@ -102,11 +105,32 @@ impl WireGuardTransport {
         let mut encrypted_rx = encrypted_rx.into();
         let inbound_tx = inbound_tx.into();
         while let Some(delivery) = encrypted_rx.recv(self.resource_capture()).await {
-            let parts = delivery.into_parts();
+            let (wire_resources, mut packet, mut wire_pool) = delivery.into_parts_with_pool();
             // This guard precedes the original packet local: cancellation and
             // every early exit free its Vec before retiring its observation.
-            let _wire_resources = parts.0;
-            let packet = parts.1;
+            let _wire_resources = wire_resources;
+            let has_capture = self.kernel_capture.is_some()
+                || self.rx_business_capture.is_some()
+                || evidence
+                    .as_ref()
+                    .and_then(|feed| feed.overlay_ingress_tx.as_ref())
+                    .is_some();
+            if has_capture {
+                if let Some(buffer) = wire_pool.take() {
+                    packet.wire_bytes = buffer.into_vec();
+                }
+            }
+            let wire = wire_pool
+                .as_ref()
+                .map_or(packet.wire_bytes.as_slice(), |pool| pool.bytes());
+            let wire_len = wire.len();
+            let received_index = wire_receiver_index(wire);
+            let received_counter = wire_counter(wire);
+            let wire_fp = if tracing::enabled!(tracing::Level::DEBUG) {
+                wire_fingerprint(wire)
+            } else {
+                0
+            };
             let profiler = global_dataplane_profiler();
             let sampled = packet.profile_sampled;
             let transport_dequeued = Instant::now();
@@ -147,10 +171,10 @@ impl WireGuardTransport {
             let physical_ingress = packet.physical_ingress;
             debug!(
                 event = "wireguard_inbound_envelope_received",
-                bytes = packet.wire_bytes.len(),
-                receiver_index = ?wire_receiver_index(&packet.wire_bytes),
-                counter = ?wire_counter(&packet.wire_bytes),
-                wire_fp = format_args!("{:016x}", wire_fingerprint(&packet.wire_bytes)),
+                bytes = wire_len,
+                receiver_index = ?received_index,
+                counter = ?received_counter,
+                wire_fp = format_args!("{:016x}", wire_fp),
                 source = ?source,
                 local_endpoint = ?local_endpoint,
                 socket_index = ?socket_index,
@@ -173,17 +197,47 @@ impl WireGuardTransport {
             } else {
                 None
             };
-            match self
-                .decrypt_inbound_for_peer(&packet.wire_bytes, expected_peer)
-                .await
-            {
+            let pooled = if inbound_tx.supports_pool() {
+                peers
+                    .as_ref()
+                    .zip(packet_network_generation)
+                    .and_then(|(peers, generation)| {
+                        self.open_stable_pooled(&mut wire_pool, expected_peer, peers, generation)
+                    })
+            } else {
+                None
+            };
+            let wire = wire_pool.as_ref().map(|pool| pool.bytes()).or_else(|| {
+                (!packet.wire_bytes.is_empty()).then_some(packet.wire_bytes.as_slice())
+            });
+            let tuning = TuningIngress {
+                generation: packet_network_generation,
+                counter: received_counter,
+                wire,
+                source: IngressKey {
+                    relay: relay_connection_id,
+                    socket_owner: udp_transport_owner,
+                    socket_index,
+                    address: source,
+                },
+            };
+            let decrypted = match pooled {
+                Some(plain) => Ok(Some(plain)),
+                None => {
+                    self.decrypt_inbound_for_peer(wire.unwrap_or_default(), expected_peer)
+                        .await
+                }
+            };
+            match decrypted {
                 Ok(Some(DecryptedInboundWithSource {
                     packet: owned_inbound,
                     source: original_session_source,
                 })) => {
-                    let parts = owned_inbound.into_parts();
-                    let plaintext_resources = parts.0;
-                    let mut inbound = parts.1;
+                    let (plaintext_resources, mut inbound, inbound_pool) =
+                        owned_inbound.into_parts_with_pool();
+                    let inbound_bytes = inbound_pool
+                        .as_ref()
+                        .map_or(inbound.packet.as_slice(), |pool| pool.bytes());
                     if let Some(link) = tcp_link {
                         let Some(owner) = peers.as_ref() else {
                             continue;
@@ -205,11 +259,8 @@ impl WireGuardTransport {
                     });
                     let mut legacy_ingress = None;
                     if let Some(capture) = self.rx_business_capture.as_ref() {
-                        let wire = match (
-                            wire_receiver_index(&packet.wire_bytes),
-                            wire_counter(&packet.wire_bytes),
-                            u32::try_from(packet.wire_bytes.len()),
-                        ) {
+                        let wire = match (received_index, received_counter, u32::try_from(wire_len))
+                        {
                             (Some(receiver_index), Some(counter), Ok(wire_len)) => {
                                 Some(crate::business_evidence::WireTuple {
                                     receiver_index,
@@ -220,7 +271,7 @@ impl WireGuardTransport {
                             _ => None,
                         };
                         legacy_ingress = capture.capture_authenticated(
-                            &inbound.packet,
+                            inbound_bytes,
                             &inbound.peer_id,
                             physical_ingress.as_deref(),
                             self.wg_evidence_owner,
@@ -263,9 +314,9 @@ impl WireGuardTransport {
                     debug!(
                         event = "wireguard_inbound_decrypt_succeeded",
                         peer_id = %inbound.peer_id,
-                        receiver_index = ?wire_receiver_index(&packet.wire_bytes),
-                        counter = ?wire_counter(&packet.wire_bytes),
-                        wire_fp = format_args!("{:016x}", wire_fingerprint(&packet.wire_bytes)),
+                        receiver_index = ?received_index,
+                        counter = ?received_counter,
+                        wire_fp = format_args!("{:016x}", wire_fp),
                         session_instance = ?inbound.session_instance,
                         from_previous_session = inbound.from_previous_session,
                         source = ?source,
@@ -466,7 +517,7 @@ impl WireGuardTransport {
                                         relay_connection_id,
                                     );
                                 if session_evidence_eligible
-                                    && is_real_overlay_business_packet(&inbound.packet)
+                                    && is_real_overlay_business_packet(inbound_bytes)
                                 {
                                     peer_manager
                                         .confirm_relay_peer_from_business_ingress_for_session(
@@ -483,7 +534,7 @@ impl WireGuardTransport {
                         let legacy_business_confirmation = session_current
                             && inbound.session_instance.is_none()
                             && session_evidence_eligible
-                            && is_real_overlay_business_packet(&inbound.packet);
+                            && is_real_overlay_business_packet(inbound_bytes);
                         drop(session_guard);
                         // A real encrypted overlay packet arriving through
                         // the current relay is itself an end-to-end relay
@@ -516,8 +567,8 @@ impl WireGuardTransport {
                     // probe ACK whose real ingress was relay.  A local
                     // TCP/TLS connect or a command-queue accept is never
                     // delivery.
-                    let internal_rekey_confirmation = is_rekey_confirmation_packet(&inbound.packet);
-                    let direct_validation = parse_direct_validation_token(&inbound.packet);
+                    let internal_rekey_confirmation = is_rekey_confirmation_packet(inbound_bytes);
+                    let direct_validation = parse_direct_validation_token(inbound_bytes);
                     if relay_endpoint.is_none() {
                         if let (Some(udp), Some(index), Some(remote)) =
                             (udp.as_ref(), socket_index, source)
@@ -535,9 +586,50 @@ impl WireGuardTransport {
                             }
                         }
                     }
+                    let is_tuning_record = transport_tuning::is_internal(inbound_bytes);
+                    if session_evidence_eligible
+                        && (owns_direct_packet
+                            || tcp_link.is_some()
+                            || relay_connection_id.is_some())
+                    {
+                        if let Some(peers) = peers.as_ref() {
+                            self.observe_tuning_ingress(
+                                peers,
+                                &inbound_tx,
+                                &inbound,
+                                inbound_bytes,
+                                &tuning,
+                            )
+                            .await?;
+                        }
+                    }
+                    if is_tuning_record {
+                        let Some(Message::Compressed { length, data }) =
+                            transport_tuning::decode(inbound_bytes)
+                        else {
+                            continue;
+                        };
+                        let Some(decoded) = Compression::decode(length, data) else {
+                            continue;
+                        };
+                        // Restored user data must pass TUN source and room checks.
+                        // The physical read authenticated the carrier bytes only.
+                        inbound.packet = decoded;
+                        inbound.authenticated_ingress = None;
+                        inbound_tx
+                            .send_owned(crate::dataplane_resources::RxOwned::from_parts(
+                                inbound,
+                                plaintext_resources,
+                            ))
+                            .await
+                            .map_err(|_| {
+                                DaemonError::Network("inbound packet channel closed".into())
+                            })?;
+                        continue;
+                    }
                     let direct_validation_dplpmtud_capability = direct_validation.is_some()
-                        && crate::dplpmtud::direct_validation_supports_dplpmtud(&inbound.packet);
-                    let dplpmtud = crate::dplpmtud::parse_control_packet(&inbound.packet);
+                        && crate::dplpmtud::direct_validation_supports_dplpmtud(inbound_bytes);
+                    let dplpmtud = crate::dplpmtud::parse_control_packet(inbound_bytes);
                     if relay_endpoint.is_some() {
                         if let Some(feed) = evidence.as_ref() {
                             if let Some(timeline) = feed.timeline.as_ref() {
@@ -557,7 +649,7 @@ impl WireGuardTransport {
                             }
                         }
                     }
-                    let relay_probe = crate::relay_probe::parse_relay_probe_token(&inbound.packet);
+                    let relay_probe = crate::relay_probe::parse_relay_probe_token(inbound_bytes);
                     if let (Some(token), Some(feed)) = (relay_probe, evidence.as_ref()) {
                         if let Some(timeline) = feed.timeline.as_ref() {
                             let scope = format!("peer:{}:{}", inbound.peer_id, token.generation);
@@ -578,7 +670,7 @@ impl WireGuardTransport {
                             );
                         }
                     }
-                    let path_commit = crate::path_commit::parse_path_commit_token(&inbound.packet);
+                    let path_commit = crate::path_commit::parse_path_commit_token(inbound_bytes);
                     if session_evidence_eligible {
                         if let Some(peers) = peers.as_ref() {
                             // Forced-relay path-probe / path-ack: consumed here and
@@ -621,7 +713,7 @@ impl WireGuardTransport {
                                     if session_current {
                                         let probe = RelayProbeIngress {
                                             peer_id: &inbound.peer_id,
-                                            packet: &inbound.packet,
+                                            packet: inbound_bytes,
                                             relay_endpoint: relay_endpoint
                                                 .as_deref()
                                                 .unwrap_or("unknown"),
@@ -699,7 +791,7 @@ impl WireGuardTransport {
                                     if path_session_current {
                                         let probe = PathCommitIngress {
                                             peer_id: &inbound.peer_id,
-                                            packet: &inbound.packet,
+                                            packet: inbound_bytes,
                                             relay_endpoint: relay_endpoint
                                                 .as_deref()
                                                 .unwrap_or("unknown"),
@@ -856,8 +948,8 @@ impl WireGuardTransport {
                                             peers,
                                             udp,
                                             &inbound.peer_id,
-                                            &inbound.packet,
-                                            packet.wire_bytes.len(),
+                                            inbound_bytes,
+                                            wire_len,
                                             source,
                                             local_endpoint,
                                             socket_index,
@@ -943,7 +1035,7 @@ impl WireGuardTransport {
                                             peers,
                                             udp.as_ref(),
                                             &inbound.peer_id,
-                                            &inbound.packet,
+                                            inbound_bytes,
                                             source,
                                             local_endpoint,
                                             socket_index,
@@ -1171,8 +1263,7 @@ impl WireGuardTransport {
                     // that harness to ever emit first_usable. The ingress is
                     // taken from this packet's envelope and never inferred
                     // from the current selected path.
-                    if session_evidence_eligible && is_real_overlay_business_packet(&inbound.packet)
-                    {
+                    if session_evidence_eligible && is_real_overlay_business_packet(inbound_bytes) {
                         if let Some(feed) = evidence.as_ref() {
                             let ingress = if let Some(relay_endpoint) = relay_endpoint.as_ref() {
                                 Some((
@@ -1292,7 +1383,7 @@ impl WireGuardTransport {
                                             || "none".to_string(),
                                             |id| id.to_string(),
                                         );
-                                        let packet_identity = Ipv4Packet::new(&inbound.packet)
+                                        let packet_identity = Ipv4Packet::new(inbound_bytes)
                                             .map(|packet| {
                                                 format!(
                                                     "protocol={} src={} dst={}",
@@ -1311,13 +1402,13 @@ impl WireGuardTransport {
                                             ingress_label,
                                             relay_id.unwrap_or("none"),
                                             relay_transport_key,
-                                            wire_counter(&packet.wire_bytes).map_or_else(
+                                            received_counter.map_or_else(
                                                 || "none".to_string(),
                                                 |counter| counter.to_string(),
                                             ),
-                                            inbound.packet.len(),
+                                            inbound_bytes.len(),
                                             packet_identity,
-                                            wire_fingerprint(&inbound.packet),
+                                            wire_fingerprint(inbound_bytes),
                                         );
                                         timeline.emit_first_scoped_with_business_attribution_identity(
                                             &scope,
@@ -1397,8 +1488,7 @@ impl WireGuardTransport {
                         }
                     }
                     #[cfg(test)]
-                    if inbound.from_previous_session
-                        && is_overlay_payload_candidate(&inbound.packet)
+                    if inbound.from_previous_session && is_overlay_payload_candidate(inbound_bytes)
                     {
                         self.observe_previous_overlay_for_test(
                             &inbound,
@@ -1414,7 +1504,7 @@ impl WireGuardTransport {
                     // from this envelope, never from the active path).
                     if session_evidence_eligible {
                         if let Some(feed) = evidence.as_ref() {
-                            if is_overlay_payload_candidate(&inbound.packet) {
+                            if is_overlay_payload_candidate(inbound_bytes) {
                                 let ingress = if let Some(relay_endpoint) = relay_endpoint.as_ref()
                                 {
                                     Some(OverlayIngress::Relay(relay_endpoint.clone()))
@@ -1438,7 +1528,7 @@ impl WireGuardTransport {
                                             .unwrap_or_default();
                                         let event = OverlayIngressEvent {
                                             peer_id: inbound.peer_id.clone(),
-                                            packet: inbound.packet.clone(),
+                                            packet: inbound_bytes.to_vec(),
                                             ingress,
                                             connection_generation,
                                         };
@@ -1503,10 +1593,13 @@ impl WireGuardTransport {
                         }
                     }
                     inbound_tx
-                        .send_owned(crate::dataplane_resources::RxOwned::from_parts(
-                            inbound,
-                            plaintext_resources,
-                        ))
+                        .send_owned(
+                            crate::dataplane_resources::RxOwned::from_parts(
+                                inbound,
+                                plaintext_resources,
+                            )
+                            .with_pool(inbound_pool),
+                        )
                         .await
                         .map_err(|_| {
                             DaemonError::Network("inbound packet channel closed".to_string())
@@ -1517,6 +1610,9 @@ impl WireGuardTransport {
                 }
                 Err(err) => {
                     if err.is_replay() {
+                        if let Some(peers) = peers.as_ref() {
+                            self.report_tuning_replay(peers, &tuning);
+                        }
                         // The per-peer hedge-duplicate counter was already
                         // attributed and logged rate-limited inside
                         // `decrypt_inbound`; per-datagram WARNs would only

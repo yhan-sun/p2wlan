@@ -1,5 +1,8 @@
 use super::*;
 use crate::dataplane::{DeferredOutboundPreparationProfile, OutboundPreparationStage};
+use crate::transport_tuning::{self, SessionKey};
+
+mod pooled;
 
 /// Compatibility entry for unit tests of one isolated send. The worker
 /// supplies the FIFO's original deadline through the bounded entry below.
@@ -79,6 +82,44 @@ async fn encrypt_then_send_bounded(
     // operation still owns its original epoch, connection or emit guard.
     let mut path_log = crate::peer::DeferredPathSelectionLog::default();
     let mut packet = packet.into();
+    if let Some(mut buffer) = packet.take_pool() {
+        let window = SendAdmissionWindow {
+            deadline: admission_deadline,
+            stopping,
+            expected_generation,
+        };
+        let result = pooled::try_send(
+            &packet,
+            &mut buffer,
+            transport,
+            peers,
+            prefer_direct,
+            udp_transport,
+            relay_transport,
+            relay_expected,
+            window,
+        )
+        .await;
+        if matches!(result, pooled::Attempt::Sent) {
+            return EncryptSendOutcome::Sent;
+        }
+        packet.put_pool(buffer);
+        if let pooled::Attempt::Terminal(reason_code, reason) = result {
+            return EncryptSendOutcome::Terminal {
+                packet,
+                reason_code,
+                reason,
+            };
+        }
+    }
+    if packet.tuning_expired() {
+        return EncryptSendOutcome::Terminal {
+            packet,
+            reason_code: REASON_OUTBOUND_DELIVERY_DEADLINE,
+            reason: "transport redundancy expired before handoff".into(),
+        };
+    }
+    packet.materialize();
     packet.observe_resources(
         transport.resource_capture(),
         crate::dataplane_resources::ResidencyStage::DetachedRaw,
@@ -212,6 +253,41 @@ async fn encrypt_then_send_bounded(
         // Resolve this owned primary socket before the epoch transaction.
         // The original generation/path/budget and final owner fences remain.
         let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
+        let internal = transport_tuning::is_internal(&packet.packet);
+        let tune_business = packet.tunes_transport() && transport.resource_capture().is_none();
+        let tune_key = if internal || tune_business {
+            transport
+                .current_send_instance(&packet.peer_id)
+                .await
+                .map(|instance| SessionKey {
+                    generation: expected_generation,
+                    instance,
+                })
+        } else {
+            None
+        };
+        if internal
+            && (tune_key.is_none() || transport_tuning::queued_key(&packet.packet) != tune_key)
+        {
+            return Err(EncryptSendOutcome::Terminal {
+                packet: preparation_retry,
+                reason_code: REASON_OUTBOUND_SESSION_NOT_READY,
+                reason: "transport record expired with its WireGuard session".into(),
+            });
+        }
+        let mut saved_bytes = 0;
+        if let Some(key) = tune_key.filter(|_| tune_business) {
+            if peers.transport_config().compression == crate::config::CompressionMode::Auto {
+                if let Some(compressed) =
+                    peers
+                        .tuning()
+                        .compress(&packet.peer_id, key, &packet.packet)
+                {
+                    saved_bytes = packet.packet.len() - compressed.len();
+                    packet.packet = compressed;
+                }
+            }
+        }
         // Materialize real wire storage after the original emit turn and endpoint
         // query. Emit wait retains only its original plaintext buffer budget;
         // the same outer timeout/cancellation owner covers this allocation.
@@ -509,9 +585,11 @@ async fn encrypt_then_send_bounded(
             emit_guard_acquired,
             physical_preparation,
             serialized_buffer_lease,
+            tune_key.filter(|_| tune_business),
+            saved_bytes,
         ))
     };
-    let (emit_guard, encrypted, direct_business_plan, force_relay, emit_lock_started, emit_guard_acquired, physical_preparation, _serialized_buffer_lease) =
+    let (emit_guard, encrypted, direct_business_plan, force_relay, emit_lock_started, emit_guard_acquired, physical_preparation, _serialized_buffer_lease, tune_key, saved_bytes) =
         match timeout(preparation_bound, prepare).await {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(outcome)) => return outcome,
@@ -618,6 +696,56 @@ async fn encrypt_then_send_bounded(
     )
     .await;
     let transport_handoff_completed = Instant::now();
+    let mut tuning_records = Vec::new();
+    if matches!(&outcome, SendOutcome::Sent) {
+        if let (Some(key), Some(counter)) = (
+            tune_key,
+            crate::transport::wire_counter(&encrypted.wire_bytes),
+        ) {
+            let tuning = peers.tuning();
+            if saved_bytes > 0 {
+                tuning
+                    .compressed_saved_bytes
+                    .fetch_add(saved_bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                tuning.compressed_original_bytes.fetch_add(
+                    retry_packet.packet.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            let path = peers
+                .committed_business_path_snapshot_sync(&encrypted.peer_id)
+                .map(|path| path.active);
+            for mut record in tuning.sent(
+                &encrypted.peer_id,
+                key,
+                path,
+                encrypted.room_authorization.clone(),
+                counter,
+                &encrypted.wire_bytes,
+                peers.transport_config(),
+            ) {
+                transport_tuning::stamp(&mut record, key);
+                let limit = if matches!(
+                    transport_tuning::decode(&record),
+                    Some(transport_tuning::Message::Parity(_))
+                ) {
+                    Duration::from_millis(40)
+                } else {
+                    Duration::from_millis(500)
+                };
+                tuning_records.push(RawRequestDelivery::tuning_record(
+                    crate::dataplane::OutboundPacket {
+                        room_authorization: encrypted.room_authorization.clone(),
+                        peer_id: encrypted.peer_id.clone(),
+                        dst_ip: encrypted.dst_ip.clone(),
+                        packet: record,
+                        trace: None,
+                    },
+                    tokio::time::Instant::now() + limit,
+                ));
+            }
+        }
+    }
     // The inner send future has ended. Seal any remaining original result;
     // Relay already sealed before its post-send policy waits. Finish is idempotent.
     // Retain the original completion timestamp for every duration below.
@@ -705,6 +833,9 @@ async fn encrypt_then_send_bounded(
         );
     }
     match outcome {
+        SendOutcome::Sent if !tuning_records.is_empty() => {
+            EncryptSendOutcome::SentWithTuning(tuning_records)
+        }
         SendOutcome::Sent => EncryptSendOutcome::Sent,
         SendOutcome::Retryable(failure) => EncryptSendOutcome::Retryable {
             packet: retry_packet,

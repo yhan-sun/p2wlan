@@ -271,6 +271,37 @@ impl WireGuardTransport {
         .await
     }
 
+    /// The caller owns emit, network epoch, and the current UDP publication.
+    /// Session mutation remains ordered even if inbound promotes a pending key.
+    pub(crate) fn try_send_pooled(
+        &self,
+        peer_id: &str,
+        expected: u64,
+        buffer: &mut p2pnet_crypto::packet_buf::PacketBuf,
+        send: impl FnOnce(&[u8]) -> std::result::Result<usize, crate::udp::DirectBusinessUdpSendError>,
+    ) -> p2pnet_wireguard::Result<
+        Option<std::result::Result<usize, crate::udp::DirectBusinessUdpSendError>>,
+    > {
+        let Ok(mut sessions) = self.sessions.try_lock() else {
+            return Ok(None);
+        };
+        let Some(active) = sessions
+            .get_mut(peer_id)
+            .and_then(|session| session.active.as_mut())
+        else {
+            return Ok(None);
+        };
+        if active.session_instance != expected || active.session.is_expired() {
+            return Ok(None);
+        }
+        active.session.seal_packet(buffer)?;
+        let result = send(buffer.bytes());
+        if result.is_err() {
+            active.session.restore_unsent_packet(buffer)?;
+        }
+        Ok(Some(result))
+    }
+
     /// Same original session transaction, with storage prepared before epoch/sessions.
     pub(crate) async fn encrypt_outbound_with_prepared_buffer_diagnostics(
         &self,
@@ -280,13 +311,21 @@ impl WireGuardTransport {
         profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
         log: Option<&mut DeferredEncryptionLog>,
     ) -> Result<Option<EncryptedOutboundWithSource>> {
+        let is_business = !matches!(
+            crate::transport_tuning::decode(&packet.packet),
+            Some(
+                crate::transport_tuning::Message::Hello { .. }
+                    | crate::transport_tuning::Message::Feedback { .. }
+                    | crate::transport_tuning::Message::Parity(_)
+            )
+        );
         self.encrypt_outbound_inner_with_capture(
             prepared::EncryptionInput {
                 packet,
                 prepared: Some(prepared),
             },
             false,
-            true,
+            is_business,
             capture_source,
             profile,
             log,
@@ -718,7 +757,7 @@ impl WireGuardTransport {
         );
         let now = Instant::now();
         let peer_id = packet.peer_id.clone();
-        let packet_len = packet.packet.len();
+        let packet_len = packet.payload().len();
         let (stale_dropped, stale_bytes, overflow_dropped, overflow_bytes, depth) = {
             let mut pending = self.pending_outbound.lock().await;
             let queue = pending.entry(peer_id.clone()).or_default();
@@ -727,7 +766,7 @@ impl WireGuardTransport {
             queue.retain(|queued| {
                 let fresh = now.saturating_duration_since(queued.queued_at) <= PENDING_OUTBOUND_TTL;
                 if !fresh {
-                    stale_bytes = stale_bytes.saturating_add(queued.packet.packet.len());
+                    stale_bytes = stale_bytes.saturating_add(queued.packet.payload().len());
                 }
                 fresh
             });
@@ -737,7 +776,7 @@ impl WireGuardTransport {
             while queue.len() >= MAX_PENDING_OUTBOUND_PER_PEER {
                 if let Some(old) = queue.pop_front() {
                     overflow_dropped = overflow_dropped.saturating_add(1);
-                    overflow_bytes = overflow_bytes.saturating_add(old.packet.packet.len());
+                    overflow_bytes = overflow_bytes.saturating_add(old.packet.payload().len());
                 }
             }
             queue.push_back(PendingOutboundPacket {
@@ -881,7 +920,7 @@ impl WireGuardTransport {
                     packets.push(queued.packet);
                 } else {
                     expired_count = expired_count.saturating_add(1);
-                    expired_bytes = expired_bytes.saturating_add(queued.packet.packet.len());
+                    expired_bytes = expired_bytes.saturating_add(queued.packet.payload().len());
                 }
             }
             pending.remove(peer_id);
@@ -917,12 +956,12 @@ impl WireGuardTransport {
         let total_packets = packets.len();
         let total_bytes = packets
             .iter()
-            .map(|packet| packet.packet.len())
+            .map(|packet| packet.payload().len())
             .sum::<usize>();
         let mut forwarded = 0usize;
         let mut forwarded_bytes = 0usize;
         for packet in packets {
-            let packet_bytes = packet.packet.len();
+            let packet_bytes = packet.payload().len();
             if let Err(err) = self.outbound_tx.send(packet).await {
                 warn!(
                     "Pending outbound packet channel closed while flushing peer {}: {err}",

@@ -118,9 +118,10 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 
 	defer func() {
 		s.hub.unregister(p)
-		close(p.done)
+		p.closeQueue()
 		_ = conn.Close()
 		writerWg.Wait()
+		p.drainQueue()
 		atomic.AddInt64(&s.activeConnections, -1)
 		if p.writeFailed.Load() {
 			setCloseCause("write_failed")
@@ -133,38 +134,11 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 
 	go func() {
 		defer writerWg.Done()
-		for {
-			select {
-			case frame, ok := <-p.send:
-				if !ok {
-					return
-				}
-				if !p.authorizedAt(time.Now()) {
-					p.releaseFrame(frame.data)
-					_ = conn.Close()
-					return
-				}
-				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				// This is the forwarding write-start boundary. An already-started
-				// write may finish during revocation; queued frames cannot borrow
-				// a newer source connection. Never hold hub locks across writeFull.
-				if _, business := forwardedSource(frame.data); business && !s.hub.currentForward(frame.source, p) {
-					p.releaseFrame(frame.data)
-					atomic.AddUint64(&s.stats.forwardErrorsTotal, 1)
-					continue
-				}
-				err := writeFull(conn, frame.data)
-				p.releaseFrame(frame.data)
-				if err != nil {
-					p.writeFailed.Store(true)
-					setCloseCause("write_failed")
-					_ = conn.Close()
-					return
-				}
-			case <-p.done:
-				return
-			}
+		if !s.writePeer(p) {
+			p.writeFailed.Store(true)
+			setCloseCause("write_failed")
 		}
+		_ = conn.Close()
 	}()
 
 	source := authFailureSource(conn.RemoteAddr())
@@ -175,7 +149,9 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 
 	// Registration timeout
 	_ = conn.SetReadDeadline(time.Now().Add(s.config.RegisterTimeout))
-	typ, payload, err := readFrame(conn, s.config.MaxFramePayload)
+	var reader frameReader
+	defer reader.release()
+	typ, payload, err := reader.read(conn, s.config.MaxFramePayload)
 	if err != nil {
 		atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
 		_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
@@ -354,9 +330,14 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 
 // handlePostRegister handles the read loop after registration completes.
 func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, networkID string, setCloseCause func(string)) {
+	if udp, ok := conn.(*datagramConn); ok {
+		udp.enableBusiness()
+	}
+	var reader frameReader
+	defer reader.release()
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
-		typ, payload, err := readFrame(conn, s.config.MaxFramePayload)
+		typ, payload, err := reader.read(conn, s.config.MaxFramePayload)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				atomic.AddUint64(&s.stats.frameErrorsTotal, 1)

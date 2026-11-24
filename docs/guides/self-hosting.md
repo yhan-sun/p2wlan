@@ -205,11 +205,14 @@ Docker 公网部署的 Control HTTP 只发布到 loopback。内置 edge 容器�
 | --- | --- | --- |
 | HTTP 网页端口（默认 80） | 跳转至配置的 HTTPS 地址 | 是 |
 | HTTPS 网页端口（默认 443） | Control API、WebSocket、可选 `/admin/` | 是 |
-| TLS 18081 | Relay 数据连接 | 是 |
+| TCP/TLS 18081 | Relay 数据连接 | 是 |
+| UDP 18081 | 可选的认证 UDP Relay，使用相同的公网端口 | 启用时公开 |
 | HTTP 18080 | Control 内部监听 | 否 |
 | HTTP 18082 | Relay metrics、readyz | 否 |
 
 原生部署由外部反向代理提供 HTTPS，80 是否开放取决于 ACME 或跳转策略。Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。JWT、设备凭据、Relay ticket、票据签名密钥和 TLS 私钥各有独立用途。
+
+启用 UDP Relay 时，在私有 `relay.env` 设置 `RELAY_UDP_BIND=:18081`，并在防火墙放通与 Relay catalog 端点相同的 UDP 端口。独立 Docker 部署可以把 `deploy/selfhost/compose.udp-relay.yml` 与当前 Compose 配置一起加载，将 UDP 发布到指定的 Relay 主机地址。UDP 流量应直接到 Relay 容器或原生进程。
 
 ## 配置
 

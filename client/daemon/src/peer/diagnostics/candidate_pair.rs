@@ -142,6 +142,8 @@ pub struct PathHealthDiagnostics {
     pub last_liveness: Option<String>,
     pub latency_ms: Option<u64>,
     pub rtt_ewma_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rtt_ms: Option<u64>,
     pub jitter_ms: Option<u64>,
     pub success_count: u64,
     pub failure_count: u64,
@@ -158,6 +160,7 @@ impl From<&PathHealth> for PathHealthDiagnostics {
             last_liveness: health.last_liveness.map(liveness_verdict_string),
             latency_ms: health.latency_ms,
             rtt_ewma_ms: health.rtt_ewma_ms,
+            min_rtt_ms: health.min_rtt_ms,
             jitter_ms: health.jitter_ms,
             success_count: health.success_count,
             failure_count: health.failure_count,

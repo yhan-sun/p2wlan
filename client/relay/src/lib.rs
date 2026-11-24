@@ -229,6 +229,8 @@ pub struct RelayClientConfig {
     /// pinned before connect so a system-wide TUN route cannot capture relay
     /// traffic. Loopback relay endpoints ignore this option.
     pub outbound_interface: Option<String>,
+    /// Try the authenticated QUIC DATAGRAM transport before TCP TLS.
+    pub prefer_datagrams: bool,
 }
 
 impl Default for RelayClientConfig {
@@ -253,6 +255,7 @@ impl Default for RelayClientConfig {
             relay_ticket: None,
             connect_timeout: Duration::from_millis(1500),
             outbound_interface: None,
+            prefer_datagrams: false,
         }
     }
 }

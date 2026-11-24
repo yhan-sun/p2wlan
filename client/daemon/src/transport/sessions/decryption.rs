@@ -2,6 +2,62 @@ use super::*;
 use crate::dataplane_resources::{VecOperation, VecSite};
 
 impl WireGuardTransport {
+    /// Stable active keys can decrypt directly over the UDP read allocation.
+    /// A failed tag check leaves the wire bytes untouched for the regular
+    /// pending/previous-key and replay-attribution path.
+    pub(in crate::transport) fn open_stable_pooled(
+        &self,
+        buffer: &mut Option<p2pnet_crypto::packet_buf::PacketBuf>,
+        expected_peer: Option<&str>,
+        peers: &PeerManager,
+        generation: u64,
+    ) -> Option<DecryptedInboundWithSource> {
+        let storage = buffer.as_mut()?;
+        let receiver_index = wire::wire_receiver_index(storage.bytes())?;
+        let mut sessions = self.sessions.try_lock().ok()?;
+        let (peer_id, slot) = sessions.iter_mut().find_map(|(id, sessions)| {
+            let slot = sessions.active.as_mut()?;
+            (expected_peer.is_none_or(|peer| peer == id)
+                && slot.session.our_index() == receiver_index)
+                .then_some((id, slot))
+        })?;
+        let instance = slot.session_instance;
+        let key = crate::transport_tuning::SessionKey {
+            generation,
+            instance,
+        };
+        if slot.awaiting_confirmation
+            || peers
+                .tuning()
+                .needs_wire_copy(peer_id, key, peers.transport_config())
+        {
+            return None;
+        }
+        slot.session.open_packet(storage).ok()?;
+        peers
+            .tuning()
+            .pooled_rx_packets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let source = self.original_session_source(
+            peer_id,
+            instance,
+            OriginalSessionRole::Active,
+            slot.authorized_peer_lifecycle,
+        );
+        Some(DecryptedInboundWithSource {
+            packet: crate::dataplane_resources::RxOwned::from(InboundPacket {
+                authenticated_ingress: None,
+                peer_id: peer_id.clone(),
+                packet: Vec::new(),
+                session_instance: Some(instance),
+                from_previous_session: false,
+                trace: None,
+            })
+            .with_pool(buffer.take()),
+            source,
+        })
+    }
+
     /// Decrypt one inbound WireGuard transport packet.
     pub async fn decrypt_inbound(&self, wire_bytes: &[u8]) -> Result<Option<InboundPacket>> {
         self.decrypt_inbound_classified(wire_bytes)

@@ -42,7 +42,10 @@ pub(crate) fn validate_ohos_vpn_fd(owned_fd: OwnedFd) -> Result<OwnedFd> {
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
+    use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
 
     fn open_dev_null(read: bool, write: bool, nonblocking: bool, close_on_exec: bool) -> OwnedFd {
         let mut options = OpenOptions::new();
@@ -65,18 +68,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_mode_and_closes_consumed_fd() {
-        for fd in [
-            open_dev_null(true, false, true, true),
-            open_dev_null(true, true, false, true),
-            open_dev_null(true, true, true, false),
-        ] {
-            let raw_fd = fd.as_raw_fd();
-            assert!(validate_ohos_vpn_fd(fd).is_err());
-            let result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD, 0) };
-            let error = std::io::Error::last_os_error().raw_os_error();
-            assert_eq!(result, -1, "invalid OwnedFd must be closed on failure");
-            assert_eq!(error, Some(libc::EBADF));
+    fn rejects_read_only_fd() {
+        assert!(validate_ohos_vpn_fd(open_dev_null(true, false, true, true)).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_flags_and_closes_consumed_fd() {
+        for (nonblocking, close_on_exec) in [(false, true), (true, false)] {
+            let (candidate, mut peer) = UnixStream::pair().unwrap();
+            candidate.set_nonblocking(nonblocking).unwrap();
+            if !close_on_exec {
+                let result = unsafe { libc::fcntl(candidate.as_raw_fd(), libc::F_SETFD, 0) };
+                assert_eq!(result, 0);
+            }
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let invalid_fd: OwnedFd = candidate.into();
+            assert!(validate_ohos_vpn_fd(invalid_fd).is_err());
+            // EOF proves the particular socket was closed even if another
+            // test immediately reuses its descriptor number.
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
         }
     }
 }
