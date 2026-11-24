@@ -14,6 +14,6 @@ crate-type = ["cdylib"]
 [target.'cfg(target_env = "ohos")'.dependencies]
 hex = { workspace = true }
 libc = { workspace = true }
-p2pnet-crypto = { path = "../crypto", version = "1.0.1" }
-p2pnet-daemon = { package = "p2wlan-daemon", path = "../daemon", version = "1.0.1" }
+p2pnet-crypto = { path = "../crypto", version = "1.0.2" }
+p2pnet-daemon = { package = "p2wlan-daemon", path = "../daemon", version = "1.0.2" }
 tokio = { workspace = true }

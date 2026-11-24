@@ -10,7 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-p2pnet-nat = { path = "../client/nat", version = "1.0.1" }
+p2pnet-nat = { path = "../client/nat", version = "1.0.2" }
 
 [[bin]]
 name = "pnch_parser"
