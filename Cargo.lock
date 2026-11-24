@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-crypto"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -2497,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-nat"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "if-addrs",
  "p2pnet-crypto",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-netbind"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "if-addrs",
  "libc",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-relay"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bytes",
  "ed25519-dalek",
@@ -2548,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-tun"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2563,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-wireguard"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hex",
  "p2pnet-crypto",
@@ -2577,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "p2wlan-android-native"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hex",
  "jni 0.21.1",
@@ -2594,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "p2wlan-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "clap",
  "flate2",
@@ -2611,7 +2611,7 @@ dependencies = [
 
 [[package]]
 name = "p2wlan-daemon"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -2651,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "p2wlan-desktop-host"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "dirs",
  "reqwest",
@@ -2664,7 +2664,7 @@ dependencies = [
 
 [[package]]
 name = "p2wlan-harmony-native"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hex",
  "libc",
@@ -2675,7 +2675,7 @@ dependencies = [
 
 [[package]]
 name = "p2wlan-tray"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arboard",
  "hex",
