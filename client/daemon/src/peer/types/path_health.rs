@@ -58,7 +58,10 @@ impl PathHealth {
         self.record_success();
         let latency_ms = duration_millis(latency);
         self.latency_ms = Some(latency_ms);
-        self.min_rtt_ms = Some(self.min_rtt_ms.map_or(latency_ms, |minimum| minimum.min(latency_ms)));
+        self.min_rtt_ms = Some(
+            self.min_rtt_ms
+                .map_or(latency_ms, |minimum| minimum.min(latency_ms)),
+        );
         update_latency_ewma(&mut self.rtt_ewma_ms, &mut self.jitter_ms, latency_ms);
     }
 
@@ -76,7 +79,10 @@ impl PathHealth {
         self.record_success();
         let latency_ms = duration_millis(latency);
         self.latency_ms = Some(latency_ms);
-        self.min_rtt_ms = Some(self.min_rtt_ms.map_or(latency_ms, |minimum| minimum.min(latency_ms)));
+        self.min_rtt_ms = Some(
+            self.min_rtt_ms
+                .map_or(latency_ms, |minimum| minimum.min(latency_ms)),
+        );
         update_latency_ewma(&mut self.rtt_ewma_ms, &mut self.jitter_ms, latency_ms);
         self.authoritative_sample_count = self.authoritative_sample_count.saturating_add(1);
     }

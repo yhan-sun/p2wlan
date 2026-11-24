@@ -96,7 +96,8 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
     println!("网络：{}", config.network.network_id);
     println!(
         "虚拟网卡：{} MTU {}",
-        config.network.interface, config.tun_mtu()
+        config.network.interface,
+        config.tun_mtu()
     );
     println!("MTU profile：{}", mtu_profile(config.tun_mtu()));
     let transport = serde_json::to_string(&config.transport).map_err(|e| e.to_string())?;

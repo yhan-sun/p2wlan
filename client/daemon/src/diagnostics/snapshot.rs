@@ -9,7 +9,11 @@ async fn build_snapshot(context: DiagnosticsContext, request_id: u64) -> Diagnos
         None => Vec::new(),
     };
     let relay_mode = context.relay_transport.read().await.as_ref().map(|relay| {
-        if relay.is_udp() { "udp" } else { "tls" }
+        if relay.is_udp() {
+            "udp"
+        } else {
+            "tls"
+        }
     });
     let relay_connected = relay_mode.is_some();
     let direct_retry_after = DIRECT_RETRY_BASE_INTERVAL;
@@ -154,32 +158,39 @@ fn transport_diagnostics(
     let original = tuning.compressed_original_bytes.load(Relaxed);
     let saved = tuning.compressed_saved_bytes.load(Relaxed);
     let configured_mtu = context.config.tun_mtu();
-    let peers = peers.iter().map(|peer| {
-        let health = match peer.active_path {
-            Some(NetworkPath::Direct) => Some(&peer.direct),
-            Some(NetworkPath::Relay) => Some(&peer.relay),
-            _ => None,
-        };
-        let confirmed_budget = peer.dplpmtud.as_ref().and_then(|pmtu| pmtu.overlay_payload_budget);
-        let budget = match peer.active_path {
-            Some(NetworkPath::Direct) => confirmed_budget.unwrap_or(1168),
-            Some(NetworkPath::Relay) => RELAY_SAFE_MTU,
-            _ => configured_mtu,
-        };
-        let (loss_rate, fec_state) = tuning.peer_metrics(&peer.node_id, generation, context.config.transport.fec_mode);
-        let (tx_bps, rx_bps) = tuning.rate(&peer.node_id, peer.bytes_sent, peer.bytes_received);
-        TransportPeerDiagnostics {
-            peer_id: peer.node_id.clone(),
-            effective_mtu: configured_mtu.min(budget),
-            rtt_ms: health.and_then(|health| health.rtt_ewma_ms.or(health.latency_ms)),
-            min_rtt_ms: health.and_then(|health| health.min_rtt_ms),
-            jitter_ms: health.and_then(|health| health.jitter_ms),
-            loss_rate,
-            fec_state: fec_state.to_owned(),
-            tx_bps,
-            rx_bps,
-        }
-    }).collect();
+    let peers = peers
+        .iter()
+        .map(|peer| {
+            let health = match peer.active_path {
+                Some(NetworkPath::Direct) => Some(&peer.direct),
+                Some(NetworkPath::Relay) => Some(&peer.relay),
+                _ => None,
+            };
+            let confirmed_budget = peer
+                .dplpmtud
+                .as_ref()
+                .and_then(|pmtu| pmtu.overlay_payload_budget);
+            let budget = match peer.active_path {
+                Some(NetworkPath::Direct) => confirmed_budget.unwrap_or(1168),
+                Some(NetworkPath::Relay) => RELAY_SAFE_MTU,
+                _ => configured_mtu,
+            };
+            let (loss_rate, fec_state) =
+                tuning.peer_metrics(&peer.node_id, generation, context.config.transport.fec_mode);
+            let (tx_bps, rx_bps) = tuning.rate(&peer.node_id, peer.bytes_sent, peer.bytes_received);
+            TransportPeerDiagnostics {
+                peer_id: peer.node_id.clone(),
+                effective_mtu: configured_mtu.min(budget),
+                rtt_ms: health.and_then(|health| health.rtt_ewma_ms.or(health.latency_ms)),
+                min_rtt_ms: health.and_then(|health| health.min_rtt_ms),
+                jitter_ms: health.and_then(|health| health.jitter_ms),
+                loss_rate,
+                fec_state: fec_state.to_owned(),
+                tx_bps,
+                rx_bps,
+            }
+        })
+        .collect();
     TransportDiagnostics {
         mss_clamped_count: context.peers.mss_clamped_count(),
         pooled_tx_packets: tuning.pooled_tx_packets.load(Relaxed),
@@ -189,7 +200,8 @@ fn transport_diagnostics(
         fec_recovered: tuning.fec_recovered.load(Relaxed),
         fec_parity_queued: tuning.fec_parity_queued.load(Relaxed),
         compression_saved_bytes: saved,
-        compressed_ratio: (original > 0).then(|| original.saturating_sub(saved) as f64 / original as f64),
+        compressed_ratio: (original > 0)
+            .then(|| original.saturating_sub(saved) as f64 / original as f64),
         replay_rejected: tuning.replay_rejected.load(Relaxed),
         peers,
     }

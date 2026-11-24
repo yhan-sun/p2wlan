@@ -94,7 +94,9 @@ impl TunPacket<'_> {
     fn bytes_mut(&mut self) -> &mut [u8] {
         match self {
             #[cfg(test)]
-            Self::Borrowed(_) => unreachable!("outbound routing owns its packet before modifying it"),
+            Self::Borrowed(_) => {
+                unreachable!("outbound routing owns its packet before modifying it")
+            }
             Self::Owned(bytes) => bytes.to_mut(),
             Self::Pooled(bytes) => bytes.bytes_mut(),
         }
@@ -559,7 +561,10 @@ where
         use std::future::Future;
 
         let capacity = self.tun.mtu() as usize;
-        let mut pooled = self.tx_pool.as_ref().filter(|_| self.resource_capture.is_none() && capacity <= 4096)
+        let mut pooled = self
+            .tx_pool
+            .as_ref()
+            .filter(|_| self.resource_capture.is_none() && capacity <= 4096)
             .and_then(|pool| pool.acquire(capacity.max(2048)));
         let read_space = match pooled.as_mut() {
             Some(buffer) => buffer.read_space(),
@@ -636,8 +641,13 @@ where
         tun_read_started: std::time::Instant,
         tun_read_completed: std::time::Instant,
     ) -> Result<()> {
-        self.route_outbound_packet_with_binding(TunPacket::Borrowed(packet), tun_read_started, tun_read_completed, None)
-            .await
+        self.route_outbound_packet_with_binding(
+            TunPacket::Borrowed(packet),
+            tun_read_started,
+            tun_read_completed,
+            None,
+        )
+        .await
     }
 
     async fn route_outbound_packet_with_binding(
@@ -866,7 +876,8 @@ where
         let mut delivery = match pool {
             Some(buffer) => RawRequestDelivery::pooled(routed, buffer),
             None => RawRequestDelivery::routed(routed, binding),
-        }.mark_tun_read();
+        }
+        .mark_tun_read();
         delivery.observe_resources(
             self.resource_capture(),
             crate::dataplane_resources::ResidencyStage::ChannelReserve,
@@ -950,13 +961,18 @@ where
             true,
         );
         let (_plaintext_resources, mut packet, pool) = owned.into_parts_with_pool();
-        let bytes = pool.as_ref().map_or(packet.packet.as_slice(), |buffer| buffer.bytes());
+        let bytes = pool
+            .as_ref()
+            .map_or(packet.packet.as_slice(), |buffer| buffer.bytes());
         let trace = packet.trace.clone();
         let validation_started = std::time::Instant::now();
         let parsed = match IpPacket::new(bytes) {
             Ok(parsed) => parsed,
             Err(err) => {
-                warn!("Dropping invalid inbound IP packet from peer {}: {err}", packet.peer_id);
+                warn!(
+                    "Dropping invalid inbound IP packet from peer {}: {err}",
+                    packet.peer_id
+                );
                 return Ok(());
             }
         };
@@ -970,8 +986,17 @@ where
             crate::dataplane_resources::RxOwned::from(Vec::new()).with_pool(Some(buffer))
         } else if let Some(capture) = self.resource_capture() {
             let bytes = packet.packet[..total_len].to_vec();
-            capture.observe_vec(VecSite::RxTunPacketCopy, VecOperation::SliceCopy, Some(bytes.len()), &bytes);
-            crate::dataplane_resources::RxOwned::observe(bytes, Some(capture), crate::dataplane_resources::ResidencyStage::RxTunPacket)
+            capture.observe_vec(
+                VecSite::RxTunPacketCopy,
+                VecOperation::SliceCopy,
+                Some(bytes.len()),
+                &bytes,
+            );
+            crate::dataplane_resources::RxOwned::observe(
+                bytes,
+                Some(capture),
+                crate::dataplane_resources::ResidencyStage::RxTunPacket,
+            )
         } else {
             packet.packet.truncate(total_len);
             crate::dataplane_resources::RxOwned::from(std::mem::take(&mut packet.packet))
@@ -1093,7 +1118,11 @@ where
             .and_then(PacketIngressEvidence::kernel)
             .and_then(|original| original.write_context(&self.peers, inbound_packet.bytes()));
         let written = match kernel_write {
-            Some(context) => self.tun.write_with_context(inbound_packet.bytes(), context).await,
+            Some(context) => {
+                self.tun
+                    .write_with_context(inbound_packet.bytes(), context)
+                    .await
+            }
             None => self.tun.write(inbound_packet.bytes()).await,
         }
         .map_err(|e| DaemonError::Network(format!("TUN write failed: {e}")))?;
@@ -1128,8 +1157,11 @@ where
 
         #[cfg(target_os = "android")]
         if let Some(trace) = trace.as_ref() {
-            self.tun_turnaround
-                .record_request(inbound_packet.bytes(), tun_write_completed, trace.sampled);
+            self.tun_turnaround.record_request(
+                inbound_packet.bytes(),
+                tun_write_completed,
+                trace.sampled,
+            );
         }
 
         if let Some(trace) = trace {

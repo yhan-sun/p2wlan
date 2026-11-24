@@ -21,7 +21,8 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
             println!("proxy-mode = {}", config.control.proxy_mode.as_label());
             println!("interface = {}", config.network.interface);
             println!("mtu = {}", config.tun_mtu());
-            let transport = serde_json::to_string(&config.transport).map_err(|error| error.to_string())?;
+            let transport =
+                serde_json::to_string(&config.transport).map_err(|error| error.to_string())?;
             println!("transport = {transport}");
             println!("udp-bind = {}", config.network.udp_bind);
             println!(

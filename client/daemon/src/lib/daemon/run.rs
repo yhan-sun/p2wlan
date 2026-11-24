@@ -195,7 +195,10 @@ impl Daemon {
 
         info!(
             "[startup] initializing TUN: interface={} address={} netmask={} mtu={}",
-            self.config.network.interface, virtual_ip, netmask, self.config.tun_mtu()
+            self.config.network.interface,
+            virtual_ip,
+            netmask,
+            self.config.tun_mtu()
         );
         // Initialize TUN using the resolved IP details
         let tun = self.init_tun_with(&virtual_ip, &netmask, self.config.tun_mtu())?;

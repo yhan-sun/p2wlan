@@ -205,16 +205,19 @@ impl PeerConnection {
     }
 
     fn authenticated_loss_penalty(&self, path: NetworkPath, endpoint: Option<SocketAddr>) -> i32 {
-        let Some(sample) = self.transport_loss.as_ref() else { return 0 };
-        if sample.high_samples < 2 || sample.received.elapsed() > Duration::from_secs(8)
+        let Some(sample) = self.transport_loss.as_ref() else {
+            return 0;
+        };
+        if sample.high_samples < 2
+            || sample.received.elapsed() > Duration::from_secs(8)
             || sample.path != self.path_state_machine.snapshot().state.active
         {
             return 0;
         }
         match (&sample.path, path) {
             (ActiveBusinessPath::Direct(validation), NetworkPath::Direct)
-                if validation.commit_endpoint() == endpoint => {},
-            (ActiveBusinessPath::Relay(_), NetworkPath::Relay) => {},
+                if validation.commit_endpoint() == endpoint => {}
+            (ActiveBusinessPath::Relay(_), NetworkPath::Relay) => {}
             _ => return 0,
         }
         -(i32::from(sample.loss_bp) / 14).min(100)
@@ -260,7 +263,9 @@ impl PeerConnection {
             self.direct_health.failure_count,
         );
         let migration_penalty = if trial && !confirmed { -5 } else { 0 };
-        let penalty_score = jitter_penalty + migration_penalty + self.authenticated_loss_penalty(NetworkPath::Direct, Some(direct_endpoint));
+        let penalty_score = jitter_penalty
+            + migration_penalty
+            + self.authenticated_loss_penalty(NetworkPath::Direct, Some(direct_endpoint));
         let score =
             reachability_score + preference_score + latency_score + stability_score + penalty_score;
         Some(PathScore {
@@ -298,7 +303,8 @@ impl PeerConnection {
             self.relay_health.consecutive_failures,
             self.relay_health.failure_count,
         );
-        let penalty_score = jitter_penalty + self.authenticated_loss_penalty(NetworkPath::Relay, None);
+        let penalty_score =
+            jitter_penalty + self.authenticated_loss_penalty(NetworkPath::Relay, None);
         let score =
             reachability_score + preference_score + latency_score + stability_score + penalty_score;
         Some(PathScore {

@@ -1000,13 +1000,23 @@ impl PeerConnection {
             return;
         }
         let now = tokio::time::Instant::now();
-        let high_samples = self.transport_loss.as_ref()
-            .filter(|sample| sample.path == path && now.duration_since(sample.received) <= Duration::from_secs(6))
+        let high_samples = self
+            .transport_loss
+            .as_ref()
+            .filter(|sample| {
+                sample.path == path && now.duration_since(sample.received) <= Duration::from_secs(6)
+            })
             .map_or(0, |sample| sample.high_samples);
         self.transport_loss = Some(TransportPathLoss {
             path,
             loss_bp,
-            high_samples: if loss_bp >= 800 { high_samples.saturating_add(1) } else if loss_bp < 300 { 0 } else { high_samples },
+            high_samples: if loss_bp >= 800 {
+                high_samples.saturating_add(1)
+            } else if loss_bp < 300 {
+                0
+            } else {
+                high_samples
+            },
             received: now,
         });
     }

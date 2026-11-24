@@ -12,23 +12,28 @@ impl PeerManager {
     }
 
     pub(crate) fn count_mss_clamp(&self) {
-        self.mss_clamped_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.mss_clamped_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn mss_clamped_count(&self) -> u64 {
-        self.mss_clamped_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.mss_clamped_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn count_qos_drops(&self, count: usize) {
-        self.qos_queue_drops.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+        self.qos_queue_drops
+            .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn qos_queue_drops(&self) -> u64 {
-        self.qos_queue_drops.load(std::sync::atomic::Ordering::Relaxed)
+        self.qos_queue_drops
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn transport_send_delay(&self, bytes: usize) -> Option<Duration> {
-        self.transport_pacer.as_ref()?
+        self.transport_pacer
+            .as_ref()?
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .reserve(bytes, tokio::time::Instant::now())
@@ -36,7 +41,9 @@ impl PeerManager {
 
     pub(crate) async fn inner_mtu_for_syn(&self, peer: &str) -> u32 {
         let local = self.config.tun_mtu();
-        let confirmed = self.current_dplpmtud_runtime().await
+        let confirmed = self
+            .current_dplpmtud_runtime()
+            .await
             .and_then(|runtime| runtime.direct_business_budget_entry(peer))
             .and_then(|entry| entry.update.budget)
             .filter(|budget| self.dplpmtud_path_is_current_sync(&budget.path_identity))
@@ -94,7 +101,8 @@ impl PeerManager {
             tuning: Default::default(),
             transport_pacer: config.transport.max_tx_mbps.map(|rate| {
                 std::sync::Mutex::new(crate::traffic_pacer::TrafficPacer::new(
-                    rate, config.tun_mtu(),
+                    rate,
+                    config.tun_mtu(),
                 ))
             }),
             tcp_listener: Default::default(),

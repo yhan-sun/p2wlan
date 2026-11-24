@@ -312,11 +312,29 @@ mod tests {
         let snapshot: DiagnosticsSnapshot = serde_json::from_str(body).unwrap();
         let payload: serde_json::Value = serde_json::from_str(body).unwrap();
         let transport = &payload["transport"];
-        for name in ["mss_clamped_count", "qos_queue_drops", "relay_mode", "fec_recovered", "fec_parity_queued", "compression_saved_bytes", "compressed_ratio", "replay_rejected"] {
+        for name in [
+            "mss_clamped_count",
+            "qos_queue_drops",
+            "relay_mode",
+            "fec_recovered",
+            "fec_parity_queued",
+            "compression_saved_bytes",
+            "compressed_ratio",
+            "replay_rejected",
+        ] {
             assert!(transport.get(name).is_some(), "transport lacks {name}");
         }
         let peer = &transport["peers"][0];
-        for name in ["effective_mtu", "rtt_ms", "min_rtt_ms", "jitter_ms", "loss_rate", "fec_state", "tx_bps", "rx_bps"] {
+        for name in [
+            "effective_mtu",
+            "rtt_ms",
+            "min_rtt_ms",
+            "jitter_ms",
+            "loss_rate",
+            "fec_state",
+            "tx_bps",
+            "rx_bps",
+        ] {
             assert!(peer.get(name).is_some(), "peer transport lacks {name}");
         }
         assert_eq!(snapshot.version, env!("CARGO_PKG_VERSION"));

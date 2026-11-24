@@ -1511,7 +1511,11 @@ mod profiling_tests {
                 .env(CHILD, "1")
                 .output()
                 .unwrap();
-            assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stdout));
+            assert!(
+                child.status.success(),
+                "{}",
+                String::from_utf8_lossy(&child.stdout)
+            );
             return;
         }
 

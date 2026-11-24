@@ -92,7 +92,9 @@ fn decode_parity(data: &[u8]) -> Option<Parity<'_>> {
     }
     let mut ids = [0; DATA];
     let mut lengths = [0; DATA];
-    for (index, item) in data.get(4..4 + DATA * 10)?.chunks_exact(10).enumerate() {
+    let (descriptors, data) = data.get(4..)?.split_at_checked(DATA * 10)?;
+    let (entries, _) = descriptors.as_chunks::<10>();
+    for (index, item) in entries.iter().enumerate() {
         ids[index] = u64::from_be_bytes(item[..8].try_into().ok()?);
         lengths[index] = usize::from(u16::from_be_bytes(item[8..10].try_into().ok()?));
         if !(32..=MAX_CIPHERTEXT).contains(&lengths[index])
@@ -102,7 +104,6 @@ fn decode_parity(data: &[u8]) -> Option<Parity<'_>> {
         }
     }
     let width = lengths.iter().copied().max()?;
-    let data = data.get(4 + DATA * 10..)?;
     if offset >= width || data.len() != CHUNK.min(width - offset) {
         return None;
     }

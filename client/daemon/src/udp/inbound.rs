@@ -1649,46 +1649,50 @@ impl UdpTransport {
                 );
             }
             let packet = ReceivedEncryptedPacket {
-                        physical_ingress,
-                        original_relay_read: None,
-                        original_udp_read: Some(ingress_origin::OriginalUdpIngressSource::capture(
-                            self,
-                            &socket,
-                            socket_index,
-                            publication_owner,
-                            network_generation,
-                            udp_received,
-                            transport_queue_send_started,
-                        )),
-                        source: Some(source),
-                        local_endpoint,
-                        relay_endpoint: None,
-                        relay_connection_id: None,
-                        relay_peer_id: None,
-                        socket_index: Some(socket_index),
-                        direct_socket: (socket_index >= DYNAMIC_SOCKET_INDEX_BASE)
-                            .then(|| socket.clone()),
-                        // The token is sampled at enqueue time, not when the
-                        // WireGuard worker later decrypts this datagram. A
-                        // publication replacement can therefore reject a queued
-                        // packet from the retired reader instead of treating it
-                        // as evidence for the replacement socket.
-                        udp_transport_owner: Some(publication_owner),
-                        network_generation: Some(network_generation),
-                        profile_sampled,
-                        udp_received: Some(udp_received),
-                        transport_queue_send_started: Some(transport_queue_send_started),
-                        wire_bytes,
-                    };
-            let enqueued = if let Some(slab) = slab {
-                inbound_tx.send_owned(crate::dataplane_resources::RxOwned::from(packet).with_pool(Some(slab))).await
-            } else {
-                inbound_tx.send_with_capture(packet, self.resource_capture()).await
+                physical_ingress,
+                original_relay_read: None,
+                original_udp_read: Some(ingress_origin::OriginalUdpIngressSource::capture(
+                    self,
+                    &socket,
+                    socket_index,
+                    publication_owner,
+                    network_generation,
+                    udp_received,
+                    transport_queue_send_started,
+                )),
+                source: Some(source),
+                local_endpoint,
+                relay_endpoint: None,
+                relay_connection_id: None,
+                relay_peer_id: None,
+                socket_index: Some(socket_index),
+                direct_socket: (socket_index >= DYNAMIC_SOCKET_INDEX_BASE).then(|| socket.clone()),
+                // The token is sampled at enqueue time, not when the
+                // WireGuard worker later decrypts this datagram. A
+                // publication replacement can therefore reject a queued
+                // packet from the retired reader instead of treating it
+                // as evidence for the replacement socket.
+                udp_transport_owner: Some(publication_owner),
+                network_generation: Some(network_generation),
+                profile_sampled,
+                udp_received: Some(udp_received),
+                transport_queue_send_started: Some(transport_queue_send_started),
+                wire_bytes,
             };
-            enqueued
-                .map_err(|_| {
-                    DaemonError::Network("received encrypted packet channel closed".to_string())
-                })?;
+            let enqueued = if let Some(slab) = slab {
+                inbound_tx
+                    .send_owned(
+                        crate::dataplane_resources::RxOwned::from(packet).with_pool(Some(slab)),
+                    )
+                    .await
+            } else {
+                inbound_tx
+                    .send_with_capture(packet, self.resource_capture())
+                    .await
+            };
+            enqueued.map_err(|_| {
+                DaemonError::Network("received encrypted packet channel closed".to_string())
+            })?;
 
             // Sampled tail metrics below are recorded after enqueue into the
             // bounded transport queue. Their contended metrics lock does not
