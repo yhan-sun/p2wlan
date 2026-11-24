@@ -4,7 +4,7 @@ go 1.26.11
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
-	github.com/gorilla/websocket v1.5.3
+	github.com/gorilla/websocket v1.5.4-0.20240701034025-d67f41855da4
 	github.com/quic-go/quic-go v0.66.0
 	golang.org/x/crypto v0.57.0
 	modernc.org/sqlite v1.61.1
