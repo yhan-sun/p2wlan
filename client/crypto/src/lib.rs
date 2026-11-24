@@ -26,6 +26,7 @@ pub mod error;
 pub mod hash;
 pub mod hkdf;
 pub mod noise;
+pub mod packet_buf;
 pub mod sign;
 
 // Re-export primary types

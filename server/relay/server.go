@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
@@ -37,13 +38,17 @@ func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
 
 	// Determine TLS or plaintext
 	var listener net.Listener
+	var tlsConfig *tls.Config
 	hasTLS := config.TLSCertChainPath != "" && config.TLSPrivateKeyPath != ""
+	if config.UDPBind != "" && (!hasTLS || !config.RequireAuthentication || config.AllowLegacyUnauthenticated) {
+		return nil, fmt.Errorf("UDP relay requires TLS and authenticated registration")
+	}
 	if hasTLS {
 		cert, err := tls.LoadX509KeyPair(config.TLSCertChainPath, config.TLSPrivateKeyPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 		}
-		tlsConfig := &tls.Config{
+		tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS13,
 		}
@@ -102,6 +107,14 @@ func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
 	}
 	server.hub.forwardDelay = config.ForwardDelay
 	server.hub.debugFrames = config.DebugFrames
+	if config.UDPBind != "" {
+		server.datagramListener, err = listenDatagrams(config.UDPBind, tlsConfig)
+		if err != nil {
+			_ = server.Close()
+			return nil, fmt.Errorf("UDP relay: %w", err)
+		}
+		log.Printf("Authenticated UDP relay enabled on %s", server.datagramListener.Addr())
+	}
 	server.startRevocationPolling()
 	return server, nil
 }
@@ -152,6 +165,7 @@ func (s *RelayServer) statsSnapshot() RelayStatsSnapshot {
 		FrameErrorsTotal:                atomic.LoadUint64(&s.stats.frameErrorsTotal),
 		UDPObserverRequestsTotal:        atomic.LoadUint64(&s.stats.udpObserverRequestsTotal),
 		UDPObserverErrorsTotal:          atomic.LoadUint64(&s.stats.udpObserverErrorsTotal),
+		UDPDatagramDropsTotal:           atomic.LoadUint64(&s.stats.udpDatagramDropsTotal),
 		AuthFailuresTotal:               atomic.LoadUint64(&s.stats.authFailuresTotal),
 		AuthRateLimitedTotal:            atomic.LoadUint64(&s.stats.authRateLimitedTotal),
 		LegacyRegistrationsTotal:        atomic.LoadUint64(&s.stats.legacyRegistrationsTotal),
@@ -164,10 +178,20 @@ func (s *RelayServer) statsSnapshot() RelayStatsSnapshot {
 }
 
 func (s *RelayServer) Serve() {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
 	if s.udpObserverConn != nil {
 		s.wg.Add(1)
 		go s.serveUDPObserver()
 	}
+	if s.datagramListener != nil {
+		s.wg.Add(1)
+		go s.serveDatagrams()
+	}
+	s.mu.Unlock()
 
 	for {
 		conn, err := s.listener.Accept()
@@ -183,39 +207,57 @@ func (s *RelayServer) Serve() {
 			}
 		}
 
-		s.mu.Lock()
-		if s.closing {
-			s.mu.Unlock()
-			_ = conn.Close()
-			continue
-		}
-
-		// Atomic connection limit check
-		if atomic.AddInt64(&s.activeConnections, 1) > int64(s.config.MaxConnections) {
-			atomic.AddInt64(&s.activeConnections, -1)
-			atomic.AddUint64(&s.stats.rejectedConnectionsTotal, 1)
-			s.mu.Unlock()
-			// A first TLS Write starts a handshake. Never perform it in the
-			// accept loop, especially when the server has no free worker.
-			_ = conn.Close()
-			continue
-		}
-
-		s.connections[conn] = struct{}{}
-		atomic.AddUint64(&s.stats.acceptedConnectionsTotal, 1)
-		s.wg.Add(1)
-		s.mu.Unlock()
-
-		go func(c net.Conn) {
-			defer func() {
-				s.mu.Lock()
-				delete(s.connections, c)
-				s.mu.Unlock()
-				s.wg.Done()
-			}()
-			s.handleConn(c)
-		}(conn)
+		s.acceptConnection(conn)
 	}
+}
+
+func (s *RelayServer) serveDatagrams() {
+	defer s.wg.Done()
+	for {
+		conn, err := s.datagramListener.Accept(context.Background())
+		if err != nil {
+			return
+		}
+		s.acceptConnection(newDatagramConn(conn, s.config.MaxFramePayload, &s.stats.udpDatagramDropsTotal))
+	}
+}
+
+func (s *RelayServer) acceptConnection(conn net.Conn) {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	if atomic.AddInt64(&s.activeConnections, 1) > int64(s.config.MaxConnections) {
+		atomic.AddInt64(&s.activeConnections, -1)
+		atomic.AddUint64(&s.stats.rejectedConnectionsTotal, 1)
+		s.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	s.connections[conn] = struct{}{}
+	atomic.AddUint64(&s.stats.acceptedConnectionsTotal, 1)
+	s.wg.Add(1)
+	s.mu.Unlock()
+
+	go func() {
+		defer func() {
+			_ = conn.Close()
+			s.mu.Lock()
+			delete(s.connections, conn)
+			s.mu.Unlock()
+			s.wg.Done()
+		}()
+		if udp, ok := conn.(*datagramConn); ok {
+			defer udp.readers.Wait()
+			if err := udp.open(s.config.RegisterTimeout); err != nil {
+				atomic.AddInt64(&s.activeConnections, -1)
+				return
+			}
+		}
+		s.handleConn(conn)
+	}()
 }
 
 func (s *RelayServer) Close() error {
@@ -225,6 +267,9 @@ func (s *RelayServer) Close() error {
 		s.closing = true
 		close(s.shutdownChan)
 		err = s.listener.Close()
+		if s.datagramListener != nil {
+			_ = s.datagramListener.Close()
+		}
 		if s.udpObserverConn != nil {
 			_ = s.udpObserverConn.Close()
 		}

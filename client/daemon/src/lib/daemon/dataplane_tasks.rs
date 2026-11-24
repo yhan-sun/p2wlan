@@ -115,7 +115,7 @@ impl Daemon {
             let transport = self.transport.clone();
             let local_vip = self.config.network.virtual_ip.clone();
             let interface_name = self.config.network.interface.clone();
-            let mtu = self.config.network.mtu;
+            let mtu = self.config.tun_mtu();
             let (tun, controller) =
                 p2pnet_tun::mock::MockTunDevice::new_pair(&interface_name, mtu, &local_vip);
             let (dataplane, outbound_rx, inbound_tx) = DataPlane::new_bidirectional_for_daemon(

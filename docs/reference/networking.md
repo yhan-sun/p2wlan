@@ -19,7 +19,13 @@ Control 反向代理必须支持 WebSocket Upgrade。Relay TLS 不能用 Control
 
 Relay 路径使用保守的业务报文预算。DPLPMTUD 从安全下限开始，成功后逐步提升，失败或取消时回退；Direct 与 Relay 的预算、网络 generation 和连接 epoch 不能混用。高于 1380 的 Relay 路径应提示 PMTU blackhole 风险。
 
+入口可为 IPv4 和 IPv6 的 SYN、SYN-ACK 增量调整 TCP MSS。Direct 的 UDP 读写使用有界批次，健康的已确认链路可在 TUN 与 UDP 之间复用缓冲并执行原地 AEAD。认证的传输协商允许双方启用 LZ4 和 XOR 或 Reed–Solomon 冗余。FEC 恢复的是 WireGuard 密文，并重新通过原会话的完整认证和重放检查。`auto` 和 `score` 路径策略可把持续的认证丢包反馈纳入已有评分。
+
 诊断至少显示当前路径、selected MTU、探测状态、失败 reason code 和建议值。MTU smoke、真实 TUN、NAT、网络切换和业务流量是不同验证层，不能互相冒充。
+
+## UDP Relay
+
+支持认证 UDP 的 Relay 通过 QUIC DATAGRAM 转发 WireGuard 密文，注册、心跳和错误使用可靠控制流。客户端优先用配置的 Relay 主机和端口尝试 UDP，再用同一地址的 TCP/TLS 入口完成注册。已连接的 UDP 通道失活时，Relay 监督器重新选择可用连接。裸 UDP 与 TLS 不共享未完成的报文。
 
 ## NAT 限制
 

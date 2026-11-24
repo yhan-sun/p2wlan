@@ -118,6 +118,7 @@ impl Config {
                 allow_insecure_plaintext: false,
                 ca_cert_path: None,
             },
+            transport: TransportConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             port_mappings: Vec::new(),
             dns: DnsConfig::default(),

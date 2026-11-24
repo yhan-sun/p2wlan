@@ -79,8 +79,9 @@ impl WireGuardTransport {
         profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
         log: Option<&mut crate::transport::DeferredEncryptionLog>,
     ) -> Result<Option<EncryptedRequestDelivery>> {
+        packet.materialize();
         observe_crypto_input(self, &mut packet);
-        let RawRequestDelivery { raw, metadata } = packet;
+        let RawRequestDelivery { raw, metadata, .. } = packet;
         let (binding, original_residency) = metadata.into_parts();
         let encrypted = if let Some(prepared) = prepared {
             self.encrypt_outbound_with_prepared_buffer_diagnostics(
@@ -136,6 +137,7 @@ impl WireGuardTransport {
         profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
         log: Option<&mut crate::transport::DeferredEncryptionLog>,
     ) -> RequestEncryptionAttempt {
+        packet.materialize();
         observe_crypto_input(self, &mut packet);
         let RawRequestDelivery { raw, metadata } = packet;
         let (binding, original_residency) = metadata.into_parts();

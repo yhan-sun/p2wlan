@@ -8,6 +8,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::error::{Error, Result};
 
+mod transport;
+pub use transport::{clamp_tcp_mss, is_tcp_syn, traffic_class, TrafficClass};
+
 include!("packet/protocol.rs");
 include!("packet/ip.rs");
 include!("packet/ipv4.rs");

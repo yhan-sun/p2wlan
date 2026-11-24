@@ -480,7 +480,7 @@ fn describe_overlay_routes(context: &DiagnosticsContext) -> RoutesResponse {
     }];
     RoutesResponse::new(
         obs.expected_interface,
-        context.config.network.mtu,
+        context.config.tun_mtu(),
         healthy,
         conflict_count,
         entries,

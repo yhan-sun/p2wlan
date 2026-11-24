@@ -746,7 +746,8 @@ async fn b17_managed_original_core_full_fact_and_synthetic_emsgsize_has_no_fact(
             matches!(&result, EncryptSendOutcome::Sent),
             "managed fixture expected Sent; actual {}",
             match &result {
-                EncryptSendOutcome::Sent => "Sent".to_string(),
+                EncryptSendOutcome::Sent | EncryptSendOutcome::SentWithTuning(_) =>
+                    "Sent".to_string(),
                 EncryptSendOutcome::BudgetPending { reason, .. } => {
                     format!("BudgetPending: {reason}")
                 }

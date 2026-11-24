@@ -38,15 +38,15 @@
 
 //!      the earlier packet's send completed — a low counter can never fall
 
-//!      behind a higher counter into the receiver's 64-packet replay window.
+//!      behind a higher counter into the receiver's replay window.
 
 //!      A retry releases the guard and re-encrypts from plaintext.
 
-//!   4. Per-peer business traffic stays FIFO: drops evict the OLDEST entry,
+//!   4. Plaintext traffic stays FIFO within its class. QoS can schedule
 
-//!      retries re-park at the front, and the flush drains strictly in queue
+//!      classes before encryption, and retries re-park at the front of their
 
-//!      order.
+//!      class.
 
 //!
 
@@ -245,6 +245,7 @@ pub(crate) const REASON_RELAY_STARTUP_WAIT_EXPIRED: &str = "relay_startup_wait_e
 /// Stable reason code for a pending packet dropped because the per-peer queue
 /// exceeded its packet/byte bound.
 pub(crate) const REASON_OUTBOUND_QUEUE_FULL: &str = "outbound_queue_full";
+pub(crate) const REASON_OUTBOUND_QOS_EXPIRED: &str = "outbound_qos_expired";
 
 /// Stable reason code for a waiting peer that went offline.
 pub(crate) const REASON_OUTBOUND_PEER_OFFLINE: &str = "outbound_peer_offline";
@@ -400,6 +401,7 @@ pub(crate) use queue::run_network_outbound_with_request_carriage;
 /// Outcome of encrypting and sending one RAW packet.
 enum EncryptSendOutcome {
     Sent,
+    SentWithTuning(Vec<RawRequestDelivery>),
     BudgetPending {
         packet: RawRequestDelivery,
         reason: String,
@@ -541,7 +543,7 @@ pub(crate) async fn send_original_for_test(
                 None
             )
             .await,
-            EncryptSendOutcome::Sent
+            EncryptSendOutcome::Sent | EncryptSendOutcome::SentWithTuning(_)
         )
     };
     tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), send)
@@ -576,7 +578,7 @@ pub(crate) async fn send_original_slow_for_test(
             None,
         )
         .await,
-        EncryptSendOutcome::Sent
+        EncryptSendOutcome::Sent | EncryptSendOutcome::SentWithTuning(_)
     )
 }
 
@@ -605,7 +607,7 @@ pub(crate) async fn send_original_managed_for_test(
                 None,
             )
             .await,
-            EncryptSendOutcome::Sent
+            EncryptSendOutcome::Sent | EncryptSendOutcome::SentWithTuning(_)
         )
     })
     .await

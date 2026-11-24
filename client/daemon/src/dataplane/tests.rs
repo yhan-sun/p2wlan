@@ -92,7 +92,7 @@ async fn tun_worker_readiness_ignores_empty_read_then_reports_nonempty_read() {
     let packet = vec![0x45, 1, 2, 3];
     controller.inject(packet.clone()).await.unwrap();
     let (read, ..) = dataplane.read_packet(&mut buf, &mut ready).await.unwrap();
-    assert_eq!(read, packet);
+    assert_eq!(&*read, packet.as_slice());
     assert!(ready.is_none());
     assert_eq!(ready_rx.try_recv(), Ok(()));
 }
@@ -130,7 +130,7 @@ async fn tun_worker_readiness_survives_read_cancellation_without_losing_next_pac
     let packet = vec![0x45, 4, 5, 6];
     controller.inject(packet.clone()).await.unwrap();
     let (read, ..) = dataplane.read_packet(&mut buf, &mut ready).await.unwrap();
-    assert_eq!(read, packet);
+    assert_eq!(&*read, packet.as_slice());
     assert!(ready.is_none());
 }
 

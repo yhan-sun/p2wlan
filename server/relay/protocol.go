@@ -81,8 +81,20 @@ func queue(p *peer, frame []byte) {
 	}
 }
 
-func readFrame(conn net.Conn, maxPayload int) (byte, []byte, error) {
-	header := make([]byte, frameHeader)
+type frameReader struct {
+	header [frameHeader]byte
+	input  *frameStorage
+}
+
+func (r *frameReader) release() {
+	r.input.release()
+	r.input = nil
+}
+
+// The returned payload is borrowed until release or the next read.
+func (r *frameReader) read(conn net.Conn, maxPayload int) (byte, []byte, error) {
+	r.release()
+	header := r.header[:]
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return 0, nil, err
 	}
@@ -96,34 +108,44 @@ func readFrame(conn net.Conn, maxPayload int) (byte, []byte, error) {
 	if length > maxPayload {
 		return 0, nil, ErrFrameTooLarge
 	}
-	payload := make([]byte, length)
-	if length > 0 {
-		if _, err := io.ReadFull(conn, payload); err != nil {
-			return 0, nil, err
-		}
+	if length == 0 {
+		return header[5], nil, nil
 	}
-	return header[5], payload, nil
+	r.input = acquireFrame(length)
+	if _, err := io.ReadFull(conn, r.input.bytes); err != nil {
+		r.release()
+		return 0, nil, err
+	}
+	return header[5], r.input.bytes, nil
+}
+
+func readFrame(conn net.Conn, maxPayload int) (byte, []byte, error) {
+	var reader frameReader
+	defer reader.release()
+	kind, payload, err := reader.read(conn, maxPayload)
+	return kind, append([]byte(nil), payload...), err
 }
 
 func makeFrame(typ byte, payload []byte) []byte {
 	frame := make([]byte, frameHeader+len(payload))
-	copy(frame[:4], magic)
-	frame[4] = version
-	frame[5] = typ
-	binary.BigEndian.PutUint16(frame[6:8], uint16(len(payload)))
-	copy(frame[8:], payload)
+	putFrameHeader(frame, typ)
+	copy(frame[frameHeader:], payload)
 	return frame
 }
 
-func receivedFrame(srcID string, data []byte) ([]byte, error) {
-	if len(srcID) > 255 || len(data)+1+len(srcID) > 65535 {
-		return nil, io.ErrShortBuffer
-	}
-	payload := make([]byte, 1+len(srcID)+len(data))
+func putFrameHeader(frame []byte, typ byte) {
+	copy(frame[:4], magic)
+	frame[4] = version
+	frame[5] = typ
+	binary.BigEndian.PutUint16(frame[6:8], uint16(len(frame)-frameHeader))
+}
+
+func putReceivedFrame(frame []byte, srcID string, data []byte) {
+	putFrameHeader(frame, msgReceived)
+	payload := frame[frameHeader:]
 	payload[0] = byte(len(srcID))
 	copy(payload[1:], srcID)
 	copy(payload[1+len(srcID):], data)
-	return makeFrame(msgReceived, payload), nil
 }
 
 func parsePeerPayload(payload []byte) (string, []byte, bool) {

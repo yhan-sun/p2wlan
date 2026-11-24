@@ -1501,6 +1501,24 @@ mod profiling_tests {
 
     #[test]
     fn b03_profile_schema_keeps_duration_aliases_and_separates_resource_units() {
+        // Tracing callsite interest caches are shared by all tests in a
+        // process. Run the schema subscriber in isolation, so other scoped
+        // test subscribers cannot rebuild the same cache during emission.
+        const CHILD: &str = "P2WLAN_TEST_PROFILE_SCHEMA_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "dataplane::profiling_tests::b03_profile_schema_keeps_duration_aliases_and_separates_resource_units"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{}",
+                String::from_utf8_lossy(&child.stdout)
+            );
+            return;
+        }
+
         use std::collections::BTreeMap;
         use std::sync::Arc;
         use tracing::{

@@ -562,6 +562,7 @@ impl RelayClient {
             Self {
                 cmd_tx,
                 close_signal,
+                udp: false,
             },
             msg_rx,
         ))

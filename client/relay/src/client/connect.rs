@@ -182,12 +182,47 @@ impl RelayClient {
 
         match parsed.scheme.as_str() {
             "tls" => {
-                let connector = crate::tls::build_tls_connector(config.tls_ca_cert_path.as_ref())?;
                 let server_name = config
                     .tls_server_name
                     .clone()
                     .unwrap_or_else(|| parsed.connect_host().to_string());
 
+                if config.prefer_datagrams && config.relay_ticket.is_some() {
+                    let dial = super::quic::dial(
+                        parsed.connect_host(),
+                        parsed.port,
+                        &server_name,
+                        &config,
+                    );
+                    if let Ok(Ok(stream)) = tokio::time::timeout(
+                        config.connect_timeout.min(super::quic::CONNECT_BUDGET),
+                        dial,
+                    )
+                    .await
+                    {
+                        let mut udp_config = config.clone();
+                        udp_config.register_timeout =
+                            config.register_timeout.min(Duration::from_secs(2));
+                        match Self::finish_connect_with_read_options(
+                            stream,
+                            node_id,
+                            udp_config,
+                            options.clone(),
+                        )
+                        .await
+                        {
+                            Ok((mut client, rx)) => {
+                                client.udp = true;
+                                return Ok((client, rx));
+                            }
+                            Err(
+                                RelayError::Timeout(_) | RelayError::Io(_) | RelayError::Closed(_),
+                            ) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                let connector = crate::tls::build_tls_connector(config.tls_ca_cert_path.as_ref())?;
                 let tcp_stream = tokio::time::timeout(
                     config.connect_timeout,
                     p2pnet_netbind::connect_tcp_host(
@@ -734,6 +769,7 @@ impl RelayClient {
             Self {
                 cmd_tx,
                 close_signal,
+                udp: false,
             },
             msg_rx,
         ))

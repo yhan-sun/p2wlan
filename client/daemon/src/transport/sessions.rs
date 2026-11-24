@@ -261,7 +261,7 @@ impl WireGuardTransport {
         self
     }
     pub(crate) fn accepts_request_carriage(&self) -> bool {
-        self.outbound_tx.is_tracked()
+        self.accepts_request_carriage
     }
 
     /// Select the original channel capacity before any worker or clone exists.
@@ -271,11 +271,8 @@ impl WireGuardTransport {
         track_requests: bool,
         capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
     ) -> (Self, crate::request_carriage::RawOutboundReceiver) {
-        if !track_requests && capture.is_none() {
-            let (transport, receiver) = Self::new();
-            return (transport, receiver.into());
-        }
         let (mut transport, receiver) = Self::new_with_request_carriage();
+        transport.accepts_request_carriage = track_requests || capture.is_some();
         if let Some(capture) = capture {
             transport.outbound_tx = transport.outbound_tx.with_resource_capture(capture.clone());
             transport.resource_capture = Some(capture);
@@ -349,6 +346,7 @@ impl WireGuardTransport {
             outbound_emit_locks: Arc::new(emit_gate::EmitRegistry::new()),
             promoted_responder_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hedge_replay_counters: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            accepts_request_carriage: outbound_tx.is_tracked(),
             outbound_tx,
             outbound_loss_sink: Arc::new(std::sync::Mutex::new(None)),
             outbound_loss_context: Arc::new(std::sync::Mutex::new(None)),
@@ -1387,6 +1385,33 @@ impl WireGuardTransport {
     pub async fn remove_session(&self, peer_id: &str) {
         self.remove_session_with_reason(peer_id, "unspecified", "legacy_callsite")
             .await;
+    }
+
+    /// The caller uses the same emit fence through the physical write.
+    pub(crate) async fn current_send_instance(&self, peer_id: &str) -> Option<u64> {
+        let sessions = self.sessions.lock().await;
+        let active = sessions.get(peer_id)?.active.as_ref()?;
+        (!active.session.is_expired()).then_some(active.session_instance)
+    }
+
+    pub(crate) fn queue_tuning_record(
+        &self,
+        peer_id: &str,
+        dst_ip: &str,
+        room_authorization: Option<crate::rooms::RoomSendPermit>,
+        key: crate::transport_tuning::SessionKey,
+        mut record: Vec<u8>,
+    ) -> bool {
+        crate::transport_tuning::stamp(&mut record, key);
+        self.outbound_tx
+            .try_send(OutboundPacket {
+                room_authorization,
+                peer_id: peer_id.to_owned(),
+                dst_ip: dst_ip.to_owned(),
+                packet: record,
+                trace: None,
+            })
+            .is_ok()
     }
 
     /// Return whether a peer has an encrypting session.

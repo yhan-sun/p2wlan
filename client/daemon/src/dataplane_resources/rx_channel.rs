@@ -21,6 +21,7 @@ impl RxChannelPayload for crate::dataplane::InboundPacket {
 
 pub(crate) enum RxSink<T: RxChannelPayload> {
     Legacy(mpsc::Sender<T>),
+    Pooled(mpsc::Sender<RxOwned<T>>),
     Observed {
         tx: mpsc::Sender<RxOwned<T>>,
         capture: Arc<ResourceCapture>,
@@ -28,6 +29,7 @@ pub(crate) enum RxSink<T: RxChannelPayload> {
 }
 pub(crate) enum RxReceiver<T: RxChannelPayload> {
     Legacy(mpsc::Receiver<T>),
+    Pooled(mpsc::Receiver<RxOwned<T>>),
     Observed {
         rx: mpsc::Receiver<RxOwned<T>>,
         capture: Arc<ResourceCapture>,
@@ -40,6 +42,7 @@ impl<T: RxChannelPayload> Clone for RxSink<T> {
     fn clone(&self) -> Self {
         match self {
             Self::Legacy(tx) => Self::Legacy(tx.clone()),
+            Self::Pooled(tx) => Self::Pooled(tx.clone()),
             Self::Observed { tx, capture } => Self::Observed {
                 tx: tx.clone(),
                 capture: capture.clone(),
@@ -77,22 +80,37 @@ impl<T: RxChannelPayload> RxSink<T> {
             (Self::Legacy(tx), RxReceiver::Legacy(rx))
         }
     }
+    pub(crate) fn channel_with_pool(
+        capacity: usize,
+        capture: Option<Arc<ResourceCapture>>,
+    ) -> (Self, RxReceiver<T>) {
+        if capture.is_some() {
+            return Self::channel(capacity, capture);
+        }
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self::Pooled(tx), RxReceiver::Pooled(rx))
+    }
+
+    pub(crate) fn supports_pool(&self) -> bool {
+        matches!(self, Self::Pooled(_))
+    }
+
     pub(crate) fn capture(&self) -> Option<&Arc<ResourceCapture>> {
         match self {
-            Self::Legacy(_) => None,
+            Self::Legacy(_) | Self::Pooled(_) => None,
             Self::Observed { capture, .. } => Some(capture),
         }
     }
     pub(crate) fn capacity(&self) -> usize {
         match self {
             Self::Legacy(tx) => tx.capacity(),
-            Self::Observed { tx, .. } => tx.capacity(),
+            Self::Observed { tx, .. } | Self::Pooled(tx) => tx.capacity(),
         }
     }
     pub(crate) fn max_capacity(&self) -> usize {
         match self {
             Self::Legacy(tx) => tx.max_capacity(),
-            Self::Observed { tx, .. } => tx.max_capacity(),
+            Self::Observed { tx, .. } | Self::Pooled(tx) => tx.max_capacity(),
         }
     }
     pub(crate) async fn send(&self, value: T) -> Result<(), RxChannelClosed> {
@@ -139,6 +157,7 @@ impl<T: RxChannelPayload> RxSink<T> {
                     tx.send(value).await.map_err(|_| RxChannelClosed)
                 }
             }
+            Self::Pooled(tx) => tx.send(owned).await.map_err(|_| RxChannelClosed),
             Self::Observed { tx, capture } => {
                 owned.align(Some(capture), T::ADMISSION, false);
                 let slot = tx.reserve().await.map_err(|_| RxChannelClosed)?;
@@ -157,6 +176,7 @@ impl<T: RxChannelPayload> RxReceiver<T> {
     ) -> Option<RxOwned<T>> {
         let mut owned = match self {
             Self::Legacy(rx) => RxOwned::from(rx.recv().await?),
+            Self::Pooled(rx) => rx.recv().await?,
             Self::Observed { rx, capture } => {
                 let mut owned = rx.recv().await?;
                 owned.align(Some(capture), T::ACTIVE, false);
@@ -169,7 +189,7 @@ impl<T: RxChannelPayload> RxReceiver<T> {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Legacy(rx) => rx.len(),
-            Self::Observed { rx, .. } => rx.len(),
+            Self::Observed { rx, .. } | Self::Pooled(rx) => rx.len(),
         }
     }
 }

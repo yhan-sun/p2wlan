@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn test_replay_window_accepts_edge_and_rejects_old_counter() {
         let (mut sender, mut receiver) = establish_session();
-        let messages: Vec<_> = (0..=64)
+        let messages: Vec<_> = (0..=REPLAY_WINDOW_SIZE)
             .map(|counter| {
                 sender
                     .encrypt(format!("packet-{counter}").as_bytes())
@@ -131,11 +131,22 @@ mod tests {
             })
             .collect();
 
-        let newest = receiver.decrypt(&messages[64]).unwrap();
-        assert_eq!(&newest, b"packet-64");
+        let newest = receiver
+            .decrypt(&messages[REPLAY_WINDOW_SIZE as usize])
+            .unwrap();
+        assert_eq!(newest, format!("packet-{REPLAY_WINDOW_SIZE}").as_bytes());
 
-        let edge = receiver.decrypt(&messages[1]).unwrap();
-        assert_eq!(&edge, b"packet-1");
+        for counter in (1..REPLAY_WINDOW_SIZE).rev() {
+            let message = &messages[counter as usize];
+            assert_eq!(
+                receiver.decrypt(message).unwrap(),
+                format!("packet-{counter}").as_bytes()
+            );
+            assert!(matches!(
+                receiver.decrypt(message),
+                Err(WireGuardError::ReplayDetected(replayed)) if replayed == counter
+            ));
+        }
 
         let too_old = receiver.decrypt(&messages[0]);
         assert!(matches!(too_old, Err(WireGuardError::ReplayDetected(0))));

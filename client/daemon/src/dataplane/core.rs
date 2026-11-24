@@ -54,6 +54,55 @@ impl RequestRouteTestGate {
     }
 }
 
+enum TunPacket<'a> {
+    #[cfg(test)]
+    Borrowed(&'a [u8]),
+    Owned(std::borrow::Cow<'a, [u8]>),
+    Pooled(p2pnet_crypto::packet_buf::PacketBuf),
+}
+
+impl std::ops::Deref for TunPacket<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            #[cfg(test)]
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+            Self::Pooled(bytes) => bytes.bytes(),
+        }
+    }
+}
+
+impl TunPacket<'_> {
+    fn into_owned(self, length: usize) -> Self {
+        match self {
+            Self::Pooled(mut bytes) => {
+                let _ = bytes.trim(0, bytes.len() - length);
+                Self::Pooled(bytes)
+            }
+            Self::Owned(bytes) => {
+                let mut bytes = bytes.into_owned();
+                bytes.truncate(length);
+                Self::Owned(std::borrow::Cow::Owned(bytes))
+            }
+            #[cfg(test)]
+            Self::Borrowed(bytes) => Self::Owned(std::borrow::Cow::Owned(bytes[..length].to_vec())),
+        }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            #[cfg(test)]
+            Self::Borrowed(_) => {
+                unreachable!("outbound routing owns its packet before modifying it")
+            }
+            Self::Owned(bytes) => bytes.to_mut(),
+            Self::Pooled(bytes) => bytes.bytes_mut(),
+        }
+    }
+}
+
 /// Reads packets from a virtual interface and routes them by destination IP.
 pub struct DataPlane<T> {
     resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
@@ -63,6 +112,7 @@ pub struct DataPlane<T> {
     #[allow(dead_code)]
     tun_evidence_identity: Option<crate::business_evidence::TunEvidenceIdentity>,
     tun: T,
+    tx_pool: Option<p2pnet_crypto::packet_buf::BufPool>,
     #[cfg(test)]
     request_route_test_gate: Option<Arc<RequestRouteTestGate>>,
     peers: Arc<PeerManager>,
@@ -94,13 +144,12 @@ where
         crate::request_carriage::RawOutboundReceiver,
         crate::dataplane_resources::PlaintextRxSink,
     ) {
-        if !track_requests && capture.is_none() {
-            let (plane, receiver, inbound) = Self::new_bidirectional(tun, peers);
-            return (plane, receiver.into(), inbound.into());
-        }
         let (mut plane, receiver) = Self::new_with_request_carriage(tun, peers);
+        if !track_requests && capture.is_none() {
+            plane.tx_pool = Some(Default::default());
+        }
         let (inbound, inbound_rx) =
-            crate::dataplane_resources::PlaintextRxSink::channel(1024, capture.clone());
+            crate::dataplane_resources::PlaintextRxSink::channel_with_pool(1024, capture.clone());
         plane.inbound_rx = Some(inbound_rx);
         if let Some(capture) = capture {
             plane.outbound_tx = plane.outbound_tx.with_resource_capture(capture.clone());
@@ -235,6 +284,7 @@ where
             rx_business_capture: None,
             tun_evidence_identity: None,
             tun,
+            tx_pool: None,
             #[cfg(test)]
             request_route_test_gate: None,
             peers,
@@ -356,7 +406,7 @@ where
                             // select future so a competing inbound packet
                             // cannot cancel after bytes were consumed.
                             self.route_outbound_packet_with_binding(
-                                &packet,
+                                packet,
                                 tun_read_started,
                                 tun_read_completed,
                                 binding,
@@ -370,9 +420,7 @@ where
                             break;
                         };
                         let profiler = global_dataplane_profiler();
-                        let parts = packet.into_parts();
-                        let resources = parts.0;
-                        let mut packet = parts.1;
+                        let (resources, mut packet, pool) = packet.into_parts_with_pool();
                         if let Some(trace) = packet.trace.as_mut() {
                             trace.inbound_queue_dequeued = Some(std::time::Instant::now());
                             profiler.record_value(
@@ -399,7 +447,7 @@ where
                                 );
                             }
                         }
-                        self.write_inbound(crate::dataplane_resources::RxOwned::from_parts(packet, resources)).await?;
+                        self.write_inbound(crate::dataplane_resources::RxOwned::from_parts(packet, resources).with_pool(pool)).await?;
                     }
                     feedback = local_feedback_rx.recv(), if local_feedback_open => {
                         match feedback {
@@ -431,7 +479,7 @@ where
                         // Match the bidirectional loop: once read consumed a
                         // packet, feedback cannot cancel its routing awaits.
                         self.route_outbound_packet_with_binding(
-                            &packet,
+                            packet,
                             tun_read_started,
                             tun_read_completed,
                             binding,
@@ -488,7 +536,7 @@ where
             return Ok(());
         }
         self.route_outbound_packet_with_binding(
-            &packet,
+            packet,
             tun_read_started,
             tun_read_completed,
             binding,
@@ -505,16 +553,26 @@ where
         buf: &mut [u8],
         tun_worker_ready: &mut Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(
-        Vec<u8>,
+        TunPacket<'static>,
         std::time::Instant,
         std::time::Instant,
         Option<RequestBinding>,
     )> {
         use std::future::Future;
 
+        let capacity = self.tun.mtu() as usize;
+        let mut pooled = self
+            .tx_pool
+            .as_ref()
+            .filter(|_| self.resource_capture.is_none() && capacity <= 4096)
+            .and_then(|pool| pool.acquire(capacity.max(2048)));
+        let read_space = match pooled.as_mut() {
+            Some(buffer) => buffer.read_space(),
+            None => &mut *buf,
+        };
         let started = std::time::Instant::now();
         let n = if tun_worker_ready.is_some() {
-            let mut read = std::pin::pin!(self.tun.read(buf));
+            let mut read = std::pin::pin!(self.tun.read(read_space));
             std::future::poll_fn(|context| {
                 let polled = read.as_mut().poll(context);
                 let worker_entered = match &polled {
@@ -531,7 +589,7 @@ where
             })
             .await
         } else {
-            self.tun.read(buf).await
+            self.tun.read(read_space).await
         }
         .map_err(|e| DaemonError::Network(format!("TUN read failed: {e}")))?;
 
@@ -541,20 +599,34 @@ where
         } else {
             self.tun.take_last_read_context()
         };
-        let packet = buf[..n].to_vec();
         let completed = std::time::Instant::now();
-        if let Some(capture) = self.resource_capture() {
-            let _ = capture.observe_vec(
-                crate::dataplane_resources::VecSite::TxTunReadCopy,
-                crate::dataplane_resources::VecOperation::SliceCopy,
-                Some(packet.len()),
-                &packet,
-            );
-        }
         let binding = if self.outbound_tx.is_tracked() {
-            RequestBinding::from_read_context(context, &packet, &self.peers, completed)
+            RequestBinding::from_read_context(context, &read_space[..n], &self.peers, completed)
         } else {
             None
+        };
+        let packet = match pooled {
+            Some(mut pool) if binding.is_none() => {
+                debug_assert!(n <= capacity.max(2048));
+                let _ = pool.set_read_len(n);
+                TunPacket::Pooled(pool)
+            }
+            Some(mut pool) => {
+                let _ = pool.set_read_len(n);
+                TunPacket::Owned(std::borrow::Cow::Owned(pool.into_vec()))
+            }
+            None => {
+                let packet = buf[..n].to_vec();
+                if let Some(capture) = self.resource_capture() {
+                    let _ = capture.observe_vec(
+                        crate::dataplane_resources::VecSite::TxTunReadCopy,
+                        crate::dataplane_resources::VecOperation::SliceCopy,
+                        Some(packet.len()),
+                        &packet,
+                    );
+                }
+                TunPacket::Owned(std::borrow::Cow::Owned(packet))
+            }
         };
         Ok((packet, started, completed, binding))
     }
@@ -569,13 +641,18 @@ where
         tun_read_started: std::time::Instant,
         tun_read_completed: std::time::Instant,
     ) -> Result<()> {
-        self.route_outbound_packet_with_binding(packet, tun_read_started, tun_read_completed, None)
-            .await
+        self.route_outbound_packet_with_binding(
+            TunPacket::Borrowed(packet),
+            tun_read_started,
+            tun_read_completed,
+            None,
+        )
+        .await
     }
 
     async fn route_outbound_packet_with_binding(
         &mut self,
-        packet: &[u8],
+        packet: TunPacket<'_>,
         tun_read_started: std::time::Instant,
         tun_read_completed: std::time::Instant,
         mut binding: Option<RequestBinding>,
@@ -585,7 +662,7 @@ where
         #[cfg(target_os = "android")]
         if let Some(turnaround) = self
             .tun_turnaround
-            .observe_reply(packet, tun_read_completed)
+            .observe_reply(&packet, tun_read_completed)
         {
             profiler.record(true, "android_tun_kernel_turnaround_us", turnaround);
         }
@@ -596,7 +673,7 @@ where
             "tun_read_idle_wait_us",
             tun_read_completed.duration_since(tun_read_started),
         );
-        let parsed = match IpPacket::new(packet) {
+        let parsed = match IpPacket::new(&packet) {
             Ok(parsed) => parsed,
             Err(err) => {
                 warn!("Dropping invalid IP packet from TUN: {err}");
@@ -627,20 +704,22 @@ where
             return Ok(());
         };
 
-        let routed_packet = if src_ip == self.tun.address() {
-            let routed = packet[..total_len].to_vec();
+        let mut routed_packet = if src_ip == self.tun.address() {
             if let Some(capture) = self.resource_capture() {
+                let routed = packet[..total_len].to_vec();
                 let _ = capture.observe_vec(
                     crate::dataplane_resources::VecSite::TxRoutedPacketCopy,
                     crate::dataplane_resources::VecOperation::SliceCopy,
                     Some(routed.len()),
                     &routed,
                 );
+                TunPacket::Owned(std::borrow::Cow::Owned(routed))
+            } else {
+                packet.into_owned(total_len)
             }
-            routed
         } else {
             match self.normalize_outbound_source(&packet[..total_len], &src_ip, &dst_ip, protocol) {
-                Some(normalized) => normalized,
+                Some(normalized) => TunPacket::Owned(std::borrow::Cow::Owned(normalized)),
                 None => return Ok(()),
             }
         };
@@ -726,6 +805,15 @@ where
             return Ok(());
         }
 
+        if self.peers.transport_config().enable_mss_clamping
+            && p2pnet_tun::packet::is_tcp_syn(&routed_packet)
+        {
+            let mtu = self.peers.inner_mtu_for_syn(&peer_id).await;
+            if p2pnet_tun::packet::clamp_tcp_mss(routed_packet.bytes_mut(), mtu) {
+                self.peers.count_mss_clamp();
+            }
+        }
+
         let route_ready = std::time::Instant::now();
         profiler.record(
             sampled,
@@ -745,11 +833,17 @@ where
             );
             return Ok(());
         }
+        let (packet, pool) = match routed_packet {
+            TunPacket::Pooled(buffer) => (Vec::new(), Some(buffer)),
+            TunPacket::Owned(packet) => (packet.into_owned(), None),
+            #[cfg(test)]
+            TunPacket::Borrowed(_) => unreachable!("routed packet must own its bytes"),
+        };
         let mut routed = OutboundPacket {
             room_authorization,
             peer_id: peer_id.clone(),
             dst_ip: dst_ip.clone(),
-            packet: routed_packet,
+            packet,
             trace: Some(DataplaneTxTrace {
                 sampled,
                 tun_read_started,
@@ -779,7 +873,11 @@ where
         // The routed Vec remains this future's local owner while reserve
         // waits. This observation ends before synchronous channel handoff;
         // it does not cover queued packets or change admission/deadlines.
-        let mut delivery = RawRequestDelivery::routed(routed, binding);
+        let mut delivery = match pool {
+            Some(buffer) => RawRequestDelivery::pooled(routed, buffer),
+            None => RawRequestDelivery::routed(routed, binding),
+        }
+        .mark_tun_read();
         delivery.observe_resources(
             self.resource_capture(),
             crate::dataplane_resources::ResidencyStage::ChannelReserve,
@@ -862,12 +960,13 @@ where
             crate::dataplane_resources::ResidencyStage::RxPlaintextActive,
             true,
         );
-        let parts = owned.into_parts();
-        let _plaintext_resources = parts.0;
-        let packet = parts.1;
+        let (_plaintext_resources, mut packet, pool) = owned.into_parts_with_pool();
+        let bytes = pool
+            .as_ref()
+            .map_or(packet.packet.as_slice(), |buffer| buffer.bytes());
         let trace = packet.trace.clone();
         let validation_started = std::time::Instant::now();
-        let parsed = match IpPacket::new(&packet.packet) {
+        let parsed = match IpPacket::new(bytes) {
             Ok(parsed) => parsed,
             Err(err) => {
                 warn!(
@@ -879,23 +978,29 @@ where
         };
 
         let protocol = parsed.protocol();
-        let total_len = parsed.total_len().min(packet.packet.len());
-        let inbound_packet = packet.packet[..total_len].to_vec();
-        if let Some(capture) = self.resource_capture() {
+        let total_len = parsed.total_len().min(bytes.len());
+        let src_ip = parsed.src_addr_string();
+        let dst_ip = parsed.dst_addr_string();
+        let mut inbound_packet = if let Some(mut buffer) = pool {
+            let _ = buffer.trim(0, buffer.len() - total_len);
+            crate::dataplane_resources::RxOwned::from(Vec::new()).with_pool(Some(buffer))
+        } else if let Some(capture) = self.resource_capture() {
+            let bytes = packet.packet[..total_len].to_vec();
             capture.observe_vec(
                 VecSite::RxTunPacketCopy,
                 VecOperation::SliceCopy,
-                Some(inbound_packet.len()),
-                &inbound_packet,
+                Some(bytes.len()),
+                &bytes,
             );
-        }
-        let src_ip = parsed.src_addr_string();
-        let dst_ip = parsed.dst_addr_string();
-        let mut inbound_packet = crate::dataplane_resources::RxOwned::observe(
-            inbound_packet,
-            self.resource_capture(),
-            crate::dataplane_resources::ResidencyStage::RxTunPacket,
-        );
+            crate::dataplane_resources::RxOwned::observe(
+                bytes,
+                Some(capture),
+                crate::dataplane_resources::ResidencyStage::RxTunPacket,
+            )
+        } else {
+            packet.packet.truncate(total_len);
+            crate::dataplane_resources::RxOwned::from(std::mem::take(&mut packet.packet))
+        };
 
         let Some(peer) = self.peers.get_connection(&packet.peer_id).await else {
             warn!(
@@ -927,7 +1032,7 @@ where
         let source_was_normalized = src_ip != peer.virtual_ip;
         if source_was_normalized {
             match self.normalize_inbound_source(
-                &inbound_packet,
+                inbound_packet.bytes(),
                 &packet.peer_id,
                 &src_ip,
                 &peer.virtual_ip,
@@ -945,7 +1050,7 @@ where
             }
         }
 
-        let parsed = match IpPacket::new(&inbound_packet) {
+        let parsed = match IpPacket::new(inbound_packet.bytes()) {
             Ok(parsed) => parsed,
             Err(err) => {
                 warn!(
@@ -1011,20 +1116,24 @@ where
             .authenticated_ingress
             .as_deref()
             .and_then(PacketIngressEvidence::kernel)
-            .and_then(|original| original.write_context(&self.peers, &inbound_packet));
+            .and_then(|original| original.write_context(&self.peers, inbound_packet.bytes()));
         let written = match kernel_write {
-            Some(context) => self.tun.write_with_context(&inbound_packet, context).await,
-            None => self.tun.write(&inbound_packet).await,
+            Some(context) => {
+                self.tun
+                    .write_with_context(inbound_packet.bytes(), context)
+                    .await
+            }
+            None => self.tun.write(inbound_packet.bytes()).await,
         }
         .map_err(|e| DaemonError::Network(format!("TUN write failed: {e}")))?;
         let tun_write_completed = std::time::Instant::now();
 
-        if written != inbound_packet.len() {
+        if written != inbound_packet.bytes().len() {
             return Err(DaemonError::Network(format!(
                 "short TUN write for inbound packet from peer {}: wrote {} of {} bytes",
                 packet.peer_id,
                 written,
-                inbound_packet.len()
+                inbound_packet.bytes().len()
             )));
         }
 
@@ -1034,7 +1143,7 @@ where
                     capture.capture_tun_full(
                         authenticated,
                         target,
-                        &inbound_packet,
+                        inbound_packet.bytes(),
                         written,
                         allowed_source,
                         tun_write_completed,
@@ -1048,8 +1157,11 @@ where
 
         #[cfg(target_os = "android")]
         if let Some(trace) = trace.as_ref() {
-            self.tun_turnaround
-                .record_request(&inbound_packet, tun_write_completed, trace.sampled);
+            self.tun_turnaround.record_request(
+                inbound_packet.bytes(),
+                tun_write_completed,
+                trace.sampled,
+            );
         }
 
         if let Some(trace) = trace {
@@ -1122,14 +1234,14 @@ where
             auth.record_packet(&packet.peer_id, true);
         }
         self.peers
-            .record_received(&packet.peer_id, inbound_packet.len() as u64)
+            .record_received(&packet.peer_id, inbound_packet.bytes().len() as u64)
             .await;
 
         debug!(
             "Wrote {} byte {protocol} packet from peer {} to TUN ({} -> {dst_ip})",
-            inbound_packet.len(),
+            inbound_packet.bytes().len(),
             packet.peer_id,
-            IpPacket::new(&inbound_packet)
+            IpPacket::new(inbound_packet.bytes())
                 .map(|packet| packet.src_addr_string())
                 .unwrap_or(src_ip)
         );

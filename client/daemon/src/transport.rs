@@ -559,6 +559,7 @@ pub struct WireGuardTransport {
     /// business packet can never hold the emit lock, occupy a counter, or be
     /// overtaken on the wire by a higher-counter control packet.
     outbound_tx: crate::request_carriage::RawOutboundSink,
+    accepts_request_carriage: bool,
     /// Shared structural outbound-loss counters (terminal drops + send
     /// failures), wired by the daemon to the peer manager's map so `/status`
     /// reports the transport-level session queue loss together with the

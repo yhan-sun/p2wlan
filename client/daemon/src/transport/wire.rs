@@ -235,6 +235,7 @@ pub(crate) fn is_overlay_payload_candidate(packet: &[u8]) -> bool {
 /// overlay echo format.
 pub(crate) fn is_real_overlay_business_packet(packet: &[u8]) -> bool {
     Ipv4Packet::new(packet).is_ok()
+        && !crate::transport_tuning::is_internal(packet)
         && !is_relay_validation_packet(packet)
         && !is_rekey_confirmation_packet(packet)
         && parse_direct_validation_token(packet).is_none()

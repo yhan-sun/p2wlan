@@ -179,7 +179,7 @@ async fn completed_peer_flush_stays_ahead_of_live_fifo_arrivals() {
     let merged = pending.remove("peer-a").expect("merged queue");
     let sequences: Vec<u8> = merged
         .queue
-        .into_iter()
+        .iter()
         .map(|entry| match entry {
             PendingPacket::Plain { packet, .. } => packet.packet[0],
         })
@@ -309,8 +309,8 @@ async fn completed_flush_merge_obeys_byte_limit_without_extending_deadlines() {
     let merged = &pending["peer-a"];
     assert_eq!(merged.bytes, MAX_PENDING_BYTES_PER_PEER);
     assert_eq!(merged.queue.len(), 2);
-    assert_eq!(merged.queue[0].raw_packet()[0], 2);
-    assert_eq!(merged.queue[1].raw_packet()[0], 3);
+    assert_eq!(merged.queue.front().unwrap().raw_packet()[0], 2);
+    assert_eq!(merged.queue.iter().nth(1).unwrap().raw_packet()[0], 3);
     assert_eq!(merged.delivery_deadline, Some(deadline));
     assert_eq!(merged.wait_deadline, Some(deadline));
     let losses = peers.outbound_loss_stats().await;
@@ -337,7 +337,7 @@ async fn stale_completed_flush_cannot_poison_current_generation_queue() {
     assert_eq!(merged.wait_generation, Some(current));
     assert_eq!(merged.queue.len(), 1);
     assert_eq!(merged.bytes, 11);
-    assert_eq!(merged.queue[0].raw_packet(), [2; 11]);
+    assert_eq!(merged.queue.front().unwrap().raw_packet(), [2; 11]);
     let losses = peers.outbound_loss_stats().await;
     let stale = &losses.drops[REASON_OUTBOUND_GENERATION_CHANGED];
     assert_eq!((stale.packets, stale.bytes), (1, 7));
@@ -363,7 +363,7 @@ async fn stale_pending_queue_cannot_contaminate_current_completed_flush() {
     assert_eq!(merged.wait_generation, Some(current));
     assert_eq!(merged.bytes, 7);
     assert_eq!(merged.queue.len(), 1);
-    assert_eq!(merged.queue[0].raw_packet(), [1; 7]);
+    assert_eq!(merged.queue.front().unwrap().raw_packet(), [1; 7]);
     let losses = peers.outbound_loss_stats().await;
     let stale = &losses.drops[REASON_OUTBOUND_GENERATION_CHANGED];
     assert_eq!((stale.packets, stale.bytes), (1, 11));
@@ -464,7 +464,10 @@ async fn generation_advance_during_flush_preserves_new_network_ingress() {
     assert_eq!(pending["peer-a"].wait_generation, Some(generation));
     assert_eq!(pending["peer-a"].bytes, 11);
     assert_eq!(pending["peer-a"].queue.len(), 1);
-    assert_eq!(pending["peer-a"].queue[0].raw_packet(), [2; 11]);
+    assert_eq!(
+        pending["peer-a"].queue.front().unwrap().raw_packet(),
+        [2; 11]
+    );
     let losses = peers.outbound_loss_stats().await;
     let stale = &losses.drops[REASON_OUTBOUND_GENERATION_CHANGED];
     assert_eq!((stale.packets, stale.bytes), (1, 7));

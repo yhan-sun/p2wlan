@@ -117,6 +117,7 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	}
 
 	bind := fs.String("bind", getenv("RELAY_BIND", ":18081"), "TCP listen address")
+	udpBind := fs.String("udp-bind", getenv("RELAY_UDP_BIND", ""), "Authenticated UDP relay listen address")
 	udpObserverAlternate := fs.String("udp-observer-alternate-bind", getenv("RELAY_UDP_OBSERVER_ALTERNATE_BIND", ""), "Optional independent local IP and port for CHANGE-REQUEST replies")
 	udpObserverBind := fs.String("udp-observer-bind", getenv("RELAY_UDP_OBSERVER_BIND", ""), "Optional UDP observer/STUN bind address")
 	metricsBind := fs.String("metrics-bind", getenv("RELAY_METRICS_BIND", ""), "Optional read-only metrics HTTP listen address (empty disables)")
@@ -151,6 +152,7 @@ func parseConfig(args []string) (*RelayConfig, error) {
 
 	config := &RelayConfig{
 		Bind:                       *bind,
+		UDPBind:                    strings.TrimSpace(*udpBind),
 		UDPObserverAlternateBind:   strings.TrimSpace(*udpObserverAlternate),
 		UDPObserverBind:            strings.TrimSpace(*udpObserverBind),
 		MetricsBind:                strings.TrimSpace(*metricsBind),

@@ -52,6 +52,50 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
             }
             config.network.mtu = mtu;
         }
+        "mtu-mode" => {
+            let mode = match value.trim() {
+                "auto" => Value::String("auto".into()),
+                fixed => Value::from(
+                    fixed
+                        .parse::<u16>()
+                        .map_err(|_| "mtu-mode 必须是 auto 或 576 到 65503 的整数")?,
+                ),
+            };
+            config.transport.mtu_mode = serde_json::from_value(mode)
+                .map_err(|_| "mtu-mode 必须是 auto 或 576 到 65503 的整数".to_owned())?;
+        }
+        "mss-clamping" => {
+            config.transport.enable_mss_clamping = parse_bool_config(value, key)?;
+        }
+        "fec-mode" => {
+            config.transport.fec_mode = serde_json::from_value(Value::String(value.trim().into()))
+                .map_err(|_| "fec-mode 必须是 auto、off、light 或 strong".to_owned())?;
+        }
+        "compression" => {
+            config.transport.compression =
+                serde_json::from_value(Value::String(value.trim().into()))
+                    .map_err(|_| "compression 必须是 auto 或 off".to_owned())?;
+        }
+        "qos" => {
+            config.transport.enable_qos = parse_bool_config(value, key)?;
+        }
+        "max-tx-mbps" => {
+            config.transport.max_tx_mbps = if is_clear_value(value) {
+                None
+            } else {
+                Some(
+                    value
+                        .trim()
+                        .parse()
+                        .map_err(|_| "max-tx-mbps 必须是正整数或 off")?,
+                )
+            };
+        }
+        "relay-transport" => {
+            config.transport.relay_transport =
+                serde_json::from_value(Value::String(value.trim().into()))
+                    .map_err(|_| "relay-transport 必须是 auto_udp_first 或 tls_only".to_owned())?;
+        }
         "udp-bind" => {
             let endpoint = parse_socket_addr(value, "udp-bind")?;
             config.network.udp_bind = endpoint.to_string();

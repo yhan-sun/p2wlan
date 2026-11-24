@@ -61,7 +61,9 @@ mod request_carriage;
 pub mod rooms;
 pub mod route;
 pub mod tasks;
+mod traffic_pacer;
 pub mod transport;
+mod transport_tuning;
 pub mod traversal_history;
 pub mod udp;
 

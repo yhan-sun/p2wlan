@@ -71,6 +71,7 @@ enum ReadMode {
     Original { requested_endpoint: Arc<str> },
 }
 
+#[derive(Clone)]
 pub(super) struct ReadOptions {
     mode: ReadMode,
     #[cfg(test)]

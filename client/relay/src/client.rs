@@ -235,6 +235,7 @@ pub struct RelayClient {
     /// write timeout.  It must not wait behind a potentially blocked
     /// `SendData` command in `cmd_tx`.
     close_signal: Arc<close::RelayCloseSignal>,
+    udp: bool,
 }
 
 impl RelayClient {
@@ -249,7 +250,12 @@ impl RelayClient {
         Self {
             cmd_tx: tx,
             close_signal,
+            udp: false,
         }
+    }
+
+    pub fn is_udp(&self) -> bool {
+        self.udp
     }
 
     /// Synchronously close this client without waiting behind queued writes or
@@ -287,6 +293,7 @@ mod commands;
 mod connect;
 mod data_completion;
 mod legacy_tcp;
+mod quic;
 
 #[cfg(test)]
 pub(crate) mod original_workers_for_test;

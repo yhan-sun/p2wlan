@@ -195,10 +195,13 @@ impl Daemon {
 
         info!(
             "[startup] initializing TUN: interface={} address={} netmask={} mtu={}",
-            self.config.network.interface, virtual_ip, netmask, self.config.network.mtu
+            self.config.network.interface,
+            virtual_ip,
+            netmask,
+            self.config.tun_mtu()
         );
         // Initialize TUN using the resolved IP details
-        let tun = self.init_tun_with(&virtual_ip, &netmask, self.config.network.mtu)?;
+        let tun = self.init_tun_with(&virtual_ip, &netmask, self.config.tun_mtu())?;
         if let Some(ref tun) = tun {
             self.route_manager.set_interface(tun.name().to_string());
         }
@@ -264,7 +267,7 @@ impl Daemon {
             ));
         };
         let (network_inbound_tx, network_inbound_rx) =
-            crate::dataplane_resources::EncryptedRxSink::channel(
+            crate::dataplane_resources::EncryptedRxSink::channel_with_pool(
                 1024,
                 self.transport.resource_capture().cloned(),
             );

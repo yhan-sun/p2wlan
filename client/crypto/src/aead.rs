@@ -141,6 +141,20 @@ pub fn decrypt_with_counter(
     decrypt(key, &nonce, aad, ciphertext)
 }
 
+pub fn decrypt_in_place_with_counter(
+    key: &AeadKey,
+    counter: u64,
+    aad: &[u8],
+    payload: &mut [u8],
+    tag: &[u8; TAG_SIZE],
+) -> Result<()> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce = nonce_from_counter(counter);
+    cipher
+        .decrypt_in_place_detached(Nonce::from_slice(&nonce), aad, payload, tag.into())
+        .map_err(|e| CryptoError::CipherError(format!("AEAD decrypt failed: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

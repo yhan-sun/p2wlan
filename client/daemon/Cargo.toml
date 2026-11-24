@@ -13,6 +13,7 @@ name = "p2wlan-daemon"
 path = "src/main.rs"
 
 [dependencies]
+lz4_flex = { version = "0.14.2", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 p2pnet-tun = { path = "../tun", version = "1.0.1" }
 p2pnet-crypto = { path = "../crypto", version = "1.0.1" }
 p2pnet-wireguard = { path = "../wireguard", version = "1.0.1" }

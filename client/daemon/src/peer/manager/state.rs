@@ -773,6 +773,10 @@ pub struct PeerManager {
     outbound_loss_default: Arc<tokio::sync::Mutex<OutboundLossCounters>>,
     /// Configuration.
     config: Config,
+    mss_clamped_count: std::sync::atomic::AtomicU64,
+    qos_queue_drops: std::sync::atomic::AtomicU64,
+    tuning: crate::transport_tuning::Tuning,
+    transport_pacer: Option<std::sync::Mutex<crate::traffic_pacer::TrafficPacer>>,
     /// Authoritative active-path telemetry hub.
     pub(crate) telemetry_hub: Arc<path_telemetry::PathTelemetryHub>,
 }

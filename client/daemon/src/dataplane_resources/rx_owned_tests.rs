@@ -10,6 +10,10 @@ impl RxPayload for ValueWithDrop {
     fn payload(&self) -> &Vec<u8> {
         &self.bytes
     }
+
+    fn payload_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
+    }
 }
 impl Drop for ValueWithDrop {
     fn drop(&mut self) {

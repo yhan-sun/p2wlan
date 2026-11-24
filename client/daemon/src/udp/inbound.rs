@@ -338,6 +338,22 @@ impl UdpTransport {
         .await
     }
 
+    async fn recv_udp_batch(
+        socket: &UdpSocket,
+        bytes: &mut [u8],
+        ready: &mut Option<oneshot::Sender<bool>>,
+        batch: &mut u8,
+    ) -> std::io::Result<(usize, SocketAddr)> {
+        if *batch != 0 && ready.is_none() {
+            match socket.try_recv_from(bytes) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                result => return result,
+            }
+        }
+        *batch = 0;
+        Self::recv_from_with_reader_ready(socket, bytes, ready).await
+    }
+
     async fn run_inbound_socket_inner(
         &self,
         socket_index: usize,
@@ -350,8 +366,23 @@ impl UdpTransport {
 
         let inbound_tx = inbound_tx.into();
         let mut buf = crate::dataplane_resources::FixedReadBuffer::udp(self.resource_capture());
+        const BATCH_SIZE: u8 = 32;
+        let pool = (inbound_tx.supports_pool() && self.peers.configured_tun_mtu() <= 4064)
+            .then(p2pnet_crypto::packet_buf::BufPool::default);
+        let mut batch = 0;
 
         loop {
+            if batch == BATCH_SIZE {
+                tokio::task::yield_now().await;
+                batch = 0;
+            }
+            let mut slab = pool.as_ref().and_then(|pool| pool.acquire(4096));
+            let using_slab = slab.is_some();
+            let read = match slab.as_mut() {
+                Some(slab) => slab.datagram_read_space(),
+                None => &mut *buf,
+            };
+            let receive = Self::recv_udp_batch(&socket, read, &mut reader_ready_tx, &mut batch);
             // The shutdown signal is selected TOGETHER with the receive: a
             // reader parked in `recv_from` must never stay blocked forever
             // when the owning generation is cancelled before its socket was
@@ -369,6 +400,7 @@ impl UdpTransport {
             let packet = match shutdown_rx.as_deref_mut() {
                 Some(shutdown_rx) => {
                     tokio::select! {
+                        biased;
                         change = shutdown_rx.changed() => {
                             match change {
                                 // The sender was dropped (pre-insert
@@ -385,14 +417,10 @@ impl UdpTransport {
                                 Ok(()) => continue,
                             }
                         }
-                        packet = Self::recv_from_with_reader_ready(
-                            &socket,
-                            &mut buf,
-                            &mut reader_ready_tx,
-                        ) => packet,
+                        packet = receive => packet,
                     }
                 }
-                None => socket.recv_from(&mut buf).await,
+                None => receive.await,
             };
             let (n, source) = match packet {
                 Ok(packet) => packet,
@@ -406,6 +434,11 @@ impl UdpTransport {
                     )));
                 }
             };
+            batch += 1;
+            if using_slab && n > 4096 {
+                debug!("Ignored oversized UDP datagram on a standard-MTU tunnel");
+                continue;
+            }
             let udp_received = Instant::now();
 
             // A loopback birthday target can equal another private fixture
@@ -424,7 +457,7 @@ impl UdpTransport {
                 continue;
             }
 
-            let data = &buf[..n];
+            let data = &read[..n];
 
             // STUN responses are completion signals for the live candidate
             // gather.  Dispatch them before any peer-manager or diagnostics
@@ -1600,7 +1633,13 @@ impl UdpTransport {
                     ),
                 ))
             });
-            let wire_bytes = data.to_vec();
+            let (wire_bytes, slab) = if using_slab && compact.is_none() {
+                let mut slab = slab.take().expect("pooled UDP read owns its buffer");
+                let _ = slab.set_read_len(n);
+                (Vec::new(), Some(slab))
+            } else {
+                (data.to_vec(), None)
+            };
             if let Some(capture) = self.resource_capture() {
                 capture.observe_vec(
                     VecSite::UdpWireCopy,
@@ -1609,46 +1648,51 @@ impl UdpTransport {
                     &wire_bytes,
                 );
             }
-            inbound_tx
-                .send_with_capture(
-                    ReceivedEncryptedPacket {
-                        physical_ingress,
-                        original_relay_read: None,
-                        original_udp_read: Some(ingress_origin::OriginalUdpIngressSource::capture(
-                            self,
-                            &socket,
-                            socket_index,
-                            publication_owner,
-                            network_generation,
-                            udp_received,
-                            transport_queue_send_started,
-                        )),
-                        source: Some(source),
-                        local_endpoint,
-                        relay_endpoint: None,
-                        relay_connection_id: None,
-                        relay_peer_id: None,
-                        socket_index: Some(socket_index),
-                        direct_socket: (socket_index >= DYNAMIC_SOCKET_INDEX_BASE)
-                            .then(|| socket.clone()),
-                        // The token is sampled at enqueue time, not when the
-                        // WireGuard worker later decrypts this datagram. A
-                        // publication replacement can therefore reject a queued
-                        // packet from the retired reader instead of treating it
-                        // as evidence for the replacement socket.
-                        udp_transport_owner: Some(publication_owner),
-                        network_generation: Some(network_generation),
-                        profile_sampled,
-                        udp_received: Some(udp_received),
-                        transport_queue_send_started: Some(transport_queue_send_started),
-                        wire_bytes,
-                    },
-                    self.resource_capture(),
-                )
-                .await
-                .map_err(|_| {
-                    DaemonError::Network("received encrypted packet channel closed".to_string())
-                })?;
+            let packet = ReceivedEncryptedPacket {
+                physical_ingress,
+                original_relay_read: None,
+                original_udp_read: Some(ingress_origin::OriginalUdpIngressSource::capture(
+                    self,
+                    &socket,
+                    socket_index,
+                    publication_owner,
+                    network_generation,
+                    udp_received,
+                    transport_queue_send_started,
+                )),
+                source: Some(source),
+                local_endpoint,
+                relay_endpoint: None,
+                relay_connection_id: None,
+                relay_peer_id: None,
+                socket_index: Some(socket_index),
+                direct_socket: (socket_index >= DYNAMIC_SOCKET_INDEX_BASE).then(|| socket.clone()),
+                // The token is sampled at enqueue time, not when the
+                // WireGuard worker later decrypts this datagram. A
+                // publication replacement can therefore reject a queued
+                // packet from the retired reader instead of treating it
+                // as evidence for the replacement socket.
+                udp_transport_owner: Some(publication_owner),
+                network_generation: Some(network_generation),
+                profile_sampled,
+                udp_received: Some(udp_received),
+                transport_queue_send_started: Some(transport_queue_send_started),
+                wire_bytes,
+            };
+            let enqueued = if let Some(slab) = slab {
+                inbound_tx
+                    .send_owned(
+                        crate::dataplane_resources::RxOwned::from(packet).with_pool(Some(slab)),
+                    )
+                    .await
+            } else {
+                inbound_tx
+                    .send_with_capture(packet, self.resource_capture())
+                    .await
+            };
+            enqueued.map_err(|_| {
+                DaemonError::Network("received encrypted packet channel closed".to_string())
+            })?;
 
             // Sampled tail metrics below are recorded after enqueue into the
             // bounded transport queue. Their contended metrics lock does not

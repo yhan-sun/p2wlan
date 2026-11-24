@@ -139,7 +139,7 @@ async fn stale_task_completion_cannot_inherit_new_generation_or_its_deadline() {
     assert_eq!(merged.wait_deadline, deadline);
     assert!(merged.delivery_deadline.is_none());
     assert_eq!(merged.queue.len(), 1);
-    assert_eq!(merged.queue[0].raw_packet(), packet(2).packet);
+    assert_eq!(merged.queue.front().unwrap().raw_packet(), packet(2).packet);
     report_deferred_losses(merged, "peer-a", &ctx).await;
     assert_eq!(
         ctx.peers.outbound_loss_stats().await.drops[REASON_OUTBOUND_GENERATION_CHANGED].packets,

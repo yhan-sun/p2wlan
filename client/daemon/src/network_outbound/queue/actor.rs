@@ -38,6 +38,7 @@ pub(super) fn append_ingress(
     entry.attach_resource_capture(ctx.transport.resource_capture());
     if entry.wait_generation.is_none() {
         let now = Instant::now();
+        entry.queue.enabled = ctx.peers.transport_config().enable_qos;
         entry.wait_generation = Some(generation);
         // This snapshot chooses a workflow deadline only. The per-peer task
         // must still obtain the authoritative admission/selection fences.
@@ -178,6 +179,7 @@ pub(super) fn merge_peer_work(
     }
     if completed.wait_generation.is_none() {
         completed.wait_generation = newer.wait_generation;
+        completed.queue.enabled = newer.queue.enabled;
     }
     // A task may have emptied its old batch while live arrivals accumulated.
     // Its timing still bounds those same-generation arrivals until the whole
@@ -228,7 +230,7 @@ fn earliest(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
     }
 }
 
-fn finish_discard(packet: &mut PendingPacket, peer_id: &str, ctx: &PeerWorkContext) {
+pub(super) fn finish_discard(packet: &mut PendingPacket, peer_id: &str, ctx: &PeerWorkContext) {
     let _ = ctx.peers.emit_local_mtu_feedback(
         peer_id,
         packet.raw_packet(),
@@ -269,7 +271,7 @@ pub(super) fn discard_packets(
     defer_loss(queue, peer_id, generation, reason, count, bytes, ctx);
 }
 
-fn defer_loss(
+pub(super) fn defer_loss(
     queue: &mut PeerPendingQueue,
     peer_id: &str,
     generation: Option<u64>,
@@ -280,6 +282,14 @@ fn defer_loss(
 ) {
     if packets == 0 {
         return;
+    }
+    if queue.queue.enabled
+        && matches!(
+            reason,
+            QueueLossReason::QueueFull | QueueLossReason::QosExpired
+        )
+    {
+        ctx.peers.count_qos_drops(packets);
     }
     queue
         .loss_report_deadline
@@ -316,7 +326,7 @@ fn merge_loss(
         return;
     }
     if queue.deferred_losses.len() >= MAX_DEFERRED_LOSS_RECORDS {
-        // Eight typed reasons x two accounting phases fit in 16 slots. Fold
+        // Nine typed reasons x two accounting phases fit in 18 slots. Fold
         // generation detail only; counted and not-yet-counted totals never
         // mix, so a resumed report cannot count a previous partial commit twice.
         let old = std::mem::take(&mut queue.deferred_losses);

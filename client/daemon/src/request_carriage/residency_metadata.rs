@@ -6,6 +6,9 @@ use std::sync::Arc;
 
 pub(super) enum DeliveryMetadata {
     Empty,
+    Tun,
+    Pooled(p2pnet_crypto::packet_buf::PacketBuf),
+    Tuning(tokio::time::Instant),
     Bound(RequestBinding),
     Observed(Box<ObservedDelivery>),
 }
@@ -33,7 +36,7 @@ impl DeliveryMetadata {
 
     pub(super) fn into_parts(self) -> (Option<RequestBinding>, Option<ResidencyLease>) {
         match self {
-            Self::Empty => (None, None),
+            Self::Empty | Self::Tun | Self::Pooled(_) | Self::Tuning(_) => (None, None),
             Self::Bound(binding) => (Some(binding), None),
             Self::Observed(observed) => {
                 let ObservedDelivery { binding, lease } = *observed;
@@ -44,13 +47,18 @@ impl DeliveryMetadata {
 
     pub(super) fn binding(&self) -> Option<&RequestBinding> {
         match self {
-            Self::Empty => None,
+            Self::Empty | Self::Tun | Self::Pooled(_) | Self::Tuning(_) => None,
             Self::Bound(binding) => Some(binding),
             Self::Observed(observed) => observed.binding.as_ref(),
         }
     }
 
     pub(super) fn clone_for(&self, bytes: &Vec<u8>) -> Self {
+        match self {
+            Self::Tun | Self::Pooled(_) => return Self::Tun,
+            Self::Tuning(deadline) => return Self::Tuning(*deadline),
+            _ => {}
+        }
         let binding = self.binding().cloned();
         let lease = match self {
             Self::Observed(observed) => observed.lease.clone_for(bytes),

@@ -3,12 +3,14 @@ use crate::dataplane::{NetworkOutboundResourceSnapshot, PendingQueueResidence};
 use crate::dataplane_resources::{QueueAggregateLease, QueueStage, QueueTotals, ResourceCapture};
 
 mod actor;
+mod scheduler;
 use actor::*;
+use scheduler::PacketQueues;
 
 /// Loss metadata travels with the existing FIFO owner, never with retained
 /// ciphertext or a second report task. At saturation, reason totals remain
 /// exact while generation detail is explicitly omitted.
-const MAX_DEFERRED_LOSS_RECORDS: usize = 16;
+const MAX_DEFERRED_LOSS_RECORDS: usize = 18;
 
 struct DeferredLoss {
     generation: Option<u64>,
@@ -21,6 +23,7 @@ struct DeferredLoss {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueueLossReason {
     QueueFull,
+    QosExpired,
     GenerationChanged,
     WorkerStopped,
     DirectOnly,
@@ -34,6 +37,7 @@ impl QueueLossReason {
     fn code(self) -> &'static str {
         match self {
             Self::QueueFull => REASON_OUTBOUND_QUEUE_FULL,
+            Self::QosExpired => REASON_OUTBOUND_QOS_EXPIRED,
             Self::GenerationChanged => REASON_OUTBOUND_GENERATION_CHANGED,
             Self::WorkerStopped => REASON_OUTBOUND_WORKER_STOPPED,
             Self::DirectOnly => REASON_DIRECT_ONLY_NO_RELAY,
@@ -86,19 +90,19 @@ impl PendingPacket {
 
     fn stored_bytes(&self) -> usize {
         match self {
-            Self::Plain { packet, .. } => packet.packet.len(),
+            Self::Plain { packet, .. } => packet.payload().len(),
         }
     }
 
     fn stored_capacity(&self) -> usize {
         match self {
-            Self::Plain { packet, .. } => packet.packet.capacity(),
+            Self::Plain { packet, .. } => packet.allocated_payload_capacity(),
         }
     }
 
     fn raw_packet(&self) -> &[u8] {
         match self {
-            Self::Plain { packet, .. } => &packet.packet,
+            Self::Plain { packet, .. } => packet.payload(),
         }
     }
 
@@ -165,10 +169,9 @@ pub(crate) struct RelayStartupWait {
     pub(crate) timeout: Option<Duration>,
 }
 
-/// One per-peer pending queue.  Packets are sent strictly in arrival order
-/// (FIFO), so a drop or retry never reorders a peer's stream.
+/// One bounded per-peer collection of plaintext traffic classes.
 pub(super) struct PeerPendingQueue {
-    queue: VecDeque<PendingPacket>,
+    queue: PacketQueues,
     bytes: usize,
     resource_capture: Option<PendingQueueCapture>,
     /// When the peer's FIRST packet started waiting (None = not waiting).
@@ -200,7 +203,7 @@ struct PendingQueueCapture {
 impl PeerPendingQueue {
     fn new() -> Self {
         Self {
-            queue: VecDeque::new(),
+            queue: PacketQueues::default(),
             bytes: 0,
             resource_capture: None,
             wait_started: None,
@@ -227,7 +230,7 @@ impl PeerPendingQueue {
         // shell. An existing bounded FIFO is adopted once, never scanned on
         // each packet; every later mutation adjusts capacity in constant work.
         let mut vec_capacity = Some(0usize);
-        for packet in &mut self.queue {
+        for packet in self.queue.iter_mut() {
             packet.observe_residency(
                 capture,
                 crate::dataplane_resources::ResidencyStage::PendingFifo,
@@ -283,10 +286,8 @@ impl PeerPendingQueue {
         let _ = capture.lease.set_totals(totals);
     }
 
-    /// Park a packet in the bounded queue, dropping the OLDEST entries first
-    /// when the packet/byte bound is exceeded.  Returns (dropped packets,
-    /// dropped bytes) for the overflow so the caller can count them into
-    /// `/status.stats.outbound_drops` — the loss is never silently ignored.
+    /// Park a packet in the bounded queue. A higher class can displace older
+    /// traffic from a lower class. Charge evictions to the original queue.
     fn enqueue(&mut self, mut packet: PendingPacket) -> (Vec<PendingPacket>, usize) {
         let packet_len = packet.stored_bytes();
         let capture = self.resource_capture.as_ref().map(|c| c.lease.capture());
@@ -307,11 +308,16 @@ impl PeerPendingQueue {
             && (self.queue.len() >= MAX_PENDING_PACKETS_PER_PEER
                 || self.bytes.saturating_add(packet_len) > MAX_PENDING_BYTES_PER_PEER)
         {
-            if let Some(mut old) = self.pop_front() {
+            if let Some(old) = self.queue.evict_for(&packet) {
+                let mut old = self.finish_pop(old);
                 old.relocate_residency(crate::dataplane_resources::ResidencyStage::DiscardBatch);
                 let old_len = old.stored_bytes();
                 dropped_bytes = dropped_bytes.saturating_add(old_len);
                 dropped_packets.push(old);
+            } else {
+                packet.relocate_residency(crate::dataplane_resources::ResidencyStage::DiscardBatch);
+                dropped_packets.push(packet);
+                return (dropped_packets, dropped_bytes.saturating_add(packet_len));
             }
         }
         let packet_capacity = packet.stored_capacity();
@@ -322,11 +328,15 @@ impl PeerPendingQueue {
     }
 
     fn pop_front(&mut self) -> Option<PendingPacket> {
-        let mut packet = self.queue.pop_front()?;
+        let packet = self.queue.pop_front()?;
+        Some(self.finish_pop(packet))
+    }
+
+    fn finish_pop(&mut self, mut packet: PendingPacket) -> PendingPacket {
         self.bytes = self.bytes.saturating_sub(packet.stored_bytes());
         self.change_resource_capacity(packet.stored_capacity(), false);
         packet.relocate_residency(crate::dataplane_resources::ResidencyStage::DetachedRaw);
-        Some(packet)
+        packet
     }
 
     fn push_front(&mut self, mut packet: PendingPacket) {
@@ -361,6 +371,7 @@ impl PeerPendingQueue {
     /// batch is task-owned. New arrivals share its original deadlines.
     fn timing_shell(&self) -> Self {
         let mut shell = Self::new();
+        shell.queue.enabled = self.queue.enabled;
         shell.wait_started = self.wait_started;
         shell.wait_deadline = self.wait_deadline;
         shell.wait_generation = self.wait_generation;
@@ -450,57 +461,73 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
     let mut flushing_peers = HashMap::new();
     let mut fast_paths = HashMap::new();
     let mut fast_path_ineligible = HashMap::new();
+    let pacing = ctx.peers.transport_config().max_tx_mbps.is_some();
     loop {
+        let pacing_wake = pacing
+            .then(|| {
+                let now = Instant::now();
+                pending
+                    .values()
+                    .filter_map(|queue| queue.retry_after)
+                    .filter(|deadline| *deadline > now)
+                    .min()
+            })
+            .flatten();
         tokio::select! {
             packet = outbound_rx.recv() => {
-                let Some(mut packet) = packet else { break; };
-                let now = Instant::now();
-                if let Some(trace) = packet.trace.as_mut() {
-                    trace.network_queue_dequeued = Some(now);
-                    if trace.sampled {
-                        global_dataplane_profiler().record_network_outbound_resources(true,
-                            resource_snapshot(outbound_rx.len(), &pending, flush_tasks.len()));
+                let Some(packet) = packet else { break; };
+                let mut first = Some(packet);
+                let batch = if ctx.transport.accepts_request_carriage() { 1 } else { 32 };
+                for _ in 0..batch {
+                    let Some(mut packet) = first.take().or_else(|| outbound_rx.try_recv().ok()) else { break; };
+                    let now = Instant::now();
+                    if let Some(trace) = packet.trace.as_mut() {
+                        trace.network_queue_dequeued = Some(now);
+                        if trace.sampled {
+                            global_dataplane_profiler().record_network_outbound_resources(true,
+                                resource_snapshot(outbound_rx.len(), &pending, flush_tasks.len()));
+                        }
+                        if let Some(enqueued) = trace.transport_queue_send_started {
+                            global_dataplane_profiler().record(trace.sampled,
+                                "tx_network_outbound_queue_wait_us", now.duration_since(enqueued));
+                        }
                     }
-                    if let Some(enqueued) = trace.transport_queue_send_started {
-                        global_dataplane_profiler().record(trace.sampled,
-                            "tx_network_outbound_queue_wait_us", now.duration_since(enqueued));
-                    }
+                    packet.observe_initial_queue_intervals();
+                    let peer_id = packet.peer_id.clone();
+                    let can_try_fast = !pacing && ctx.prefer_direct && ctx.peers.is_direct_sync(&peer_id)
+                        && !pending.contains_key(&peer_id) && !flushing_peers.contains_key(&peer_id);
+                    let packet = if can_try_fast {
+                        match try_lan_direct_fast_path(packet, &ctx.transport, &ctx.peers,
+                            ctx.prefer_direct, &ctx.udp_transport, &mut fast_paths, &mut fast_path_ineligible) {
+                            FastPathAttempt::Sent => continue,
+                            FastPathAttempt::Fallback(packet) => packet,
+                            FastPathAttempt::Terminal { packet, generation, reason_code, reason } => {
+                                let active_peer = peer_id.clone();
+                                let ctx = ctx.clone();
+                                let task = flush_tasks.spawn(async move {
+                                    report_fast_path_terminal(&ctx.transport, &ctx.peers, &peer_id,
+                                        generation, packet.payload().len(), reason_code, reason, &ctx.timeline, None).await;
+                                    (peer_id, PeerPendingQueue::new())
+                                });
+                                flushing_peers.insert(active_peer, task.id());
+                                continue;
+                            }
+                            FastPathAttempt::TerminalBytes { peer_id, path, local_endpoint, bytes, reason_code, reason } => {
+                                let active_peer = peer_id.clone();
+                                let ctx = ctx.clone();
+                                let task = flush_tasks.spawn(async move {
+                                    report_fast_path_terminal(&ctx.transport, &ctx.peers, &peer_id,
+                                        path.generation, bytes, reason_code, reason, &ctx.timeline,
+                                        Some((path, local_endpoint))).await;
+                                    (peer_id, PeerPendingQueue::new())
+                                });
+                                flushing_peers.insert(active_peer, task.id());
+                                continue;
+                            }
+                        }
+                    } else { packet };
+                    append_ingress(packet, &mut pending, &ctx, &mut probe_kick, &relay_probe_kick_tx);
                 }
-                packet.observe_initial_queue_intervals();
-                let peer_id = packet.peer_id.clone();
-                let can_try_fast = ctx.prefer_direct && ctx.peers.is_direct_sync(&peer_id)
-                    && !pending.contains_key(&peer_id) && !flushing_peers.contains_key(&peer_id);
-                let packet = if can_try_fast {
-                    match try_lan_direct_fast_path(packet, &ctx.transport, &ctx.peers,
-                        ctx.prefer_direct, &ctx.udp_transport, &mut fast_paths, &mut fast_path_ineligible) {
-                        FastPathAttempt::Sent => continue,
-                        FastPathAttempt::Fallback(packet) => packet,
-                        FastPathAttempt::Terminal { packet, generation, reason_code, reason } => {
-                            let active_peer = peer_id.clone();
-                            let ctx = ctx.clone();
-                            let task = flush_tasks.spawn(async move {
-                                report_fast_path_terminal(&ctx.transport, &ctx.peers, &peer_id,
-                                    generation, packet.packet.len(), reason_code, reason, &ctx.timeline, None).await;
-                                (peer_id, PeerPendingQueue::new())
-                            });
-                            flushing_peers.insert(active_peer, task.id());
-                            continue;
-                        }
-                        FastPathAttempt::TerminalBytes { peer_id, path, local_endpoint, bytes, reason_code, reason } => {
-                            let active_peer = peer_id.clone();
-                            let ctx = ctx.clone();
-                            let task = flush_tasks.spawn(async move {
-                                report_fast_path_terminal(&ctx.transport, &ctx.peers, &peer_id,
-                                    path.generation, bytes, reason_code, reason, &ctx.timeline,
-                                    Some((path, local_endpoint))).await;
-                                (peer_id, PeerPendingQueue::new())
-                            });
-                            flushing_peers.insert(active_peer, task.id());
-                            continue;
-                        }
-                    }
-                } else { packet };
-                append_ingress(packet, &mut pending, &ctx, &mut probe_kick, &relay_probe_kick_tx);
                 schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
             }
             _ = direct_notify.notified() => {
@@ -522,6 +549,13 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
             changed = relay_available_rx.changed() => {
                 if changed.is_err() { break; }
                 bump_probe_kick(&mut probe_kick, &relay_probe_kick_tx);
+                schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
+            }
+            _ = async {
+                if let Some(deadline) = pacing_wake {
+                    tokio::time::sleep_until(deadline.into()).await;
+                }
+            }, if pacing_wake.is_some() => {
                 schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
             }
             _ = ticker.tick() => {
@@ -553,7 +587,7 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
                             let (front_token, front_len, front_capacity) = match front {
                                 Some(PendingPacket::Plain { packet, .. }) =>
                                     (packet.binding().map(|binding| binding.token().clone()),
-                                     packet.packet.len(), packet.packet.capacity()),
+                                     packet.payload().len(), packet.allocated_payload_capacity()),
                                 None => (None, 0, 0),
                             };
                             ctx.transport.observe_worker_loss_for_test(crate::transport::WorkerLossObservation {
@@ -916,6 +950,29 @@ pub(super) async fn flush_one_peer_until_stopped(
         let Some(front) = queue.pop_front() else {
             break;
         };
+        if queue.queue.is_expired(&front, queue.delivery_deadline) {
+            let mut front = front;
+            record_pending_residence(
+                front.take_pending_residence(),
+                "tx_pending_residence_dropped_us",
+            );
+            defer_loss(
+                &mut queue,
+                &peer_id,
+                Some(generation),
+                QueueLossReason::QosExpired,
+                1,
+                front.stored_bytes(),
+                &ctx,
+            );
+            flushed += 1;
+            continue;
+        }
+        if let Some(delay) = peers.transport_send_delay(front.stored_bytes()) {
+            queue.push_front(front);
+            queue.retry_after = Some(Instant::now() + delay);
+            break;
+        }
 
         let PendingPacket::Plain {
             packet,
@@ -943,7 +1000,37 @@ pub(super) async fn flush_one_peer_until_stopped(
         )
         .await
         {
-            EncryptSendOutcome::Sent => {
+            outcome @ (EncryptSendOutcome::Sent | EncryptSendOutcome::SentWithTuning(_)) => {
+                if let EncryptSendOutcome::SentWithTuning(records) = outcome {
+                    for record in records {
+                        let is_parity = matches!(
+                            crate::transport_tuning::decode(record.payload()),
+                            Some(crate::transport_tuning::Message::Parity(_))
+                        );
+                        let (dropped, bytes) = queue.enqueue(PendingPacket::plain(record));
+                        let count = dropped.len();
+                        // Follow-up frames share the current peer queue and its bounds, so
+                        // parity is available before this worker drains the remaining bulk.
+                        if is_parity {
+                            peers
+                                .tuning()
+                                .fec_parity_queued
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        for mut packet in dropped {
+                            actor::finish_discard(&mut packet, &peer_id, &ctx);
+                        }
+                        defer_loss(
+                            &mut queue,
+                            &peer_id,
+                            Some(generation),
+                            QueueLossReason::QueueFull,
+                            count,
+                            bytes,
+                            &ctx,
+                        );
+                    }
+                }
                 #[cfg(test)]
                 transport
                     .pause_worker_loss_for_test(
@@ -1171,7 +1258,7 @@ pub(super) async fn record_retry_and_repark(
     timeline: &ConnectionTimeline,
 ) {
     let packet = packet.into();
-    let bytes = packet.packet.len();
+    let bytes = packet.payload().len();
     let generation = entry
         .wait_generation
         .unwrap_or_else(|| peers.current_network_generation_sync());
@@ -1260,7 +1347,7 @@ pub(super) async fn record_terminal_drop(
         peers,
         peer_id,
         packet_generation,
-        packet.packet.len(),
+        packet.payload().len(),
         reason_code,
         reason,
         timeline,

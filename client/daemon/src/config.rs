@@ -15,6 +15,8 @@ use std::path::Path;
 use crate::error::{DaemonError, Result};
 
 include!("config/types.rs");
+mod transport;
+pub use transport::{CompressionMode, FecMode, MtuMode, RelayTransportMode, TransportConfig};
 #[cfg(unix)]
 #[path = "config/private_file.rs"]
 mod private_file;

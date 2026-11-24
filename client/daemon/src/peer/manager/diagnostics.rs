@@ -48,6 +48,14 @@ impl PeerManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(peers.to_vec());
     }
 
+    pub(crate) fn record_transport_loss(&self, id: &str, path: ActiveBusinessPath, loss_bp: u16) {
+        if let Ok(mut connections) = self.connections.try_write() {
+            if let Some(peer) = connections.get_mut(id) {
+                peer.record_transport_loss(path, loss_bp);
+            }
+        }
+    }
+
     /// Record bytes sent to a peer.
     pub async fn record_sent(&self, node_id: &str, n: u64) {
         // Advisory counters share the existing connection read guard with
